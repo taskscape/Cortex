@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+local-agent/file-index/data/*.json
+local-agent/file-broker/backups/
+local-agent/logs/

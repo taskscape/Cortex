@@ -1,0 +1,27 @@
+{
+  "deniedPathFragments": [
+    "\\AppData\\Roaming\\Microsoft\\Credentials\\",
+    "\\AppData\\Local\\Google\\Chrome\\User Data\\",
+    "\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\",
+    "\\.ssh\\",
+    "\\.gnupg\\",
+    "\\Microsoft\\Crypto\\",
+    "\\Windows\\System32\\config\\",
+    "\\password",
+    "\\wallet",
+    "\\private key"
+  ],
+  "highRiskExtensions": [
+    ".env",
+    ".pem",
+    ".key",
+    ".pfx",
+    ".cer",
+    ".crt",
+    ".ps1",
+    ".cmd",
+    ".bat"
+  ],
+  "maxReadBytes": 1048576,
+  "backupRoot": "local-agent\\file-broker\\backups"
+}

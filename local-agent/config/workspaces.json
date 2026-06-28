@@ -1,0 +1,27 @@
+{
+  "roots": [
+    {
+      "path": "C:\\Projects",
+      "mode": "read-write",
+      "type": "projects"
+    },
+    {
+      "path": "C:\\Users\\Maciej\\Documents",
+      "mode": "read-only",
+      "type": "documents"
+    }
+  ],
+  "excludedPatterns": [
+    "**\\node_modules\\**",
+    "**\\.git\\**",
+    "**\\bin\\**",
+    "**\\obj\\**",
+    "**\\.vs\\**",
+    "**\\packages\\**",
+    "**\\dist\\**",
+    "**\\build\\**",
+    "**\\*.dll",
+    "**\\*.exe",
+    "**\\*.pdb"
+  ]
+}

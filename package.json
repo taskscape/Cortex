@@ -1,0 +1,21 @@
+{
+  "name": "matbot-local-agent-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Windows-native Matbot local assistant scaffold with Mem0 memory and controlled file context.",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "node --test tests/*.test.mjs",
+    "verify:openai": "node tests/verify-openai-key.mjs"
+  },
+  "workspaces": [
+    "local-agent/file-broker",
+    "local-agent/file-index",
+    "local-agent/matbot/plugins/hybrid-knowledge-index"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}

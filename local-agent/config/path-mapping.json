@@ -1,0 +1,9 @@
+{
+  "mappings": [
+    {
+      "windowsPrefix": "C:\\",
+      "wslPrefix": "/mnt/c/",
+      "dockerPrefix": "/workspace/c/"
+    }
+  ]
+}

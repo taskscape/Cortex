@@ -1,0 +1,23 @@
+{
+  "durableMemoryKinds": [
+    "preference",
+    "decision",
+    "project-fact",
+    "troubleshooting-outcome",
+    "domain-term",
+    "implementation-note"
+  ],
+  "doNotStoreInMemory": [
+    "raw-file-content",
+    "secret",
+    "temporary-command-output",
+    "large-log",
+    "duplicate-index-content"
+  ],
+  "promotionRequires": [
+    "explicit-user-request",
+    "stable-project-or-user-fact",
+    "reusable-decision",
+    "confirmed-recurring-solution"
+  ]
+}

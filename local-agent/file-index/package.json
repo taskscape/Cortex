@@ -1,0 +1,14 @@
+{
+  "name": "@local-agent/file-index",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "minimatch": "^10.0.3"
+  }
+}
