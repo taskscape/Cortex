@@ -874,6 +874,34 @@ plugins:
   - ./packages/plugins/background
 ```
 
+### Adding Plugins At Runtime
+
+Matbot can discover and add plugins while the WebUI is running. Prefer local
+specifiers for bundled plugins:
+
+```text
+plugin discover_local
+plugin add ./packages/plugins/background
+```
+
+Using a local `./packages/plugins/<name>` specifier does not need a package
+install; the runtime loads the plugin from the current Matbot checkout.
+
+Adding an npm-named plugin is different. Matbot runs `pnpm add` for npm
+specifiers, and pnpm normally blocks adding dependencies to the workspace root
+with `ERR_PNPM_ADDING_TO_ROOT`. This repository's
+`local-agent\matbot\.npmrc` sets `ignore-workspace-root-check=true` so npm-named
+plugin installation can work from the Matbot workspace root. Even so, local
+specifier paths are safer for bundled plugins because they avoid unnecessary
+package-manager changes.
+
+Plugin changes are boot-sensitive. If a plugin registers tools, services,
+stores, providers, or frontend behavior, restart Cortex after adding it:
+
+```powershell
+.\scripts\run.ps1
+```
+
 ### `workspace_action`
 
 Manages files in Matbot's workspace namespace. This is not unrestricted host
@@ -1074,6 +1102,51 @@ plugin lifecycle and stop it during teardown.
 ## Memory And Retrieval
 
 Cortex has several related but distinct retrieval layers.
+
+### Memory ("remember my name")
+
+The `cognition` plugin's `remember_fact` tool captures durable user facts into
+the `remembered_facts` store. The automatic trigger for this lives in the
+combination of `skills`, `triggers`, and `cognition`: the trigger notices
+messages that look memory-worthy, then invokes `remember_fact` as a silent side
+effect. The model does not need to reply with a tool result for the fact to be
+stored.
+
+Example user messages that should become durable facts:
+
+```text
+Memorize my name: Maciej Zagozda
+Remember that I prefer PowerShell on Windows
+My Siemens docs are in C:\Projects\Siemens\docs
+```
+
+For the name example, the intended path is:
+
+1. The user asks Cortex to memorize the name.
+2. `triggers` classifies the message as matching the memory trigger.
+3. `remember_fact` extracts the actual fact: `The user's name is Maciej Zagozda.`
+4. The fact is written to `remembered_facts` with session/message provenance.
+5. A later conversation can retrieve it through `contextual_search`.
+
+Recall and storage are separate. A fact can be correctly stored but not appear
+in an answer if the model does not call retrieval or if the needed memory context
+is not injected. This is why `contextual_search` now searches raw
+`remembered_facts` directly instead of waiting for `dream_time`.
+
+`dream_time` is slower consolidation, not immediate recall. It processes
+unassigned remembered facts and, when a fact strongly matches a skill, merges it
+into skill markdown so it becomes part of the long-term skills/knowledge layer.
+
+The default provider was changed to `gpt-4o` because weaker models previously
+produced spurious refusals such as "I can't store personal information" even
+when the user explicitly asked Cortex to remember a harmless name. The extraction
+prompt in `packages/plugins/cognition/src/remember/tool.ts` is tuned so explicit
+"remember" or "memorize" requests store the fact, not the instruction.
+
+If name recall fails, inspect the store directly with
+`remembered_facts_action`. If the fact exists there, the storage side worked and
+the issue is retrieval/injection/model behavior. If it does not exist, check
+that `skills`, `triggers`, and `cognition` are loaded in the active workspace.
 
 ### `remembered_facts`
 
