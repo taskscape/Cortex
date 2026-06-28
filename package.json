@@ -7,14 +7,18 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "node --test tests/*.test.mjs",
+    "test:webui": "playwright test",
+    "test:all": "npm test && npm run test:webui",
     "verify:openai": "node tests/verify-openai-key.mjs"
   },
   "workspaces": [
     "local-agent/file-broker",
     "local-agent/file-index",
+    "local-agent/matbot/plugins/expert-panel",
     "local-agent/matbot/plugins/hybrid-knowledge-index"
   ],
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^24.10.1",
     "typescript": "^5.9.3"
   }

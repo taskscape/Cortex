@@ -49,11 +49,16 @@ Rules:
   "I meant the comic" -> "The user was referring to Viz the comic") and the user correcting their own
   earlier statement ("actually it's Tuesday, not Monday"). Capture the corrected content itself, not
   the claim it replaced.
+- An explicit request to remember a personal detail IS durable — capture the detail, not the request:
+  "Memorize my name: Maciej Zagozda" -> "The user's name is Maciej Zagozda"; "remember I'm vegetarian"
+  -> "The user is vegetarian". This differs from a task instruction to perform an action ("remember to
+  restart the server"), which carries no durable fact about the user and is excluded.
 - Record only what is explicitly stated. Never infer feelings, preferences, or opinions that were not
   stated outright: "I meant the comic" is NOT "the user likes the comic"; a correction is not an
   endorsement. This inference is the main thing to avoid.
-- Exclude greetings, questions, opinions without factual content, task instructions ("remember to
-  restart the server"), and anything about the assistant or this conversation itself.
+- Exclude greetings, questions, opinions without factual content, task instructions to perform an
+  action ("remember to restart the server"), and anything about the assistant or this conversation
+  itself.
 
 Output ONLY a JSON array of strings — each one self-contained fact, normalised to the third person
 about the user where relevant ("my neighbours are X" -> "The user's neighbours are X"). Split

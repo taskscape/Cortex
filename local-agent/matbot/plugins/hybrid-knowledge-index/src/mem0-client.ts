@@ -1,4 +1,5 @@
 import type { KnowledgeEntry } from "./types.js";
+import { makeKnowledgeEntry } from "./entry.js";
 
 export interface Mem0ClientOptions {
   baseUrl: string;
@@ -13,7 +14,18 @@ export class Mem0Client {
     const payload = {
       messages: [{ role: "user", content: entry.content }],
       user_id: this.options.userId ?? "local-agent",
-      metadata: entry.metadata ?? {}
+      metadata: {
+        id: entry.id,
+        version: entry.version,
+        entities: entry.entities,
+        tags: entry.tags,
+        summary: entry.summary,
+        source: entry.source,
+        contentHash: entry.contentHash,
+        confidence: entry.confidence,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt
+      }
     };
 
     await this.request(["/memories", "/v1/memories"], {
@@ -37,15 +49,24 @@ export class Mem0Client {
     });
 
     const rows = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
-    return rows.map((item: Record<string, unknown>) => ({
-      content: String(item.memory ?? item.text ?? item.content ?? ""),
-      source: "mem0",
-      kind: "memory",
-      metadata: {
-        score: item.score,
-        id: item.id
-      }
-    })).filter(entry => entry.content.length > 0);
+    return rows.map((item: Record<string, unknown>) => {
+      const content = String(item.memory ?? item.text ?? item.content ?? "");
+      const metadata = asRecord(item.metadata);
+      const source = asRecord(metadata.source);
+      const sourceUuid = stringValue(source.uuid) ?? stringValue(item.id) ?? undefined;
+      return makeKnowledgeEntry({
+        id: stringValue(metadata.id) ?? (sourceUuid ? `mem0:${sourceUuid}` : undefined),
+        sourceType: stringValue(source.type) ?? "mem0",
+        sourceUuid,
+        content,
+        summary: stringValue(metadata.summary),
+        entities: stringArray(metadata.entities),
+        tags: stringArray(metadata.tags) ?? ["mem0", "memory"],
+        confidence: numberValue(item.score) ?? numberValue(metadata.confidence),
+        createdAt: stringValue(metadata.createdAt),
+        updatedAt: stringValue(metadata.updatedAt)
+      });
+    }).filter(entry => entry.content.length > 0);
   }
 
   private async request(paths: string[], init: RequestInit): Promise<Record<string, unknown> | unknown[]> {
@@ -82,4 +103,26 @@ export class Mem0Client {
 
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  return strings.length > 0 ? strings : undefined;
 }

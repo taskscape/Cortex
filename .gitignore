@@ -7,3 +7,4 @@ local-agent/file-index/data/*.json
 local-agent/file-broker/backups/
 local-agent/logs/
 local-agent/matbot/.vscode
+test-results

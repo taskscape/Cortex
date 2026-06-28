@@ -1,0 +1,13 @@
+{
+  "name": "@local-agent/expert-panel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": "./dist/index.js",
+  "types": "dist/index.d.ts",
+  "matbotRuntime": ["node"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

@@ -9,7 +9,7 @@ export function mergeRankAndDeduplicate(entries: KnowledgeEntry[], limit = 12): 
   const result: KnowledgeEntry[] = [];
 
   for (const item of ranked) {
-    const key = `${item.entry.source ?? ""}:${item.entry.metadata?.path ?? ""}:${item.entry.content}`;
+    const key = `${item.entry.source.type}:${item.entry.source.uuid}:${item.entry.contentHash ?? item.entry.content}`;
 
     if (seen.has(key)) {
       continue;
@@ -27,7 +27,7 @@ export function mergeRankAndDeduplicate(entries: KnowledgeEntry[], limit = 12): 
 }
 
 function score(entry: KnowledgeEntry): number {
-  const explicit = Number(entry.metadata?.score ?? 0);
-  const sourceBoost = entry.source === "mem0" ? 2 : entry.source === "file-index" ? 1 : 0;
+  const explicit = Number(entry.confidence ?? 0);
+  const sourceBoost = entry.source.type === "mem0" ? 2 : entry.source.type === "file-index" ? 1 : 0;
   return explicit + sourceBoost;
 }

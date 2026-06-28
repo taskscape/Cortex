@@ -67,11 +67,29 @@ test("file writer creates a backup and a diff for overwrites", async () => {
 
 test("hybrid ranking deduplicates entries", () => {
   const ranked = mergeRankAndDeduplicate([
-    { content: "same", source: "file-index", metadata: { path: "a", score: 2 } },
-    { content: "same", source: "file-index", metadata: { path: "a", score: 2 } },
-    { content: "memory", source: "mem0", metadata: { score: 1 } }
+    knowledgeEntry({ id: "file-index:a", content: "same", sourceType: "file-index", sourceUuid: "a", confidence: 2 }),
+    knowledgeEntry({ id: "file-index:a-copy", content: "same", sourceType: "file-index", sourceUuid: "a", confidence: 2 }),
+    knowledgeEntry({ id: "mem0:m", content: "memory", sourceType: "mem0", sourceUuid: "m", confidence: 1 })
   ]);
 
   assert.equal(ranked.length, 2);
   assert.equal(ranked[0].content, "same");
 });
+
+function knowledgeEntry({ id, content, sourceType, sourceUuid, confidence }) {
+  const now = "2026-06-28T00:00:00.000Z";
+  const contentHash = `${sourceType}:${sourceUuid}:${content}`;
+  return {
+    id,
+    version: id,
+    entities: [],
+    tags: [sourceType],
+    summary: content,
+    content,
+    contentHash,
+    source: { type: sourceType, uuid: sourceUuid },
+    confidence,
+    createdAt: now,
+    updatedAt: now
+  };
+}

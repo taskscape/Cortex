@@ -1,4 +1,5 @@
 import type { KnowledgeEntry } from "./types.js";
+import { hashText, makeKnowledgeEntry } from "./entry.js";
 
 export interface LocalFileIndexClientOptions {
   baseUrl: string;
@@ -28,16 +29,32 @@ export class LocalFileIndexClient {
     }
 
     const data = await response.json() as { results?: FileSearchResult[] };
-    return (data.results ?? []).map(result => ({
-      content: result.snippet,
-      source: "file-index",
-      kind: "file-context",
-      metadata: {
-        path: result.path,
-        relativePath: result.relativePath,
-        score: result.score,
-        ...result.metadata
-      }
-    }));
+    return (data.results ?? []).map(result => {
+      const sourceUuid = hashText(`${result.path}:${result.snippet}`);
+      return makeKnowledgeEntry({
+        id: `file-index:${sourceUuid}`,
+        sourceType: "file-index",
+        sourceUuid,
+        content: result.snippet,
+        summary: result.relativePath ?? result.path,
+        entities: extractEntities(result),
+        tags: ["file-index", "file-context", ...metadataTags(result.metadata)],
+        confidence: result.score
+      });
+    });
   }
+}
+
+function extractEntities(result: FileSearchResult): string[] {
+  const entities = [result.relativePath, result.path]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  return [...new Set(entities)];
+}
+
+function metadataTags(metadata: Record<string, unknown>): string[] {
+  const tags = metadata.tags;
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+  return tags.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
 }

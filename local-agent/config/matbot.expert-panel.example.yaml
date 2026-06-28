@@ -1,0 +1,19 @@
+providers:
+  openai:
+    module: ./packages/plugins/providers/openai-compat
+    endpoint: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+    credentials:
+      apiKey: ${OPENAI_API_KEY}
+    parameters:
+      maxTokens: 4096
+
+plugins:
+  - ./plugins/hybrid-knowledge-index
+  - ./packages/plugins/skills
+  - ./packages/plugins/triggers
+  - ./packages/plugins/rumsfeld
+  - ./packages/plugins/cognition
+  - ./packages/plugins/workspace
+  - ./plugins/expert-panel
+  - ./packages/plugins/frontend/web

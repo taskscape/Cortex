@@ -1,13 +1,21 @@
 export interface KnowledgeEntry {
+  id: string;
+  version: string;
+  entities: string[];
+  tags: string[];
+  summary: string;
   content: string;
-  source?: string;
-  kind?: string;
-  metadata?: Record<string, unknown>;
+  contentHash?: string;
+  source: { type: string; uuid: string };
+  confidence?: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface KnowledgeIndex {
   index(entry: KnowledgeEntry): Promise<void>;
   search(terms: Array<{ term: string; context?: string }>, signal: AbortSignal): Promise<KnowledgeEntry[]>;
+  entries?(): Iterable<KnowledgeEntry>;
 }
 
 export interface MatbotServices {

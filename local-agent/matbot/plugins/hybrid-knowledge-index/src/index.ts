@@ -10,19 +10,7 @@ export class HybridKnowledgeIndex implements KnowledgeIndex {
   ) {}
 
   async index(entry: KnowledgeEntry): Promise<void> {
-    await this.mem0.add({
-      content: entry.content,
-      source: entry.source ?? "matbot",
-      kind: entry.kind ?? "knowledge",
-      metadata: {
-        source: entry.source ?? "matbot",
-        kind: entry.kind ?? "knowledge",
-        scope: entry.metadata?.scope ?? "global",
-        project: entry.metadata?.project,
-        path: entry.metadata?.path,
-        createdBy: "matbot"
-      }
-    });
+    await this.mem0.add(entry);
   }
 
   async search(terms: Array<{ term: string; context?: string }>, signal: AbortSignal): Promise<KnowledgeEntry[]> {

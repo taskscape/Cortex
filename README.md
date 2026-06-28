@@ -128,11 +128,15 @@ pnpm install
 
 Configuration (already created, both gitignored):
 
-- `local-agent/matbot/matbot.yaml` — defines the `openai` provider (`gpt-4o-mini`, key via
-  `${OPENAI_API_KEY}`) and loads two plugins: `frontend/web` and
-  `plugins/hybrid-knowledge-index`.
+- `local-agent/matbot/matbot.yaml` — defines the `openai` provider (`gpt-4o`, key via
+  `${OPENAI_API_KEY}`) and loads the plugin stack: `hybrid-knowledge-index` (Mem0 + file
+  index), `skills`, `triggers`, `rumsfeld` (`contextual_search`), `cognition`
+  (`remember_fact` memory), `workspace` (file management), `expert-panel`
+  (`expert_panel` multi-expert orchestration), and `frontend/web`.
 - `local-agent/matbot/.env` — the Matbot Vault secrets: `OPENAI_API_KEY` plus the
   `MEM0_BASE_URL` / `FILE_INDEX_BASE_URL` / `FILE_BROKER_BASE_URL` the hybrid plugin uses.
+- `local-agent/config/matbot.expert-panel.example.yaml` — a tracked reference config that
+  mirrors the local gitignored `local-agent/matbot/matbot.yaml` plugin stack.
 
 Start the backend stack and the local-agent services first (see *Commands*), then launch
 the front-end:
@@ -150,6 +154,149 @@ Notes:
   and target plugin `apiVersion` `0.1` (Matbot's current API major) — both are set.
 - The browser bundle (`pnpm web-build` / `pnpm web-server`) is **not** wired to the local
   services: it runs entirely client-side and cannot reach the Node-only hybrid plugin.
+
+### Memory ("remember my name")
+
+The `cognition` plugin's `remember_fact` tool (plus its auto-trigger, enabled by `skills` +
+`triggers`) captures durable user facts into a `remembered_facts` store under
+`local-agent/matbot/.data/`. Stating a fact ("My name is …", "Memorize my name: …")
+persists it across conversations. `gpt-4o` is used because `gpt-4o-mini` produced spurious
+"I can't store personal information" refusals. The extraction prompt in
+`packages/plugins/cognition/src/remember/tool.ts` was tuned so an explicit "remember/
+memorize my …" request stores the *fact*, not the instruction.
+
+### Adding plugins at runtime
+
+`plugin add ./packages/plugins/<name>` loads a local plugin (no install needed). Adding an
+**npm-named** plugin runs `pnpm add` at the workspace root, which pnpm blocks by default
+(`ERR_PNPM_ADDING_TO_ROOT`); `local-agent/matbot/.npmrc` sets
+`ignore-workspace-root-check=true` so that works. Prefer the local `./packages/plugins/…`
+path (as returned by `plugin discover_local`) for bundled plugins.
+
+## Expert panel
+
+The repository includes a tool-based expert panel for running one conversation against
+selected domain experts, comparing their opinions, and letting an orchestrating model
+collate the result.
+
+### What was implemented
+
+- `local-agent/matbot/plugins/expert-panel` — a Node-only Matbot plugin that registers the
+  `expert_panel` tool.
+- `local-agent/config/experts.json` — config-driven expert definitions. The default experts
+  are `design`, `finance`, and `engineering`.
+- `local-agent/config/matbot.expert-panel.example.yaml` — tracked reference config showing
+  the Matbot plugin order required to enable the expert panel.
+- `local-agent/knowledge/<expert-id>/` — file-backed knowledge roots for each expert.
+  Put `.md`, `.txt`, `.json`, `.csv`, `.tsv`, `.yaml`, or `.yml` files here to ground that
+  expert's answers.
+- `local-agent/matbot/plugins/hybrid-knowledge-index` now maps Mem0 and file-index results
+  into Matbot's real `KnowledgeEntry` shape (`id`, `version`, `entities`, `tags`,
+  `summary`, `source`, timestamps, etc.) instead of returning the older simplified shape.
+
+### How it works
+
+The orchestration style is intentionally tool-based:
+
+1. The main Matbot agent calls `expert_panel`.
+2. `expert_panel` selects the requested experts, or all experts if none are specified.
+3. Each expert retrieves matching text snippets from its configured knowledge roots.
+4. Each expert gets an independent `services.singleTurn(...)` call with:
+   - that expert's system prompt;
+   - the user question;
+   - retrieved, expert-scoped source text;
+   - instructions to state evidence, assumptions, risks, and confidence.
+5. If `synthesize` is true, the plugin runs one final orchestrator `singleTurn(...)` call
+   to collate consensus, disagreements, assumptions, and a final recommendation.
+
+This keeps experts isolated by knowledge source while still running inside one Matbot
+process. It avoids spinning up separate chatbot processes for each expert.
+
+### Using the expert panel
+
+In the web UI, ask for the panel explicitly, for example:
+
+```text
+Use the expert panel to review whether we should build Google Drive persistence for
+the Node host. Ask design, finance, and engineering, then synthesize the decision.
+```
+
+The underlying tool input is:
+
+```json
+{
+  "question": "Should we build Google Drive persistence for the Node host?",
+  "experts": ["design", "finance", "engineering"],
+  "mode": "review",
+  "maxCitationsPerExpert": 5,
+  "synthesize": true
+}
+```
+
+Supported modes:
+
+- `parallel` — each expert answers independently.
+- `review` — experts critique a proposal or decision.
+- `debate` — experts emphasize tradeoffs and disagreement.
+
+### Adding or changing experts
+
+Edit `local-agent/config/experts.json`:
+
+```json
+{
+  "id": "security",
+  "title": "Security Expert",
+  "description": "Threat modeling, privacy, auth, and operational security.",
+  "provider": "openai",
+  "roots": ["../knowledge/security"],
+  "tags": ["security", "privacy"],
+  "systemPrompt": "You are the Security Expert..."
+}
+```
+
+Then create the knowledge folder:
+
+```powershell
+mkdir local-agent\knowledge\security
+```
+
+Add text files to that folder and restart Matbot:
+
+```powershell
+cd local-agent\matbot
+pnpm start
+```
+
+The plugin resolves roots relative to `local-agent/config/experts.json`. You can also point
+an expert at an absolute path if the material lives elsewhere.
+
+### Implementation notes
+
+- Expert retrieval is file-backed in this implementation. It ranks text files by simple term
+  occurrence in the filename and file content, then passes the top matches to the expert.
+- The expert panel is deliberately separate from the global `KnowledgeIndex`. That prevents
+  design, finance, and engineering from collapsing into one shared retrieval pool.
+- The current design is ready for a later RAG/database backend: replace `FileExpertKnowledge`
+  in `plugins/expert-panel/src/file-knowledge.ts` with a tenant-filtered vector search that
+  accepts `expertId`.
+- The orchestrator does not hide disagreement. The synthesis prompt asks for consensus,
+  disagreements, risks/assumptions, and a final recommendation.
+
+### Expert panel test data and tests
+
+Each default expert has a minimal `panel-probe.md` file under its knowledge folder. These
+files contain unique probe terms (`PanelProbeDesign`, `PanelProbeFinance`,
+`PanelProbeEngineering`) so automated tests can prove retrieval stays expert-scoped.
+
+The expert panel is covered by `tests/expert-panel.test.mjs`. The test uses a fake Matbot
+`singleTurn` implementation, so it verifies plugin registration, expert selection,
+per-expert file retrieval, prompt construction, citation output, synthesis invocation, and
+unknown-expert errors without spending model tokens.
+
+Playwright is not used for this layer because the expert system is currently exposed as a
+Matbot tool, not as custom browser UI. Add Playwright coverage when the web UI grows
+expert-specific controls or render states that need browser-level verification.
 
 ## Safety Defaults
 
