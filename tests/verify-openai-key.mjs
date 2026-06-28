@@ -1,6 +1,14 @@
 import { readFile } from "node:fs/promises";
 
-const spec = await readFile(new URL("../specification.md", import.meta.url), "utf8");
+let spec = "";
+try {
+  spec = await readFile(new URL("../specification.md", import.meta.url), "utf8");
+} catch (error) {
+  if (error?.code !== "ENOENT") {
+    throw error;
+  }
+}
+
 const key = spec.match(/sk-[A-Za-z0-9_-]{20,}/)?.[0] ?? process.env.OPENAI_API_KEY;
 
 if (!key) {

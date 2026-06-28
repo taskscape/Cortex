@@ -1,0 +1,59 @@
+{
+  "_comment": "Browser matbot config (the matbot.yaml analogue, as JSON so the node assembler needs no YAML parser). Plugin entries are repo-relative package paths; the assembler resolves them to inlined modules (preferring each package's `browser` export condition). `plugins` is the AUTO-LOAD core (loaded at boot) — kept minimal, mirroring node where only configured plugins load. `bundledPlugins` are baked into the artifact and the import map but NOT auto-loaded: they're offered via the browser `plugin` tool's discover and loaded on demand by package name, which (being baked) persists across reloads with no network. `providers` is intentionally empty — the browser asks for the full provider config at first startup and persists it. `providerModules` are the adapters the wizard offers. `assets` are raw files baked verbatim for the in-process frontend to inject. This is the default, full-featured UI (frontend/web's browser entry, sharing index.html + app.js with the Node server); the minimal demonstrator is matbot.web-demo.json.",
+
+  "output": "matbot.html",
+
+  "assets": {
+    "scaffold": "packages/plugins/frontend/web/static/index.html",
+    "appJs": "packages/plugins/frontend/web/static/app.js"
+  },
+
+  "plugins": [
+    "packages/plugins/browser",
+    "packages/plugins/frontend/web"
+  ],
+
+  "bundledPlugins": [
+    "packages/plugins/http",
+    "packages/plugins/ask-user",
+    "packages/plugins/sessions",
+    "packages/plugins/edit-session",
+    "packages/plugins/workspace",
+    "packages/plugins/rumsfeld",
+    "packages/plugins/triggers",
+    "packages/plugins/skills",
+    "packages/plugins/mcp-http",
+    "packages/plugins/whoami",
+    "packages/plugins/hook-logger",
+    "packages/plugins/persist-ki-bge",
+    "packages/plugins/json-validation",
+    "packages/plugins/tool-store",
+    "packages/plugins/cognition",
+    "packages/plugins/storage/google-drive"
+  ],
+
+  "providers": {},
+
+  "providerModules": [
+    {
+      "label": "Anthropic Messages API (Claude, DeepSeek /anthropic)",
+      "module": "packages/plugins/providers/anthropic",
+      "endpointHint": "https://api.deepseek.com/anthropic",
+      "modelHint": "deepseek-chat"
+    },
+    {
+      "label": "OpenAI-compatible chat completions (GPT, DeepSeek, Azure, local)",
+      "module": "packages/plugins/providers/openai-compat",
+      "endpointHint": "https://api.deepseek.com/v1/chat/completions",
+      "modelHint": "deepseek-chat"
+    },
+    {
+      "label": "Customer Services (free demo LLM — no endpoint or API key needed)",
+      "module": "packages/plugins/providers/customer-services",
+      "modelHint": "customer-services",
+      "selfContained": true
+    }
+  ],
+
+  "defaultProvider": null
+}

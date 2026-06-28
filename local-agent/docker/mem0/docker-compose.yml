@@ -1,17 +1,32 @@
 services:
   mem0-api:
-    image: mem0/mem0-api-server:latest
+    # Patched image: upstream mem0/mem0-api-server is missing the psycopg driver
+    # required by its pgvector store, so we layer it in (see Dockerfile.mem0-api).
+    build:
+      context: .
+      dockerfile: Dockerfile.mem0-api
+    image: matbot/mem0-api-server:patched
+    # Upstream only publishes a linux/arm64 manifest for the base image; run it under
+    # Docker Desktop's QEMU emulation on amd64 hosts.
+    platform: linux/arm64
     env_file:
-      - .env.example
+      # OPENAI_API_KEY is injected from .env here (not via ${..} interpolation),
+      # so a real key present in the launching shell cannot shadow the configured one.
+      - .env
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_DB: mem0
-      POSTGRES_USER: mem0
-      POSTGRES_PASSWORD: mem0-local
+      POSTGRES_DB: ${POSTGRES_DB:-mem0}
+      POSTGRES_USER: ${POSTGRES_USER:-mem0}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USERNAME: neo4j
-      NEO4J_PASSWORD: mem0-local-password
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}
+    volumes:
+      # The server defaults HISTORY_DB_PATH to /app/history/history.db, but that
+      # directory does not exist in the image. Mount a volume so it exists, is
+      # writable, and persists the SQLite history across restarts.
+      - mem0-history:/app/history
     ports:
       - "8888:8000"
     depends_on:
@@ -23,15 +38,15 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: mem0
-      POSTGRES_USER: mem0
-      POSTGRES_PASSWORD: mem0-local
+      POSTGRES_DB: ${POSTGRES_DB:-mem0}
+      POSTGRES_USER: ${POSTGRES_USER:-mem0}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
       - "5432:5432"
     volumes:
       - mem0-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mem0 -d mem0"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mem0} -d ${POSTGRES_DB:-mem0}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -39,7 +54,7 @@ services:
   neo4j:
     image: neo4j:5
     environment:
-      NEO4J_AUTH: neo4j/mem0-local-password
+      NEO4J_AUTH: ${NEO4J_AUTH:?NEO4J_AUTH is required (format neo4j/<password>)}
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -49,3 +64,4 @@ services:
 volumes:
   mem0-postgres:
   mem0-neo4j:
+  mem0-history:

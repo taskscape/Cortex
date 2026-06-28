@@ -1,0 +1,10 @@
+# The upstream mem0/mem0-api-server image is configured to use the pgvector
+# vector store but does not bundle a PostgreSQL driver, so it crashes on startup
+# with "Neither 'psycopg' nor 'psycopg2' library is available". This thin overlay
+# adds the missing driver. Built for linux/arm64 (the only published base arch).
+# The image is missing several runtime dependencies that its DEFAULT_CONFIG needs:
+#   - psycopg: required by the pgvector vector store
+#   - langchain-neo4j: required by the neo4j graph store (enabled via NEO4J_* env)
+#   - rank-bm25: required by the neo4j graph store for BM25 reranking
+FROM mem0/mem0-api-server:latest
+RUN pip install --no-cache-dir "psycopg[binary,pool]" langchain-neo4j rank-bm25

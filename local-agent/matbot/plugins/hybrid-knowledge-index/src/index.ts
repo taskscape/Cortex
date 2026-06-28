@@ -45,7 +45,7 @@ export class HybridKnowledgeIndex implements KnowledgeIndex {
 }
 
 export const plugin: MatbotPluginSpec = {
-  apiVersion: "1.0.0",
+  apiVersion: "0.1",
   async setup(services) {
     const mem0 = new Mem0Client({
       baseUrl: process.env.MEM0_BASE_URL ?? "http://localhost:8888",
