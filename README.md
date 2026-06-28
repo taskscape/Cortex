@@ -1,315 +1,547 @@
-# Matbot Local Agent Scaffold
+# Cortex Local Agent
 
-This repository implements a Windows-native local assistant scaffold based on the supplied specification.
+Cortex is a Windows-native local assistant built on the Matbot runtime. It combines
+local chat, provider selection, workspace isolation, durable memory, controlled file
+access, markdown RAG, and a tool-based expert panel.
 
-Implemented components:
-
-- `local-agent/file-index`: JSON-backed local file index with keyword search, path metadata, hash tracking, exclusion rules and likely-secret skipping.
-- `local-agent/file-broker`: policy-aware file access service for directory listing, text reads and approved writes with diffs and backups.
-- `local-agent/matbot/plugins/hybrid-knowledge-index`: Matbot-compatible `KnowledgeIndex` plugin that queries Mem0 and the local file index, then ranks and deduplicates results.
-- `local-agent/docker/mem0`: Docker Compose stack for Mem0 API dependencies and the Mem0 API endpoint.
-- `scripts`: setup, start, stop and health-check PowerShell scripts.
+Matbot remains the underlying runtime and plugin system. Cortex is the product shell
+configured in this repository: the WebUI branding, PowerShell launch scripts, workspace
+registry, local services, and default plugin set.
 
 PROJECTMEM is intentionally not integrated.
 
-## Secrets and credentials
+## Conceptual Overview
 
-The Mem0 stack requires several secrets that are **not** stored in the repository. They
-are kept as User-scoped environment variables and mirrored into a gitignored
-`local-agent\docker\mem0\.env` file that Docker Compose reads:
+Cortex is a local-agent workbench. It is meant to feel like one assistant in the
+browser, but internally it is a composed runtime:
 
-| Variable | Purpose | Source |
+- a WebUI for conversations, files, providers, experts, workspaces, and settings;
+- a Matbot process that loads providers, plugins, tools, stores, sessions, and
+  hooks from the active workspace configuration;
+- local services that expose safe file indexing, safe file access, and Mem0;
+- per-workspace persistent data, so different projects can carry different
+  providers, plugins, memories, skills, files, and RAG indexes;
+- retrieval layers that can bring back remembered facts, skills, indexed files,
+  workspace markdown, and expert-specific files;
+- an expert-panel tool that runs selected domain experts independently and can
+  synthesize their opinions.
+
+The important idea is that Cortex is not one hard-coded chatbot. It is a runtime
+whose behavior is assembled from configuration and plugins. The WebUI is just the
+visible control surface over that runtime.
+
+The default installation gives one `Default` workspace. That workspace is the
+current repository setup: its `matbot.yaml` defines the OpenAI-compatible
+providers, the active plugins, the Cortex WebUI, workspace RAG, memory, skills,
+the expert panel, and file-management tools. New workspaces copy this shape and
+then diverge independently.
+
+## How To Read This Document
+
+Start with these first sections if you are trying to understand the system:
+
+1. `Conceptual Overview` explains what Cortex is.
+2. `Architecture At A Glance` explains how requests move through the system.
+3. `Core Systems` explains plugins, memory, workspaces, RAG, and experts.
+4. `Repository Map`, `Requirements`, and `Quick Start` explain how to run it.
+5. `Configuration Reference` and later sections document every configurable part.
+
+The detailed reference sections intentionally repeat some terms introduced early.
+The goal is that a new reader first learns the mental model, then has exact files,
+commands, schemas, and troubleshooting steps close at hand.
+
+## Architecture At A Glance
+
+Cortex is layered rather than monolithic.
+
+| Layer | Responsibility | Main files/services |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | OpenAI access for Mem0 / verification | Supplied by you |
-| `POSTGRES_PASSWORD` | Postgres (pgvector) password | Generated |
-| `NEO4J_PASSWORD` | Neo4j password | Generated |
-| `NEO4J_AUTH` | `neo4j/<NEO4J_PASSWORD>` for the Neo4j container | Generated |
-| `MEM0_API_KEY` | Mem0 API auth key | Generated |
+| Browser UI | Chat, provider picker, expert controls, files, skills, workspace switcher, workspace settings. | `local-agent\matbot\packages\plugins\frontend\web` |
+| Matbot runtime | Loads config, providers, plugins, stores, sessions, tools, hooks, and the WebUI server. | `local-agent\matbot`, active `matbot.yaml` |
+| Workspace manager | Selects, creates, renames, and switches Cortex workspaces. | `cortex-workspaces.json`, `workspaces\<id>` |
+| Provider layer | Converts Matbot messages/tools into model API requests. | `providers.openai-compat` |
+| Plugin layer | Adds capabilities such as sessions, skills, triggers, memory, RAG, expert panel, and workspace files. | `plugins:` in `matbot.yaml` |
+| Retrieval layer | Pulls context from remembered facts, KnowledgeIndex, Mem0, file-index, workspace RAG, and expert files. | `contextual_search`, `workspace_rag`, `expert_panel` |
+| Local services | Host-side indexing, host file access, and Mem0. | ports `8877`, `8878`, `8888` |
+| Persistence layer | Stores sessions, files, skills, facts, RAG indexes, and service data. | `.data`, Docker volumes, JSON stores |
 
-Generate the passwords and store everything (one-time, before the first launch):
+Default local endpoints:
+
+| Service | Default URL | Backing code |
+| --- | --- | --- |
+| File index | `http://localhost:8877` | `local-agent\file-index` |
+| File broker | `http://localhost:8878` | `local-agent\file-broker` |
+| Mem0 API | `http://localhost:8888` | `local-agent\docker\mem0` |
+| Cortex WebUI | `http://localhost:19778` | `local-agent\matbot\packages\plugins\frontend\web` |
+
+Startup flow:
+
+1. `scripts\run.ps1` checks install/build state.
+2. It starts file-index, file-broker, and the Mem0 Docker stack unless skipped.
+3. It starts or restarts the Matbot WebUI process.
+4. Matbot finds `matbot.yaml`, then loads `cortex-workspaces.json`.
+5. The active workspace selects the actual `matbot.yaml` and `.env`.
+6. Matbot loads providers first, then plugins in configured order.
+7. Plugins register tools, services, stores, hooks, and the WebUI HTTP/SSE server.
+8. The browser connects to the WebUI and streams turns, tool calls, usage, and
+   timing events.
+
+Per-turn flow:
+
+1. The user sends a message in the WebUI.
+2. The frontend plugin appends it to the active session.
+3. Hooks and triggers may add context or fire side-effect tools.
+4. Workspace RAG may inject relevant markdown snippets.
+5. The provider adapter sends messages and available tools to the selected model.
+6. Tool calls run inside the Matbot tool layer and can query memory, RAG, files,
+   experts, or local services.
+7. The assistant response streams back to the WebUI with token and elapsed-time
+   summaries.
+
+Persistence is deliberately split:
+
+| Data | Scope | Location |
+| --- | --- | --- |
+| Workspace registry | Whole Cortex installation | `local-agent\matbot\cortex-workspaces.json` |
+| Provider/plugin config | One Cortex workspace | that workspace's `matbot.yaml` |
+| Provider secrets | One Cortex workspace | that workspace's `.env` |
+| Sessions, files, stores, memories, skills | One Cortex workspace | that workspace's `.data` |
+| Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
+| Workspace RAG index | One Cortex workspace | `.data\workspace-rag\index.json` |
+| File-index data | Host service | `local-agent\file-index\data\index.json` |
+| Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
+
+## Core Systems
+
+### Plugin System
+
+Matbot plugins are the main extension mechanism. A plugin can provide one or more
+of these things:
+
+- tools callable by the model or by the WebUI HTTP tool endpoint;
+- services registered into the runtime, such as `KnowledgeIndex` or
+  `WorkspaceRagManager`;
+- stores and generated CRUD tools;
+- hooks that observe or modify turn behavior;
+- provider adapters;
+- frontend surfaces such as the WebUI server.
+
+Plugins are loaded from the active workspace's `plugins:` list. The order matters
+because later plugins can depend on services registered by earlier plugins. In
+the default config, `hybrid-knowledge-index` registers `KnowledgeIndex` before
+`rumsfeld` exposes `contextual_search`, and the frontend loads last so its plugin
+catalog reflects the fully initialized runtime.
+
+There are three common plugin categories in this repository:
+
+| Category | Examples | Pattern |
+| --- | --- | --- |
+| Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
+| Retrieval plugins | `hybrid-knowledge-index`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context and grounded answers. |
+| Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
+
+Bundled plugins may exist in the tree without being active. They become active
+only when listed in the active workspace's `matbot.yaml`. That distinction is
+important when debugging errors like `workspace_rag plugin unavailable`: the code
+can exist on disk while the running workspace did not load it.
+
+### Memory System
+
+Cortex memory is not a single bucket. It is several layers with different jobs:
+
+| Layer | What it stores | Main tool/service |
+| --- | --- | --- |
+| Session history | The active conversation and previous conversations. | `sessions` |
+| Remembered facts | Explicit durable facts such as names, preferences, and project facts. | `remember_fact`, `remembered_facts_action` |
+| Skills | Reusable markdown playbooks and long-term operating knowledge. | `skill_action` |
+| KnowledgeIndex | Search interface over skills, Mem0, and file-index results. | `KnowledgeIndex` service |
+| Workspace RAG | Markdown files configured for the current workspace. | `workspace_rag` |
+| Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
+
+The "remember my name" flow is the simplest way to understand this:
+
+1. The user says, "Memorize my name: Maciej Zagozda."
+2. The `triggers` plugin classifies that message as memory-worthy.
+3. The `cognition` plugin runs `remember_fact` as a silent side effect.
+4. `remember_fact` extracts the stable fact and writes it to `remembered_facts`.
+5. On a later turn, `contextual_search` can search raw `remembered_facts`
+   directly, so the name can be recalled before any slower consolidation happens.
+6. `dream_time` is a separate consolidation pass that can later merge remembered
+   facts into skills when they strongly match a skill.
+
+This separation matters. Storing a fact and recalling a fact are different
+operations. A model can fail to recall a name even when the fact exists if it
+does not call the retrieval tool or the relevant memory context is not injected.
+That is why direct inspection through `remembered_facts_action` is documented
+later in this README.
+
+### Workspace System
+
+A Cortex workspace is a boot-scoped runtime context. It controls:
+
+- provider and model list;
+- plugin list;
+- workspace-local secrets;
+- sessions and files;
+- remembered facts and tool stores;
+- skills and knowledge;
+- workspace RAG folders and index.
+
+Switching workspaces restarts the Matbot process intentionally. Providers,
+plugins, vaults, stores, hooks, and session runners are initialized at boot, so a
+true workspace switch needs a fresh runtime.
+
+The default workspace points at `local-agent\matbot\matbot.yaml`. New workspaces
+live under `local-agent\matbot\workspaces\<workspace-id>` and receive their own
+copy of `matbot.yaml`, `.env`, and `.data`.
+
+### RAG And Retrieval Patterns
+
+Cortex uses several retrieval patterns at once because they solve different
+problems:
+
+| Pattern | Scope | Best for | Implementation |
+| --- | --- | --- | --- |
+| Host file index | Configured host roots | Broad project file search and metadata. | `file-index`, `hybrid-knowledge-index` |
+| File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` |
+| Workspace RAG | One Cortex workspace | Grounding every conversation in selected markdown folders. | `workspace-rag` |
+| Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
+| Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
+| Expert knowledge roots | One expert definition | Isolated domain expertise. | `expert-panel` |
+| Mem0 | Shared Mem0 service, queried by user id | External memory service integration. | `hybrid-knowledge-index` |
+
+The high-level rule is:
+
+- use `workspace_rag` for markdown folders selected for the current workspace;
+- use `contextual_search` when the model needs a blended recall layer;
+- use `expert_panel` when the user wants different domain perspectives;
+- use file-broker/file-index when the task is about host files rather than
+  workspace RAG context.
+
+### Expert System
+
+The expert panel is a tool-based panel of specialists. Each expert has its own
+definition, provider choice, system prompt, and knowledge roots. When asked, the
+tool retrieves relevant expert-specific files, runs each expert independently,
+and optionally performs a synthesis pass.
+
+This gives three useful behaviors:
+
+- experts can disagree because they are prompted from different perspectives;
+- citations stay scoped to each expert's configured files;
+- the orchestrator can collate consensus, disagreement, risks, assumptions, and
+  a recommendation.
+
+## Repository Map
+
+| Path | Purpose |
+| --- | --- |
+| `scripts\` | PowerShell setup, run, stop, and health-check commands. |
+| `local-agent\file-index` | JSON-backed file index with keyword search, metadata, hashing, exclusions, and likely-secret skipping. |
+| `local-agent\file-broker` | Policy-aware file access service for listing, reading, and approved writes with diffs and backups. |
+| `local-agent\docker\mem0` | Docker Compose stack for Mem0, Postgres/pgvector, and Neo4j. |
+| `local-agent\config` | Host-side configuration for file roots, security policy, path mapping, memory policy, and expert definitions. |
+| `local-agent\knowledge` | Minimal file-backed knowledge samples for the default experts. |
+| `local-agent\matbot` | Matbot runtime checkout, Cortex WebUI, providers, plugins, workspace registry, and per-workspace data. |
+| `tests` | Node test suite plus Playwright WebUI coverage. |
+
+## Requirements
+
+- Node.js 20 or newer provides `node` and `npm`; it is required for builds,
+  tests, file-index, file-broker, and Matbot.
+- `pnpm` is required by the Matbot monorepo. `run.ps1` installs `pnpm@9` when it
+  is missing unless `-SkipInstall` is used.
+- Docker Desktop with WSL2 is required for the Mem0 stack: Postgres, Neo4j, and
+  the Mem0 API.
+- The Mem0 API image used here is currently run as `linux/arm64` in Docker
+  Compose. On `amd64` Windows hosts, Docker Desktop runs it through QEMU
+  emulation.
+- The local Mem0 API image is patched with `Dockerfile.mem0-api` because the
+  upstream image lacks the `psycopg` driver needed by pgvector and needs a
+  persistent history directory. The first compose startup may take a few minutes
+  while this derived image is built; later starts reuse it.
+- An OpenAI-compatible model provider is required for real model turns. The
+  default hosted provider uses `OPENAI_API_KEY`; the configured `Local` provider
+  points at `http://100.122.2.99:11435/v1`.
+
+## Quick Start
+
+Prerequisites:
+
+- Windows PowerShell.
+- Node.js 20 or newer.
+- Docker Desktop if you want Mem0 memory services.
+- Network access to any configured hosted provider.
+
+Configure secrets once:
 
 ```powershell
 .\scripts\setup-secrets.ps1 -OpenAiKey "<your-openai-key>"
 ```
 
-This generates strong random passwords, sets all of the variables above at the User
-scope, and writes `local-agent\docker\mem0\.env`. Re-run with `-Force` to rotate the
-generated passwords. After it runs, **open a new terminal** so the User-scoped variables
-are visible to subsequent commands.
+This generates strong local passwords, stores them as User-scoped environment
+variables, and writes `local-agent\docker\mem0\.env`. Open a new terminal after
+running it so the new User-scoped environment variables are visible.
 
-Notes:
-- `.env` and the real secret values are gitignored and must never be committed.
-  `local-agent\docker\mem0\.env.example` is the committed placeholder template.
-- `docker-compose.yml` now reads `POSTGRES_PASSWORD`, `NEO4J_PASSWORD`, `NEO4J_AUTH`
-  and the Mem0 settings from the environment / `.env`; it fails fast if a required
-  secret is missing.
-- The Postgres and Neo4j passwords are baked into their data volumes on first run.
-  If you rotate them after the stack has already started once, recreate the volumes:
-  `docker compose -f local-agent\docker\mem0\docker-compose.yml down -v`.
-
-## Commands
-
-Install/build if needed, start services, check health, and open the Cortex WebUI:
+Launch everything:
 
 ```powershell
 .\scripts\run.ps1
 ```
 
-`run.ps1` restarts the Matbot WebUI process on the selected port by default so plugin,
-configuration, and WebUI changes are picked up. Pass `-NoRestartMatbot` only when you
-explicitly want to reuse an already-running WebUI process.
+The command installs and builds when needed, starts local services, checks health,
+starts or restarts the WebUI process, and opens the browser at:
 
-Install and build:
-
-```powershell
-.\scripts\setup-local-agent.ps1
+```text
+http://localhost:19778
 ```
 
-Start local services:
-
-```powershell
-.\scripts\start-local-agent.ps1
-```
-
-Check service health:
-
-```powershell
-.\scripts\health-check.ps1
-```
-
-Stop services:
+Stop local services:
 
 ```powershell
 .\scripts\stop-local-agent.ps1
 ```
 
-Run tests:
+## Commands
+
+### PowerShell
+
+Run commands from `C:\Projects\Cortex`.
+
+| Command | Purpose |
+| --- | --- |
+| `.\scripts\setup-secrets.ps1 -OpenAiKey "<key>"` | Generate local passwords and write Mem0/OpenAI environment configuration. |
+| `.\scripts\setup-local-agent.ps1` | Install dependencies and build the local agent workspaces. |
+| `.\scripts\start-local-agent.ps1` | Start file-index, file-broker, Mem0 Docker services, and optionally Matbot. |
+| `.\scripts\health-check.ps1` | Check health of file-index, file-broker, and Mem0. |
+| `.\scripts\stop-local-agent.ps1` | Stop local service processes and the Docker stack. |
+| `.\scripts\run.ps1` | Aggregate setup, start, health-check, and browser launch. |
+
+Useful `run.ps1` switches:
+
+| Switch | Effect |
+| --- | --- |
+| `-ForceInstall` | Force dependency checks and installation. |
+| `-SkipInstall` | Do not install dependencies. Requires dependencies to already exist. |
+| `-SkipBuild` | Do not run builds. |
+| `-SkipDocker` | Do not start the Mem0 Docker stack. |
+| `-SkipHealth` | Do not run health checks. |
+| `-NoBrowser` | Start services but do not open a browser. |
+| `-NoStart` | Check install/build state without starting services. |
+| `-NoRestartMatbot` | Reuse an already-running WebUI process instead of restarting it. |
+| `-WebPort 19779` | Start the WebUI on a different port. |
+| `-HealthTimeoutSec 180` | Wait longer for services to become healthy. |
+
+`run.ps1` restarts the WebUI process by default so changes to plugins,
+configuration, providers, and UI assets are picked up. Use `-NoRestartMatbot`
+only when you deliberately want to keep the existing WebUI process.
+
+### npm
+
+| Command | Purpose |
+| --- | --- |
+| `npm run build` | Build all npm workspaces declared in the root `package.json`. |
+| `npm test` | Run the Node test suite in `tests\*.test.mjs`. |
+| `npm run test:webui` | Run Playwright WebUI tests. |
+| `npm run test:all` | Run Node tests and Playwright tests. |
+| `npm run verify:openai` | Verify the current OpenAI API key with the configured test script. |
+
+First Playwright setup on a machine:
 
 ```powershell
-npm test
-```
-
-Run WebUI tests:
-
-```powershell
-# First time on a machine, install the Playwright Chromium browser:
 npx playwright install chromium
-
-npm run test:webui
 ```
 
-Run the complete local test set:
+## Configuration Reference
+
+This section is the main reference for configuration files and environment
+variables. Prefer editing configuration files over changing code when adding
+providers, plugins, workspaces, or RAG folders.
+
+### Configuration Files
+
+| File | Purpose |
+| --- | --- |
+| `local-agent\matbot\matbot.yaml` | Default workspace Matbot config: providers, plugin order, prompt flags, and optional principal/default provider. |
+| `local-agent\matbot\.env` | Active default-workspace secrets loaded by Matbot's `EnvFileVault`. Gitignored. |
+| `local-agent\matbot\.env.example` | Committed template for workspace-level Matbot provider/service environment variables. |
+| `local-agent\matbot\cortex-workspaces.json` | Cortex workspace registry. Created automatically if missing. |
+| `local-agent\matbot\cortex-rag.json` | Default workspace RAG contexts and watched markdown folders. |
+| `local-agent\matbot\workspaces\<id>\matbot.yaml` | Per-workspace Matbot config for non-default workspaces. |
+| `local-agent\matbot\workspaces\<id>\.env` | Per-workspace secret file copied from the default workspace when the workspace is created. |
+| `local-agent\matbot\workspaces\<id>\cortex-rag.json` | Per-workspace RAG configuration. Created when RAG is configured. |
+| `local-agent\config\workspaces.json` | Host filesystem roots allowed for file-index and file-broker. |
+| `local-agent\config\security-policy.json` | File-broker denied path fragments, high-risk extensions, read limit, and backup root. |
+| `local-agent\config\path-mapping.json` | Windows, WSL, and Docker path prefix mappings. |
+| `local-agent\config\memory-policy.json` | Human policy for durable memory: what to store, avoid, and promote. |
+| `local-agent\config\experts.json` | Expert panel definitions and knowledge roots. |
+| `local-agent\docker\mem0\.env` | Docker Compose secrets for Mem0/Postgres/Neo4j. Gitignored. |
+| `local-agent\docker\mem0\.env.example` | Committed template for Mem0 environment variables. |
+| `package.json` | Root npm scripts and npm workspaces. |
+
+### Secrets And Environment
+
+`setup-secrets.ps1` manages the required local secrets:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | OpenAI-compatible hosted provider and Mem0/OpenAI verification. |
+| `POSTGRES_PASSWORD` | Postgres password for the Mem0 Docker stack. |
+| `NEO4J_PASSWORD` | Neo4j password for the Mem0 Docker stack. |
+| `NEO4J_AUTH` | `neo4j/<NEO4J_PASSWORD>` value consumed by Neo4j. |
+| `MEM0_API_KEY` | API key used by the Mem0 service. |
+
+The script writes these values to User-scoped environment variables and mirrors
+Docker values into `local-agent\docker\mem0\.env`.
+
+Additional runtime environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FILE_INDEX_BASE_URL` | `http://localhost:8877` | URL used by the hybrid KnowledgeIndex plugin. |
+| `FILE_BROKER_BASE_URL` | `http://localhost:8878` | URL used by local file tools. |
+| `MEM0_BASE_URL` | `http://localhost:8888` | URL used by Mem0 retrieval. |
+| `MEM0_USER_ID` | `local-agent` | User id used by hybrid Mem0 retrieval. |
+| `MATBOT_WEB_PORT` | `19778` | WebUI port. Set by `run.ps1 -WebPort`. |
+| `MATBOT_COMMAND` | unset | Optional command consumed by `start-local-agent.ps1` to launch Matbot. |
+| `MATBOT_PRINCIPAL` | unset | Boot identity override for Matbot. Accepts an id or JSON `{ "id", "type" }`. |
+| `CORTEX_WORKSPACES_FILE` | `cortex-workspaces.json` next to `matbot.yaml` | Override workspace registry location. |
+| `CORTEX_WORKSPACE_ID` | active workspace in registry | Select workspace config for a restarted Matbot process. |
+| `CORTEX_RESTART_DELAY_MS` | `0` | Delay used by workspace switch restarts. |
+| `EXPERT_PANEL_CONFIG` | `local-agent\config\experts.json` | Override expert panel configuration. |
+| `WORKSPACES_CONFIG` | `local-agent\config\workspaces.json` | Override file-index/file-broker root policy. |
+| `SECURITY_POLICY_CONFIG` | `local-agent\config\security-policy.json` | Override file-broker security policy. |
+| `FILE_INDEX_PORT` | `8877` | File-index HTTP port. |
+| `FILE_INDEX_STORE` | `local-agent\file-index\data\index.json` | File-index persistent store path. |
+| `FILE_INDEX_MAX_FILE_BYTES` | `1000000` | Maximum file size indexed by file-index. |
+| `FILE_BROKER_PORT` | `8878` | File-broker HTTP port. |
+
+Provider API keys can also be supplied in `local-agent\matbot\.env` or a
+workspace-specific `.env`. The vault resolves `${NAME}` placeholders from this
+file and from process environment variables.
+
+Do not commit real `.env` files or secret values.
+
+### Mem0 Docker
+
+`local-agent\docker\mem0\docker-compose.yml` reads
+`local-agent\docker\mem0\.env`. The expected template is:
+
+```dotenv
+MEM0_BASE_URL=http://localhost:8888
+MEM0_API_KEY=CHANGE_ME
+POSTGRES_DB=mem0
+POSTGRES_USER=mem0
+POSTGRES_PASSWORD=CHANGE_ME
+NEO4J_PASSWORD=CHANGE_ME
+NEO4J_AUTH=neo4j/CHANGE_ME
+OPENAI_API_KEY=CHANGE_ME
+```
+
+The Postgres and Neo4j passwords are baked into their Docker volumes on first
+start. If you rotate them after the stack has already started, recreate the
+volumes:
 
 ```powershell
-npm run test:all
+docker compose -f local-agent\docker\mem0\docker-compose.yml down -v
 ```
 
-Verify the configured OpenAI key (read from the `OPENAI_API_KEY` environment variable,
-or `specification.md` if present) without printing it:
+Then run `setup-secrets.ps1` and start again.
 
-```powershell
-npm run verify:openai
-```
+### Host File Access
 
-## Requirements
-
-- **Node.js 20+** (provides `node` / `npm`) — required for the build, the file-index and
-  file-broker services, `npm test`, and `npm run verify:openai`.
-- **Docker Desktop** with WSL2 — required for the Mem0 stack (Postgres, Neo4j, Mem0 API).
-- The Mem0 API image (`mem0/mem0-api-server`) is currently published **only for
-  `linux/arm64`**. On `amd64` hosts the `mem0-api` service runs under Docker Desktop's
-  QEMU emulation via `platform: linux/arm64` in `docker-compose.yml` (no extra setup;
-  emulation ships with Docker Desktop). It also requires `OPENAI_API_KEY`, which is
-  supplied through the gitignored `.env` (see *Secrets and credentials*).
-- The upstream Mem0 image has two gaps that are patched locally, so the first launch
-  **builds a small derived image** (`Dockerfile.mem0-api`):
-  - it lacks the `psycopg` driver its pgvector store needs — the Dockerfile installs it;
-  - its history DB path (`/app/history/history.db`) has no directory — a `mem0-history`
-    volume provides and persists it.
-  The first `docker compose ... up` therefore builds this image (a few minutes under
-  emulation); subsequent launches reuse it.
-
-## Endpoints
-
-- File index: `http://localhost:8877`
-- File broker: `http://localhost:8878`
-- Mem0 API: `http://localhost:8888`
-- Matbot web UI: `http://localhost:19778` (when the front-end is running — see below)
-
-## Matbot front-end (web UI)
-
-The Matbot agent runtime lives in `local-agent/matbot` (a separate pnpm monorepo). It is
-wired to this project via the `hybrid-knowledge-index` plugin (Mem0 + the local file
-index) and configured with selectable OpenAI-compatible providers.
-
-One-time setup:
-
-```powershell
-# pnpm is required (Node already provides corepack/npm):
-npm install -g pnpm@9
-cd local-agent\matbot
-pnpm install
-```
-
-Configuration (already created, both gitignored):
-
-- `local-agent/matbot/matbot.yaml` — defines the `openai` provider (`gpt-4o`, key via
-  `${OPENAI_API_KEY}`), the local `Local` provider (`qwen3-coder-next-256k` via
-  `http://100.122.2.99:11435/v1`), and loads the plugin stack:
-  `hybrid-knowledge-index` (Mem0 + file
-  index), `workspace-rag` (per-workspace markdown RAG), `skills`, `triggers`,
-  `rumsfeld` (`contextual_search`), `cognition` (`remember_fact` memory),
-  `workspace` (file management), `expert-panel` (`expert_panel` multi-expert
-  orchestration), and `frontend/web`.
-- `local-agent/matbot/.env` — the Matbot Vault secrets: `OPENAI_API_KEY` plus the
-  `MEM0_BASE_URL` / `FILE_INDEX_BASE_URL` / `FILE_BROKER_BASE_URL` the hybrid plugin uses.
-- `local-agent/config/matbot.expert-panel.example.yaml` — a tracked reference config that
-  mirrors the local gitignored `local-agent/matbot/matbot.yaml` plugin stack.
-
-### Cortex workspaces
-
-Cortex can run as separate named workspaces. A workspace is selected before the Matbot
-runtime boots, so each workspace gets its own configuration, provider/model list, plugin
-list, Vault `.env`, sessions, workspace files, memories, remembered facts, knowledge stores,
-and any storage-backend data rooted under `.data`.
-
-The workspace registry is persisted at:
-
-```text
-local-agent/matbot/cortex-workspaces.json
-```
-
-If the file does not exist, startup creates it with a `default` workspace pointing at the
-current `local-agent/matbot/matbot.yaml`. That means existing installations become the
-default workspace, and new deployments always start with a default workspace.
-
-New workspaces created from the WebUI are stored under:
-
-```text
-local-agent/matbot/workspaces/<workspace-id>/
-```
-
-Each generated workspace contains:
-
-- `matbot.yaml` — copied from the default config with local plugin/provider paths converted
-  to absolute paths so the workspace can load the same local plugins from its own directory.
-- `.env` — copied from `local-agent/matbot/.env` if it exists, so the new workspace starts
-  with the same secrets but can then be changed independently.
-- `.data\` — created lazily by the runtime for that workspace's sessions, files, memories,
-  remembered facts, skills, and plugin stores.
-
-The WebUI selector is in the bottom-left sidebar. Use it to switch workspaces, create a new
-workspace, or rename the active workspace. Switching writes the new active workspace to
-`cortex-workspaces.json`, restarts the local Matbot server against that workspace's config,
-and reloads the page. This restart is intentional: providers, plugins, vaults, storage
-backends, and session runners are boot-scoped.
-
-The registry format is:
+`local-agent\config\workspaces.json` controls host directories exposed to
+file-index and file-broker:
 
 ```json
 {
-  "active": "default",
-  "workspaces": [
+  "roots": [
     {
-      "id": "default",
-      "name": "Default",
-      "configPath": "matbot.yaml",
-      "createdAt": "2026-06-28T00:00:00.000Z",
-      "updatedAt": "2026-06-28T00:00:00.000Z"
+      "path": "C:\\Projects",
+      "mode": "read-write",
+      "type": "projects"
+    },
+    {
+      "path": "C:\\Users\\Maciej\\Documents",
+      "mode": "read-only",
+      "type": "documents"
     }
+  ],
+  "excludedPatterns": [
+    "**\\node_modules\\**",
+    "**\\.git\\**",
+    "**\\dist\\**"
   ]
 }
 ```
 
-`configPath` is resolved relative to `cortex-workspaces.json`. Advanced users can add a
-workspace manually by creating a workspace directory, writing a `matbot.yaml`, and adding a
-record to the registry. Set `CORTEX_WORKSPACE_ID=<id>` before startup to force a workspace
-for that process; set `CORTEX_WORKSPACES_FILE=<path>` to use a different registry file.
+`mode` is `read-write` or `read-only`. File-broker writes are allowed only inside
+read-write roots and still pass security checks.
 
-Start the backend stack and the local-agent services first (see *Commands*), then launch
-the front-end:
+`local-agent\config\security-policy.json` blocks sensitive paths, marks high-risk
+extensions, caps reads with `maxReadBytes`, and stores backups under
+`local-agent\file-broker\backups`.
 
-```powershell
-cd local-agent\matbot
-pnpm start          # headless server mode; hosts the web frontend
-```
-
-It prints `[frontend-web] http://localhost:19778` — **open that URL in your browser**.
-(Override the port with `MATBOT_WEB_PORT`.) For a terminal UI instead, use `pnpm repl`.
-
-Notes:
-- The `hybrid-knowledge-index` plugin must expose an `exports` entry in its `package.json`
-  and target plugin `apiVersion` `0.1` (Matbot's current API major) — both are set.
-- The browser bundle (`pnpm web-build` / `pnpm web-server`) is **not** wired to the local
-  services: it runs entirely client-side and cannot reach the Node-only hybrid plugin.
-
-### Memory ("remember my name")
-
-The `cognition` plugin's `remember_fact` tool (plus its auto-trigger, enabled by `skills` +
-`triggers`) captures durable user facts into a `remembered_facts` store under
-`local-agent/matbot/.data/`. Stating a fact ("My name is …", "Memorize my name: …")
-persists it across conversations. `gpt-4o` is used because `gpt-4o-mini` produced spurious
-"I can't store personal information" refusals. The extraction prompt in
-`packages/plugins/cognition/src/remember/tool.ts` was tuned so an explicit "remember/
-memorize my …" request stores the *fact*, not the instruction.
-
-Recall and storage are separate:
-
-- `remember_fact` captures durable facts and writes them to `remembered_facts`.
-- `contextual_search` retrieves local context during chat. It now searches both the
-  active `KnowledgeIndex` and the raw `remembered_facts` store, so facts such as
-  "The user's name is Maciej Zagozda" are available immediately instead of waiting
-  for background consolidation.
-- `dream_time` is the slower consolidation pass. It processes unassigned remembered
-  facts and, when it finds a strong matching skill, merges those facts into skill
-  markdown so they become part of the long-term skill/knowledge layer.
-
-### Adding plugins at runtime
-
-`plugin add ./packages/plugins/<name>` loads a local plugin (no install needed). Adding an
-**npm-named** plugin runs `pnpm add` at the workspace root, which pnpm blocks by default
-(`ERR_PNPM_ADDING_TO_ROOT`); `local-agent/matbot/.npmrc` sets
-`ignore-workspace-root-check=true` so that works. Prefer the local `./packages/plugins/…`
-path (as returned by `plugin discover_local`) for bundled plugins.
-
-## Configured Matbot plugins
-
-The live Matbot stack is defined in `local-agent/matbot/matbot.yaml`. Plugins are loaded
-in order; provider profiles are configured separately under `providers`.
-
-Most examples below are direct tool payloads. In the WebUI you can ask the agent to use
-the tool naturally, or call the local tool endpoint while Matbot is running:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://localhost:19778/tools/<tool-name> `
-  -ContentType "application/json" `
-  -Body '<json-payload>'
-```
-
-### `./packages/plugins/providers/openai-compat`
-
-The OpenAI-compatible provider adapter backs the configured `openai` and `Local` provider
-profiles. `openai` points at OpenAI chat completions, uses `gpt-4o`, and reads the key
-from `${OPENAI_API_KEY}`. `Local` points at `http://100.122.2.99:11435/v1`, uses
-`qwen3-coder-next-256k`, and does not require an API key in the checked-in config.
-
-Use either profile by selecting it in the WebUI provider selector, or through provider tools:
+`local-agent\config\path-mapping.json` maps path prefixes across Windows, WSL, and
+Docker contexts. The current default maps:
 
 ```json
 {
-  "action": "list"
+  "windowsPrefix": "C:\\",
+  "wslPrefix": "/mnt/c/",
+  "dockerPrefix": "/workspace/c/"
 }
 ```
 
-Send that payload to:
+### Matbot Runtime
 
-```text
-POST /tools/provider
+`local-agent\matbot\matbot.yaml` is the default workspace runtime config. The
+active sections are:
+
+```yaml
+providers:
+  openai:
+    module: ./packages/plugins/providers/openai-compat
+    endpoint: https://api.openai.com/v1/chat/completions
+    model: gpt-4o
+    credentials:
+      apiKey: ${OPENAI_API_KEY}
+    parameters:
+      maxTokens: 4096
+
+plugins:
+  - ./packages/plugins/sessions
+  - ./plugins/hybrid-knowledge-index
+  - ./packages/plugins/workspace-rag
+  - ./packages/plugins/skills
+  - ./packages/plugins/triggers
+  - ./packages/plugins/rumsfeld
+  - ./packages/plugins/cognition
+  - ./packages/plugins/workspace
+  - ./plugins/expert-panel
+  - ./packages/plugins/frontend/web
 ```
 
-Provider profiles are ordinary named entries under `providers`:
+Optional top-level keys supported by the loader:
+
+| Key | Purpose |
+| --- | --- |
+| `default_provider` | Provider key to use when no provider is selected. |
+| `prompt` | Run a single non-interactive prompt and exit. |
+| `ephemeral` | If `true`, do not persist the session. |
+| `principal` | Boot identity. Either a string id or `{ id, type }`. |
+| `providers` | Native Matbot provider profiles. |
+| `language_models` | Higher-level provider shorthand for OpenAI-compatible local providers. |
+| `plugins` | Ordered startup plugin list. |
+
+Plugin order matters when one plugin provides a service consumed by another. For
+example, `hybrid-knowledge-index` registers `KnowledgeIndex` before `rumsfeld`
+uses it, and `frontend/web` loads last so the WebUI sees the complete tool and
+plugin catalog.
+
+### Providers
+
+Native provider schema:
 
 ```yaml
 providers:
@@ -317,12 +549,16 @@ providers:
     module: ./packages/plugins/providers/openai-compat
     endpoint: http://100.122.2.99:11435/v1
     model: qwen3-coder-next-256k
+    credentials:
+      apiKey: ${LOCAL_API_KEY}
     parameters:
       apiUrl: http://100.122.2.99:11435/v1
       maxTokens: 32768
       maxContextTokens: 262144
       maxOutputTokens: 32768
       maxCompletionTokens: 262144
+      temperature: 0.2
+      tokenLimitParam: max_tokens
       capabilities:
         tools: true
         images: false
@@ -332,17 +568,26 @@ providers:
         interleaved_reasoning: false
 ```
 
-The adapter accepts either a concrete `/chat/completions` endpoint or an API root such
-as `/v1`; API roots are normalized to `/chat/completions` at request time. The request
-output limit uses `parameters.maxOutputTokens` when present, otherwise `parameters.maxTokens`.
-Capability metadata is preserved and used where it affects chat completions behavior:
-`tools: false` suppresses tool definitions, and `parallel_tool_calls` is forwarded when
-set.
+Important fields:
 
-For local-provider registries that describe several models, `matbot.yaml` can also use
-the higher-level format below. On load, each listed model is normalized into a selectable
-provider profile. If a group has one model, the provider name is the group name (`Local`);
-if it has multiple models, provider names are generated as `<group>-<model-name>`.
+| Field | Meaning |
+| --- | --- |
+| `module` | Provider plugin module. OpenAI-compatible providers use `./packages/plugins/providers/openai-compat`. |
+| `endpoint` | Base URL or full `/chat/completions` URL. The adapter appends `/chat/completions` when needed. |
+| `model` | Model name sent to the provider. |
+| `credentials.apiKey` | API key or `${ENV_VAR}` placeholder. Empty is allowed for local servers that ignore auth. |
+| `credentials.organization` | Optional OpenAI organization header. |
+| `parameters.maxTokens` | General output token limit fallback. |
+| `parameters.maxContextTokens` | Metadata for context window size. |
+| `parameters.maxOutputTokens` | Preferred output token limit. |
+| `parameters.maxCompletionTokens` | Metadata for providers that distinguish completion limit. |
+| `parameters.temperature` | Sent as `temperature` when present. |
+| `parameters.tokenLimitParam` | Force `max_tokens` or `max_completion_tokens`. Without this, gpt-5/o-series/4o models use `max_completion_tokens`; most other models use `max_tokens`. |
+| `parameters.promptCache` | Enables Anthropic-style cache control in converted messages/tools when `true`. |
+| `parameters.capabilities.tools` | Set `false` to suppress tool definitions for providers that cannot accept tools. |
+| `parameters.capabilities.parallel_tool_calls` | When boolean, sent as `parallel_tool_calls`. |
+
+The loader also accepts this higher-level local provider format:
 
 ```yaml
 language_models:
@@ -350,8 +595,7 @@ language_models:
     Local:
       api_url: http://100.122.2.99:11435/v1
       available_models:
-        -
-          name: qwen3-coder-next-256k
+        - name: qwen3-coder-next-256k
           max_tokens: 262144
           max_output_tokens: 32768
           max_completion_tokens: 262144
@@ -364,167 +608,154 @@ language_models:
             interleaved_reasoning: false
 ```
 
-Use the native `providers` form when you want direct Matbot control over provider names,
-fallbacks, credentials, or per-profile parameters. Use `language_models.openai_compatible`
-when copying configuration from another local model registry.
+For each model, the loader creates an OpenAI-compatible provider profile. If a
+group contains one model, the provider name is the group name (`Local`). If a
+group contains multiple models, provider names become
+`<group>-<model-name>`. Native `providers:` entries are loaded after
+`language_models:`, so a native provider with the same name overrides the
+generated one.
 
-### `./packages/plugins/sessions`
+After changing providers, restart the WebUI:
 
-Adds persistent conversation session management. The WebUI uses this for the conversation
-list, opening prior conversations, renaming, and hiding sessions.
+```powershell
+.\scripts\run.ps1
+```
 
-Examples:
+Then hard-refresh the browser if the provider selector still shows stale data.
+
+### Cortex Workspaces
+
+Cortex workspaces isolate configuration and backend data. The default workspace
+uses `local-agent\matbot\matbot.yaml`. Additional workspaces are created under
+`local-agent\matbot\workspaces\<workspace-id>`.
+
+Each workspace has:
+
+- its own `matbot.yaml`;
+- its own `.env`;
+- its own `.data` directory;
+- separate sessions, files, tool stores, memories, skills, and RAG index;
+- its own `cortex-rag.json` when RAG is configured.
+
+The workspace registry is `local-agent\matbot\cortex-workspaces.json`:
 
 ```json
 {
-  "action": "list"
+  "active": "default",
+  "workspaces": [
+    {
+      "id": "default",
+      "name": "Default",
+      "configPath": "matbot.yaml",
+      "createdAt": "2026-06-28T17:18:02.608Z",
+      "updatedAt": "2026-06-28T17:18:02.608Z"
+    }
+  ]
 }
 ```
 
-```json
-{
-  "action": "rename",
-  "sessionId": "session-id",
-  "title": "Architecture review"
-}
-```
+If the registry is missing, Matbot creates it with a `default` workspace on
+startup.
 
-Send those payloads to:
+The bottom-left WebUI workspace selector can:
 
-```text
-POST /tools/session_action
-```
+- switch active workspace;
+- create a workspace;
+- rename a workspace;
+- open workspace settings.
 
-### `./plugins/hybrid-knowledge-index`
+Creating a workspace copies the default `matbot.yaml`, rewrites relative plugin
+and provider module paths to absolute paths, and copies the default `.env` when
+it exists. Switching workspaces writes `active` in the registry and restarts the
+Matbot process with `CORTEX_WORKSPACE_ID`.
 
-Provides Matbot's `KnowledgeIndex` service by querying both Mem0 and the local file index,
-then normalizing, ranking, and deduplicating results. It does not expose a direct user tool;
-other plugins use it behind the scenes.
+### Workspace RAG Configuration
 
-`KnowledgeIndex` is the runtime retrieval interface used by Matbot plugins. Producers add
-`KnowledgeEntry` documents to it and consumers search it with one or more terms. A
-`KnowledgeEntry` contains searchable metadata (`entities`, `tags`, `summary`) plus the
-full `content` returned to the model when it needs context. In this repository the active
-implementation is hybrid:
+The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
+conversation. It is installed by default in `matbot.yaml`, and the CLI ensures it
+is present in every workspace config when Matbot starts.
 
-- Mem0 stores semantic memories and skill-derived entries.
-- The file index searches indexed local text files and returns matching snippets.
-- The hybrid plugin queries both sources, merges the result lists, ranks by confidence,
-  and deduplicates equivalent entries.
-
-The important boundary: `KnowledgeIndex` is not the same thing as the raw
-`remembered_facts` store. Skills are mirrored into `KnowledgeIndex`, Mem0 memories are
-searched through it, and file snippets are searched through it. Raw remembered facts are
-stored separately by cognition, then are either read directly by `contextual_search` or
-later merged into skills by `dream_time`.
-
-Main consumers:
-
-- `rumsfeld`, via `contextual_search`.
-- `skills`, for skill metadata/search.
-- The model's contextual retrieval flow when it sees an unknown local concept.
-
-Operational dependencies:
-
-- File index: `http://localhost:8877`
-- Mem0 API: `http://localhost:8888`
-- Environment URLs in `local-agent/matbot/.env`
-
-### `./packages/plugins/workspace-rag`
-
-Adds workspace-scoped markdown RAG for every conversation. The plugin is installed in
-`local-agent/matbot/matbot.yaml`, so the default workspace has it and newly created Cortex
-workspaces inherit it when their `matbot.yaml` is copied.
-
-What it does:
-
-- Stores each workspace's RAG configuration in `cortex-rag.json` next to that workspace's
-  `matbot.yaml`.
-- Supports multiple named RAG contexts per workspace. One context is active at a time for
-  chat retrieval, while the ingestion manager scans configured markdown folders.
-- Monitors the folders listed in each context for `.md` files.
-- Chunks markdown, hashes file content, builds a local vector index, and persists it under
-  that workspace's `.data\workspace-rag\index.json`.
-- Removes deleted markdown files from the index and re-indexes changed files when the
-  markdown hash changes.
-- Scans every workspace listed in `cortex-workspaces.json`, so ingestion can continue for
-  workspaces other than the one currently selected in the UI.
-- Injects top matching chunks as ephemeral workspace context before each model turn.
-- Exposes `WorkspaceRagManager` so tools such as `contextual_search` can retrieve from the
-  workspace RAG index without replacing the existing hybrid `KnowledgeIndex`.
-
-The WebUI exposes RAG configuration in the bottom-left workspace area:
-
-- The workspace selector switches between Cortex workspaces.
-- The gear button opens a full-page workspace settings editor for the active RAG context:
-  - `Context name` is the human-readable name shown in retrieved context.
-  - `Markdown folders` is one absolute local folder path per line. Only `.md` files are indexed.
-- `Save` persists the settings and returns to the chat window.
-- `Cancel` discards unsaved changes and returns to the chat window.
-- When saved markdown folders differ from the previous settings, ingestion is restarted for
-  the current workspace immediately. Background ingestion then keeps scanning configured
-  folders every minute for changed, added, or deleted markdown files.
-- Additional contexts can be created or selected through the `workspace_rag` tool API.
-
-`cortex-rag.json` uses this format:
+RAG configuration lives next to the active workspace config:
 
 ```json
 {
-  "activeContextId": "engineering",
+  "activeContextId": "default",
   "contexts": [
     {
-      "id": "engineering",
-      "name": "Engineering Notes",
+      "id": "default",
+      "name": "Default",
       "paths": [
-        "C:\\Projects\\Cortex\\docs",
-        "D:\\Knowledge\\Engineering"
-      ]
-    },
-    {
-      "id": "finance",
-      "name": "Finance Notes",
-      "paths": [
-        "D:\\Knowledge\\Finance"
+        "C:\\Projects\\Siemens\\docs"
       ]
     }
   ]
 }
 ```
 
-Older files with a single `contextName` and `paths` array still load as the `default`
-context and are rewritten in the multi-context format after the next configuration save.
+Concepts:
+
+| Element | Meaning |
+| --- | --- |
+| Context | A named set of local markdown folders inside one Cortex workspace. |
+| Active context | The context injected into conversations and edited by the WebUI settings page. |
+| Paths | Absolute local folders. Only files with the `.md` extension are indexed. |
+| Vector DB | Local JSON index at `.data\workspace-rag\index.json` inside each workspace. |
+
+The ingestion manager:
+
+- scans all workspaces in `cortex-workspaces.json`, not only the currently selected workspace;
+- indexes markdown files under configured paths;
+- chunks markdown, hashes document content, and stores a local vector-like index;
+- re-indexes changed files when the markdown hash changes;
+- removes deleted markdown files from the index;
+- continues in the background while the WebUI is open;
+- rescans configured folders every minute after the initial pass;
+- restarts ingestion for the current workspace immediately when saved paths change.
+
+The WebUI exposes the active context through the workspace settings page:
+
+1. Click the workspace gear in the bottom-left area.
+2. Edit `Context name`.
+3. Enter one absolute markdown folder path per line.
+4. Click `Save` to persist and return to chat, or `Cancel` to discard changes.
+
+The status line displays state, percentage, CPU/NVIDIA status, a human message,
+and the currently processed file name when indexing is active.
 
 The same operations are available through the `workspace_rag` tool:
 
 ```json
+{ "action": "status" }
+```
+
+```json
+{ "action": "get_config" }
+```
+
+```json
 {
-  "action": "status"
+  "action": "configure",
+  "contextId": "default",
+  "contextName": "Engineering Notes",
+  "paths": [
+    "C:\\Projects\\Cortex\\docs",
+    "D:\\Knowledge\\Engineering"
+  ]
 }
 ```
 
 ```json
 {
   "action": "create_context",
-  "contextName": "Engineering Notes"
+  "contextName": "Finance Notes",
+  "paths": ["D:\\Knowledge\\Finance"]
 }
 ```
 
 ```json
 {
   "action": "select_context",
-  "contextId": "engineering-notes"
-}
-```
-
-```json
-{
-  "action": "configure",
-  "contextId": "engineering-notes",
-  "contextName": "Engineering Notes",
-  "paths": [
-    "C:\\Projects\\Cortex\\docs",
-    "D:\\Knowledge\\Engineering"
-  ]
+  "contextId": "finance-notes"
 }
 ```
 
@@ -537,227 +768,320 @@ The same operations are available through the `workspace_rag` tool:
 ```
 
 ```json
+{ "action": "reindex_now" }
+```
+
+Status responses include:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `pending`, `indexing`, `ready`, or an error state. |
+| `percent` | Ingestion progress percentage. |
+| `processedFiles` / `totalFiles` | Current scan progress. |
+| `currentFile` | Current markdown file being processed. |
+| `nvidiaAvailable` | Whether `nvidia-smi` is visible on the host. |
+| `accelerated` | Whether the current ingestion backend is GPU-accelerated. |
+| `accelerator` | `nvidia` or `cpu`. |
+| `message` | Human-readable status message. |
+
+The current built-in vectorizer is CPU-based. It detects NVIDIA availability for
+reporting, but `accelerated` remains `false` and `accelerator` reports `cpu`
+until a GPU embedding backend is added.
+
+### Expert Panel Configuration
+
+Expert configuration lives in `local-agent\config\experts.json`:
+
+```json
 {
-  "action": "reindex_now"
+  "defaultProvider": "openai",
+  "experts": [
+    {
+      "id": "design",
+      "title": "Design Expert",
+      "description": "Product design, UX, visual systems, interaction quality, and user-facing tradeoffs.",
+      "provider": "openai",
+      "roots": ["../knowledge/design"],
+      "tags": ["design", "ux", "product"],
+      "systemPrompt": "You are the Design Expert..."
+    }
+  ]
 }
 ```
 
-The status response includes `state`, `percent`, `processedFiles`, `totalFiles`,
-`nvidiaAvailable`, `accelerated`, and `accelerator`. `nvidiaAvailable` reports whether
-`nvidia-smi` is visible on the host. The current built-in vectorizer is CPU-based, so
-`accelerated` remains `false` and `accelerator` reports `cpu` unless a future GPU embedding
-backend is installed.
+Fields:
 
-### `./packages/plugins/skills`
+| Field | Meaning |
+| --- | --- |
+| `defaultProvider` | Provider used when an expert does not specify one. |
+| `id` | Stable expert id used by tools and tests. |
+| `title` | Human-facing expert name in the UI. |
+| `description` | Short UI/tool description. |
+| `provider` | Provider key from the active `matbot.yaml`. |
+| `roots` | File knowledge roots for the expert. Relative paths resolve from `local-agent\config\experts.json`. |
+| `tags` | Metadata returned in expert definitions. |
+| `systemPrompt` | Expert-specific instruction prompt. |
 
-Adds named markdown playbooks that the assistant can load, apply, edit, and catalogue.
-Skills are persisted under Matbot's data directory and can be surfaced by metadata search.
-The WebUI skill editor uses this plugin.
+The default experts are `design`, `finance`, and `engineering`. Minimal probe
+knowledge files live under `local-agent\knowledge\<expert-id>`.
+
+## Plugins And Tools
+
+The active default plugin list is in `local-agent\matbot\matbot.yaml`.
+
+| Plugin | Role | Main user-facing tools/services |
+| --- | --- | --- |
+| `./packages/plugins/providers/openai-compat` | OpenAI-compatible provider adapter. | Provider profiles in the UI selector. |
+| `./packages/plugins/sessions` | Persistent sessions and conversation metadata. | Conversation list, rename/hide/pin-style session actions. |
+| `./plugins/hybrid-knowledge-index` | Registers Matbot `KnowledgeIndex` backed by Mem0 and file-index. | Service consumed by retrieval tools. |
+| `./packages/plugins/workspace-rag` | Workspace-scoped markdown RAG. | `workspace_rag`, automatic per-turn RAG context. |
+| `./packages/plugins/skills` | Persistent markdown skills/playbooks. | `skill_action`, skill editor UI. |
+| `./packages/plugins/triggers` | Data-driven automatic tool triggers. | Trigger management and automatic `remember_fact` firing. |
+| `./packages/plugins/rumsfeld` | Context lookup tool. | `contextual_search`. |
+| `./packages/plugins/cognition` | Durable memory, inner voice, dream-time stores/tools. | `remember_fact`, `remembered_facts_action`, `dream_time`, `dream_runs_action`, `ask_inner_voice`, `cognition_config`. |
+| `./packages/plugins/workspace` | Matbot workspace file abstraction. | `workspace_action`, WebUI file upload/delete/list. |
+| `./plugins/expert-panel` | Multi-perspective expert orchestration. | `expert_panel`. |
+| `./packages/plugins/frontend/web` | Cortex WebUI HTTP/SSE server. | Browser UI and HTTP tool endpoints. |
+
+Bundled plugins that exist in `local-agent\matbot\packages\plugins` but are not
+loaded by the default `matbot.yaml`:
+
+| Plugin | Purpose |
+| --- | --- |
+| `ask-user` | Interactive user prompts with text, password, select, and confirm controls. |
+| `background` | Detached and recurring prompts. Useful for scheduled jobs such as hourly `dream_time`. |
+| `bash` | Run bash scripts in the session workspace. |
+| `browser` | Browser-native IndexedDB, OPFS, and WebCrypto backends for browser-only Matbot runs. |
+| `docker-bash` | Replace bash with a persistent Docker container. |
+| `edit-session` | Cut, fork, and compact sessions. |
+| `files` | Node filesystem-backed file store served by the frontend. |
+| `hook-logger` | Diagnostic hook logging for plugin pipeline debugging. |
+| `http` | HTTP request tool for web APIs and remote resources. |
+| `json-validation` | Validates tool-call input against each tool's JSON Schema. |
+| `mcp` | Local stdio MCP client plus remote MCP delegation. |
+| `mcp-http` | Cross-runtime remote MCP HTTP/SSE client. |
+| `persist-ki-bge` | Store-backed `KnowledgeIndex` with entity/heading search and optional BGE reranking. |
+| `skills-node` | Node-only skills plugin with local filesystem markdown import/watch. |
+| `tool-store` | Defines named stores and generated CRUD tools. Used indirectly by cognition. |
+| `web-principal-user` | Sets frontend request principal from the host OS user. |
+| `whoami` | Reports the current security principal. |
+
+To activate one, add its specifier to the active workspace's `plugins:` list and
+restart Cortex. For example:
+
+```yaml
+plugins:
+  - ./packages/plugins/background
+```
+
+### `workspace_action`
+
+Manages files in Matbot's workspace namespace. This is not unrestricted host
+filesystem access.
 
 Examples:
 
 ```json
+{ "action": "list", "recursive": true }
+```
+
+```json
 {
-  "action": "list"
+  "action": "write",
+  "path": "notes/summary.md",
+  "content": "# Summary\n\nHello.",
+  "encoding": "utf8"
 }
 ```
 
 ```json
 {
-  "action": "load",
-  "name": "Panel Etiquette"
+  "action": "read",
+  "path": "notes/summary.md"
 }
+```
+
+```json
+{
+  "action": "delete",
+  "path": "notes/summary.md"
+}
+```
+
+### `skill_action`
+
+Manages named markdown skills. Skills are persisted and mirrored into the active
+`KnowledgeIndex` when that service is available.
+
+Common actions:
+
+```json
+{ "action": "list" }
+```
+
+```json
+{ "action": "load", "name": "Inner voice" }
 ```
 
 ```json
 {
   "action": "save",
-  "name": "Release Checklist",
-  "content": "# Release Checklist\nVerify tests, config, logs, and rollback notes.",
-  "catalogue": true
+  "name": "Panel Etiquette",
+  "content": "# Panel Etiquette\n\nUse concise expert disagreement."
 }
 ```
 
-Send those payloads to:
+### `contextual_search`
 
-```text
-POST /tools/skill_action
-```
+`contextual_search` is the model-facing lookup tool for local context. It queries:
 
-Skills also expose provider configuration for skill metadata analysis:
-
-```json
-{
-  "action": "get"
-}
-```
-
-Send that payload to:
-
-```text
-POST /tools/skills_config
-```
-
-### `./packages/plugins/triggers`
-
-Adds data-driven hooks that invoke tools when an LLM classifier decides a condition
-matches. This project uses triggers with cognition so explicit "remember this" style
-messages can call `remember_fact` automatically.
-
-Examples:
-
-```json
-{
-  "action": "list"
-}
-```
-
-```json
-{
-  "action": "add",
-  "tool": "skill_action",
-  "params": {
-    "action": "use",
-    "name": "Release Checklist"
-  },
-  "conditions": [
-    {
-      "kind": "ephemeral",
-      "rule": "MATCH if the user asks for release readiness advice. DO NOT MATCH ordinary implementation questions."
-    }
-  ]
-}
-```
-
-Send those payloads to:
-
-```text
-POST /tools/trigger_action
-```
-
-Trigger classifier configuration:
-
-```json
-{
-  "action": "get"
-}
-```
-
-Send that payload to:
-
-```text
-POST /tools/triggers_config
-```
-
-### `./packages/plugins/rumsfeld`
-
-Adds `contextual_search`, a tool the model can use when the user references an unknown
-local concept, project term, preference, personal detail, or entity.
-
-`contextual_search` is the model-facing recall tool. The model should call it before
-guessing when the user asks about something local or user-specific: project names,
-workspace files, personal preferences, remembered profile details, or domain terms that
-are not general internet knowledge.
-
-The tool searches three layers:
-
-- `remembered_facts`, directly. This is the raw durable memory store written by
-  `remember_fact`. Direct search makes newly captured facts immediately recallable.
-- `KnowledgeIndex`, through the active hybrid plugin. In this repository that means
-  Mem0, indexed local files, and skill metadata/content.
-- `WorkspaceRagManager`, when the `workspace-rag` plugin is active. This searches the
-  selected workspace's active markdown RAG context and appends matching local file chunks.
-
-When remembered facts match, the tool returns `name: "remembered_facts"` and a content
-block beginning with `Remembered facts:`. If the `KnowledgeIndex` also has a good result,
-that result is appended below the remembered facts; workspace RAG results are appended when
-available. When no remembered fact matches, the tool falls back to workspace RAG and then
-the best `KnowledgeIndex` result. If no layer has context, it returns an error saying no
-skill/context is available.
+- raw `remembered_facts`;
+- active `KnowledgeIndex`;
+- workspace RAG results, when available.
 
 Example:
 
 ```json
 {
-  "terms": [
-    {
-      "term": "Matbot expert panel",
-      "context": "The user asked why the Matbot expert panel is unavailable."
-    }
-  ]
+  "query": "What do we know about Maciej's preferred shell?",
+  "limit": 5
 }
 ```
 
-Send that payload to:
+When remembered facts match, the tool returns a result named
+`remembered_facts` and includes a `Remembered facts:` content block. When RAG
+matches, it includes workspace RAG results with file citations.
 
-```text
-POST /tools/contextual_search
-```
+### `expert_panel` Tool
 
-In normal chat, you usually do not call this manually. Ask a question that includes a
-project-specific unknown term, and the model should use it when it needs local context.
-
-Direct example for personal memory recall:
+Runs selected experts against one question, optionally synthesizing a final
+decision.
 
 ```json
 {
-  "terms": [
-    {
-      "term": "name",
-      "context": "What is my name?"
-    }
-  ]
+  "question": "Should we add Google Drive persistence for the Node host?",
+  "experts": ["design", "finance", "engineering"],
+  "mode": "review",
+  "maxCitationsPerExpert": 5,
+  "synthesize": true
 }
 ```
 
-Typical response when the name has been remembered:
+Modes:
 
-```json
-{
-  "name": "remembered_facts",
-  "content": "Remembered facts:\n- The user's name is Maciej Zagozda"
-}
-```
+| Mode | Use |
+| --- | --- |
+| `parallel` | Each expert answers independently. |
+| `review` | Experts critique a proposal or decision. |
+| `debate` | Experts emphasize disagreement and tradeoffs. |
 
-### `./packages/plugins/cognition`
+The WebUI integrates this with the main composer. Use the `Experts` control next
+to the send button to select experts, choose mode, and enable or disable
+synthesis. The user question is typed in the main chat entry box.
 
-Adds memory and reflective cognition tools. In this project it is used mainly for durable
-remembered facts, "Inner voice" critique, and background dream-time consolidation.
+### Cognition Tools
 
-Examples:
-
-Capture facts from the current user message:
+Capture durable facts from the latest user message:
 
 ```json
 {}
 ```
 
-Send that payload to:
+Send to:
 
 ```text
-POST /tools/remember_fact
+POST http://localhost:19778/tools/remember_fact
 ```
 
-Query remembered facts:
+Inspect remembered facts:
 
 ```json
 {
   "action": "query",
   "query": {
-    "limit": 10
+    "limit": 50,
+    "sort": [{ "field": "createdAt", "dir": "desc" }]
   }
 }
 ```
 
-Send that payload to:
+Send to:
 
 ```text
-POST /tools/remembered_facts_action
+POST http://localhost:19778/tools/remembered_facts_action
 ```
 
-`remembered_facts_action` is a generated CRUD tool over the persistent
-`remembered_facts` store. Use it to inspect, correct, remove, or manually seed durable
-facts. Documents have this shape:
+Run one memory consolidation pass:
+
+```json
+{}
+```
+
+Send to:
+
+```text
+POST http://localhost:19778/tools/dream_time
+```
+
+Configure cognition:
+
+```json
+{ "action": "get" }
+```
+
+```json
+{
+  "action": "set",
+  "innerVoiceProvider": "Local",
+  "dreamRankerProvider": "openai",
+  "dreamMergerProvider": "openai",
+  "strongThreshold": 0.75,
+  "weakThreshold": 0.5,
+  "maxClusterSize": 5,
+  "blocklist": ["Inner voice"],
+  "weakDeferralMs": 129600000
+}
+```
+
+Send to:
+
+```text
+POST http://localhost:19778/tools/cognition_config
+```
+
+`cognition_config` settings are:
+
+| Setting | Purpose |
+| --- | --- |
+| `innerVoiceProvider` | Provider used by `ask_inner_voice`; `null` unpins. |
+| `dreamRankerProvider` | Provider used to score fact/skill matches in `dream_time`; `null` unpins. |
+| `dreamMergerProvider` | Provider used to merge facts into skill text in `dream_time`; `null` unpins. |
+| `strongThreshold` | Score needed to merge a fact into a skill. Default `0.75`. |
+| `weakThreshold` | Score needed to defer a weak match. Default `0.5`. Must be <= `strongThreshold`. |
+| `maxClusterSize` | Maximum facts merged in one pass. Default `5`. |
+| `blocklist` | Skill names excluded from dream-time routing. Default `["Inner voice"]`. |
+| `weakDeferralMs` | Milliseconds before weakly matched facts are reconsidered. Default 36 hours. |
+
+The repository contains `startDreamTimeScheduler`, which waits 60 seconds after
+startup and then runs `dream_time` every hour. In the current active plugin
+configuration, the persistent store and manual `dream_time` tool are active, but
+the default `matbot.yaml` does not load the `background` plugin and cognition
+does not call `startDreamTimeScheduler` during setup. To run consolidation on an
+actual persistent hourly schedule, either add a background schedule that invokes
+`dream_time`, or wire `startDreamTimeScheduler(services)` into the cognition
+plugin lifecycle and stop it during teardown.
+
+## Memory And Retrieval
+
+Cortex has several related but distinct retrieval layers.
+
+### `remembered_facts`
+
+`remembered_facts` is the raw durable memory store written by `remember_fact`.
+It is best for facts explicitly worth remembering, such as names, stable
+preferences, decisions, project facts, and reusable troubleshooting outcomes.
+
+Document shape:
 
 ```ts
 interface RememberedFact {
@@ -772,19 +1096,7 @@ interface RememberedFact {
 }
 ```
 
-Fields:
-
-- `fact` is the normalized durable statement, usually phrased in third person.
-- `sessionId`, `messageId`, and `createdAt` record where the fact came from.
-- `dreamSkill` is set by `dream_time` after a fact has been terminally processed.
-  A real skill name means it was merged into that skill; internal sentinel values mean
-  it was declined or quarantined.
-- `ignoreUntil` is used by `dream_time` to defer weakly matched facts without retiring
-  them.
-- `version` is managed by the store. Use the version you last read as `expected` for
-  safe `cas` or `delete` operations.
-
-Explore all remembered facts from PowerShell:
+Explore remembered facts from PowerShell:
 
 ```powershell
 $body = @{
@@ -803,7 +1115,7 @@ Invoke-RestMethod `
   ConvertTo-Json -Depth 8
 ```
 
-Search remembered facts by substring:
+Search by substring:
 
 ```json
 {
@@ -819,7 +1131,7 @@ Search remembered facts by substring:
 }
 ```
 
-Read one fact by id:
+Read one fact:
 
 ```json
 {
@@ -828,7 +1140,7 @@ Read one fact by id:
 }
 ```
 
-Create or replace a fact manually:
+Create or replace manually:
 
 ```json
 {
@@ -842,8 +1154,7 @@ Create or replace a fact manually:
 }
 ```
 
-Correct a fact safely with compare-and-swap. First `get` the document and copy its
-`version`, then send:
+Correct safely with compare-and-swap:
 
 ```json
 {
@@ -859,7 +1170,7 @@ Correct a fact safely with compare-and-swap. First `get` the document and copy i
 }
 ```
 
-Delete an incorrect fact:
+Delete:
 
 ```json
 {
@@ -871,239 +1182,65 @@ Delete an incorrect fact:
 
 Omit `expected` only when you intentionally want an unconditional delete.
 
-Consult the Inner voice:
+### `KnowledgeIndex`
 
-```json
-{
-  "prompt": "Critique this draft answer for missing risks and unclear assumptions.",
-  "system": "Be concise and specific."
-}
-```
+`KnowledgeIndex` is the runtime retrieval service interface used by plugins.
+In this repository, `hybrid-knowledge-index` registers an implementation that
+queries Mem0 and file-index, ranks results, and deduplicates them.
 
-Send that payload to:
+Skills also mirror saved skill content into the active `KnowledgeIndex`.
+`KnowledgeIndex` is not the same as `remembered_facts`: facts are stored raw in
+`remembered_facts`; skills and indexed entries are searched through
+`KnowledgeIndex`; `contextual_search` bridges both.
 
-```text
-POST /tools/ask_inner_voice
-```
+### Workspace RAG Retrieval
 
-Run one background consolidation pass:
+Workspace RAG is scoped to the active Cortex workspace and its active RAG
+context. It is file-backed markdown retrieval with per-workspace persistence.
+It injects relevant snippets automatically before each model turn and can also
+be queried by `workspace_rag` and `contextual_search`.
 
-```json
-{}
-```
+### `contextual_search` Retrieval
 
-Send that payload to:
+Use `contextual_search` when the model needs local context before answering. It
+searches remembered facts, the active `KnowledgeIndex`, and workspace RAG. This
+is why a remembered name can be found before `dream_time` has merged that fact
+into a skill.
 
-```text
-POST /tools/dream_time
-```
+### `memory-policy.json`
 
-Inspect cognition settings:
+`local-agent\config\memory-policy.json` documents what Cortex should treat as
+durable memory:
 
-```json
-{
-  "action": "get"
-}
-```
+- durable kinds: `preference`, `decision`, `project-fact`,
+  `troubleshooting-outcome`, `domain-term`, `implementation-note`;
+- do not store: raw file content, secrets, temporary command output, large logs,
+  duplicate index content;
+- promotion requires: explicit user request, stable fact, reusable decision, or
+  confirmed recurring solution.
 
-Send that payload to:
+It is a policy file for humans and future automation. The active memory tools
+still enforce their own schemas and prompts.
 
-```text
-POST /tools/cognition_config
-```
+## Expert Panel Workflow
 
-### `./packages/plugins/workspace`
+The expert panel is deliberately tool-based. It does not spin up separate
+chatbot processes.
 
-Adds file management inside Matbot's workspace namespace. This is the plugin behind
-reading, writing, listing, deleting, and serving workspace artifacts through the WebUI.
-It is intentionally a workspace abstraction, not unrestricted host filesystem access.
-
-Examples:
-
-```json
-{
-  "action": "list"
-}
-```
-
-```json
-{
-  "action": "write",
-  "path": "notes/panel-test.md",
-  "content": "# Panel Test\nThis file was written through workspace_action."
-}
-```
-
-```json
-{
-  "action": "read",
-  "path": "notes/panel-test.md"
-}
-```
-
-```json
-{
-  "action": "delete",
-  "path": "notes/panel-test.md"
-}
-```
-
-Send those payloads to:
-
-```text
-POST /tools/workspace_action
-```
-
-### `./plugins/expert-panel`
-
-Adds the local multi-expert panel. It loads expert definitions from
-`local-agent/config/experts.json`, retrieves each expert's scoped knowledge files, asks
-each expert independently, and optionally runs a synthesis pass.
-
-Examples:
-
-List configured experts:
-
-```json
-{
-  "action": "list"
-}
-```
-
-Ask all experts and synthesize:
-
-```json
-{
-  "action": "ask",
-  "question": "Should we keep the expert panel as a tool-based orchestration feature?",
-  "mode": "review",
-  "synthesize": true,
-  "maxCitationsPerExpert": 5
-}
-```
-
-Ask selected experts without synthesis:
-
-```json
-{
-  "action": "ask",
-  "question": "What are the delivery risks of this change?",
-  "experts": ["engineering", "finance"],
-  "mode": "debate",
-  "synthesize": false
-}
-```
-
-Send those payloads to:
-
-```text
-POST /tools/expert_panel
-```
-
-The WebUI exposes this directly in the `Experts` sidebar section.
-
-### `./packages/plugins/frontend/web`
-
-Serves the browser WebUI on `http://localhost:19778` using HTTP plus SSE event streams.
-It also registers `url_for_resource`, which lets the assistant create shareable local URLs
-for public workspace files.
-
-Example:
-
-```json
-{
-  "namespace": "workspace",
-  "name": "notes/panel-test.md"
-}
-```
-
-Send that payload to:
-
-```text
-POST /tools/url_for_resource
-```
-
-If the named workspace file exists and is viewable, the result contains a local URL such
-as:
-
-```text
-http://localhost:19778/workspace/notes/panel-test.md
-```
-
-## Expert panel
-
-The repository includes a tool-based expert panel for running one conversation against
-selected domain experts, comparing their opinions, and letting an orchestrating model
-collate the result.
-
-### What was implemented
-
-- `local-agent/matbot/plugins/expert-panel` — a Node-only Matbot plugin that registers the
-  `expert_panel` tool.
-- `local-agent/config/experts.json` — config-driven expert definitions. The default experts
-  are `design`, `finance`, and `engineering`.
-- `local-agent/config/matbot.expert-panel.example.yaml` — tracked reference config showing
-  the Matbot plugin order required to enable the expert panel.
-- `local-agent/knowledge/<expert-id>/` — file-backed knowledge roots for each expert.
-  Put `.md`, `.txt`, `.json`, `.csv`, `.tsv`, `.yaml`, or `.yml` files here to ground that
-  expert's answers.
-- `local-agent/matbot/plugins/hybrid-knowledge-index` now maps Mem0 and file-index results
-  into Matbot's real `KnowledgeEntry` shape (`id`, `version`, `entities`, `tags`,
-  `summary`, `source`, timestamps, etc.) instead of returning the older simplified shape.
-
-### How it works
-
-The orchestration style is intentionally tool-based:
+Flow:
 
 1. The main Matbot agent calls `expert_panel`.
-2. `expert_panel` selects the requested experts, or all experts if none are specified.
-3. Each expert retrieves matching text snippets from its configured knowledge roots.
-4. Each expert gets an independent `services.singleTurn(...)` call with:
-   - that expert's system prompt;
-   - the user question;
-   - retrieved, expert-scoped source text;
-   - instructions to state evidence, assumptions, risks, and confidence.
-5. If `synthesize` is true, the plugin runs one final orchestrator `singleTurn(...)` call
-   to collate consensus, disagreements, assumptions, and a final recommendation.
+2. The plugin selects requested experts or all configured experts.
+3. Each expert retrieves text snippets from its own configured roots.
+4. Each expert receives an independent `services.singleTurn(...)` call with its
+   system prompt, question, and expert-scoped citations.
+5. If `synthesize` is `true`, a final orchestrator call collates consensus,
+   disagreement, assumptions, risks, and recommendation.
 
-This keeps experts isolated by knowledge source while still running inside one Matbot
-process. It avoids spinning up separate chatbot processes for each expert.
+This keeps design, finance, and engineering knowledge isolated while still
+running inside one Matbot process.
 
-### Using the expert panel
-
-In the web UI, open the `Experts` sidebar section. Enter a question, keep `All experts`
-enabled or select individual experts, choose the panel mode, and leave `Synthesize decision`
-enabled when you want the orchestrator to collate a final recommendation. Press `Ask` to run
-the panel directly from the UI.
-
-You can still ask for the panel explicitly in the main chat, for example:
-
-```text
-Use the expert panel to review whether we should build Google Drive persistence for
-the Node host. Ask design, finance, and engineering, then synthesize the decision.
-```
-
-The underlying tool input is:
-
-```json
-{
-  "question": "Should we build Google Drive persistence for the Node host?",
-  "experts": ["design", "finance", "engineering"],
-  "mode": "review",
-  "maxCitationsPerExpert": 5,
-  "synthesize": true
-}
-```
-
-Supported modes:
-
-- `parallel` — each expert answers independently.
-- `review` — experts critique a proposal or decision.
-- `debate` — experts emphasize tradeoffs and disagreement.
-
-### Adding or changing experts
-
-Edit `local-agent/config/experts.json`:
+Add an expert by editing `local-agent\config\experts.json`:
 
 ```json
 {
@@ -1117,113 +1254,187 @@ Edit `local-agent/config/experts.json`:
 }
 ```
 
-Then create the knowledge folder:
+Then add text files:
 
 ```powershell
 mkdir local-agent\knowledge\security
 ```
 
-Add text files to that folder and restart Matbot:
+Restart Cortex:
 
 ```powershell
-cd local-agent\matbot
-pnpm start
+.\scripts\run.ps1
 ```
 
-The plugin resolves roots relative to `local-agent/config/experts.json`. You can also point
-an expert at an absolute path if the material lives elsewhere.
+Supported knowledge file extensions are `.md`, `.txt`, `.json`, `.csv`, `.tsv`,
+`.yaml`, and `.yml`. Files larger than 1 MB are skipped by the expert file
+retriever.
 
-### Implementation notes
+## WebUI
 
-- Expert retrieval is file-backed in this implementation. It ranks text files by simple term
-  occurrence in the filename and file content, then passes the top matches to the expert.
-- The expert panel is deliberately separate from the global `KnowledgeIndex`. That prevents
-  design, finance, and engineering from collapsing into one shared retrieval pool.
-- The current design is ready for a later RAG/database backend: replace `FileExpertKnowledge`
-  in `plugins/expert-panel/src/file-knowledge.ts` with a tenant-filtered vector search that
-  accepts `expertId`.
-- The orchestrator does not hide disagreement. The synthesis prompt asks for consensus,
-  disagreements, risks/assumptions, and a final recommendation.
+The WebUI is served by the frontend web plugin at `http://localhost:19778`.
 
-### Expert panel test data and tests
+Current UI capabilities include:
 
-Each default expert has a minimal `panel-probe.md` file under its knowledge folder. These
-files contain unique probe terms (`PanelProbeDesign`, `PanelProbeFinance`,
-`PanelProbeEngineering`) so automated tests can prove retrieval stays expert-scoped.
+- conversation list and session controls;
+- provider selector;
+- main chat composer with send/stop behavior;
+- token and elapsed-time summaries per turn;
+- workspace file upload/list/delete;
+- plugin catalog display;
+- skill editor;
+- workspace selector in the bottom-left corner;
+- workspace creation, rename, and switch;
+- full-page workspace settings editor for RAG context name and markdown folders;
+- RAG ingestion progress, including current file;
+- expert panel controls integrated into the main composer;
+- mobile sidebar behavior.
 
-The expert panel is covered by `tests/expert-panel.test.mjs`. The test uses a fake Matbot
-`singleTurn` implementation, so it verifies plugin registration, expert selection,
-per-expert file retrieval, prompt construction, citation output, synthesis invocation, and
-unknown-expert errors without spending model tokens. It also verifies the token-free
-`expert_panel` list action used by the WebUI to discover configured experts.
-
-The WebUI controls are covered by `tests/webui/matbot-webui.spec.mjs`. The harness fakes
-`expert_panel`, so the tests verify expert discovery, whole-panel selection, individual
-expert selection, mode selection, citation rendering, and synthesis toggling without model
-tokens.
-
-## WebUI Playwright tests
-
-The Matbot WebUI is covered by Playwright tests under `tests/webui/`.
-
-The suite uses a deterministic local harness (`tests/webui/harness.mjs`) instead of the live
-OpenAI-backed Matbot process. The harness serves the real WebUI assets from
-`local-agent/matbot/packages/plugins/frontend/web/static` and implements fake versions of the
-HTTP/SSE endpoints the UI consumes. This keeps the tests fast, deterministic, and token-free while
-still exercising the actual browser JavaScript and DOM.
-
-Covered WebUI features:
-
-- Initial shell render: provider selector, conversation list, file list, plugin list, and skill list.
-- Workspace selector: workspace list, create, rename, switch, and reload after a selected
-  workspace becomes active, with required default plugins still visible after the switch.
-- Workspace RAG controls: context name, markdown folder paths, save, reindex, indexing
-  progress percentage, and CPU/NVIDIA status display.
-- Memory workflow: create a remembered fact, verify it persists through
-  `remembered_facts_action`, start a new conversation, and use that memory in an answer.
-- Automatic workspace RAG retrieval: a sample markdown-backed context is surfaced during a
-  conversation and the assistant answer uses the retrieved local content.
-- Expert panel sidebar controls: configured expert discovery, all-expert runs, selected-expert
-  runs, mode selection, citation output, and synthesis on/off.
-- Desktop conversation flow: new conversation, message submit, SSE queued event, thinking block,
-  tool call rendering, tool result rendering, streamed assistant text, and token stats.
-- Interactive prompt flow over the session event stream.
-- Workspace file upload, live file refresh, and delete action.
-- Plugin panel rendering, loaded plugin tool rows, local plugin discovery, and incompatible-runtime
-  plugin display (for example browser-only Google Drive storage on the Node host).
-- Skill list and skill editor: metadata tab, trigger tab, adding a trigger row, and save flow.
-- Session sidebar actions: rename and hide.
-- Stop/abort control while a turn is busy.
-- Mobile layout: burger button opens the sidebar drawer.
-
-Commands:
+The WebUI uses the same Matbot tool APIs as the model. When the UI says a plugin
+is unavailable, the active Matbot process usually does not have that plugin
+loaded. Restart with:
 
 ```powershell
-# Installs the Playwright browser binary. Needed once per machine/user profile.
-npx playwright install chromium
+.\scripts\run.ps1
+```
 
-# Runs only the WebUI browser tests.
-npm run test:webui
+Then hard-refresh the browser.
 
-# Runs node:test unit/integration tests and then the WebUI Playwright tests.
+## Testing
+
+Run all tests:
+
+```powershell
 npm run test:all
 ```
 
-Playwright traces are retained on failure in `test-results/`. Inspect a trace with:
+Run only Node tests:
 
 ```powershell
-npx playwright show-trace <path-to-trace.zip>
+npm test
 ```
 
-The Node test suite also includes `tests/workspace-rag.test.mjs`, which launches the
-workspace RAG plugin under Matbot's TypeScript loader, creates a temporary workspace,
-ingests a sample markdown file, verifies the persisted vector index, searches it, and
-checks that the screen hook injects retrieved context into a turn.
+Run only Playwright WebUI tests:
+
+```powershell
+npm run test:webui
+```
+
+Install Chromium for Playwright:
+
+```powershell
+npx playwright install chromium
+```
+
+The WebUI tests use `tests\webui\harness.mjs`, a fake Matbot transport/server.
+They validate exposed UI behavior without spending model tokens.
+
+Current Playwright coverage includes:
+
+- shell load, providers, conversations, files, plugins, and skills;
+- workspace selector create/rename/switch;
+- workspace RAG settings save and ingestion progress display;
+- remembered facts persisting across conversations;
+- workspace RAG retrieval during conversation;
+- expert panel all-expert and selected-expert composer flows;
+- streaming output, tools, usage, and elapsed-time summary;
+- interactive prompt controls;
+- workspace file upload/delete;
+- skill editor metadata and trigger controls;
+- session rename/hide/mark controls;
+- send/stop busy behavior;
+- mobile sidebar behavior.
+
+Node tests cover:
+
+- file-index storage and search;
+- file-broker policy and write backups;
+- hybrid KnowledgeIndex ranking/deduplication;
+- expert-panel plugin behavior and isolated retrieval;
+- workspace-rag runtime ingestion flow.
+
+## Troubleshooting
+
+### Provider Does Not Appear
+
+Provider options come from the active workspace's `matbot.yaml`. If you edited
+the default `matbot.yaml` but the UI is running another workspace, switch to the
+default workspace or edit that workspace's own config under
+`local-agent\matbot\workspaces\<id>\matbot.yaml`.
+
+Restart after config changes:
+
+```powershell
+.\scripts\run.ps1
+```
+
+Hard-refresh the browser if the old provider list is cached.
+
+### Old WebUI Appears After Running `run.ps1`
+
+`run.ps1` restarts the WebUI by default. If an old process remains, check for a
+different port or a browser tab using cached assets. Run:
+
+```powershell
+.\scripts\stop-local-agent.ps1
+.\scripts\run.ps1
+```
+
+Then hard-refresh the browser.
+
+### `workspace_rag plugin unavailable`
+
+The active Matbot process did not load `./packages/plugins/workspace-rag`.
+Check the active workspace's `matbot.yaml`, restart Cortex, and verify the plugin
+appears in the WebUI plugin list.
+
+### `expert_panel plugin unavailable`
+
+The active Matbot process did not load `./plugins/expert-panel`, or the browser
+is connected to an older WebUI process. Restart Cortex and check
+`local-agent\logs\matbot.err.log` for plugin load errors.
+
+### Remembered Name Is Not Recalled
+
+Name recall needs all of these to work:
+
+1. `skills`, `triggers`, and `cognition` are loaded.
+2. `remember_fact` fires and writes to `remembered_facts`.
+3. A later turn calls `contextual_search`, or the provider receives enough
+   context to use remembered facts.
+
+Inspect the store directly with `remembered_facts_action` if recall fails.
+
+### RAG Indexed Fewer Files Than Expected
+
+Workspace RAG indexes only files with the `.md` extension under configured paths.
+The indexed count reflects successfully scanned/read markdown documents in the
+active RAG context. Check:
+
+- `workspace_rag` status;
+- configured `paths` in `cortex-rag.json`;
+- whether files are below accessible folders;
+- file permissions;
+- whether the process has restarted after configuration changes;
+- `local-agent\logs\matbot.err.log`.
+
+### Mem0 Startup Errors
+
+If Mem0 fails after rotating passwords, recreate Docker volumes because Postgres
+and Neo4j keep first-run credentials in their volumes:
+
+```powershell
+docker compose -f local-agent\docker\mem0\docker-compose.yml down -v
+.\scripts\run.ps1
+```
 
 ## Safety Defaults
 
-- Workspace roots are configured in `local-agent/config/workspaces.json`.
-- Denied path fragments and high-risk extensions are configured in `local-agent/config/security-policy.json`.
-- The file index skips unsupported files, oversized files and files that look like they contain secrets.
-- The file broker blocks paths outside configured roots, blocks writes to read-only roots, rejects delete operations and requires `approved=true` for high-risk writes.
-- Writes create backups under `local-agent/file-broker/backups` before overwriting existing files.
+- Secrets are gitignored and should stay out of commits.
+- File-broker only writes inside configured read-write roots.
+- File-broker creates backups and diffs for overwrites.
+- Security policy blocks sensitive path fragments and marks high-risk extensions.
+- File-index skips likely secrets and excludes common generated directories.
+- Workspace RAG indexes markdown only and stores per-workspace data locally.
+- Expert knowledge roots are isolated by expert id.
+- Playwright tests use a fake Matbot harness and do not spend model tokens.

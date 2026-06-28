@@ -37,7 +37,7 @@ export function runDriveSetup(initial: { clientId?: string; rootFolder?: string 
 
   const backdrop = el('div',
     'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;' +
-    'background:rgba(0,0,0,.55);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;');
+    'background:rgba(0,0,0,.55);font-family:Inter, sans-serif;');
 
   const card = el('div',
     'background:#fff;color:#1a1a1a;max-width:520px;width:calc(100% - 32px);border-radius:12px;' +

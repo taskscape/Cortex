@@ -402,6 +402,7 @@ async function handleTool(res, name, input) {
         totalFiles: context.paths.length ? 3 : 0,
         processedFiles: context.paths.length ? 2 : 0,
         percent: context.paths.length ? 67 : 0,
+        currentFile: context.paths.length ? "C:\\Projects\\Cortex\\docs\\retrieval-probe.md" : "",
         message: context.paths.length ? "Indexing markdown files." : "No markdown folders configured."
       });
       return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });

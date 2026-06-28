@@ -172,6 +172,7 @@ const workspaceContextNameEl = document.getElementById('workspace-context-name')
 const workspaceRagPathsEl = document.getElementById('workspace-rag-paths');
 const workspaceRagProgressBarEl = document.getElementById('workspace-rag-progress-bar');
 const workspaceRagStatusEl = document.getElementById('workspace-rag-status');
+const workspaceRagCurrentFileEl = document.getElementById('workspace-rag-current-file');
 const workspaceRagSaveBtn = document.getElementById('workspace-rag-save-btn');
 let expertPanelExperts = [];
 let expertPanelBusy = false;
@@ -442,6 +443,13 @@ function renderWorkspaceRagStatus(status) {
   const percent = Math.max(0, Math.min(100, status.percent ?? 0));
   const message = status.message ? ' · ' + status.message : '';
   setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${message}`, state === 'error');
+  if (workspaceRagCurrentFileEl) {
+    const currentFile = typeof status.currentFile === 'string' && status.currentFile.trim()
+      ? status.currentFile.trim()
+      : '';
+    workspaceRagCurrentFileEl.textContent = currentFile ? `Current file: ${currentFile}` : '';
+    workspaceRagCurrentFileEl.title = currentFile;
+  }
 }
 
 function activeWorkspaceRagContext(config = workspaceRagConfig) {
@@ -463,6 +471,10 @@ async function loadWorkspaceRagStatus() {
     renderWorkspaceRagStatus(status);
   } catch (e) {
     setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
+    if (workspaceRagCurrentFileEl) {
+      workspaceRagCurrentFileEl.textContent = '';
+      workspaceRagCurrentFileEl.title = '';
+    }
   }
 }
 
@@ -476,6 +488,10 @@ async function loadWorkspaceRagConfig() {
     renderWorkspaceRagStatus(status);
   } catch (e) {
     setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
+    if (workspaceRagCurrentFileEl) {
+      workspaceRagCurrentFileEl.textContent = '';
+      workspaceRagCurrentFileEl.title = '';
+    }
   }
 }
 

@@ -23,7 +23,7 @@ export interface ProviderDraft {
 
 const CSS = `
 .mb-setup-overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
-  background:#0f172a; font:14px/1.5 system-ui,sans-serif; color:#1a1a1a; z-index:9999; }
+  background:#0f172a; font:14px/1.5 Inter, sans-serif; color:#1a1a1a; z-index:9999; }
 .mb-setup-card { background:#fff; border-radius:14px; padding:24px; width:min(440px,92vw);
   box-shadow:0 10px 40px rgba(0,0,0,.4); display:flex; flex-direction:column; gap:12px; }
 .mb-setup-card h2 { margin:0; font-size:18px; }

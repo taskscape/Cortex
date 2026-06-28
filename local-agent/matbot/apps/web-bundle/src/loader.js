@@ -264,7 +264,7 @@
   } catch (err) {
     console.error('[matbot] boot failed:', err);
     const pre = document.createElement('pre');
-    pre.style.cssText = 'color:#b91c1c;padding:16px;white-space:pre-wrap;font:13px monospace';
+    pre.style.cssText = 'color:#b91c1c;padding:16px;white-space:pre-wrap;font:13px Inter, sans-serif';
     pre.textContent = 'matbot failed to start:\n' + (err && err.stack ? err.stack : String(err));
     document.body.appendChild(pre);
   }

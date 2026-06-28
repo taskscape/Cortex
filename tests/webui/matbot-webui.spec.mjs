@@ -102,6 +102,7 @@ test("workspace RAG configuration panel saves paths and shows indexing progress"
   await page.locator("#workspace-config-btn").click();
   await expect(page.locator("#workspace-rag-status")).toContainText("indexing");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
+  await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");
 });
 
 test("remembered facts persist across conversations and are used in later answers", async ({ page, isMobile }) => {

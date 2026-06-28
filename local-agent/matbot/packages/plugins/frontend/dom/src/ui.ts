@@ -4,7 +4,7 @@ import type {
 import { createSession, currentPrincipal, PromptCancelledError } from '@matatbread/matbot-core';
 
 const CSS = `
-.mb-app { display:flex; flex-direction:column; height:100vh; font:14px/1.5 system-ui,sans-serif; color:#1a1a1a; background:#fafafa; }
+.mb-app { display:flex; flex-direction:column; height:100vh; font:14px/1.5 Inter, sans-serif; color:#1a1a1a; background:#fafafa; }
 .mb-head { display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid #e2e2e2; background:#fff; }
 .mb-head .mb-title { font-weight:600; margin-right:auto; }
 .mb-head select, .mb-head button { font:inherit; padding:4px 8px; border:1px solid #cfcfcf; border-radius:6px; background:#fff; }
@@ -19,11 +19,11 @@ const CSS = `
 .mb-bubble.mb-md > :first-child { margin-top:0; }
 .mb-bubble.mb-md > :last-child { margin-bottom:0; }
 .mb-bubble.mb-md pre { background:#0f172a; color:#e2e8f0; padding:8px 10px; border-radius:8px; overflow-x:auto; }
-.mb-bubble.mb-md code { font-family:ui-monospace,monospace; font-size:.92em; }
+.mb-bubble.mb-md code { font-family:Inter, sans-serif; font-size:.92em; }
 .mb-bubble.mb-md :not(pre) > code { background:rgba(0,0,0,.06); padding:1px 4px; border-radius:4px; }
 .mb-row.user .mb-bubble.mb-md :not(pre) > code { background:rgba(255,255,255,.2); }
 .mb-bubble.mb-md a { color:inherit; }
-.mb-tool { font-family:ui-monospace,monospace; font-size:12px; background:#0f172a; color:#e2e8f0; border-radius:8px; padding:8px 10px; max-width:72ch; white-space:pre-wrap; }
+.mb-tool { font-family:Inter, sans-serif; font-size:12px; background:#0f172a; color:#e2e8f0; border-radius:8px; padding:8px 10px; max-width:72ch; white-space:pre-wrap; }
 .mb-tool .mb-tool-name { color:#7dd3fc; }
 .mb-err { color:#b91c1c; }
 .mb-think { color:#888; font-style:italic; font-size:12px; }
