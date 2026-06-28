@@ -4,6 +4,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+if (-not [System.IO.Path]::IsPathRooted($WorkspaceConfig)) {
+    $WorkspaceConfig = Join-Path $Root $WorkspaceConfig
+}
+
 function Test-Command($Name) {
     $command = Get-Command $Name -ErrorAction SilentlyContinue
     return $null -ne $command
@@ -42,8 +47,14 @@ if (-not (Test-Path -LiteralPath $WorkspaceConfig)) {
     throw "Workspace config not found: $WorkspaceConfig"
 }
 
-npm install
-npm run build
+Push-Location $Root
+try {
+    npm install
+    npm run build
+}
+finally {
+    Pop-Location
+}
 
 Write-Host "Setup complete."
 Write-Host "Review configured roots in $WorkspaceConfig before indexing or allowing writes."

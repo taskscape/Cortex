@@ -17,6 +17,7 @@
 //   fileEvents(signal)                             -> AsyncIterable<{ namespace, name, size }>
 //   skillEvents(signal)                            -> AsyncIterable<{ type: 'saved'|'deleted', name }>
 //   openFile(namespace, path)                      -> void
+//   listWorkspaces/createWorkspace/renameWorkspace/switchWorkspace -> Promise<any>
 
 (function () {
   // Split a growing SSE buffer into complete events, returning the unparsed tail. `data:` lines only.
@@ -175,9 +176,46 @@
     window.open('/files/' + namespace + '/' + path, '_blank');
   }
 
+  async function listWorkspaces() {
+    const res = await fetch('/workspaces');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  async function createWorkspace(name) {
+    const res = await fetch('/workspaces', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  async function renameWorkspace(id, name) {
+    const res = await fetch('/workspaces/' + encodeURIComponent(id) + '/rename', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  async function switchWorkspace(id) {
+    const res = await fetch('/workspaces/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
   window.matbotTransport = {
     hostRuntime: 'node',
     callTool, createSession, sessionBusy, submit,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
+    listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
   };
 })();

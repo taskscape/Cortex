@@ -282,10 +282,26 @@ function makeInProcessTransport(services) {
     window.open(URL.createObjectURL(new Blob([bytes], { type: handle.mimeType })), '_blank');
   }
 
+  async function listWorkspaces() {
+    return { active: 'default', workspaces: [{ id: 'default', name: 'Default', configPath: 'matbot.yaml', active: true }] };
+  }
+  async function createWorkspace(name) {
+    throw new Error('Workspace creation is only available in the Node-hosted Cortex UI.');
+  }
+  async function renameWorkspace(id, name) {
+    if (id === 'default') return { id, name, configPath: 'matbot.yaml', active: true };
+    throw new Error(`Unknown workspace "${id}".`);
+  }
+  async function switchWorkspace(id) {
+    if (id === 'default') return { active: 'default', restarting: false };
+    throw new Error(`Unknown workspace "${id}".`);
+  }
+
   return {
     hostRuntime: 'browser',
     callTool, createSession: createSessionFn, sessionBusy, submit,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
+    listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
   };
 }
 

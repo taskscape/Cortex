@@ -26,6 +26,14 @@ test("expert panel runs selected experts with isolated knowledge and synthesis",
   await expertPanelPlugin.setup(services);
   assert.equal(registeredTool?.name, "expert_panel");
 
+  const listEvents = [];
+  for await (const event of registeredTool.executor.execute({ action: "list" }, { signal: new AbortController().signal, provider: "openai" })) {
+    listEvents.push(event);
+  }
+  const listResult = listEvents.find(event => event.type === "result");
+  assert.deepEqual(listResult.value.experts.map(expert => expert.id), ["design", "finance", "engineering"]);
+  assert.equal(listResult.value.experts.some(expert => "systemPrompt" in expert), false);
+
   const events = [];
   const context = { signal: new AbortController().signal, provider: "openai" };
   for await (const event of registeredTool.executor.execute({

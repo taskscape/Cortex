@@ -28,21 +28,8 @@
  */
 
 import type { MatbotMachine, Tool, ToolExecutor, ToolContext, ToolEvent } from '@matatbread/matbot-plugin-api';
-import { runOnce } from './runOnce.js';
-import { createLlmRanker } from './llmRanker.js';
-import { createLlmMerger } from './llmMerger.js';
 import type { DreamRun } from './types.js';
-import { DREAM_RANKER_PROVIDER_KEY, DREAM_MERGER_PROVIDER_KEY } from '../inner-voice/tool.js';
-
-// Process-local mutex. A Promise the next caller awaits; the chain extends with every call and
-// settles in order. Simple, correct, no third-party dependency.
-let runChain: Promise<unknown> = Promise.resolve();
-
-function serialise<T>(fn: () => Promise<T>): Promise<T> {
-  const next = runChain.then(fn, fn);   // run regardless of prior settle state
-  runChain = next.catch(() => undefined); // don't let one failure poison the chain
-  return next;
-}
+import { runDreamTimePass } from './service.js';
 
 export function createDreamTimeTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
@@ -64,24 +51,9 @@ export function createDreamTimeTool(services: MatbotMachine): Tool {
         return;
       }
 
-      // Ranker and merger each resolve their own provider pin independently, falling back to the
-      // calling turn's provider when unset or stale (the pinned name no longer exists). This
-      // matters most for the merger, which sees a whole skill's prose plus the fact — a
-      // small-context provider can truncate and fail there even though the same provider ranks
-      // fine (ranking only ever sees short summaries).
-      const [rankerPinned, mergerPinned] = await Promise.all([
-        services.settings().get<string>(DREAM_RANKER_PROVIDER_KEY),
-        services.settings().get<string>(DREAM_MERGER_PROVIDER_KEY),
-      ]);
-      const rankerProvider = (rankerPinned !== undefined && services.providers.has(rankerPinned)) ? rankerPinned : ctx.provider;
-      const mergerProvider = (mergerPinned !== undefined && services.providers.has(mergerPinned)) ? mergerPinned : ctx.provider;
-
-      const ranker = createLlmRanker(services, rankerProvider);
-      const merger = createLlmMerger(services, mergerProvider);
-
       let run: DreamRun;
       try {
-        run = await serialise(() => runOnce(services, ranker, merger, ctx.signal));
+        run = await runDreamTimePass(services, ctx.provider, ctx.signal);
       } catch (e) {
         // runOnce catches its own pipeline errors into the run record. A throw here is something
         // unexpected — a setup-shaped failure (missing SkillManager, malformed settings,
@@ -89,16 +61,6 @@ export function createDreamTimeTool(services: MatbotMachine): Tool {
         // error so the caller sees it; nothing was written to the dream_runs store.
         yield { type: 'error', message: `dream_time failed before producing a run record: ${(e as Error).message ?? String(e)}` };
         return;
-      }
-
-      // Persist the run record. Failures here are logged but do NOT block returning the result —
-      // the caller still gets the in-memory record, just without store-side history. A persist
-      // failure on its own should not look like a pipeline failure.
-      try {
-        const dreamRuns = services.createStore<DreamRun>('dream_runs');
-        await dreamRuns.set(run.id, run);
-      } catch (e) {
-        console.warn('[dream/tool] failed to persist DreamRun:', (e as Error).message ?? e);
       }
 
       yield { type: 'result', value: run };

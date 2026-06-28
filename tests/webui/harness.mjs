@@ -19,10 +19,77 @@ const sessionStreams = new Map();
 const globalStreams = new Set();
 const pendingPrompts = new Map();
 const runningTurns = new Map();
+let workspaceSeq = 1;
+let rememberedFactSeq = 1;
+const rememberedFacts = new Map();
 
 const files = new Map([
   ["brief.md", Buffer.from("# Brief\nInitial workspace file.", "utf8")]
 ]);
+
+const workspaces = [
+  {
+    id: "default",
+    name: "Default",
+    configPath: "matbot.yaml",
+    createdAt: now(),
+    updatedAt: now(),
+    active: true
+  }
+];
+let workspaceRagConfig = {
+  activeContextId: "default",
+  contexts: [
+    { id: "default", name: "Default", paths: ["C:\\Projects\\Cortex\\docs"] }
+  ]
+};
+let workspaceRagStatus = {
+  workspaceId: "default",
+  contextName: "Default",
+  paths: activeRagContext().paths,
+  state: "idle",
+  totalFiles: 2,
+  processedFiles: 2,
+  percent: 100,
+  message: "Indexed 2 markdown file(s).",
+  nvidiaAvailable: false,
+  accelerated: false,
+  accelerator: "cpu"
+};
+
+function activeRagContext() {
+  return workspaceRagConfig.contexts.find(context => context.id === workspaceRagConfig.activeContextId) ?? workspaceRagConfig.contexts[0];
+}
+
+function workspaceRagConfigResponse() {
+  const context = activeRagContext();
+  return {
+    ...workspaceRagConfig,
+    contextName: context.name,
+    paths: context.paths
+  };
+}
+
+function setWorkspaceRagStatusForActive(overrides = {}) {
+  const context = activeRagContext();
+  workspaceRagStatus = {
+    ...workspaceRagStatus,
+    contextName: context.name,
+    paths: context.paths,
+    ...overrides
+  };
+}
+
+sessions.set("s0", {
+  id: "s0",
+  version: "v1",
+  status: "active",
+  title: "Conversation s0",
+  messages: [],
+  contexts: [],
+  createdAt: now(),
+  updatedAt: now()
+});
 
 const skills = new Map([
   ["Panel Etiquette", {
@@ -62,11 +129,49 @@ const loadedPlugins = [
     tools: [{ name: "workspace_action", description: "Read, write, list, and delete workspace files." }]
   },
   {
+    name: "@matatbread/matbot-workspace-rag",
+    specifier: "./packages/plugins/workspace-rag",
+    description: "Workspace-scoped markdown RAG ingestion.",
+    types: ["tools", "knowledge", "hooks"],
+    tools: [{ name: "workspace_rag", description: "Configure workspace markdown RAG." }]
+  },
+  {
     name: "@matatbread/matbot-skills",
     specifier: "./packages/plugins/skills",
     description: "Skills and skill editor support.",
     types: ["tools", "service:SkillManager"],
     tools: [{ name: "skill_action", description: "Manage skills." }]
+  },
+  {
+    name: "@matatbread/matbot-cognition",
+    specifier: "./packages/plugins/cognition",
+    description: "Memory and remembered facts.",
+    types: ["tools"],
+    tools: [
+      { name: "remember_fact", description: "Store durable remembered facts." },
+      { name: "remembered_facts_action", description: "Inspect and manage remembered facts." }
+    ]
+  }
+];
+
+const expertConfigs = [
+  {
+    id: "design",
+    title: "Design Expert",
+    description: "Product experience, interaction quality, and visual design.",
+    tags: ["design", "ux"]
+  },
+  {
+    id: "finance",
+    title: "Finance Expert",
+    description: "Budget, value, and operational finance.",
+    tags: ["finance"]
+  },
+  {
+    id: "engineering",
+    title: "Engineering Expert",
+    description: "Architecture, implementation risk, and maintainability.",
+    tags: ["engineering"]
   }
 ];
 
@@ -116,6 +221,48 @@ async function handle(req, res) {
   if (method === "GET" && url.pathname === "/favicon.ico") return file(res, "image/svg+xml", "favicon.svg");
 
   if (method === "GET" && url.pathname === "/events") return openGlobalStream(req, res);
+
+  if (method === "GET" && url.pathname === "/workspaces") {
+    return json(res, 200, { active: workspaces.find(w => w.active)?.id ?? "default", workspaces });
+  }
+
+  if (method === "POST" && url.pathname === "/workspaces") {
+    const body = await readJson(req);
+    const name = String(body.name ?? "").trim();
+    if (!name) return json(res, 400, { error: "Workspace name is required" });
+    const id = `workspace-${workspaceSeq++}`;
+    const workspace = {
+      id,
+      name,
+      configPath: `workspaces/${id}/matbot.yaml`,
+      createdAt: now(),
+      updatedAt: now(),
+      active: false
+    };
+    workspaces.push(workspace);
+    return json(res, 201, workspace);
+  }
+
+  const workspaceRename = /^\/workspaces\/([^/]+)\/rename$/.exec(url.pathname);
+  if (method === "POST" && workspaceRename) {
+    const workspace = workspaces.find(w => w.id === decodeURIComponent(workspaceRename[1]));
+    if (!workspace) return json(res, 404, { error: "Workspace not found" });
+    const body = await readJson(req);
+    const name = String(body.name ?? "").trim();
+    if (!name) return json(res, 400, { error: "Workspace name is required" });
+    workspace.name = name;
+    workspace.updatedAt = now();
+    return json(res, 200, workspace);
+  }
+
+  const workspaceSwitch = /^\/workspaces\/([^/]+)\/switch$/.exec(url.pathname);
+  if (method === "POST" && workspaceSwitch) {
+    const id = decodeURIComponent(workspaceSwitch[1]);
+    const workspace = workspaces.find(w => w.id === id);
+    if (!workspace) return json(res, 404, { error: "Workspace not found" });
+    for (const item of workspaces) item.active = item.id === id;
+    return json(res, 200, { active: id, restarting: true });
+  }
 
   const sessionEvents = /^\/events\/sessions\/([^/]+)$/.exec(url.pathname);
   if (method === "GET" && sessionEvents) return openSessionStream(req, res, decodeURIComponent(sessionEvents[1]));
@@ -196,7 +343,7 @@ async function file(res, contentType, name) {
 
 async function handleTool(res, name, input) {
   if (name === "provider") {
-    return json(res, 200, { providers: [{ name: "openai" }, { name: "panel-test" }] });
+    return json(res, 200, { providers: [{ name: "openai" }, { name: "Local" }, { name: "panel-test" }] });
   }
   if (name === "session_action") {
     if (input.action === "list") {
@@ -235,9 +382,126 @@ async function handleTool(res, name, input) {
       return json(res, 200, { path: input.path });
     }
   }
+  if (name === "workspace_rag") {
+    if (input.action === "status") return json(res, 200, workspaceRagStatus);
+    if (input.action === "get_config") return json(res, 200, workspaceRagConfigResponse());
+    if (input.action === "configure") {
+      const contextId = String(input.contextId ?? workspaceRagConfig.activeContextId);
+      workspaceRagConfig = {
+        ...workspaceRagConfig,
+        activeContextId: contextId,
+        contexts: workspaceRagConfig.contexts.map(context => context.id === contextId ? {
+          ...context,
+          name: String(input.contextName ?? context.name),
+          paths: Array.isArray(input.paths) ? input.paths.map(String) : context.paths
+        } : context)
+      };
+      const context = activeRagContext();
+      setWorkspaceRagStatusForActive({
+        state: context.paths.length ? "indexing" : "pending",
+        totalFiles: context.paths.length ? 3 : 0,
+        processedFiles: context.paths.length ? 2 : 0,
+        percent: context.paths.length ? 67 : 0,
+        message: context.paths.length ? "Indexing markdown files." : "No markdown folders configured."
+      });
+      return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
+    }
+    if (input.action === "select_context") {
+      const contextId = String(input.contextId ?? "");
+      if (!workspaceRagConfig.contexts.some(context => context.id === contextId)) return json(res, 400, { error: `Unknown context ${contextId}` });
+      workspaceRagConfig = { ...workspaceRagConfig, activeContextId: contextId };
+      setWorkspaceRagStatusForActive({
+        state: activeRagContext().paths.length ? "idle" : "pending",
+        percent: activeRagContext().paths.length ? 100 : 0,
+        message: activeRagContext().paths.length ? "Indexed 2 markdown file(s)." : "No markdown folders configured."
+      });
+      return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
+    }
+    if (input.action === "create_context") {
+      const name = String(input.contextName ?? `Context ${workspaceRagConfig.contexts.length + 1}`).trim() || `Context ${workspaceRagConfig.contexts.length + 1}`;
+      const id = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || `context-${workspaceRagConfig.contexts.length + 1}`;
+      const uniqueId = workspaceRagConfig.contexts.some(context => context.id === id) ? `${id}-${workspaceRagConfig.contexts.length + 1}` : id;
+      workspaceRagConfig = {
+        activeContextId: uniqueId,
+        contexts: [...workspaceRagConfig.contexts, { id: uniqueId, name, paths: [] }]
+      };
+      setWorkspaceRagStatusForActive({
+        state: "pending",
+        totalFiles: 0,
+        processedFiles: 0,
+        percent: 0,
+        message: "No markdown folders configured."
+      });
+      return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
+    }
+    if (input.action === "reindex_now") {
+      workspaceRagStatus = { ...workspaceRagStatus, state: "idle", processedFiles: 3, totalFiles: 3, percent: 100, message: "Indexed 3 markdown file(s)." };
+      return json(res, 200, workspaceRagStatus);
+    }
+    if (input.action === "search") {
+      return json(res, 200, {
+        hits: [{
+          workspaceId: "default",
+          contextName: activeRagContext().name,
+          path: "C:/Projects/Cortex/docs/probe.md",
+          chunkId: "probe:0",
+          score: 0.92,
+          text: "Workspace RAG probe context."
+        }]
+      });
+    }
+  }
+  if (name === "remembered_facts_action") {
+    if (input.action === "list") return json(res, 200, { facts: [...rememberedFacts.values()] });
+    if (input.action === "get") return json(res, 200, rememberedFacts.get(input.id) ?? null);
+    if (input.action === "delete") {
+      rememberedFacts.delete(input.id);
+      return json(res, 200, { ok: true });
+    }
+  }
+  if (name === "remember_fact") {
+    const fact = String(input.fact ?? input.text ?? "").trim();
+    if (!fact) return json(res, 400, { error: "remember_fact requires a fact" });
+    const id = `fact-${rememberedFactSeq++}`;
+    const doc = { id, version: "v1", fact, sessionId: "manual", messageId: "manual", createdAt: now() };
+    rememberedFacts.set(id, doc);
+    return json(res, 200, { facts: [doc] });
+  }
   if (name === "plugin") {
     if (input.action === "list") return json(res, 200, { loaded: loadedPlugins });
     if (input.action === "discover_local") return json(res, 200, localPlugins);
+  }
+  if (name === "expert_panel") {
+    if (input.action === "list") return json(res, 200, { experts: expertConfigs });
+    const requested = Array.isArray(input.experts) && input.experts.length
+      ? input.experts
+      : expertConfigs.map(expert => expert.id);
+    const unknown = requested.filter(id => !expertConfigs.some(expert => expert.id === id));
+    if (unknown.length) return json(res, 400, { error: `Unknown expert(s): ${unknown.join(", ")}` });
+    const opinions = requested.map(id => {
+      const expert = expertConfigs.find(item => item.id === id);
+      return {
+        expertId: expert.id,
+        title: expert.title,
+        answer: `${expert.title} answer for "${input.question}" in ${input.mode ?? "parallel"} mode.`,
+        citations: [{
+          id: `${expert.id}-source`,
+          path: `knowledge/${expert.id}/panel-probe.md`,
+          title: "panel-probe.md",
+          score: 1
+        }],
+        usage: { inputTokens: 3, outputTokens: 4 }
+      };
+    });
+    const response = {
+      question: input.question,
+      mode: input.mode ?? "parallel",
+      experts: opinions
+    };
+    if (input.synthesize !== false) {
+      response.synthesis = `Synthesis for ${requested.join(", ")}.`;
+    }
+    return json(res, 200, response);
   }
   if (name === "skill_action") {
     if (input.action === "list") return json(res, 200, { skills: [...skills.values()].map(({ name: skillName }) => ({ name: skillName })) });
@@ -298,6 +562,7 @@ async function runTurn(sessionId, traceId, body) {
   session.messages.push(userMessage);
   setBusy(sessionId, true);
   runningTurns.set(sessionId, { traceId, aborted: false });
+  await waitForSessionStream(sessionId);
   sendSession(sessionId, "queued", { type: "queued", content: userMessage.content, queued: 0, concatQueue: false, traceId, rootTraceId: traceId });
   await sleep(20);
 
@@ -309,14 +574,39 @@ async function runTurn(sessionId, traceId, body) {
     return;
   }
 
+  const memorizedName = /memorize my name:\s*(.+)$/i.exec(content)?.[1]?.trim();
+  if (memorizedName) {
+    const id = `fact-${rememberedFactSeq++}`;
+    rememberedFacts.set(id, {
+      id,
+      version: "v1",
+      fact: `The user's name is ${memorizedName}.`,
+      sessionId,
+      messageId: userMessage.id,
+      createdAt: now()
+    });
+  }
+
   sendSession(sessionId, "thinking", { type: "thinking", delta: "Checking harness state.", traceId });
   await sleep(10);
+  if (/quasarpump/i.test(content)) {
+    sendSession(sessionId, "marker", {
+      type: "marker",
+      content: [{ type: "marker", creator: "workspace-rag", data: { hits: [{ path: "C:/Projects/Cortex/docs/retrieval-probe.md", score: 0.92 }] } }],
+      traceId
+    });
+  }
   sendSession(sessionId, "tool:start", { type: "tool:start", callId: `call-${traceId}`, name: "expert_panel", input: { question: content }, traceId });
   await sleep(10);
   sendSession(sessionId, "tool:stdout", { type: "tool:stdout", callId: `call-${traceId}`, chunk: "consulting experts\n", traceId });
   sendSession(sessionId, "tool:end", { type: "tool:end", callId: `call-${traceId}`, result: { ok: true }, isError: false, traceId });
 
-  if (/prompt me/i.test(content)) {
+  if (/what is my name/i.test(content)) {
+    const nameFact = [...rememberedFacts.values()].find(fact => /user's name is/i.test(fact.fact));
+    sendSession(sessionId, "text-delta", { type: "text-delta", delta: nameFact ? `Your name is ${nameFact.fact.replace(/^The user's name is\s*/i, "").replace(/\.$/, "")}.` : "I do not have your name stored.", traceId });
+  } else if (/quasarpump/i.test(content)) {
+    sendSession(sessionId, "text-delta", { type: "text-delta", delta: "Workspace RAG says the QuasarPump calibration value is 42 and the amber valve is required.", traceId });
+  } else if (/prompt me/i.test(content)) {
     const answer = await requestPrompt(sessionId, traceId);
     sendSession(sessionId, "text-delta", { type: "text-delta", delta: `Prompt answer received: ${answer}`, traceId });
   } else {
@@ -327,7 +617,11 @@ async function runTurn(sessionId, traceId, body) {
     id: `m-${traceId}-a`,
     traceId,
     role: "assistant",
-    content: [{ type: "text", text: /prompt me/i.test(content) ? "Prompt handled." : `Harness response to: ${content}` }],
+    content: [{ type: "text", text: /what is my name/i.test(content)
+      ? "Your name is Maciej Zagozda."
+      : /quasarpump/i.test(content)
+        ? "Workspace RAG says the QuasarPump calibration value is 42 and the amber valve is required."
+        : /prompt me/i.test(content) ? "Prompt handled." : `Harness response to: ${content}` }],
     createdAt: now()
   };
   session.messages.push(assistant);
@@ -335,6 +629,13 @@ async function runTurn(sessionId, traceId, body) {
   sendSession(sessionId, "done", { type: "done", session, traceId });
   runningTurns.delete(sessionId);
   setBusy(sessionId, false);
+}
+
+async function waitForSessionStream(sessionId) {
+  const started = Date.now();
+  while ((sessionStreams.get(sessionId)?.size ?? 0) === 0 && Date.now() - started < 500) {
+    await sleep(10);
+  }
 }
 
 function requestPrompt(sessionId, traceId) {

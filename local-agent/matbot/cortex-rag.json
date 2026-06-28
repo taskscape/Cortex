@@ -1,0 +1,12 @@
+{
+  "activeContextId": "default",
+  "contexts": [
+    {
+      "id": "default",
+      "name": "Default",
+      "paths": [
+        "C:\\Projects\\Siemens\\docs"
+      ]
+    }
+  ]
+}

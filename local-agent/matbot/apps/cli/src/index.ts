@@ -30,12 +30,13 @@ import { FilesystemStore }                 from '@matatbread/matbot-storage-file
 import { FilesystemFileStore }             from '@matatbread/matbot-files-node';
 import { createBuiltinTools, createProviderTool, classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
 import { LookupKnowledgeIndex }               from '@matatbread/matbot-knowledge';
-import { access, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { createInterface }                 from 'node:readline/promises';
 import { createRequire }                   from 'node:module';
 import { fileURLToPath, pathToFileURL }     from 'node:url';
 import process                             from 'node:process';
 import path                                from 'node:path';
+import { spawn }                           from 'node:child_process';
 
 // Prefix all console output with ISO timestamp + PID so parent and spawned
 // background processes are distinguishable in shared terminal output.
@@ -154,6 +155,14 @@ async function findUp(filename: string, start = process.cwd()): Promise<string |
     if (parent === dir) return null;  // filesystem root
     dir = parent;
   }
+}
+
+async function exists(filePath: string): Promise<boolean> {
+  try { await access(filePath); return true; } catch { return false; }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function resolveCredentials(
@@ -303,6 +312,222 @@ function resolveBootPrincipal(opts: CliOpts, config: import('./config.js').Matbo
   }
   if (config.principal !== undefined) return config.principal;
   return systemPrincipal();
+}
+
+// ── Cortex workspaces ────────────────────────────────────────────────────────
+
+interface CortexWorkspaceRecord {
+  id:         string;
+  name:       string;
+  configPath: string;
+  createdAt:  string;
+  updatedAt:  string;
+}
+
+interface CortexWorkspaceRegistry {
+  active:     string;
+  workspaces: CortexWorkspaceRecord[];
+}
+
+interface CortexWorkspaceSummary extends CortexWorkspaceRecord {
+  active: boolean;
+}
+
+interface CortexWorkspaceManager {
+  current(): Promise<CortexWorkspaceSummary>;
+  list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }>;
+  create(name: string): Promise<CortexWorkspaceSummary>;
+  rename(id: string, name: string): Promise<CortexWorkspaceSummary>;
+  switch(id: string): Promise<{ active: string; restarting: boolean }>;
+}
+
+function yamlSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function yamlPath(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+function slugifyWorkspaceName(name: string): string {
+  const slug = name.trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return slug || `workspace-${Date.now().toString(36)}`;
+}
+
+function absolutizeLocalConfigSpecifiers(text: string, configDir: string): string {
+  return text.replace(
+    /^(\s*(?:-\s+|module:\s+))(['"]?)(\.{1,2}[\\/][^#\r\n'"]+)\2(\s*(?:#.*)?$)/gm,
+    (_whole, prefix: string, _quote: string, spec: string, suffix: string) => {
+      const abs = yamlPath(path.resolve(configDir, spec.trim()));
+      return `${prefix}${yamlSingleQuoted(abs)}${suffix}`;
+    },
+  );
+}
+
+class FileWorkspaceManager implements CortexWorkspaceManager {
+  private restarter: ((id: string) => Promise<void>) | undefined;
+  private readonly registryPath: string;
+  private readonly rootConfigPath: string;
+
+  constructor(
+    registryPath: string,
+    rootConfigPath: string,
+  ) {
+    this.registryPath = registryPath;
+    this.rootConfigPath = rootConfigPath;
+  }
+
+  setRestarter(restarter: (id: string) => Promise<void>): void {
+    this.restarter = restarter;
+  }
+
+  getRegistryPath(): string {
+    return this.registryPath;
+  }
+
+  async current(): Promise<CortexWorkspaceSummary> {
+    const registry = await this.load();
+    const current = registry.workspaces.find(w => w.id === registry.active) ?? registry.workspaces[0]!;
+    return this.summarize(current, current.id === registry.active);
+  }
+
+  async list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }> {
+    const registry = await this.load();
+    return {
+      active: registry.active,
+      workspaces: registry.workspaces.map(w => this.summarize(w, w.id === registry.active)),
+    };
+  }
+
+  async create(name: string): Promise<CortexWorkspaceSummary> {
+    const cleanName = name.trim();
+    if (!cleanName) throw new Error('Workspace name is required.');
+    const registry = await this.load();
+    const existingIds = new Set(registry.workspaces.map(w => w.id));
+    const baseId = slugifyWorkspaceName(cleanName);
+    let id = baseId;
+    let suffix = 2;
+    while (existingIds.has(id)) id = `${baseId}-${suffix++}`;
+
+    const rootDir = path.dirname(this.rootConfigPath);
+    const workspaceDir = path.join(rootDir, 'workspaces', id);
+    await mkdir(workspaceDir, { recursive: true });
+
+    const sourceConfig = await readFile(this.rootConfigPath, 'utf8');
+    const workspaceConfig = absolutizeLocalConfigSpecifiers(sourceConfig, rootDir);
+    await writeFile(path.join(workspaceDir, 'matbot.yaml'), workspaceConfig, 'utf8');
+
+    const rootEnv = path.join(rootDir, '.env');
+    if (await exists(rootEnv)) await copyFile(rootEnv, path.join(workspaceDir, '.env'));
+
+    const nowIso = new Date().toISOString();
+    const record: CortexWorkspaceRecord = {
+      id,
+      name: cleanName,
+      configPath: yamlPath(path.relative(path.dirname(this.registryPath), path.join(workspaceDir, 'matbot.yaml'))),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    registry.workspaces.push(record);
+    await this.save(registry);
+    return this.summarize(record, false);
+  }
+
+  async rename(id: string, name: string): Promise<CortexWorkspaceSummary> {
+    const cleanName = name.trim();
+    if (!cleanName) throw new Error('Workspace name is required.');
+    const registry = await this.load();
+    const record = registry.workspaces.find(w => w.id === id);
+    if (record === undefined) throw new Error(`Unknown workspace "${id}".`);
+    record.name = cleanName;
+    record.updatedAt = new Date().toISOString();
+    await this.save(registry);
+    return this.summarize(record, record.id === registry.active);
+  }
+
+  async switch(id: string): Promise<{ active: string; restarting: boolean }> {
+    const registry = await this.load();
+    if (!registry.workspaces.some(w => w.id === id)) throw new Error(`Unknown workspace "${id}".`);
+    registry.active = id;
+    await this.save(registry);
+    if (this.restarter === undefined) return { active: id, restarting: false };
+    await this.restarter(id);
+    return { active: id, restarting: true };
+  }
+
+  async selectConfigPath(): Promise<string> {
+    const registry = await this.load();
+    const requested = process.env['CORTEX_WORKSPACE_ID'];
+    const workspace = registry.workspaces.find(w => w.id === requested)
+      ?? registry.workspaces.find(w => w.id === registry.active)
+      ?? registry.workspaces[0]!;
+    registry.active = workspace.id;
+    await this.save(registry);
+    return path.resolve(path.dirname(this.registryPath), workspace.configPath);
+  }
+
+  async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string): Promise<void> {
+    const registry = await this.load();
+    const rootDir = path.dirname(this.rootConfigPath);
+    for (const workspace of registry.workspaces) {
+      const configPath = path.resolve(path.dirname(this.registryPath), workspace.configPath);
+      if (!(await exists(configPath))) continue;
+      const specifier = path.resolve(configPath) === path.resolve(this.rootConfigPath)
+        ? rootRelativeSpecifier
+        : yamlSingleQuoted(yamlPath(path.resolve(rootDir, rootRelativeSpecifier)));
+      await addPluginToConfigIfMissing(configPath, specifier);
+    }
+  }
+
+  private summarize(record: CortexWorkspaceRecord, active: boolean): CortexWorkspaceSummary {
+    return { ...record, active };
+  }
+
+  private async load(): Promise<CortexWorkspaceRegistry> {
+    if (!(await exists(this.registryPath))) {
+      const nowIso = new Date().toISOString();
+      const registry: CortexWorkspaceRegistry = {
+        active: 'default',
+        workspaces: [{
+          id: 'default',
+          name: 'Default',
+          configPath: yamlPath(path.relative(path.dirname(this.registryPath), this.rootConfigPath)),
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        }],
+      };
+      await this.save(registry);
+      return registry;
+    }
+    const registry = JSON.parse(await readFile(this.registryPath, 'utf8')) as CortexWorkspaceRegistry;
+    if (!Array.isArray(registry.workspaces) || registry.workspaces.length === 0) {
+      throw new Error(`Invalid Cortex workspace registry: ${this.registryPath}`);
+    }
+    if (!registry.workspaces.some(w => w.id === registry.active)) registry.active = registry.workspaces[0]!.id;
+    return registry;
+  }
+
+  private async save(registry: CortexWorkspaceRegistry): Promise<void> {
+    await mkdir(path.dirname(this.registryPath), { recursive: true });
+    await writeFile(this.registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+  }
+}
+
+async function addPluginToConfigIfMissing(configPath: string, specifier: string): Promise<void> {
+  const text = await readFile(configPath, 'utf8');
+  if (text.includes(`- ${specifier}`)) return;
+  let updated: string;
+  const blockMatch = text.match(/^(plugins:\s*\n(?:[ \t]+-[^\n]*\n)*)/m);
+  if (blockMatch) {
+    const at = blockMatch.index! + blockMatch[0].length;
+    updated = text.slice(0, at) + `  - ${specifier}\n` + text.slice(at);
+  } else {
+    updated = `${text.trimEnd()}\n\nplugins:\n  - ${specifier}\n`;
+  }
+  await writeFile(configPath, updated, 'utf8');
 }
 
 function printHelp(): void {
@@ -595,6 +820,8 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
 
 async function main(): Promise<void> {
   const serverMode = process.argv[2] === 'start';
+  const restartDelay = Number(process.env['CORTEX_RESTART_DELAY_MS'] ?? '0');
+  if (serverMode && Number.isFinite(restartDelay) && restartDelay > 0) await sleep(restartDelay);
 
   // ── install subcommand ────────────────────────────────────────────────────
   if (process.argv[2] === 'install') {
@@ -618,6 +845,7 @@ async function main(): Promise<void> {
 
   let matbotConfig!: import('./config.js').MatbotConfig;
   let configPath: string;
+  let workspaceManager: FileWorkspaceManager | undefined;
 
   if (opts.config === '-') {
     // Read YAML from stdin; project root anchors to the base config via extends:
@@ -637,9 +865,15 @@ async function main(): Promise<void> {
     // from which the user ran the package manager) so --config foo.yaml lands
     // next to the user's project, not inside the CLI package directory.
     const userCwd = process.env['INIT_CWD'] ?? process.cwd();
-    configPath = opts.config === './matbot.yaml'
+    const requestedConfigPath = opts.config === './matbot.yaml'
       ? (await findUp('matbot.yaml')) ?? path.resolve(userCwd, 'matbot.yaml')
       : path.isAbsolute(opts.config) ? opts.config : path.resolve(userCwd, opts.config);
+    const registryPath = process.env['CORTEX_WORKSPACES_FILE'] !== undefined
+      ? path.resolve(process.env['CORTEX_WORKSPACES_FILE'])
+      : path.join(path.dirname(requestedConfigPath), 'cortex-workspaces.json');
+    workspaceManager = new FileWorkspaceManager(registryPath, requestedConfigPath);
+    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workspace-rag');
+    configPath = await workspaceManager.selectConfigPath();
     process.chdir(path.dirname(configPath));
     await loadDotEnv(path.dirname(configPath));
     let loadResult: { config: import('./config.js').MatbotConfig; projectDir: string } | null = null;
@@ -957,6 +1191,32 @@ async function main(): Promise<void> {
     get KnowledgeIndex() { return knowledgeProxy; },
   };
   const services: MatbotMachine = unifyServices(baseServices);
+
+  if (workspaceManager !== undefined) {
+    workspaceManager.setRestarter(async (workspaceId: string) => {
+      if (!serverMode) return;
+      const entry = process.argv[1] ?? fileURLToPath(import.meta.url);
+      const args = [...process.execArgv, entry, ...process.argv.slice(2)];
+      const child = spawn(process.execPath, args, {
+        cwd: path.dirname(workspaceManager.getRegistryPath()),
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          CORTEX_WORKSPACE_ID: workspaceId,
+          CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
+          CORTEX_RESTART_DELAY_MS: '900',
+        },
+      });
+      child.unref();
+      setTimeout(() => {
+        void teardownPlugins()
+          .then(async () => { await activeStorageBackend?.close?.(); process.exit(0); })
+          .catch(() => process.exit(1));
+      }, 250);
+    });
+    serviceRegistry.set('WorkspaceManager', workspaceManager);
+  }
 
   // resolveProvider reads matbotConfig.providers lazily (per turn), so it sees both the
   // canonicalised module names set below and any live `provider add/remove` edits.

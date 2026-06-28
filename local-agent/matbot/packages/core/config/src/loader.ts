@@ -62,6 +62,61 @@ function toProviderConfig(name: string, raw: YamlMap): ProviderConfig {
   return config;
 }
 
+function optionalNumber(v: YamlValue | undefined): number | undefined {
+  return typeof v === 'number' ? v : undefined;
+}
+
+function providerNameForModel(groupName: string, models: YamlValue[], modelName: string): string {
+  return models.length === 1 ? groupName : `${groupName}-${modelName}`;
+}
+
+function toOpenAICompatibleProviderConfigs(raw: YamlValue | undefined): Map<string, ProviderConfig> {
+  const providers = new Map<string, ProviderConfig>();
+  if (raw === undefined) return providers;
+
+  const root = asRecord(raw, 'language_models.openai_compatible');
+  for (const [groupName, groupRaw] of Object.entries(root)) {
+    const group = asRecord(groupRaw, `language_models.openai_compatible.${groupName}`);
+    const apiUrl = asString(group['api_url'], `language_models.openai_compatible.${groupName}.api_url`);
+    const models = group['available_models'];
+    if (!Array.isArray(models)) {
+      throw new Error(`Config: "language_models.openai_compatible.${groupName}.available_models" must be a sequence (list)`);
+    }
+
+    for (let i = 0; i < models.length; i++) {
+      const model = asRecord(models[i], `language_models.openai_compatible.${groupName}.available_models[${i}]`);
+      const modelName = asString(model['name'], `language_models.openai_compatible.${groupName}.available_models[${i}].name`);
+      const providerName = providerNameForModel(groupName, models, modelName);
+
+      const contextTokens = optionalNumber(model['max_tokens']);
+      const outputTokens = optionalNumber(model['max_output_tokens']);
+      const completionTokens = optionalNumber(model['max_completion_tokens']);
+      const capabilities = model['capabilities'] !== undefined
+        ? asRecord(model['capabilities'], `language_models.openai_compatible.${groupName}.available_models[${i}].capabilities`)
+        : undefined;
+
+      const parameters: ModelParameters = {
+        apiUrl,
+        maxTokens: outputTokens ?? completionTokens ?? contextTokens ?? 4096,
+      };
+      if (contextTokens !== undefined) parameters['maxContextTokens'] = contextTokens;
+      if (outputTokens !== undefined) parameters['maxOutputTokens'] = outputTokens;
+      if (completionTokens !== undefined) parameters['maxCompletionTokens'] = completionTokens;
+      if (capabilities !== undefined) parameters['capabilities'] = capabilities;
+
+      providers.set(providerName, {
+        name: providerName,
+        module: './packages/plugins/providers/openai-compat',
+        endpoint: apiUrl,
+        model: modelName,
+        parameters,
+      });
+    }
+  }
+
+  return providers;
+}
+
 export function parseConfig(
   text:  string,
   base?: string,
@@ -85,6 +140,14 @@ export function parseConfig(
 
   const providersRaw = doc['providers'];
   const providers    = new Map<string, ProviderConfig>();
+
+  const languageModels = doc['language_models'];
+  if (languageModels !== undefined) {
+    const languageModelsMap = asRecord(languageModels, 'language_models');
+    for (const [name, config] of toOpenAICompatibleProviderConfigs(languageModelsMap['openai_compatible'])) {
+      providers.set(name, config);
+    }
+  }
 
   if (providersRaw !== undefined) {
     const providersMap = asRecord(providersRaw, 'providers');

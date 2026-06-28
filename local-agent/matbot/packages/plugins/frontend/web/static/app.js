@@ -80,6 +80,7 @@ function isMessagesBottomVisible() {
 // scroll-to-bottom control.
 const ICON_SEND   = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M9 6v12l9-6z"/></svg>';
 const ICON_SCROLL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';
+const ICON_STOP   = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>';
 
 // Morph the send button into a scroll-down button. Stop is now its own button, and the input
 // stays enabled while a turn runs (so you can type-ahead and queue), so neither is touched here.
@@ -100,6 +101,17 @@ function scrollToBottomAndReset() {
 function resetSendButton() {
   sendBtn.innerHTML = ICON_SEND;
   sendBtn.classList.remove('scroll-down-mode', 'stop-mode');
+  sendBtn.setAttribute('aria-label', 'Send');
+  sendBtn.title = '';
+  sendBtn.disabled = false;
+}
+
+function showStopButton() {
+  sendBtn.innerHTML = ICON_STOP;
+  sendBtn.classList.remove('scroll-down-mode');
+  sendBtn.classList.add('stop-mode');
+  sendBtn.setAttribute('aria-label', 'Stop');
+  sendBtn.title = 'Stop the running turn and drop anything queued';
   sendBtn.disabled = false;
 }
 
@@ -136,6 +148,36 @@ const newBtn         = document.getElementById('new-btn');
 const providerSel    = document.getElementById('provider-select');
 const burgerBtn      = document.getElementById('burger');
 const sidebarOverlay = document.getElementById('sidebar-overlay');
+const expertMenuEl       = document.getElementById('expert-menu');
+const expertToggleBtn    = document.getElementById('expert-toggle-btn');
+const expertPopoverEl    = document.getElementById('expert-popover');
+const expertEnabledEl    = document.getElementById('expert-enabled');
+const expertAllEl        = document.getElementById('expert-all');
+const expertListEl       = document.getElementById('expert-list');
+const expertModeEl       = document.getElementById('expert-mode');
+const expertSynthesizeEl = document.getElementById('expert-synthesize');
+const expertStatusEl     = document.getElementById('expert-status');
+const workspaceToggleBtn = document.getElementById('workspace-toggle-btn');
+const workspacePopoverEl = document.getElementById('workspace-popover');
+const workspaceListEl    = document.getElementById('workspace-list');
+const workspaceNameEl    = document.getElementById('workspace-name');
+const workspaceAvatarEl  = document.getElementById('workspace-avatar');
+const workspaceStatusEl  = document.getElementById('workspace-status');
+const workspaceNewBtn    = document.getElementById('workspace-new-btn');
+const workspaceRenameBtn = document.getElementById('workspace-rename-btn');
+const workspaceConfigBtn = document.getElementById('workspace-config-btn');
+const workspaceSettingsScreenEl = document.getElementById('workspace-settings-screen');
+const workspaceSettingsCancelBtn = document.getElementById('workspace-settings-cancel-btn');
+const workspaceContextNameEl = document.getElementById('workspace-context-name');
+const workspaceRagPathsEl = document.getElementById('workspace-rag-paths');
+const workspaceRagProgressBarEl = document.getElementById('workspace-rag-progress-bar');
+const workspaceRagStatusEl = document.getElementById('workspace-rag-status');
+const workspaceRagSaveBtn = document.getElementById('workspace-rag-save-btn');
+let expertPanelExperts = [];
+let expertPanelBusy = false;
+let workspaceState = { active: 'default', workspaces: [] };
+let workspaceRagPoll = null;
+let workspaceRagConfig = null;
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
 if (burgerBtn)      burgerBtn.onclick      = () => document.body.classList.toggle('sidebar-open');
@@ -267,6 +309,401 @@ async function refreshProviderSelect() {
 async function callTool(toolName, input) {
   return T.callTool(toolName, input);
 }
+
+// ── Cortex workspaces ───────────────────────────────────────────────────────
+
+function setWorkspaceStatus(text, isError = false) {
+  if (!workspaceStatusEl) return;
+  workspaceStatusEl.textContent = text || '';
+  workspaceStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function workspaceInitial(name) {
+  const trimmed = String(name || 'Default').trim();
+  return (trimmed[0] || 'C').toUpperCase();
+}
+
+function activeWorkspace() {
+  return workspaceState.workspaces.find(w => w.active) ??
+         workspaceState.workspaces.find(w => w.id === workspaceState.active) ??
+         workspaceState.workspaces[0] ??
+         { id: 'default', name: 'Default', active: true };
+}
+
+function setWorkspacePopoverOpen(open) {
+  if (!workspacePopoverEl || !workspaceToggleBtn) return;
+  workspacePopoverEl.classList.toggle('open', open);
+  workspaceToggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) setWorkspaceSettingsOpen(false);
+}
+
+function setWorkspaceSettingsOpen(open) {
+  if (!workspaceSettingsScreenEl || !workspaceConfigBtn) return;
+  workspaceSettingsScreenEl.classList.toggle('open', open);
+  document.body.classList.toggle('workspace-settings-open', open);
+  workspaceConfigBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    setWorkspacePopoverOpen(false);
+    closeSidebar();
+    loadWorkspaceRagConfig();
+    startWorkspaceRagPoll();
+  } else {
+    stopWorkspaceRagPoll();
+  }
+}
+
+function renderWorkspaces() {
+  const current = activeWorkspace();
+  if (workspaceNameEl) workspaceNameEl.textContent = current.name || 'Default';
+  if (workspaceAvatarEl) workspaceAvatarEl.textContent = workspaceInitial(current.name);
+  if (!workspaceListEl) return;
+  workspaceListEl.innerHTML = '';
+  for (const workspace of workspaceState.workspaces) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'workspace-option' + (workspace.active ? ' active' : '');
+    btn.dataset.workspaceId = workspace.id;
+    btn.innerHTML = `<span class="workspace-option-name"></span><span class="workspace-option-check">${workspace.active ? '✓' : ''}</span>`;
+    btn.querySelector('.workspace-option-name').textContent = workspace.name;
+    btn.addEventListener('click', async () => {
+      if (workspace.active) { setWorkspacePopoverOpen(false); return; }
+      try {
+        setWorkspaceStatus('Switching...');
+        await T.switchWorkspace(workspace.id);
+        setTimeout(() => window.location.reload(), 1600);
+      } catch (e) {
+        setWorkspaceStatus(String(e.message || e), true);
+      }
+    });
+    workspaceListEl.appendChild(btn);
+  }
+}
+
+async function loadWorkspaces() {
+  if (!T.listWorkspaces || !workspaceToggleBtn) return;
+  try {
+    workspaceState = await T.listWorkspaces();
+    renderWorkspaces();
+    void loadWorkspaceRagConfig();
+    setWorkspaceStatus('');
+  } catch (e) {
+    setWorkspaceStatus('Workspace API unavailable.', true);
+  }
+}
+
+workspaceToggleBtn?.addEventListener('click', () => {
+  setWorkspacePopoverOpen(!workspacePopoverEl?.classList.contains('open'));
+});
+
+workspaceConfigBtn?.addEventListener('click', () => {
+  setWorkspaceSettingsOpen(true);
+});
+
+workspaceNewBtn?.addEventListener('click', async () => {
+  const name = prompt('New workspace name');
+  if (!name || !name.trim()) return;
+  try {
+    await T.createWorkspace(name.trim());
+    await loadWorkspaces();
+  } catch (e) {
+    setWorkspaceStatus(String(e.message || e), true);
+  }
+});
+
+workspaceRenameBtn?.addEventListener('click', async () => {
+  const current = activeWorkspace();
+  const name = prompt('Rename workspace', current.name || 'Default');
+  if (!name || !name.trim()) return;
+  try {
+    await T.renameWorkspace(current.id, name.trim());
+    await loadWorkspaces();
+  } catch (e) {
+    setWorkspaceStatus(String(e.message || e), true);
+  }
+});
+
+document.addEventListener('click', (e) => {
+  if (!workspacePopoverEl?.classList.contains('open')) return;
+  if (e.target.closest('#workspace-menu')) return;
+  setWorkspacePopoverOpen(false);
+});
+
+function setWorkspaceRagStatus(text, isError = false) {
+  if (!workspaceRagStatusEl) return;
+  workspaceRagStatusEl.textContent = text || '';
+  workspaceRagStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function renderWorkspaceRagStatus(status) {
+  if (!status) return;
+  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = Math.max(0, Math.min(100, status.percent ?? 0)) + '%';
+  const accel = status.accelerated ? 'NVIDIA' : 'CPU';
+  const state = status.state || 'idle';
+  const percent = Math.max(0, Math.min(100, status.percent ?? 0));
+  const message = status.message ? ' · ' + status.message : '';
+  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${message}`, state === 'error');
+}
+
+function activeWorkspaceRagContext(config = workspaceRagConfig) {
+  if (!config) return null;
+  const contexts = Array.isArray(config.contexts) ? config.contexts : [];
+  return contexts.find(context => context.id === config.activeContextId) ?? contexts[0] ?? null;
+}
+
+function renderWorkspaceRagConfig(config) {
+  workspaceRagConfig = config;
+  const active = activeWorkspaceRagContext(config);
+  if (workspaceContextNameEl) workspaceContextNameEl.value = active?.name || config?.contextName || activeWorkspace().name || '';
+  if (workspaceRagPathsEl) workspaceRagPathsEl.value = Array.isArray(active?.paths ?? config?.paths) ? (active?.paths ?? config.paths).join('\n') : '';
+}
+
+async function loadWorkspaceRagStatus() {
+  try {
+    const status = await callTool('workspace_rag', { action: 'status' });
+    renderWorkspaceRagStatus(status);
+  } catch (e) {
+    setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
+  }
+}
+
+async function loadWorkspaceRagConfig() {
+  try {
+    const [config, status] = await Promise.all([
+      callTool('workspace_rag', { action: 'get_config' }),
+      callTool('workspace_rag', { action: 'status' }),
+    ]);
+    renderWorkspaceRagConfig(config);
+    renderWorkspaceRagStatus(status);
+  } catch (e) {
+    setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
+  }
+}
+
+function startWorkspaceRagPoll() {
+  stopWorkspaceRagPoll();
+  workspaceRagPoll = setInterval(() => { loadWorkspaceRagStatus(); }, 3000);
+}
+
+function stopWorkspaceRagPoll() {
+  if (workspaceRagPoll !== null) {
+    clearInterval(workspaceRagPoll);
+    workspaceRagPoll = null;
+  }
+}
+
+workspaceRagSaveBtn?.addEventListener('click', async () => {
+  const contextId = activeWorkspaceRagContext()?.id;
+  const contextName = workspaceContextNameEl?.value?.trim() || activeWorkspace().name || 'Workspace';
+  const paths = (workspaceRagPathsEl?.value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  try {
+    const result = await callTool('workspace_rag', { action: 'configure', contextId, contextName, paths });
+    renderWorkspaceRagConfig(result.config);
+    renderWorkspaceRagStatus(result.status);
+    setWorkspaceSettingsOpen(false);
+  } catch (e) {
+    setWorkspaceRagStatus(String(e.message || e), true);
+  }
+});
+
+workspaceSettingsCancelBtn?.addEventListener('click', () => {
+  setWorkspaceSettingsOpen(false);
+});
+
+// ── Expert panel ─────────────────────────────────────────────────────────────
+
+function setExpertStatus(text, isError = false) {
+  if (!expertStatusEl) return;
+  expertStatusEl.textContent = text || '';
+  expertStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function updateExpertControlsState() {
+  if (expertEnabledEl) expertEnabledEl.disabled = expertPanelBusy || expertPanelExperts.length === 0;
+  if (expertToggleBtn) {
+    const enabled = expertEnabledEl?.checked === true;
+    expertToggleBtn.classList.toggle('enabled', enabled);
+    expertToggleBtn.classList.toggle('active', expertPopoverEl?.classList.contains('open') === true);
+    expertToggleBtn.setAttribute('aria-expanded', expertPopoverEl?.classList.contains('open') ? 'true' : 'false');
+    expertToggleBtn.textContent = enabled ? 'Experts on' : 'Experts';
+  }
+}
+
+function setExpertPopoverOpen(open) {
+  if (!expertPopoverEl) return;
+  expertPopoverEl.classList.toggle('open', open);
+  updateExpertControlsState();
+}
+
+async function loadExperts() {
+  if (!expertListEl) return;
+  try {
+    const result = await callTool('expert_panel', { action: 'list' });
+    renderExpertPanel(Array.isArray(result.experts) ? result.experts : []);
+    setExpertStatus(result.experts?.length ? '' : 'No experts configured.', !result.experts?.length);
+  } catch {
+    expertPanelExperts = [];
+    renderExpertPanel([]);
+    setExpertStatus('expert_panel plugin unavailable.', true);
+  }
+}
+
+function renderExpertPanel(experts) {
+  if (!expertListEl) return;
+  expertPanelExperts = [...experts];
+  expertListEl.innerHTML = '';
+
+  if (!expertPanelExperts.length) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:2px 0 2px 20px;';
+    empty.textContent = '(none)';
+    expertListEl.appendChild(empty);
+    updateExpertControlsState();
+    return;
+  }
+
+  for (const expert of expertPanelExperts) {
+    const label = document.createElement('label');
+    label.className = 'expert-option';
+    if (expert.description) label.title = expert.description;
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'expert-choice';
+    checkbox.value = expert.id;
+    checkbox.checked = true;
+
+    const text = document.createElement('span');
+    text.textContent = expert.title || expert.id;
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+    expertListEl.appendChild(label);
+  }
+
+  if (expertAllEl) expertAllEl.checked = true;
+  updateExpertControlsState();
+}
+
+function selectedExpertIds() {
+  if (expertAllEl?.checked) return [];
+  return Array.from(document.querySelectorAll('.expert-choice:checked')).map(el => el.value);
+}
+
+function syncExpertAllFromChoices() {
+  if (!expertAllEl) return;
+  const choices = Array.from(document.querySelectorAll('.expert-choice'));
+  expertAllEl.checked = choices.length > 0 && choices.every(choice => choice.checked);
+}
+
+function expertUserSummary(question, selected, mode, synthesize) {
+  return [
+    `Expert panel (${mode})`,
+    `Experts: ${selected.length ? selected.join(', ') : 'all'}`,
+    `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
+    '',
+    question
+  ].join('\n');
+}
+
+function formatExpertPanelResult(result) {
+  const lines = [
+    '## Expert panel',
+    `Mode: ${result?.mode ?? 'parallel'}`
+  ];
+
+  const opinions = Array.isArray(result?.experts) ? result.experts : [];
+  for (const opinion of opinions) {
+    lines.push('', `### ${opinion.title || opinion.expertId || 'Expert'}`, opinion.answer || '(No answer returned.)');
+    const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
+    if (citations.length) {
+      lines.push('', 'Citations:');
+      for (const citation of citations) {
+        const title = citation.title || citation.id || citation.path || 'source';
+        const path = citation.path ? ` - ${citation.path}` : '';
+        lines.push(`- ${title}${path}`);
+      }
+    }
+  }
+
+  if (result?.synthesis) {
+    lines.push('', '### Synthesis', result.synthesis);
+  }
+
+  if (!opinions.length && !result?.synthesis) {
+    lines.push('', 'No expert response was returned.');
+  }
+
+  return lines.join('\n');
+}
+
+async function runExpertPanelFromUi() {
+  const question = inputEl.value.trim();
+  const mode = expertModeEl?.value || 'parallel';
+  const synthesize = expertSynthesizeEl?.checked !== false;
+  const experts = selectedExpertIds();
+
+  if (!question) {
+    setExpertStatus('Enter a question for the panel.', true);
+    inputEl.focus();
+    return;
+  }
+  if (!expertAllEl?.checked && experts.length === 0) {
+    setExpertStatus('Select at least one expert, or choose all experts.', true);
+    return;
+  }
+
+  closeSidebar();
+  setExpertPopoverOpen(false);
+  expertPanelBusy = true;
+  updateExpertControlsState();
+  setExpertStatus('Running expert panel...');
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+
+  const userBubble = appendUserBubble(expertUserSummary(question, experts, mode, synthesize));
+  const assistantWrap = createAssistantWrap('assistant', userBubble);
+  const inner = document.createElement('div');
+  inner.className = 'md-body';
+  inner.textContent = 'Consulting experts...';
+  assistantWrap.appendChild(inner);
+  scrollMessagesToBottom();
+
+  try {
+    const input = { action: 'ask', question, mode, synthesize, maxCitationsPerExpert: 5 };
+    if (experts.length) input.experts = experts;
+    const result = await callTool('expert_panel', input);
+    inner.innerHTML = md(formatExpertPanelResult(result));
+    setExpertStatus('Complete.');
+  } catch (err) {
+    const message = err?.message ?? String(err);
+    inner.innerHTML = md(`Expert panel failed: ${message}`);
+    setExpertStatus(message, true);
+  } finally {
+    expertPanelBusy = false;
+    updateExpertControlsState();
+    scrollMessagesToBottom();
+  }
+}
+
+expertToggleBtn?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  setExpertPopoverOpen(!expertPopoverEl?.classList.contains('open'));
+});
+
+expertPopoverEl?.addEventListener('click', event => event.stopPropagation());
+
+document.addEventListener('click', () => setExpertPopoverOpen(false));
+
+expertEnabledEl?.addEventListener('change', () => updateExpertControlsState());
+
+expertAllEl?.addEventListener('change', () => {
+  const checked = expertAllEl.checked;
+  document.querySelectorAll('.expert-choice').forEach(choice => { choice.checked = checked; });
+});
+
+expertListEl?.addEventListener('change', (event) => {
+  if (event.target?.classList?.contains('expert-choice')) syncExpertAllFromChoices();
+});
 
 // Join an in-progress server run for sessionId. renderedCount is the number of
 // non-system messages already in the DOM so incremental appends start from there.
@@ -975,11 +1412,23 @@ function makeToolResultBlock(result, isError) {
   return wrap;
 }
 
-function makeTokenStatsBlock(inputTokens, outputTokens, costUsd, cacheReadTokens, cacheCreationTokens) {
+function formatElapsed(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '0.0s';
+  if (ms < 60_000) return (ms / 1000).toFixed(ms < 10_000 ? 1 : 0) + 's';
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return minutes + 'm ' + seconds.toString().padStart(2, '0') + 's';
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return hours + 'h ' + remMinutes.toString().padStart(2, '0') + 'm';
+}
+
+function makeTokenStatsBlock(inputTokens, outputTokens, costUsd, cacheReadTokens, cacheCreationTokens, elapsedMs) {
   const det = document.createElement('details');
-  det.className = 'token-stats';
+  det.className = 'token-stats turn-stats';
   const sum = document.createElement('summary');
-  sum.textContent = 'tokens';
+  sum.textContent = 'tokens · ' + formatElapsed(elapsedMs);
   const body = document.createElement('div');
   body.className = 'token-stats-body';
   const s = (t) => { const el = document.createElement('span'); el.textContent = t; return el; };
@@ -989,6 +1438,7 @@ function makeTokenStatsBlock(inputTokens, outputTokens, costUsd, cacheReadTokens
   body.appendChild(s('\u2193 ' + outputTokens.toLocaleString() + ' out'));
   if (cacheCreationTokens > 0) body.appendChild(s('\u2601 ' + cacheCreationTokens.toLocaleString() + ' written'));
   if (costUsd > 0) body.appendChild(s('\u2248 $' + costUsd.toFixed(4)));
+  body.appendChild(s('\u23f1 ' + formatElapsed(elapsedMs)));
   det.appendChild(sum);
   det.appendChild(body);
   return det;
@@ -1710,6 +2160,10 @@ async function connectSessionStream(sid) {
 // add more context. concat = false (Ctrl+Enter): a distinct queued turn, run in order — use when the
 // next ask depends on this one's tools/state (e.g. install a plugin, then use it).
 async function sendMessage(concat = true) {
+  if (expertEnabledEl?.checked) {
+    await runExpertPanelFromUi();
+    return;
+  }
   const content = inputEl.value.trim();
   if (!content) return;
   inputEl.value = '';
@@ -1801,6 +2255,7 @@ async function renderTurn(sid, traceId) {
   let turnCost        = 0;
   let turnCacheRead   = 0;
   let turnCacheCreate = 0;
+  let turnStartedAt   = null;
 
 
   function getOrMakeTextEl() {
@@ -1811,6 +2266,17 @@ async function renderTurn(sid, traceId) {
       turnWrap.appendChild(textEl);
     }
     return textEl;
+  }
+
+  function markTurnClockStarted() {
+    if (turnStartedAt === null) turnStartedAt = performance.now();
+  }
+
+  function appendTurnStats() {
+    if (!turnWrap) return;
+    if (turnWrap.querySelector('.turn-stats')) return;
+    const elapsedMs = turnStartedAt === null ? 0 : performance.now() - turnStartedAt;
+    turnWrap.appendChild(makeTokenStatsBlock(turnIn, turnOut, turnCost, turnCacheRead, turnCacheCreate, elapsedMs));
   }
 
   // Called on the first content event of each turn.  Scrolls the
@@ -1838,6 +2304,7 @@ async function renderTurn(sid, traceId) {
     for await (const ev of turnEvents(traceId)) {
       switch (ev.type) {
         case 'queued': {
+          markTurnClockStarted();
           // The submission itself, delivered on the stream. Render its user bubble here (in delta
           // order). queued > 0 ⇒ it's waiting behind a running turn → float the egg-timer; queued
           // === 0 ⇒ it runs immediately → show loading dots. A content event later promotes it.
@@ -1865,6 +2332,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'queued-append': {
+          markTurnClockStarted();
           // A later submission the runner folded into this turn (concat policy). Grow the head bubble
           // so the UI matches the single merged user message that gets persisted. Joined with '\n' to
           // match how renderSession concatenates a multi-block user message on reload.
@@ -1878,6 +2346,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'text-delta':
+          markTurnClockStarted();
           removeLoading();
           if (textElFinalised) { textEl = null; textAccum = ''; textElFinalised = false; }
           textAccum += ev.delta;
@@ -1886,6 +2355,7 @@ async function renderTurn(sid, traceId) {
           break;
 
         case 'thinking': {
+          markTurnClockStarted();
           removeLoading();
           if (!thinkingContent) {
             const { details, content: c } = makeThinkingBlock('\ud83d\udcad Thinking', true);
@@ -1905,6 +2375,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'tool:start': {
+          markTurnClockStarted();
           removeLoading();
           if (ev.name === 'provider') providerToolPending = true;
           currentTool = makeToolBlock(ev.name, ev.input, ev.callId);
@@ -1921,6 +2392,7 @@ async function renderTurn(sid, traceId) {
 
         case 'tool:stdout':
         case 'tool:stderr': {
+          markTurnClockStarted();
           if (currentTool) {
             let outEl = currentTool.querySelector('.tool-output');
             if (!outEl) {
@@ -1935,6 +2407,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'tool:end': {
+          markTurnClockStarted();
           if (currentTool) {
             currentTool.appendChild(makeToolResultBlock(ev.result, ev.isError));
             currentTool.open = false;
@@ -1947,6 +2420,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'usage':
+          markTurnClockStarted();
           turnIn  += ev.inputTokens;
           turnOut += ev.outputTokens;
           if (ev.costUsd              !== undefined) turnCost        += ev.costUsd;
@@ -1955,6 +2429,7 @@ async function renderTurn(sid, traceId) {
           break;
 
         case 'prompt': {
+          markTurnClockStarted();
           removeLoading();
           const field      = ev.field;
           const rawQ       = ev.question ?? '';
@@ -2083,6 +2558,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'robo-user': {
+          markTurnClockStarted();
           // Machine-authored content folded onto the running turn's user message (a screen hook's
           // `durable` result — e.g. a fired `contextual` trigger). Draw it as an agent-side robo
           // bubble so the live view matches the reload, where appendUserTurn splits the user turn's
@@ -2096,6 +2572,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'marker': {
+          markTurnClockStarted();
           // A marker appended to the session this turn (e.g. a hook that threw). Render it inline now;
           // on a later reload it comes back through renderSession's role==='marker' path identically.
           removeLoading();
@@ -2104,6 +2581,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'aborted': {
+          markTurnClockStarted();
           removeLoading();
           if (ev.reason === 'user-abort') {
             // Partial content already in DOM and saved to store — nothing to re-render.
@@ -2115,6 +2593,7 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'cancelled': {
+          markTurnClockStarted();
           // This queued submission was dropped (Stop pressed before it ran). It never executed and
           // was never persisted, so remove its bubble and (if any) its empty turn entirely.
           if (loadingEl) { loadingEl.remove(); loadingEl = null; }
@@ -2124,12 +2603,13 @@ async function renderTurn(sid, traceId) {
         }
 
         case 'done':
+          markTurnClockStarted();
           if (thinkingContent) {
             const det = thinkingContent.closest('details');
             if (det) det.open = false;
           }
           if (ev.session?.title && chatHeaderEl) chatTitleEl.textContent = ev.session.title;
-          if (turnWrap && (turnIn > 0 || turnOut > 0)) turnWrap.appendChild(makeTokenStatsBlock(turnIn, turnOut, turnCost, turnCacheRead, turnCacheCreate));
+          appendTurnStats();
           loadFiles();
           // Back-fill origIdx on any dividers added without an index this turn.
           if (ev.session) {
@@ -2181,15 +2661,13 @@ async function renderTurn(sid, traceId) {
 
 // ── Send / Stop button handlers ───────────────────────────────────────────────
 //
-// Send has two modes: scroll-down (▼ — jump to bottom) or default (▶ — send/queue). Stop is a
-// separate button shown only while a turn is running; it aborts and clears the queue. Send and the
-// input stay live during a turn so you can type-ahead and queue.
+// Send has three visual modes in one fixed slot: scroll-down (▼), stop (■), or default send (▶).
+// The input stays live during a turn so you can type-ahead, but the action button aborts while busy.
 sendBtn.onclick = () => {
   if (sendBtn.classList.contains('scroll-down-mode')) scrollToBottomAndReset();
+  else if (sending) requestStop();
   else sendMessage();
 };
-
-stopBtn.onclick = () => requestStop();
 
 document.getElementById('sessions-enable-btn').onclick = () => {
   submit('Discover the local plugins and add the sessions plugin to enable persistent conversations.');
@@ -2208,31 +2686,24 @@ inputEl.addEventListener('input', () => {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
 });
 
-// Busy is now authoritative from the server (the per-session 'session-busy' status events), not a
-// client-side count. Show/hide the Stop button accordingly; Send + input stay live throughout so
-// you can type-ahead and queue. The input is never disabled.
-function setStop(visible) {
-  stopBtn.style.visibility = visible ? 'visible' : 'hidden';
-  if (visible) stopBtn.disabled = false;
-}
-
-// Sync every send/stop affordance to a session's busy state. Called from each path that changes which
-// session is in view (open/new/hide) and from the live status stream, so the buttons always reflect the
-// session on screen — never a stale state carried over from the previously-viewed session.
+// Sync the single send/stop affordance to a session's busy state. Called from each path that changes
+// which session is in view and from the live status stream, so the button always reflects the
+// session on screen, not stale state from the previously-viewed session.
 function setBusyState(busy) {
   sending = busy;
-  setStop(busy);
+  if (busy) showStopButton();
+  else resetSendButton();
 }
 
 function requestStop() {
   const target = currentSessionId;
   if (!target) return;
-  stopBtn.disabled = true;
+  sendBtn.disabled = true;
   // Aborts the running turn AND drops everything still queued for the session; the resulting
   // aborted/cancelled events tidy the rendered turns over the persistent stream.
   Promise.resolve(T.abort(target))
     .catch(() => {})
-    .finally(() => { stopBtn.disabled = false; });
+    .finally(() => { sendBtn.disabled = false; });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -2280,7 +2751,7 @@ async function init() {
     };
   }
 
-  const [sessions, providers] = await Promise.all([apiListSessions(), apiListProviders()]);
+  const [sessions, providers] = await Promise.all([apiListSessions(), apiListProviders(), loadWorkspaces()]);
 
   for (const p of providers) {
     const opt = document.createElement('option');
@@ -2371,7 +2842,7 @@ async function init() {
     let timer = null;
     for await (const _event of T.pluginEvents(new AbortController().signal)) {
       if (timer) continue;
-      timer = setTimeout(() => { timer = null; loadPlugins(); }, 150);
+      timer = setTimeout(() => { timer = null; loadPlugins(); loadExperts(); }, 150);
     }
   })();
 
@@ -2399,6 +2870,7 @@ async function init() {
   loadFiles();
   loadPlugins();
   loadSkills();
+  loadExperts();
 }
 
 // ── File drag-drop + upload button ───────────────────────────────────────────

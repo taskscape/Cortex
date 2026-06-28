@@ -26,8 +26,26 @@ export interface WebServerDeps {
   workdir?:       string;
   files?:         FileStore;
   configPath?:    string;
+  workspaceManager?: WorkspaceManager;
   /** Derives the security principal for each request. Defaults to {@link defaultWebPrincipal}. */
   resolvePrincipal?: WebPrincipalResolver;
+}
+
+export interface WorkspaceSummary {
+  id:         string;
+  name:       string;
+  configPath: string;
+  createdAt:  string;
+  updatedAt:  string;
+  active:     boolean;
+}
+
+export interface WorkspaceManager {
+  current(): Promise<WorkspaceSummary>;
+  list(): Promise<{ active: string; workspaces: WorkspaceSummary[] }>;
+  create(name: string): Promise<WorkspaceSummary>;
+  rename(id: string, name: string): Promise<WorkspaceSummary>;
+  switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
 /**
@@ -278,6 +296,36 @@ export function createWebServer(deps: WebServerDeps) {
     // --- GET /health ---
     if (method === 'GET' && url === '/health') {
       json(res, 200, { status: 'ok' }); return;
+    }
+
+    if (method === 'GET' && url === '/workspaces') {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      json(res, 200, await deps.workspaceManager.list()); return;
+    }
+
+    if (method === 'POST' && url === '/workspaces') {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      let body: { name?: unknown };
+      try { body = JSON.parse(await readBody(req)) as { name?: unknown }; }
+      catch (e) { json(res, 400, { error: String(e) }); return; }
+      if (typeof body.name !== 'string') { json(res, 400, { error: 'Workspace name is required' }); return; }
+      json(res, 201, await deps.workspaceManager.create(body.name)); return;
+    }
+
+    const workspaceRename = /^\/workspaces\/([^/]+)\/rename$/.exec(url);
+    if (method === 'POST' && workspaceRename) {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      let body: { name?: unknown };
+      try { body = JSON.parse(await readBody(req)) as { name?: unknown }; }
+      catch (e) { json(res, 400, { error: String(e) }); return; }
+      if (typeof body.name !== 'string') { json(res, 400, { error: 'Workspace name is required' }); return; }
+      json(res, 200, await deps.workspaceManager.rename(decodeURIComponent(workspaceRename[1]!), body.name)); return;
+    }
+
+    const workspaceSwitch = /^\/workspaces\/([^/]+)\/switch$/.exec(url);
+    if (method === 'POST' && workspaceSwitch) {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      json(res, 200, await deps.workspaceManager.switch(decodeURIComponent(workspaceSwitch[1]!))); return;
     }
 
     // --- GET /events --- (one multiplexed SSE stream: session busy/idle, file changes, and tool/skill/
@@ -662,4 +710,3 @@ export function createWebServer(deps: WebServerDeps) {
 
   return { server, close };
 }
-

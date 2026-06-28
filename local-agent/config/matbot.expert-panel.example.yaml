@@ -7,9 +7,27 @@ providers:
       apiKey: ${OPENAI_API_KEY}
     parameters:
       maxTokens: 4096
+  Local:
+    module: ./packages/plugins/providers/openai-compat
+    endpoint: http://100.122.2.99:11435/v1
+    model: qwen3-coder-next-256k
+    parameters:
+      apiUrl: http://100.122.2.99:11435/v1
+      maxTokens: 32768
+      maxContextTokens: 262144
+      maxOutputTokens: 32768
+      maxCompletionTokens: 262144
+      capabilities:
+        tools: true
+        images: false
+        parallel_tool_calls: false
+        prompt_cache_key: false
+        chat_completions: true
+        interleaved_reasoning: false
 
 plugins:
   - ./plugins/hybrid-knowledge-index
+  - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
   - ./packages/plugins/rumsfeld

@@ -48,7 +48,7 @@ $env:NEO4J_AUTH        = $neoAuth
 $env:MEM0_API_KEY      = $mem0Key
 
 # Write the gitignored .env consumed by docker compose.
-$envPath = Join-Path $PSScriptRoot "..\docker\mem0\.env"
+$envPath = Join-Path $PSScriptRoot "..\local-agent\docker\mem0\.env"
 @(
     "MEM0_BASE_URL=http://localhost:8888",
     "MEM0_API_KEY=$mem0Key",

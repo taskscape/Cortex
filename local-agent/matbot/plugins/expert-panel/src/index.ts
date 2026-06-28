@@ -12,6 +12,7 @@ import { loadExpertConfig } from "./config.js";
 import { FileExpertKnowledge } from "./file-knowledge.js";
 
 interface ExpertPanelInput {
+  action?: "list" | "ask";
   question?: string;
   experts?: string[];
   mode?: "parallel" | "review" | "debate";
@@ -170,11 +171,16 @@ function createExpertPanelTool(panel: ExpertPanel): Tool {
       "Use this when the user wants multiple perspectives, disagreement, review, or a decision informed by design, finance, engineering, or other configured experts.",
     inputSchema: {
       type: "object",
-      required: ["question"],
       properties: {
+        action: {
+          type: "string",
+          enum: ["list", "ask"],
+          default: "ask",
+          description: "list: return configured expert metadata. ask: run the panel. Defaults to ask."
+        },
         question: {
           type: "string",
-          description: "The user question or decision to put before the expert panel."
+          description: "The user question or decision to put before the expert panel. Required for action=ask."
         },
         experts: {
           type: "array",
@@ -202,6 +208,22 @@ function createExpertPanelTool(panel: ExpertPanel): Tool {
     executor: {
       async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
         const parsed = parseInput(input);
+        if (parsed.action === "list") {
+          yield {
+            type: "result",
+            value: {
+              experts: panel.list().map(expert => ({
+                id: expert.id,
+                title: expert.title,
+                description: expert.description,
+                provider: expert.provider,
+                tags: expert.tags ?? []
+              }))
+            }
+          };
+          return;
+        }
+
         if (!parsed.question) {
           yield { type: "error", message: 'expert_panel requires "question".' };
           return;
@@ -223,11 +245,13 @@ function createExpertPanelTool(panel: ExpertPanel): Tool {
 function parseInput(input: unknown): ExpertPanelInput & { mode: "parallel" | "review" | "debate"; synthesize: boolean } {
   const value = input !== null && typeof input === "object" ? input as Record<string, unknown> : {};
   const mode = value.mode === "review" || value.mode === "debate" || value.mode === "parallel" ? value.mode : "parallel";
+  const action = value.action === "list" ? "list" : "ask";
   const experts = Array.isArray(value.experts)
     ? value.experts.filter((item): item is string => typeof item === "string" && item.length > 0)
     : undefined;
 
   return {
+    action,
     question: typeof value.question === "string" ? value.question.trim() : undefined,
     experts,
     mode,

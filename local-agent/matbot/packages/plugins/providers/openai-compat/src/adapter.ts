@@ -5,6 +5,39 @@ import { toOAIMessages, toOAITools } from './convert.js';
 const DEFAULT_ENDPOINT   = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_MAX_TOKENS = 4096;
 
+interface OpenAICompatCapabilities {
+  tools?:                boolean;
+  images?:               boolean;
+  parallel_tool_calls?:  boolean;
+  prompt_cache_key?:     boolean;
+  chat_completions?:     boolean;
+  interleaved_reasoning?: boolean;
+}
+
+function capabilities(config: ProviderConfig): OpenAICompatCapabilities {
+  const value = config.parameters?.['capabilities'];
+  return (typeof value === 'object' && value !== null && !Array.isArray(value))
+    ? value as OpenAICompatCapabilities
+    : {};
+}
+
+function endpoint(config: ProviderConfig): string {
+  const raw = config.endpoint ?? (
+    typeof config.parameters?.['apiUrl'] === 'string'
+      ? config.parameters['apiUrl']
+      : undefined
+  ) ?? DEFAULT_ENDPOINT;
+
+  const trimmed = raw.replace(/\/+$/, '');
+  return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`;
+}
+
+function outputTokenLimit(config: ProviderConfig): number {
+  const maxOutput = config.parameters?.['maxOutputTokens'];
+  if (typeof maxOutput === 'number') return maxOutput;
+  return config.parameters?.maxTokens ?? DEFAULT_MAX_TOKENS;
+}
+
 // OpenAI renamed `max_tokens` → `max_completion_tokens` for its newer models. The two are mutually
 // exclusive — OpenAI returns 400 if both are present — and the o-series / gpt-5 / 4o models reject
 // the legacy name outright. The rest of the compat ecosystem (DeepSeek, vLLM, llama.cpp, ollama,
@@ -58,28 +91,33 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     tools:    readonly Tool[],
     signal:   AbortSignal,
   ): AsyncIterable<CompletionEvent> {
-    const endpoint = config.endpoint ?? DEFAULT_ENDPOINT;
+    const endpointUrl = endpoint(config);
     const apiKey   = config.credentials?.['apiKey'] ?? '';
+    const caps     = capabilities(config);
     // Opt-in prompt caching (Anthropic-style breakpoints, e.g. via OpenRouter). Off by default so a
     // plain OpenAI / ollama endpoint never receives `cache_control` it can't parse.
     const cache    = config.parameters?.['promptCache'] === true;
 
     const body: Record<string, unknown> = {
       model:    config.model,
-      [tokenLimitParam(config)]: config.parameters?.maxTokens ?? DEFAULT_MAX_TOKENS,
+      [tokenLimitParam(config)]: outputTokenLimit(config),
       messages:       toOAIMessages(messages, cache),
       stream:         true,
       stream_options: { include_usage: true },
     };
 
     const toolDefs = toOAITools(tools, cache);
-    if (toolDefs.length > 0) body['tools'] = toolDefs;
+    if (toolDefs.length > 0 && caps.tools !== false) body['tools'] = toolDefs;
+
+    if (typeof caps.parallel_tool_calls === 'boolean') {
+      body['parallel_tool_calls'] = caps.parallel_tool_calls;
+    }
 
     if (config.parameters?.temperature !== undefined) {
       body['temperature'] = config.parameters.temperature;
     }
 
-    const res = await fetch(endpoint, {
+    const res = await fetch(endpointUrl, {
       method:  'POST',
       headers: {
         'content-type':  'application/json',

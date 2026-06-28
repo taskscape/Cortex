@@ -6,5 +6,7 @@ dist/
 local-agent/file-index/data/*.json
 local-agent/file-broker/backups/
 local-agent/logs/
+test-results/
+playwright-report/
 local-agent/matbot/.vscode
 test-results

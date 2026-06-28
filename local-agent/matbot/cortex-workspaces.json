@@ -1,0 +1,12 @@
+{
+  "active": "default",
+  "workspaces": [
+    {
+      "id": "default",
+      "name": "Default",
+      "configPath": "matbot.yaml",
+      "createdAt": "2026-06-28T17:18:02.608Z",
+      "updatedAt": "2026-06-28T17:18:02.608Z"
+    }
+  ]
+}

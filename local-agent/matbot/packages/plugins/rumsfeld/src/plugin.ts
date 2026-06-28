@@ -1,5 +1,143 @@
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
-import type { MatbotPluginSpec, MatbotMachine, ToolExecutor, ToolContext, ToolEvent } from '@matatbread/matbot-plugin-api';
+import type { MatbotPluginSpec, MatbotMachine, ToolExecutor, ToolContext, ToolEvent, KnowledgeEntry, Store } from '@matatbread/matbot-plugin-api';
+
+interface SearchTerm {
+  term: string;
+  context?: string;
+}
+
+interface RememberedFact {
+  id:           string;
+  version:      string;
+  fact:         string;
+  sessionId:    string;
+  messageId:    string;
+  createdAt:    string;
+  dreamSkill?:  string;
+  ignoreUntil?: string;
+}
+
+interface RememberedFactMatch {
+  fact:  RememberedFact;
+  score: number;
+}
+
+interface WorkspaceRagHit {
+  contextName: string;
+  path:        string;
+  score:       number;
+  text:        string;
+}
+
+interface WorkspaceRagManagerLike {
+  searchCurrent(query: string, limit: number, signal: AbortSignal): Promise<WorkspaceRagHit[]>;
+}
+
+const STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'do', 'does', 'for', 'from',
+  'has', 'have', 'how', 'i', 'in', 'is', 'it', 'its', 'me', 'my', 'of', 'on', 'or',
+  'our', 'please', 'tell', 'that', 'the', 'their', 'this', 'to', 'what', 'when',
+  'where', 'which', 'who', 'why', 'with', 'you', 'your',
+]);
+
+function normaliseText(text: string): string {
+  return text.toLowerCase().replace(/\b(user|users|user's|my|mine|me)\b/g, ' user ');
+}
+
+function tokens(text: string): string[] {
+  return [...new Set((normaliseText(text).match(/[a-z0-9]+/g) ?? [])
+    .filter(t => t.length > 1 && !STOPWORDS.has(t)))];
+}
+
+function queryText(terms: readonly SearchTerm[]): string {
+  return terms.map(item => item.context ? `${item.term} ${item.context}` : item.term).join(' ');
+}
+
+function scoreFact(fact: string, terms: readonly SearchTerm[]): number {
+  const q = queryText(terms);
+  const qTokens = tokens(q);
+  if (qTokens.length === 0) return 0;
+
+  const factText = normaliseText(fact);
+  const factTokens = new Set(tokens(factText));
+  let score = 0;
+  for (const token of qTokens) {
+    if (factTokens.has(token)) score += 1;
+  }
+
+  for (const term of terms) {
+    const normalisedTerm = normaliseText(term.term).trim();
+    if (normalisedTerm.length > 1 && factText.includes(normalisedTerm)) score += 2;
+  }
+
+  return score / qTokens.length;
+}
+
+async function fetchAllRememberedFacts(store: Store<RememberedFact>): Promise<RememberedFact[]> {
+  const out: RememberedFact[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.query(cursor !== undefined ? { cursor } : {});
+    out.push(...page.items);
+    cursor = page.cursor;
+  } while (cursor !== undefined);
+  return out;
+}
+
+async function searchRememberedFacts(
+  services: MatbotMachine,
+  terms: readonly SearchTerm[],
+): Promise<RememberedFactMatch[]> {
+  const store = services.createStore<RememberedFact>('remembered_facts');
+  const facts = await fetchAllRememberedFacts(store);
+  const seen = new Set<string>();
+  return facts
+    .map(fact => ({ fact, score: scoreFact(fact.fact, terms) }))
+    .filter(match => match.score >= 0.5)
+    .sort((a, b) => b.score - a.score || Date.parse(b.fact.createdAt) - Date.parse(a.fact.createdAt))
+    .filter(match => {
+      const key = factDedupeKey(match.fact.fact);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 5);
+}
+
+function rememberedFactsContent(matches: readonly RememberedFactMatch[]): string {
+  return ['Remembered facts:', ...matches.map(match => `- ${match.fact.fact}`)].join('\n');
+}
+
+function workspaceRagContent(hits: readonly WorkspaceRagHit[]): string {
+  return [
+    `Workspace RAG results${hits[0]?.contextName ? ` (${hits[0].contextName})` : ''}:`,
+    ...hits.map((hit, index) => [
+      `- Source ${index + 1}: ${hit.path} (score ${hit.score.toFixed(3)})`,
+      hit.text,
+    ].join('\n')),
+  ].join('\n\n');
+}
+
+function combinedContent(
+  remembered: readonly RememberedFactMatch[],
+  best: KnowledgeEntry | undefined,
+  workspaceRag: readonly WorkspaceRagHit[] = [],
+): string {
+  const parts = remembered.length > 0 ? [rememberedFactsContent(remembered)] : [];
+  if (best !== undefined) {
+    parts.push(`Knowledge index result (${knowledgeName(best)}):\n${best.content}`);
+  }
+  if (workspaceRag.length > 0) parts.push(workspaceRagContent(workspaceRag));
+  return parts.join('\n\n');
+}
+
+function knowledgeName(entry: KnowledgeEntry): string {
+  return entry.entities[0] ?? entry.id;
+}
+
+function factDedupeKey(fact: string): string {
+  return normaliseText(fact).replace(/[^a-z0-9]+/g, ' ').trim();
+}
 
 export function createRumsfeldPlugin(): MatbotPluginSpec {
   return {
@@ -8,22 +146,41 @@ export function createRumsfeldPlugin(): MatbotPluginSpec {
     async setup(services: MatbotMachine) {
       const executor: ToolExecutor = {
         async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
-          const { terms } = input as { terms: Array<{ term: string; context?: string }> };
+          const { terms } = input as { terms: SearchTerm[] };
 
           if (terms.length === 0) {
             yield { type: 'error', message: 'No search terms provided.' };
             return;
           }
 
-          const results = await services.KnowledgeIndex.search(terms, ctx.signal);
+          const [knowledgeResult, rememberedResult] = await Promise.allSettled([
+            services.KnowledgeIndex.search(terms, ctx.signal),
+            searchRememberedFacts(services, terms),
+          ]);
+          const results = knowledgeResult.status === 'fulfilled' ? knowledgeResult.value : [];
+          const remembered = rememberedResult.status === 'fulfilled' ? rememberedResult.value : [];
+          const workspaceRagManager = services.get('WorkspaceRagManager' as never) as WorkspaceRagManagerLike | undefined;
+          const workspaceRag = workspaceRagManager !== undefined
+            ? await workspaceRagManager.searchCurrent(queryText(terms), 5, ctx.signal).catch(() => [])
+            : [];
 
-          if (results.length === 0) {
+          if (remembered.length > 0) {
+            yield { type: 'result', value: { name: 'remembered_facts', content: combinedContent(remembered, results[0], workspaceRag) } };
+            return;
+          }
+
+          if (results.length === 0 && workspaceRag.length === 0) {
             yield { type: 'error', message: 'There is no skill available for the requested operation.' };
             return;
           }
 
+          if (workspaceRag.length > 0) {
+            yield { type: 'result', value: { name: 'workspace_rag', content: combinedContent([], results[0], workspaceRag) } };
+            return;
+          }
+
           const best = results[0]!;
-          yield { type: 'result', value: { name: best.entities[0] ?? best.id, content: best.content } };
+          yield { type: 'result', value: { name: knowledgeName(best), content: best.content } };
         },
       };
 

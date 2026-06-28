@@ -4,6 +4,7 @@ import { watchPlugins }                      from '@matatbread/matbot-core';
 // Type import also brings the `SkillManager` augmentation of MatbotMachine into scope.
 import type { SkillManager }                 from '@matatbread/matbot-skills';
 import { createWebServer, defaultWebPrincipal } from './server.js';
+import type { WorkspaceManager }             from './server.js';
 import process                               from 'node:process';
 
 let webServer: Awaited<ReturnType<typeof createWebServer>> | undefined;
@@ -59,6 +60,7 @@ export const plugin: MatbotPluginSpec = {
     if (!sessions) throw new Error('frontend-web requires services.sessions');
     const run = services.run;
     if (!run) throw new Error('frontend-web requires services.run');
+    const workspaceManager = services.get?.('WorkspaceManager' as never) as WorkspaceManager | undefined;
 
     webServer = createWebServer({
       store: sessions,
@@ -76,6 +78,7 @@ export const plugin: MatbotPluginSpec = {
       ...(services.workdir    !== undefined ? { workdir:    services.workdir    } : {}),
       ...(services.files      !== undefined ? { files:      services.files      } : {}),
       ...(services.configPath !== undefined ? { configPath: services.configPath } : {}),
+      ...(workspaceManager    !== undefined ? { workspaceManager } : {}),
     });
 
     await new Promise<void>((resolve, reject) => {
