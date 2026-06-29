@@ -208,6 +208,14 @@ const localPlugins = [
     matbotRuntime: ["node"],
     types: ["tools"],
     tools: [{ name: "background_prompt", description: "Run a prompt in the background." }]
+  },
+  {
+    specifier: "./packages/plugins/powershell",
+    name: "@matatbread/matbot-tool-powershell",
+    description: "Run PowerShell scripts in the session workspace on Windows.",
+    matbotRuntime: ["node"],
+    types: ["tools"],
+    tools: [{ name: "powershell", description: "Run a PowerShell script." }]
   }
 ];
 
@@ -714,6 +722,21 @@ async function handleTool(res, name, rawInput) {
         highRisk: false
       });
     }
+  }
+  if (name === "powershell") {
+    return json(res, 200, {
+      exitCode: 0,
+      stdout: [
+        `script=${input.script ?? ""}`,
+        `cwd=${input.cwd ?? ""}`,
+        `env=${input.env?.MATBOT_PS_TEST ?? ""}`
+      ].join("\n"),
+      stderr: "",
+      invocation: {
+        executable: "powershell.exe",
+        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "<temp.ps1>"]
+      }
+    });
   }
   if (name === "workspace_rag") {
     if (input.action === "status") return json(res, 200, workspaceRagStatus);

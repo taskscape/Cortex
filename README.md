@@ -234,12 +234,12 @@ common unattended-action stack is:
 | --- | --- | --- |
 | `./packages/plugins/background` | Recurring and detached prompt jobs. | Required for Cortex-managed schedules. |
 | `./packages/plugins/http` | Fetch pages, APIs, and remote resources. | Uses plain HTTP fetch; it does not render JavaScript-heavy pages. |
+| `./packages/plugins/powershell` | Execute Windows-native PowerShell scripts. | Preferred for Windows command automation. |
 | `./packages/plugins/bash` | Execute shell scripts from a scheduled prompt. | Spawns `bash -c`; Windows needs `bash.exe` in PATH, such as Git Bash or WSL. |
 | `./packages/plugins/docker-bash` | Execute shell scripts in Docker. | Prefer this for risky or untrusted command automation. |
 
-For native Windows command execution, add a dedicated PowerShell/cmd tool or
-wrap the work in a script that `bash` can call. The current `bash` plugin is not
-a PowerShell runner.
+For native Windows command execution, use the `powershell` tool. The `bash`
+plugin is not a PowerShell runner.
 
 To enable Cortex-managed schedules, insert the needed plugins in the active
 workspace's `matbot.yaml` before the existing `frontend/web` entry, then restart
@@ -250,6 +250,7 @@ plugins:
   # existing plugins above...
   - ./packages/plugins/background
   - ./packages/plugins/http
+  - ./packages/plugins/powershell
   - ./packages/plugins/bash
   - ./packages/plugins/frontend/web
 ```
@@ -336,7 +337,7 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" 
 For deterministic automation, Windows Task Scheduler can still call Cortex tools
 directly instead of supervising the Cortex process or asking a model to decide
 what to do. For example, a scheduled PowerShell script can call `POST
-/tools/http` or `POST /tools/bash` as long as the Cortex service is already
+/tools/http` or `POST /tools/powershell` as long as the Cortex service is already
 running. Direct tool calls are non-interactive; they cannot answer prompts that
 expect a live UI user.
 
@@ -349,7 +350,8 @@ Security rules for unattended actions:
 - Restrict allowed file roots through `local-agent\config\workspaces.json` and
   `local-agent\config\security-policy.json`.
 - Treat `POST /tools/<name>` as powerful local automation, especially when
-  `bash`, `docker-bash`, file access, or provider-backed tools are enabled.
+  `powershell`, `bash`, `docker-bash`, file access, or provider-backed tools are
+  enabled.
 
 ### Workspace System
 
@@ -1044,6 +1046,7 @@ loaded by the default `matbot.yaml`:
 | `mcp` | Local stdio MCP client plus remote MCP delegation. |
 | `mcp-http` | Cross-runtime remote MCP HTTP/SSE client. |
 | `persist-ki-bge` | Store-backed `KnowledgeIndex` with entity/heading search and optional BGE reranking. |
+| `powershell` | Run Windows PowerShell scripts in the session workspace. |
 | `skills-node` | Node-only skills plugin with local filesystem markdown import/watch. |
 | `tool-store` | Defines named stores and generated CRUD tools. Used indirectly by cognition. |
 | `web-principal-user` | Sets frontend request principal from the host OS user. |
@@ -1057,6 +1060,7 @@ tools the scheduled prompts are allowed to use:
 plugins:
   - ./packages/plugins/background
   - ./packages/plugins/http
+  - ./packages/plugins/powershell
   - ./packages/plugins/bash
 ```
 
@@ -1068,6 +1072,7 @@ specifiers for bundled plugins:
 ```text
 plugin discover_local
 plugin add ./packages/plugins/background
+plugin add ./packages/plugins/powershell
 ```
 
 Using a local `./packages/plugins/<name>` specifier does not need a package
@@ -1087,6 +1092,85 @@ stores, providers, or frontend behavior, restart Cortex after adding it:
 ```powershell
 .\scripts\run.ps1
 ```
+
+### `powershell`
+
+Runs Windows-native PowerShell scripts from Matbot. Use this instead of `bash`
+for service control, Windows filesystem tasks, registry checks, PowerShell module
+commands, and scheduled Windows automation.
+
+Install it by adding the plugin to the active workspace's `matbot.yaml`, before
+`frontend/web`, then restart Cortex:
+
+```yaml
+plugins:
+  - ./packages/plugins/powershell
+```
+
+Or add it while the WebUI is running:
+
+```text
+plugin add ./packages/plugins/powershell
+```
+
+The tool name is `powershell`. Its input matches the `bash` tool shape:
+
+```ts
+type PowerShellInput = {
+  script: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  timeout?: number;
+};
+```
+
+The implementation writes `script` to a temporary `.ps1` file and deliberately
+launches Windows PowerShell as:
+
+```text
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <temp.ps1>
+```
+
+Microsoft documents `-NonInteractive` as causing interactive prompts to fail
+instead of hanging, and `-ExecutionPolicy` as setting the execution policy only
+for that PowerShell session. See the
+[PowerShell.exe command-line documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe).
+
+Direct WebUI tool call example:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:19778/tools/powershell" `
+  -ContentType "application/json" `
+  -Body '{
+    "script": "Get-Service CortexLocalAgent | Select-Object -Property Name,Status | ConvertTo-Json",
+    "cwd": "C:\\Projects\\Cortex",
+    "timeout": 10000
+  }'
+```
+
+Example with environment variables:
+
+```json
+{
+  "script": "Write-Output \"Value: $env:CORTEX_TEST_VALUE\"",
+  "env": { "CORTEX_TEST_VALUE": "ok" },
+  "timeout": 5000
+}
+```
+
+Operational notes:
+
+- `cwd` defaults to the Matbot session workspace and is created if missing.
+- `env` values are merged over the Cortex process environment for the child
+  PowerShell process only.
+- `timeout` kills the child process after the requested number of milliseconds.
+- Stdout and stderr stream while the command runs; the final result includes
+  accumulated `stdout`, `stderr`, and `exitCode`.
+- A non-zero PowerShell exit code returns a tool error with accumulated output.
+- Interactive prompts are unsuitable for unattended runs because
+  `-NonInteractive` makes them fail rather than wait forever.
 
 ### `file_broker_action`
 

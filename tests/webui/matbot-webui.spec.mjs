@@ -115,6 +115,34 @@ test("activates and deactivates compatible local plugins through the plugins pan
   await expect(page.locator(".plugin-entry-inactive", { hasText: "@matatbread/matbot-tool-background" })).toBeVisible();
 });
 
+test("activates powershell plugin and invokes it through the WebUI transport", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop direct PowerShell tool coverage");
+  await page.goto("/");
+  await openPlugins(page);
+
+  const powershellInactive = page.locator(".plugin-entry-inactive", { hasText: "@matatbread/matbot-tool-powershell" });
+  await expect(powershellInactive).toBeVisible();
+  await powershellInactive.hover();
+  await powershellInactive.getByTitle("Add plugin").click();
+
+  await expect(page.locator(".message.assistant").last()).toContainText("Added plugin");
+  const powershellActive = page.locator("details.plugin-entry", { hasText: "@matatbread/matbot-tool-powershell" });
+  await expect(powershellActive).toContainText("powershell");
+
+  const result = await page.evaluate(async () => window.matbotTransport.callTool("powershell", {
+    script: "Write-Output $env:MATBOT_PS_TEST",
+    cwd: "C:\\Projects\\Cortex",
+    env: { MATBOT_PS_TEST: "playwright-ok" },
+    timeout: 5000
+  }));
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain("playwright-ok");
+  expect(result.stdout).toContain("C:\\Projects\\Cortex");
+  expect(result.invocation.executable).toBe("powershell.exe");
+  expect(result.invocation.args).toEqual(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "<temp.ps1>"]);
+});
+
 test("workspace selector lists, creates, renames, and switches workspaces", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workspace selector coverage");
   await page.goto("/");
