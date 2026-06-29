@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import test from "node:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -9,6 +10,7 @@ import { emptyStore } from "../local-agent/file-index/dist/store.js";
 import { searchChunks } from "../local-agent/file-index/dist/search.js";
 import { evaluateAccess } from "../local-agent/file-broker/dist/policy.js";
 import { writeTextFile } from "../local-agent/file-broker/dist/file-writer.js";
+import { createFileBrokerTool, FileBrokerClient } from "../local-agent/matbot/plugins/file-broker/dist/index.js";
 import { mergeRankAndDeduplicate } from "../local-agent/matbot/plugins/hybrid-knowledge-index/dist/ranking.js";
 
 test("file index stores searchable text with path metadata", async () => {
@@ -46,6 +48,46 @@ test("file broker blocks writes outside configured roots and allows project writ
   assert.equal(evaluateAccess("C:\\Windows\\system.ini", "write", workspaces, policy).allowed, false);
   assert.equal(evaluateAccess("C:\\Projects\\Bot\\README.md", "write", workspaces, policy).allowed, true);
   assert.equal(evaluateAccess("C:\\Projects\\Bot\\.env", "write", workspaces, policy).highRisk, true);
+});
+
+test("file broker Matbot tool reads host files through the broker service", async () => {
+  const requestedPaths = [];
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "GET" && url.pathname === "/read") {
+      requestedPaths.push(url.searchParams.get("path"));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, content: "broker contents", truncated: false, size: 15 }));
+      return;
+    }
+
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "not found" }));
+  });
+
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  assert.ok(address);
+
+  try {
+    const client = new FileBrokerClient({ baseUrl: `http://127.0.0.1:${address.port}` });
+    const tool = createFileBrokerTool(client);
+    const events = [];
+    for await (const event of tool.executor.execute({
+      action: "read",
+      path: "C:\\Projects\\Cortex\\readme.md"
+    }, { signal: new AbortController().signal })) {
+      events.push(event);
+    }
+
+    assert.deepEqual(requestedPaths, ["C:\\Projects\\Cortex\\readme.md"]);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "result");
+    assert.deepEqual(events[0].value, { ok: true, content: "broker contents", truncated: false, size: 15 });
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test("file writer creates a backup and a diff for overwrites", async () => {

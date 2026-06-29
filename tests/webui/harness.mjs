@@ -129,6 +129,13 @@ const loadedPlugins = [
     tools: [{ name: "workspace_action", description: "Read, write, list, and delete workspace files." }]
   },
   {
+    name: "@local-agent/file-broker-client",
+    specifier: "./plugins/file-broker",
+    description: "Client for the local file-broker HTTP service.",
+    types: ["tools"],
+    tools: [{ name: "file_broker_action", description: "List, read, and write host files through file-broker." }]
+  },
+  {
     name: "@matatbread/matbot-workspace-rag",
     specifier: "./packages/plugins/workspace-rag",
     description: "Workspace-scoped markdown RAG ingestion.",
@@ -670,6 +677,40 @@ async function handleTool(res, name, rawInput) {
       files.delete(input.path);
       sendGlobal("file-changed", { namespace: "workspace", name: input.path, size: 0 });
       return json(res, 200, { path: input.path });
+    }
+  }
+  if (name === "file_broker_action") {
+    if (input.action === "health") {
+      return json(res, 200, { ok: true, roots: 1, maxReadBytes: 1000000 });
+    }
+    if (input.action === "list") {
+      return json(res, 200, {
+        ok: true,
+        entries: [
+          { name: "readme.md", path: "C:\\Projects\\Cortex\\readme.md", type: "file", size: 1024 },
+          { name: "local-agent", path: "C:\\Projects\\Cortex\\local-agent", type: "directory" }
+        ]
+      });
+    }
+    if (input.action === "read") {
+      return json(res, 200, {
+        ok: true,
+        content: `Broker harness host read for ${input.path}.`,
+        truncated: false,
+        size: 48
+      });
+    }
+    if (input.action === "write") {
+      if (/\.env$/i.test(String(input.path ?? "")) && input.approved !== true) {
+        return json(res, 409, { error: "High-risk write requires approved=true.", highRisk: true });
+      }
+      return json(res, 200, {
+        ok: true,
+        path: input.path,
+        backupPath: "C:\\Projects\\Cortex\\local-agent\\file-broker\\backups\\harness.bak",
+        diff: `--- ${input.path}\n+++ ${input.path}\n@@\n+${input.content ?? ""}`,
+        highRisk: false
+      });
     }
   }
   if (name === "workspace_rag") {

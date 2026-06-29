@@ -65,6 +65,8 @@ test("loads the shell, providers, conversations, files, plugins, and skills", as
   await openPlugins(page);
   await expect(page.locator("#plugin-list")).toContainText("@local-agent/expert-panel");
   await expect(page.locator("#plugin-list")).toContainText("expert_panel");
+  await expect(page.locator("#plugin-list")).toContainText("@local-agent/file-broker-client");
+  await expect(page.locator("#plugin-list")).toContainText("file_broker_action");
   await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-workspace-rag");
   await expect(page.locator("#plugin-list")).toContainText("workspace_rag");
   await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-storage-google-drive");
@@ -73,6 +75,20 @@ test("loads the shell, providers, conversations, files, plugins, and skills", as
 
   await openSkills(page);
   await expect(page.locator("#skill-list")).toContainText("Panel Etiquette");
+});
+
+test("default file broker tool reads host files through the WebUI transport", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop direct file-broker coverage");
+  await page.goto("/");
+
+  const result = await page.evaluate(async () => window.matbotTransport.callTool("file_broker_action", {
+    action: "read",
+    path: "C:\\Projects\\Cortex\\readme.md"
+  }));
+
+  expect(result.ok).toBe(true);
+  expect(result.content).toContain("Broker harness host read");
+  expect(result.content).toContain("C:\\Projects\\Cortex\\readme.md");
 });
 
 test("activates and deactivates compatible local plugins through the plugins panel", async ({ page, isMobile }) => {

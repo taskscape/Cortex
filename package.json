@@ -15,6 +15,7 @@
     "local-agent/file-broker",
     "local-agent/file-index",
     "local-agent/matbot/plugins/expert-panel",
+    "local-agent/matbot/plugins/file-broker",
     "local-agent/matbot/plugins/hybrid-knowledge-index"
   ],
   "devDependencies": {

@@ -137,7 +137,7 @@ There are three common plugin categories in this repository:
 | Category | Examples | Pattern |
 | --- | --- | --- |
 | Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
-| Retrieval plugins | `hybrid-knowledge-index`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context and grounded answers. |
+| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, and policy-aware host-file access. |
 | Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
 
 Bundled plugins may exist in the tree without being active. They become active
@@ -237,7 +237,7 @@ problems:
 | Pattern | Scope | Best for | Implementation |
 | --- | --- | --- | --- |
 | Host file index | Configured host roots | Broad project file search and metadata. | `file-index`, `hybrid-knowledge-index` |
-| File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` |
+| File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` service, `file_broker_action` tool |
 | Workspace RAG | One Cortex workspace | Grounding every conversation in selected markdown folders. | `workspace-rag` |
 | Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
 | Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
@@ -249,8 +249,10 @@ The high-level rule is:
 - use `workspace_rag` for markdown folders selected for the current workspace;
 - use `contextual_search` when the model needs a blended recall layer;
 - use `expert_panel` when the user wants different domain perspectives;
-- use file-broker/file-index when the task is about host files rather than
-  workspace RAG context.
+- use `contextual_search`/file-index to discover host-file matches, then
+  `file_broker_action` to list, read, or write exact host paths;
+- use `workspace_action` only for Matbot workspace uploads and generated
+  artifacts, not host filesystem files.
 
 ### Expert System
 
@@ -546,6 +548,7 @@ providers:
 plugins:
   - ./packages/plugins/sessions
   - ./plugins/hybrid-knowledge-index
+  - ./plugins/file-broker
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
@@ -868,6 +871,7 @@ The active default plugin list is in `local-agent\matbot\matbot.yaml`.
 | `./packages/plugins/providers/openai-compat` | OpenAI-compatible provider adapter. | Provider profiles in the UI selector. |
 | `./packages/plugins/sessions` | Persistent sessions and conversation metadata. | Conversation list, rename/hide/pin-style session actions. |
 | `./plugins/hybrid-knowledge-index` | Registers Matbot `KnowledgeIndex` backed by Mem0 and file-index. | Service consumed by retrieval tools. |
+| `./plugins/file-broker` | Client for the local file-broker HTTP service. | `file_broker_action`. |
 | `./packages/plugins/workspace-rag` | Workspace-scoped markdown RAG. | `workspace_rag`, automatic per-turn RAG context. |
 | `./packages/plugins/skills` | Persistent markdown skills/playbooks. | `skill_action`, skill editor UI. |
 | `./packages/plugins/triggers` | Data-driven automatic tool triggers. | Trigger management and automatic `remember_fact` firing. |
@@ -935,6 +939,41 @@ stores, providers, or frontend behavior, restart Cortex after adding it:
 ```powershell
 .\scripts\run.ps1
 ```
+
+### `file_broker_action`
+
+Calls the local file-broker HTTP service from Matbot. Use it for exact host
+filesystem paths that are inside the configured roots from
+`local-agent\config\workspaces.json`. It is the model-facing access path for
+file-broker; the HTTP service still enforces root policy, high-risk write
+approval, read limits, backups, and diffs.
+
+Common actions:
+
+```json
+{ "action": "health" }
+```
+
+```json
+{ "action": "list", "path": "C:\\Projects\\Cortex" }
+```
+
+```json
+{ "action": "read", "path": "C:\\Projects\\Cortex\\readme.md" }
+```
+
+```json
+{
+  "action": "write",
+  "path": "C:\\Projects\\Cortex\\notes\\summary.md",
+  "content": "# Summary\n\nHello.",
+  "approved": false
+}
+```
+
+Set `approved: true` only after explicit user approval for high-risk writes
+such as `.env` files. The write response includes a unified diff and, for
+overwrites, a backup path under the configured backup root.
 
 ### `workspace_action`
 

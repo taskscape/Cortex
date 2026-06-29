@@ -27,6 +27,7 @@ providers:
 
 plugins:
   - ./plugins/hybrid-knowledge-index
+  - ./plugins/file-broker
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers

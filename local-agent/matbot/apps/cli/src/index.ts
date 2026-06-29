@@ -872,6 +872,7 @@ async function main(): Promise<void> {
       ? path.resolve(process.env['CORTEX_WORKSPACES_FILE'])
       : path.join(path.dirname(requestedConfigPath), 'cortex-workspaces.json');
     workspaceManager = new FileWorkspaceManager(registryPath, requestedConfigPath);
+    await workspaceManager.ensurePluginInAllWorkspaces('./plugins/file-broker');
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workspace-rag');
     configPath = await workspaceManager.selectConfigPath();
     process.chdir(path.dirname(configPath));

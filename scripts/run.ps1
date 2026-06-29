@@ -113,6 +113,7 @@ New-Item -ItemType Directory -Force -Path $LogsRoot | Out-Null
 
 $fileIndexOutput = Join-Path $Root "local-agent\file-index\dist\server.js"
 $fileBrokerOutput = Join-Path $Root "local-agent\file-broker\dist\server.js"
+$fileBrokerClientOutput = Join-Path $Root "local-agent\matbot\plugins\file-broker\dist\index.js"
 $rootInstallNeeded = $ForceInstall -or
     (Test-PathMissing (Join-Path $Root "node_modules")) -or
     (Test-PathMissing $fileIndexOutput) -or
@@ -121,7 +122,8 @@ $rootInstallNeeded = $ForceInstall -or
 $rootBuildNeeded = -not $SkipBuild -and (
     $rootInstallNeeded -or
     (Test-AnySourceNewerThanOutput (Join-Path $Root "local-agent\file-index\src") $fileIndexOutput) -or
-    (Test-AnySourceNewerThanOutput (Join-Path $Root "local-agent\file-broker\src") $fileBrokerOutput)
+    (Test-AnySourceNewerThanOutput (Join-Path $Root "local-agent\file-broker\src") $fileBrokerOutput) -or
+    (Test-AnySourceNewerThanOutput (Join-Path $Root "local-agent\matbot\plugins\file-broker\src") $fileBrokerClientOutput)
 )
 
 if (-not $SkipInstall -and ($rootInstallNeeded -or $rootBuildNeeded)) {
