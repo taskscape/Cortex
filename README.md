@@ -254,35 +254,48 @@ plugins:
   - ./packages/plugins/frontend/web
 ```
 
-Start Cortex without opening a browser:
+For manual foreground-free use, Cortex can still be started without opening a
+browser:
 
 ```powershell
 .\scripts\run.ps1 -NoBrowser
 ```
 
-For unattended operation, run that command from Windows Task Scheduler, a Windows
-service wrapper such as WinSW or NSSM, PM2, or another supervisor that starts the
-process at logon/boot and restarts it if it exits. A basic Task Scheduler
-registration looks like this:
+For unattended operation on Windows, install the Cortex service wrapper instead
+of supervising `run.ps1` with Task Scheduler. `run.ps1` and
+`start-local-agent.ps1` intentionally start Matbot as a hidden child process and
+then return; a scheduled task would supervise only the launcher. The service path
+uses WinSW and `scripts\run-service.ps1`, which keeps Matbot in the foreground so
+the wrapper observes the real long-running process and restarts it if it exits.
 
 ```powershell
-$action = New-ScheduledTaskAction `
-  -Execute "powershell.exe" `
-  -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Projects\Cortex\scripts\run.ps1" -NoBrowser -NoRestartMatbot'
+.\scripts\run.ps1 -NoStart
+Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "C:\Projects\Cortex\scripts\install-cortex-service.ps1" -Start'
+```
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn
+The installer downloads WinSW into `local-agent\service` unless `-WinSWExe` is
+provided, writes `CortexLocalAgent.xml`, installs the service, and optionally
+starts it. Service logs are written under `local-agent\logs\service`.
 
-$settings = New-ScheduledTaskSettingsSet `
-  -RestartCount 3 `
-  -RestartInterval (New-TimeSpan -Minutes 1) `
-  -ExecutionTimeLimit ([TimeSpan]::Zero)
+By default the service is installed under Windows' default service account. If
+Docker Desktop, provider keys, `pnpm`, Git Bash, WSL, or mapped/network drives
+are only available under your interactive Windows user, change the service Log On
+account in `services.msc` or configure secrets in the workspace `.env` files
+instead of relying on user-scoped environment variables.
 
-Register-ScheduledTask `
-  -TaskName "Cortex Local Agent" `
-  -Action $action `
-  -Trigger $trigger `
-  -Settings $settings `
-  -Description "Start Cortex without opening the browser."
+Operate the service with normal Windows service commands:
+
+```powershell
+Get-Service CortexLocalAgent
+Start-Service CortexLocalAgent
+Stop-Service CortexLocalAgent
+Restart-Service CortexLocalAgent
+```
+
+Uninstall the service from an elevated PowerShell session:
+
+```powershell
+.\scripts\uninstall-cortex-service.ps1
 ```
 
 You can create and manage schedules through chat, or through the WebUI tool HTTP
@@ -320,11 +333,12 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" 
 Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" -ContentType "application/json" -Body '{"action":"cancel","id":"<schedule-id>"}'
 ```
 
-For deterministic automation, Windows Task Scheduler can also call Cortex tools
-directly instead of asking a model to decide what to do. For example, a scheduled
-PowerShell script can call `POST /tools/http` or `POST /tools/bash` as long as
-Cortex is already running. Direct tool calls are non-interactive; they cannot
-answer prompts that expect a live UI user.
+For deterministic automation, Windows Task Scheduler can still call Cortex tools
+directly instead of supervising the Cortex process or asking a model to decide
+what to do. For example, a scheduled PowerShell script can call `POST
+/tools/http` or `POST /tools/bash` as long as the Cortex service is already
+running. Direct tool calls are non-interactive; they cannot answer prompts that
+expect a live UI user.
 
 Security rules for unattended actions:
 
@@ -480,6 +494,9 @@ Run commands from `C:\Projects\Cortex`.
 | `.\scripts\health-check.ps1` | Check health of file-index, file-broker, and Mem0. |
 | `.\scripts\stop-local-agent.ps1` | Stop local service processes and the Docker stack. |
 | `.\scripts\run.ps1` | Aggregate setup, start, health-check, and browser launch. |
+| `.\scripts\install-cortex-service.ps1 -Start` | Install the WinSW-backed Windows service and start it. Run elevated. |
+| `.\scripts\uninstall-cortex-service.ps1` | Stop and remove the Cortex Windows service. Run elevated. |
+| `.\scripts\run-service.ps1` | Foreground runner used by the Windows service wrapper. Usually not run directly. |
 
 Useful `run.ps1` switches:
 

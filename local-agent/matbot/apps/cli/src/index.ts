@@ -1196,6 +1196,14 @@ async function main(): Promise<void> {
   if (workspaceManager !== undefined) {
     workspaceManager.setRestarter(async (workspaceId: string) => {
       if (!serverMode) return;
+      if (process.env['CORTEX_SERVICE_SUPERVISED'] === '1') {
+        setTimeout(() => {
+          void teardownPlugins()
+            .then(async () => { await activeStorageBackend?.close?.(); process.exit(42); })
+            .catch(() => process.exit(1));
+        }, 250);
+        return;
+      }
       const entry = process.argv[1] ?? fileURLToPath(import.meta.url);
       const args = [...process.execArgv, entry, ...process.argv.slice(2)];
       const child = spawn(process.execPath, args, {
