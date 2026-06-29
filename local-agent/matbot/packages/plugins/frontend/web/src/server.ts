@@ -72,6 +72,17 @@ interface SubmitBody {
   concatQueue?: boolean;      // true (default): merge into the running turn's batch; false: own turn
 }
 
+interface DirectToolContextSpec {
+  provider?:  string;
+  sessionId?: string;
+}
+
+interface DirectToolInvocation {
+  input:      unknown;
+  session?:   Session;
+  provider?:  string;
+}
+
 // Last-resort anonymous identity, used only when no boot principal is established and no resolver
 // override is registered (e.g. tests, or a realm with no carrier).
 const ANONYMOUS_WEB_USER: Principal = {
@@ -118,13 +129,18 @@ function corsHeaders(origin: string): Record<string, string> {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 // The single interactive prompt implementation is the SSE round-trip built per-submit (see the
 // `/sessions/:id/submit` handler): it parks on `pendingPrompts` and is answered via
 // `POST /sessions/:id/prompt`. The direct tool-invocation endpoints (`/tools/:name`,
-// `/stream/tools/:name`) have no session and no answer channel, so they CANNOT prompt
-// interactively — a known, deliberate blind spot. Any UI flow that needs to ask the user
-// something must drive the tool through `/submit` instead. This fallback makes that boundary
-// explicit: take the default if one was offered, otherwise fail loudly rather than hang.
+// `/stream/tools/:name`) may opt into a real session/provider with the `$context` envelope, but still
+// have no answer channel, so they CANNOT prompt interactively — a known, deliberate blind spot. Any
+// UI flow that needs to ask the user something must drive the tool through `/submit` instead. This
+// fallback makes that boundary explicit: take the default if one was offered, otherwise fail loudly
+// rather than hang.
 const nonInteractivePrompt: PromptFn = ((p: string | FormField, def?: string) => {
   const fallback = typeof p === 'string' ? def : p.default;
   return fallback !== undefined
@@ -241,7 +257,7 @@ export function createWebServer(deps: WebServerDeps) {
     }
   });
 
-  function makeToolCtx(ac: AbortController, principal: Principal) {
+  function makeToolCtx(ac: AbortController, principal: Principal, invocation?: Pick<DirectToolInvocation, 'session' | 'provider'>) {
     const now = new Date().toISOString();
     const stubSession: Session = {
       id: crypto.randomUUID(), version: crypto.randomUUID(),
@@ -251,16 +267,55 @@ export function createWebServer(deps: WebServerDeps) {
     };
     return {
       callId:     crypto.randomUUID(),
-      session:    stubSession,
+      session:    invocation?.session ?? stubSession,
       signal:     ac.signal,
       vault:      deps.vault,
       loadPlugin:   deps.loadPlugin,
       unloadPlugin: deps.unloadPlugin,
       prompt:       nonInteractivePrompt,
+      ...(invocation?.provider !== undefined ? { provider: invocation.provider } : {}),
       ...(deps.workdir    !== undefined ? { workdir:    deps.workdir    } : {}),
       ...(deps.files      !== undefined ? { files:      deps.files      } : {}),
       ...(deps.configPath !== undefined ? { configPath: deps.configPath } : {}),
     };
+  }
+
+  async function resolveDirectToolInvocation(rawInput: unknown): Promise<
+    | { ok: true; invocation: DirectToolInvocation }
+    | { ok: false; status: number; error: string }
+  > {
+    if (!isRecord(rawInput) || !Object.prototype.hasOwnProperty.call(rawInput, '$context')) {
+      return { ok: true, invocation: { input: rawInput } };
+    }
+
+    const contextRaw = rawInput['$context'];
+    if (contextRaw !== undefined && !isRecord(contextRaw)) {
+      return { ok: false, status: 400, error: '"$context" must be an object when provided.' };
+    }
+
+    const context = (contextRaw ?? {}) as Record<string, unknown>;
+    const toolInput = Object.prototype.hasOwnProperty.call(rawInput, 'input') ? rawInput['input'] : {};
+    const invocation: DirectToolInvocation = { input: toolInput };
+
+    if (Object.prototype.hasOwnProperty.call(context, 'provider')) {
+      if (typeof context.provider !== 'string' || context.provider.trim() === '') {
+        return { ok: false, status: 400, error: '"$context.provider" must be a non-empty provider name.' };
+      }
+      invocation.provider = context.provider.trim();
+    }
+
+    if (Object.prototype.hasOwnProperty.call(context, 'sessionId')) {
+      if (typeof context.sessionId !== 'string' || context.sessionId.trim() === '') {
+        return { ok: false, status: 400, error: '"$context.sessionId" must be a non-empty session id.' };
+      }
+      const session = await deps.store.get(context.sessionId.trim());
+      if (!session) {
+        return { ok: false, status: 404, error: `Session "${context.sessionId.trim()}" not found.` };
+      }
+      invocation.session = session;
+    }
+
+    return { ok: true, invocation };
   }
 
   function static200(res: ServerResponse, contentType: string, path: string) {
@@ -545,14 +600,21 @@ export function createWebServer(deps: WebServerDeps) {
       const ac = new AbortController();
       req.on('close', () => ac.abort());
 
-      const toolCtx = makeToolCtx(ac, principal);
+      const invocation = await resolveDirectToolInvocation(input);
+      if (!invocation.ok) { json(res, invocation.status, { error: invocation.error }); return; }
+
+      const toolCtx = makeToolCtx(ac, principal, invocation.invocation);
       let stdout = '';
       let stderr = '';
+      const markers: Array<{ creator: string; data: unknown }> = [];
+      let sawNonResultEvent = false;
       try {
-        for await (const ev of tool.executor.execute(input, toolCtx)) {
+        for await (const ev of tool.executor.execute(invocation.invocation.input, toolCtx)) {
           if (ev.type === 'result') { json(res, 200, ev.value); return; }
+          sawNonResultEvent = true;
           if (ev.type === 'stdout') { stdout += ev.chunk; }
           if (ev.type === 'stderr') { stderr += ev.chunk; }
+          if (ev.type === 'marker') { markers.push({ creator: ev.creator, data: ev.data }); }
           if (ev.type === 'error')  {
             json(res, 500, {
               error: ev.message,
@@ -562,6 +624,15 @@ export function createWebServer(deps: WebServerDeps) {
             });
             return;
           }
+        }
+        if (sawNonResultEvent) {
+          json(res, 200, {
+            ok: true,
+            ...(markers.length > 0 ? { markers } : {}),
+            ...(stdout ? { stdout } : {}),
+            ...(stderr ? { stderr } : {}),
+          });
+          return;
         }
         json(res, 500, { error: 'Tool returned no result' });
       } catch (e) {
@@ -589,6 +660,9 @@ export function createWebServer(deps: WebServerDeps) {
       const ac = new AbortController();
       req.on('close', () => ac.abort());
 
+      const invocation = await resolveDirectToolInvocation(input);
+      if (!invocation.ok) { json(res, invocation.status, { error: invocation.error }); return; }
+
       res.writeHead(200, {
         'content-type':  'text/event-stream',
         'cache-control': 'no-cache',
@@ -597,7 +671,7 @@ export function createWebServer(deps: WebServerDeps) {
       res.write(sseComment('tool stream open'));
 
       try {
-        for await (const ev of tool.executor.execute(input, makeToolCtx(ac, principal))) {
+        for await (const ev of tool.executor.execute(invocation.invocation.input, makeToolCtx(ac, principal, invocation.invocation))) {
           if (!res.writable) break;
           res.write(sseEvent(ev.type, ev));
         }

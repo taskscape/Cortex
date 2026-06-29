@@ -833,10 +833,10 @@ async function loadFiles() {
         const prompt = document.createElement('div');
         prompt.className = 'plugin-prompt-banner';
         prompt.style.display = 'block';
-        prompt.innerHTML = `Workspace plugin not loaded - workspace file management is unavailable.<button style="display:block;margin:6px 10px;padding:4px 12px;font-size:0.86em;color:#fff;background:#d97706;border:none;border-radius:5px;cursor:pointer;font-family:inherit;font-weight:500;">Enable workspace</button>`;
+        prompt.innerHTML = `Workspace plugin not loaded - workspace file management is unavailable.<button style="display:block;margin:6px 10px;padding:4px 12px;font-size:0.86em;color:#fff;background:#2563eb;border:none;border-radius:5px;cursor:pointer;font-family:inherit;font-weight:500;">Enable workspace</button>`;
         const btn = prompt.querySelector('button');
-        btn.onmouseover = () => { btn.style.background = '#b45309'; };
-        btn.onmouseout  = () => { btn.style.background = '#d97706'; };
+        btn.onmouseover = () => { btn.style.background = '#1d4ed8'; };
+        btn.onmouseout  = () => { btn.style.background = '#2563eb'; };
         btn.onclick = () => {
           submit('Please discover local plugins and add the workspace plugin to enable file management.');
         };

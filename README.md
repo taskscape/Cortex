@@ -175,6 +175,40 @@ does not call the retrieval tool or the relevant memory context is not injected.
 That is why direct inspection through `remembered_facts_action` is documented
 later in this README.
 
+### Inner Voice
+
+Inner Voice is Cortex's built-in second-opinion pattern for improving an
+assistant response. It is part of the `cognition` plugin, but it is not durable
+memory and it is not background execution. It is a critique mechanism.
+
+The concept is a two-chamber model:
+
+- `Matbot1` is the normal chat agent: analytical, goal-directed, tool-using,
+  and responsible for the final answer.
+- `Matbot2` is the constructive critic: it looks for wrong assumptions,
+  generic reasoning, missing context, weak framing, and overconfident answers.
+
+The point is not to make one model "think harder." The point is to ask a
+different kind of thinker to challenge the first answer. In the best case,
+`Matbot2` runs on a different model lineage from the main provider so its
+critique is genuinely independent. If no separate provider is configured,
+Inner Voice can still fall back to the current turn's provider, but that is a
+same-lineage self-critique and is less valuable.
+
+Operationally, the `cognition` plugin seeds an `Inner voice` skill and
+registers the `ask_inner_voice` tool. When the skill is used, `Matbot1`
+summarizes the user's problem and its draft answer, calls `ask_inner_voice`,
+then integrates the critique into one sharper response. The user normally sees
+the improved answer, not a transcript of two agents debating.
+
+Inner Voice is best suited to strategic, design, trust, UX, communication, and
+other open-ended questions where framing matters. It is a poor fit for narrow
+data lookups, SQL/config formatting, or tasks with one straightforward correct
+answer. In the trigger system, it acts like an "expert over your shoulder":
+it can be loaded when the user asks for deeper thought, challenges an answer,
+expresses skepticism, or when an assistant response itself shows signs of an
+unresolved anomaly.
+
 ### Workspace System
 
 A Cortex workspace is a boot-scoped runtime context. It controls:
@@ -1009,10 +1043,36 @@ synthesis. The user question is typed in the main chat entry box.
 
 ### Cognition Tools
 
+Direct HTTP calls to tools that depend on the current conversation can pass a
+tool-context envelope:
+
+```json
+{
+  "$context": {
+    "sessionId": "current-session-id",
+    "provider": "openai"
+  },
+  "input": {}
+}
+```
+
+`sessionId` gives the tool a real session history, and `provider` gives tools
+such as `remember_fact`, `dream_time`, and unpinned `ask_inner_voice` the model
+that would normally come from the active turn. Tools that do not need session or
+provider context can still be called with their ordinary bare JSON body.
+When a direct tool call emits markers but no ordinary result, the HTTP endpoint
+returns `{ "ok": true, "markers": [...] }`.
+
 Capture durable facts from the latest user message:
 
 ```json
-{}
+{
+  "$context": {
+    "sessionId": "current-session-id",
+    "provider": "openai"
+  },
+  "input": {}
+}
 ```
 
 Send to:
@@ -1042,7 +1102,12 @@ POST http://localhost:19778/tools/remembered_facts_action
 Run one memory consolidation pass:
 
 ```json
-{}
+{
+  "$context": {
+    "provider": "openai"
+  },
+  "input": {}
+}
 ```
 
 Send to:
@@ -1050,6 +1115,30 @@ Send to:
 ```text
 POST http://localhost:19778/tools/dream_time
 ```
+
+Ask the Inner Voice critic to review a draft response:
+
+```json
+{
+  "$context": {
+    "provider": "openai"
+  },
+  "input": {
+    "prompt": "Summarize the user problem, relevant constraints, and the draft response to critique.",
+    "system": "You are the second chamber of a bicameral assistant. Be direct, specific, and constructive."
+  }
+}
+```
+
+Send to:
+
+```text
+POST http://localhost:19778/tools/ask_inner_voice
+```
+
+The tool returns the critic text and token usage. The provider is selected by
+`cognition_config.innerVoiceProvider`; when it is `null`, the tool falls back to
+the current turn's provider.
 
 Configure cognition:
 
@@ -1295,14 +1384,193 @@ durable memory:
 It is a policy file for humans and future automation. The active memory tools
 still enforce their own schemas and prompts.
 
-## Expert Panel Workflow
+## Expert Panel WebUI User Manual
 
-The expert panel is deliberately tool-based. It does not spin up separate
-chatbot processes.
+The Expert Panel lets one user question be answered from several configured
+perspectives, such as design, finance, and engineering. It is useful when a
+decision has tradeoffs and a single assistant answer would flatten the problem.
+
+The panel is integrated into the normal chat composer. You do not type into a
+separate expert form. You choose the expert settings, type the question in the
+main chat box, and send it normally.
+
+### Where To Find It
+
+Open the WebUI at `http://localhost:19778`. At the bottom composer, the top row
+contains:
+
+- `Model:` selector: chooses the normal chat model/provider.
+- `Experts` selector: opens the expert-panel settings popup.
+
+When the expert panel is enabled, the selector changes from `Experts` to
+`Experts on`. This is the quick visual cue that the next message will run
+through the panel instead of normal chat.
+
+### Expert Popup Controls
+
+Click `Experts` to open the popup. The popup contains these controls:
+
+| Control | What it does |
+| --- | --- |
+| `Use experts` | Turns expert-panel mode on for the next submitted chat question. If unchecked, the chat behaves normally. |
+| `All experts` | Runs every configured expert. In the default setup this means Design, Finance, and Engineering. |
+| Individual expert checkboxes | Lets you run only selected experts. These appear under `Selection` when experts are available. |
+| `Mode` | Controls how each expert should frame the answer: `Parallel`, `Review`, or `Debate`. |
+| `Synthesize decision` | When checked, runs a final orchestration pass that collates expert opinions into a recommendation. |
+| Status line | Shows whether experts are unavailable, running, complete, or failed. |
+
+The popup closes when you click outside it. Your selected settings remain in the
+composer until changed or until the page is refreshed.
+
+### Running The Whole Panel
+
+Use this when you want all available perspectives.
+
+1. Click `Experts`.
+2. Check `Use experts`.
+3. Leave `All experts` checked.
+4. Choose a `Mode`.
+5. Leave `Synthesize decision` checked if you want a final recommendation.
+6. Type your question in the main chat box.
+7. Click the send button.
+
+The user message shown in the transcript includes a short summary such as:
+
+```text
+Expert panel (review)
+Experts: all
+Synthesize decision: yes
+
+Should we ship this feature?
+```
+
+That summary is intentional. It records which panel settings were used for that
+turn.
+
+### Running Selected Experts
+
+Use this when only some perspectives are relevant.
+
+1. Click `Experts`.
+2. Check `Use experts`.
+3. Uncheck `All experts`.
+4. Check the individual experts you want, for example `Design Expert` and
+   `Engineering Expert`.
+5. Choose a `Mode`.
+6. Choose whether to synthesize.
+7. Type the question in the main chat box and send.
+
+If `All experts` is unchecked and no individual expert is selected, Cortex shows
+an error in the expert popup and does not run the panel.
+
+### Choosing A Mode
+
+| Mode | Best for | Behavior |
+| --- | --- | --- |
+| `Parallel` | Broad perspective gathering. | Each expert answers independently from its own viewpoint. |
+| `Review` | Critiquing a proposal, implementation, or plan. | Experts look for strengths, risks, omissions, and practical concerns. |
+| `Debate` | Surfacing disagreement and tradeoffs. | Experts emphasize where their priorities conflict and what would change their recommendation. |
+
+The `Mode` dropdown uses the same compact selector design as the model selector.
+
+### Synthesis
+
+`Synthesize decision` controls whether Cortex asks an orchestrating agent to
+collate the expert outputs.
+
+When synthesis is enabled, the final answer includes:
+
+- each expert's opinion;
+- citations for files retrieved for each expert;
+- a synthesis section with consensus, disagreement, risks, assumptions, and a
+  final recommendation.
+
+When synthesis is disabled, Cortex returns only the selected expert opinions.
+This is useful when you want to compare raw perspectives yourself.
+
+### Reading The Result
+
+The answer is rendered in the normal chat transcript. A typical expert-panel
+answer has:
+
+- one heading per expert, such as `Design Expert`, `Finance Expert`, or
+  `Engineering Expert`;
+- each expert's grounded answer;
+- citations listing expert-specific source files when relevant;
+- an optional `Synthesis` section.
+
+The status line in the popup changes to `Complete.` after a successful run.
+
+### Model Selector And Expert Providers
+
+The `Model:` selector still controls normal chat. Expert panel execution has two
+provider layers:
+
+- Individual experts use the provider configured for that expert in
+  `local-agent\config\experts.json`. If an expert has no provider, Cortex falls
+  back to the current turn provider or the expert panel default provider.
+- The synthesis pass uses the current turn provider when available, falling back
+  to the expert panel default provider.
+
+This means changing the WebUI `Model:` selector can affect synthesis and fallback
+behavior, but it does not directly rewrite each expert's configured provider.
+
+### Knowledge And Citations
+
+Each expert has its own knowledge roots. In the default setup:
+
+- Design knowledge lives under `local-agent\knowledge\design`.
+- Finance knowledge lives under `local-agent\knowledge\finance`.
+- Engineering knowledge lives under `local-agent\knowledge\engineering`.
+
+When the panel runs, each expert searches only its own configured files. That
+keeps perspectives separated. For example, the Design Expert does not retrieve
+from the Finance Expert's knowledge root unless both experts are explicitly
+configured to share a root.
+
+Supported expert knowledge file extensions are `.md`, `.mdx`, `.txt`, `.json`,
+`.csv`, `.tsv`, `.yaml`, and `.yml`. Files larger than 1 MB are skipped.
+
+### Common User Problems
+
+`expert_panel plugin unavailable.`
+
+The active workspace did not load `./plugins/expert-panel`, or the browser is
+connected to an old WebUI process. Restart Cortex:
+
+```powershell
+.\scripts\run.ps1
+```
+
+Then hard-refresh the browser and open the `Experts` selector again.
+
+`No experts configured.`
+
+The plugin loaded, but `local-agent\config\experts.json` is missing, invalid, or
+contains no experts.
+
+The panel runs but citations are empty.
+
+The selected expert's knowledge roots did not contain matching text for the
+question, the files are unsupported, or the files are larger than the 1 MB expert
+retrieval limit. The expert can still answer from its system prompt, but it will
+have less grounding.
+
+The wrong experts were used.
+
+Check whether `All experts` is still selected. If it is checked, individual
+checkboxes are treated as all selected. Uncheck `All experts` before selecting a
+subset.
+
+### Implementation Workflow
+
+Internally, the expert panel is deliberately tool-based. It does not spin up
+separate chatbot processes.
 
 Flow:
 
-1. The main Matbot agent calls `expert_panel`.
+1. The WebUI calls the `expert_panel` tool with the question and selected panel
+   options.
 2. The plugin selects requested experts or all configured experts.
 3. Each expert retrieves text snippets from its own configured roots.
 4. Each expert receives an independent `services.singleTurn(...)` call with its
@@ -1312,6 +1580,8 @@ Flow:
 
 This keeps design, finance, and engineering knowledge isolated while still
 running inside one Matbot process.
+
+### Adding Or Changing Experts
 
 Add an expert by editing `local-agent\config\experts.json`:
 
@@ -1339,9 +1609,8 @@ Restart Cortex:
 .\scripts\run.ps1
 ```
 
-Supported knowledge file extensions are `.md`, `.txt`, `.json`, `.csv`, `.tsv`,
-`.yaml`, and `.yml`. Files larger than 1 MB are skipped by the expert file
-retriever.
+The new expert appears in the WebUI after restart. Open the `Experts` selector
+and verify it appears under `Selection`.
 
 ## WebUI
 
@@ -1375,39 +1644,74 @@ Then hard-refresh the browser.
 
 ## Testing
 
-Run all tests:
+The repository has two test layers:
+
+- Node tests in `tests\*.test.mjs` for backend/runtime behavior.
+- Playwright WebUI tests in `tests\webui\matbot-webui.spec.mjs` for browser
+  interactions against the real static WebUI and a fake Matbot server.
+
+Run the complete suite before treating a change as verified:
 
 ```powershell
 npm run test:all
 ```
 
-Run only Node tests:
+Run only the Node tests:
 
 ```powershell
 npm test
 ```
 
-Run only Playwright WebUI tests:
+Run the complete Playwright WebUI suite:
 
 ```powershell
 npm run test:webui
 ```
 
-Install Chromium for Playwright:
+First Playwright setup on a machine:
 
 ```powershell
 npx playwright install chromium
 ```
 
-The WebUI tests use `tests\webui\harness.mjs`, a fake Matbot transport/server.
-They validate exposed UI behavior without spending model tokens.
+Useful Playwright variants:
+
+```powershell
+# Desktop WebUI project only
+npm run test:webui -- --project chromium
+
+# Mobile WebUI project only
+npm run test:webui -- --project mobile-chromium
+
+# Run tests whose title matches a feature area
+npm run test:webui -- --grep "workspace RAG"
+
+# Debug a Playwright run locally
+npm run test:webui -- --project chromium --headed --debug
+```
+
+The Playwright config starts `tests\webui\harness.mjs` on
+`http://127.0.0.1:19787` and serves the same static frontend files used by the
+Node WebUI. The harness implements fake Matbot transport endpoints for sessions,
+tools, workspaces, files, plugins, skills, remembered facts, experts, and
+workspace RAG. It validates WebUI behavior without calling real providers,
+spending model tokens, writing production memory stores, or touching live RAG
+databases.
+
+Traces are retained on failure. Inspect a failing trace with:
+
+```powershell
+npx playwright show-trace <path-to-trace.zip>
+```
 
 Current Playwright coverage includes:
 
 - shell load, providers, conversations, files, plugins, and skills;
+- compatible plugin activation/deactivation and incompatible plugin display;
 - workspace selector create/rename/switch;
 - workspace RAG settings save and ingestion progress display;
 - remembered facts persisting across conversations;
+- `contextual_search` retrieval from remembered facts plus workspace RAG context;
 - workspace RAG retrieval during conversation;
 - expert panel all-expert and selected-expert composer flows;
 - streaming output, tools, usage, and elapsed-time summary;

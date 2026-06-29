@@ -149,8 +149,18 @@ const loadedPlugins = [
     types: ["tools"],
     tools: [
       { name: "remember_fact", description: "Store durable remembered facts." },
-      { name: "remembered_facts_action", description: "Inspect and manage remembered facts." }
+      { name: "remembered_facts_action", description: "Inspect and manage remembered facts." },
+      { name: "dream_time", description: "Run one memory consolidation pass." },
+      { name: "ask_inner_voice", description: "Ask the configured inner voice critic." },
+      { name: "cognition_config", description: "Configure cognition providers." }
     ]
+  },
+  {
+    name: "@matatbread/matbot-rumsfeld",
+    specifier: "./packages/plugins/rumsfeld",
+    description: "Context lookup over memory and knowledge.",
+    types: ["tools"],
+    tools: [{ name: "contextual_search", description: "Load local context for unknown terms." }]
   }
 ];
 
@@ -186,9 +196,80 @@ const localPlugins = [
     specifier: "./packages/plugins/background",
     name: "@matatbread/matbot-tool-background",
     description: "Run prompts in detached background processes.",
-    matbotRuntime: ["node"]
+    matbotRuntime: ["node"],
+    types: ["tools"],
+    tools: [{ name: "background_prompt", description: "Run a prompt in the background." }]
   }
 ];
+
+function clonePlugin(plugin) {
+  return {
+    name: plugin.name,
+    specifier: plugin.specifier,
+    description: plugin.description,
+    types: plugin.types ?? [],
+    tools: plugin.tools ?? []
+  };
+}
+
+function addLoadedPlugin(specifier) {
+  if (loadedPlugins.some(plugin => plugin.specifier === specifier || plugin.name === specifier)) {
+    const plugin = loadedPlugins.find(item => item.specifier === specifier || item.name === specifier);
+    return { ok: true, plugin, message: `Plugin "${plugin.name}" is already loaded.` };
+  }
+  const plugin = localPlugins.find(item => item.specifier === specifier || item.name === specifier);
+  if (!plugin) return { ok: false, error: `Plugin "${specifier}" was not discovered.` };
+  if (Array.isArray(plugin.matbotRuntime) && plugin.matbotRuntime.length && !plugin.matbotRuntime.includes("node")) {
+    return { ok: false, error: `Plugin "${plugin.name}" cannot run in the node WebUI harness.` };
+  }
+  const loaded = clonePlugin(plugin);
+  loadedPlugins.push(loaded);
+  sendGlobal("plugin-changed", { type: "loaded", name: loaded.name, specifier: loaded.specifier });
+  for (const tool of loaded.tools ?? []) sendGlobal("tool-changed", { type: "registered", name: tool.name ?? tool });
+  return { ok: true, plugin: loaded, message: `Added plugin "${loaded.name}".` };
+}
+
+function removeLoadedPlugin(specifier) {
+  const index = loadedPlugins.findIndex(plugin => plugin.specifier === specifier || plugin.name === specifier);
+  if (index < 0) return { ok: false, error: `Plugin "${specifier}" is not loaded.` };
+  const [plugin] = loadedPlugins.splice(index, 1);
+  sendGlobal("plugin-changed", { type: "unloaded", name: plugin.name, specifier: plugin.specifier });
+  for (const tool of plugin.tools ?? []) sendGlobal("tool-changed", { type: "unregistered", name: tool.name ?? tool });
+  return { ok: true, plugin, message: `Removed plugin "${plugin.name}".` };
+}
+
+function unwrapToolInvocation(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input) || !Object.hasOwn(input, "$context")) {
+    return { input, context: {} };
+  }
+  return {
+    input: Object.hasOwn(input, "input") ? input.input : {},
+    context: input.$context && typeof input.$context === "object" && !Array.isArray(input.$context)
+      ? input.$context
+      : {}
+  };
+}
+
+function latestTextMessage(sessionId, role = "user") {
+  const session = sessions.get(sessionId);
+  return [...(session?.messages ?? [])]
+    .reverse()
+    .find(message => message.role === role && Array.isArray(message.content))
+    ?.content
+    ?.filter(part => part.type === "text")
+    .map(part => part.text)
+    .join("\n") ?? "";
+}
+
+function extractHarnessFact(text) {
+  const memorizedName = /memorize my name:\s*(.+)$/i.exec(text)?.[1]?.trim();
+  if (memorizedName) return `The user's name is ${memorizedName}.`;
+  const memorizedFact = /memorize(?:\s+this|\s+fact)?:\s*(.+)$/i.exec(text)?.[1]?.trim();
+  if (memorizedFact) return memorizedFact;
+  const directFact = /(?:direct recall token|direct api code word) is\s+([A-Za-z0-9_-]+)/i.exec(text);
+  if (directFact) return `The direct recall token is ${directFact[1]}.`;
+  return text.trim();
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -341,7 +422,11 @@ async function file(res, contentType, name) {
   res.end(body);
 }
 
-async function handleTool(res, name, input) {
+async function handleTool(res, name, rawInput) {
+  const invocation = unwrapToolInvocation(rawInput);
+  const input = invocation.input ?? {};
+  const context = invocation.context;
+
   if (name === "provider") {
     return json(res, 200, { providers: [{ name: "openai" }, { name: "Local" }, { name: "panel-test" }] });
   }
@@ -461,16 +546,78 @@ async function handleTool(res, name, input) {
     }
   }
   if (name === "remember_fact") {
-    const fact = String(input.fact ?? input.text ?? "").trim();
-    if (!fact) return json(res, 400, { error: "remember_fact requires a fact" });
+    if (!context.provider) return json(res, 500, { error: "remember_fact needs provider context" });
+    if (!context.sessionId || !sessions.has(context.sessionId)) return json(res, 404, { error: "remember_fact needs a real session context" });
+    const latestText = latestTextMessage(context.sessionId);
+    if (!latestText.trim()) return json(res, 500, { error: "remember_fact found no latest user message" });
+    const fact = extractHarnessFact(latestText);
     const id = `fact-${rememberedFactSeq++}`;
-    const doc = { id, version: "v1", fact, sessionId: "manual", messageId: "manual", createdAt: now() };
+    const session = sessions.get(context.sessionId);
+    const message = [...session.messages].reverse().find(item => item.role === "user");
+    const doc = { id, version: "v1", fact, sessionId: context.sessionId, messageId: message?.id ?? "manual", createdAt: now() };
     rememberedFacts.set(id, doc);
-    return json(res, 200, { facts: [doc] });
+    return json(res, 200, { ok: true, markers: [{ creator: "remember_fact", data: { facts: [fact], sessionId: context.sessionId } }] });
+  }
+  if (name === "dream_time") {
+    if (!context.provider) return json(res, 500, { error: "dream_time needs provider context" });
+    return json(res, 200, {
+      id: "dream-run-direct",
+      outcome: "no-facts",
+      provider: context.provider,
+      mergedFactIds: [],
+      judgementCalls: []
+    });
+  }
+  if (name === "ask_inner_voice") {
+    if (!context.provider) return json(res, 500, { error: "ask_inner_voice has no provider" });
+    if (!input.prompt) return json(res, 400, { error: "ask_inner_voice requires prompt" });
+    return json(res, 200, {
+      text: `Inner voice (${context.provider}) critique: sharpen the framing.`,
+      usage: { inputTokens: 9, outputTokens: 7 }
+    });
+  }
+  if (name === "contextual_search") {
+    const terms = Array.isArray(input.terms) ? input.terms : [];
+    const query = terms.map(term => [term.term, term.context].filter(Boolean).join(" ")).join(" ").toLowerCase();
+    const queryTokens = new Set((query.match(/[a-z0-9]+/g) ?? []).filter(token => token.length > 1));
+    const remembered = [...rememberedFacts.values()]
+      .filter(fact => {
+        const factText = fact.fact.toLowerCase();
+        return [...queryTokens].some(token => factText.includes(token));
+      })
+      .slice(0, 5);
+    const workspaceRag = {
+      contextName: activeRagContext().name,
+      path: "C:/Projects/Cortex/docs/probe.md",
+      score: 0.92,
+      text: "Workspace RAG probe context."
+    };
+    const parts = [];
+    if (remembered.length) parts.push(["Remembered facts:", ...remembered.map(fact => `- ${fact.fact}`)].join("\n"));
+    if (/quasarpump|rag|workspace|probe/.test(query)) {
+      parts.push([
+        `Workspace RAG results (${workspaceRag.contextName}):`,
+        `- Source 1: ${workspaceRag.path} (score ${workspaceRag.score.toFixed(3)})`,
+        workspaceRag.text
+      ].join("\n"));
+    }
+    if (!parts.length) return json(res, 404, { error: "There is no skill available for the requested operation." });
+    return json(res, 200, {
+      name: remembered.length ? "remembered_facts" : "workspace_rag",
+      content: parts.join("\n\n")
+    });
   }
   if (name === "plugin") {
     if (input.action === "list") return json(res, 200, { loaded: loadedPlugins });
     if (input.action === "discover_local") return json(res, 200, localPlugins);
+    if (input.action === "add") {
+      const result = addLoadedPlugin(String(input.specifier ?? input.name ?? ""));
+      return json(res, result.ok ? 200 : 400, result);
+    }
+    if (input.action === "remove" || input.action === "unload") {
+      const result = removeLoadedPlugin(String(input.specifier ?? input.name ?? ""));
+      return json(res, result.ok ? 200 : 400, result);
+    }
   }
   if (name === "expert_panel") {
     if (input.action === "list") return json(res, 200, { experts: expertConfigs });
@@ -575,6 +722,36 @@ async function runTurn(sessionId, traceId, body) {
     return;
   }
 
+  const addPluginMatch = /^Add the plugin '([^']+)'/i.exec(content);
+  const removePluginMatch = /^Remove the plugin '([^']+)'/i.exec(content);
+  if (addPluginMatch || removePluginMatch) {
+    const action = addPluginMatch ? "add" : "remove";
+    const specifier = (addPluginMatch ?? removePluginMatch)[1];
+    sendSession(sessionId, "thinking", { type: "thinking", delta: `${action === "add" ? "Adding" : "Removing"} plugin.`, traceId });
+    await sleep(10);
+    sendSession(sessionId, "tool:start", { type: "tool:start", callId: `call-${traceId}`, name: "plugin", input: { action, specifier }, traceId });
+    await sleep(10);
+    const result = action === "add" ? addLoadedPlugin(specifier) : removeLoadedPlugin(specifier);
+    sendSession(sessionId, "tool:end", { type: "tool:end", callId: `call-${traceId}`, result, isError: !result.ok, traceId });
+    const assistantText = result.ok
+      ? result.message
+      : `Could not ${action} plugin "${specifier}": ${result.error}`;
+    sendSession(sessionId, "text-delta", { type: "text-delta", delta: assistantText, traceId });
+    const assistant = {
+      id: `m-${traceId}-a`,
+      traceId,
+      role: "assistant",
+      content: [{ type: "text", text: assistantText }],
+      createdAt: now()
+    };
+    session.messages.push(assistant);
+    session.updatedAt = now();
+    sendSession(sessionId, "done", { type: "done", session, traceId });
+    runningTurns.delete(sessionId);
+    setBusy(sessionId, false);
+    return;
+  }
+
   const memorizedName = /memorize my name:\s*(.+)$/i.exec(content)?.[1]?.trim();
   if (memorizedName) {
     const id = `fact-${rememberedFactSeq++}`;
@@ -586,6 +763,19 @@ async function runTurn(sessionId, traceId, body) {
       messageId: userMessage.id,
       createdAt: now()
     });
+  } else {
+    const memorizedFact = /memorize(?:\s+this|\s+fact)?:\s*(.+)$/i.exec(content)?.[1]?.trim();
+    if (memorizedFact) {
+      const id = `fact-${rememberedFactSeq++}`;
+      rememberedFacts.set(id, {
+        id,
+        version: "v1",
+        fact: memorizedFact,
+        sessionId,
+        messageId: userMessage.id,
+        createdAt: now()
+      });
+    }
   }
 
   sendSession(sessionId, "thinking", { type: "thinking", delta: "Checking harness state.", traceId });
