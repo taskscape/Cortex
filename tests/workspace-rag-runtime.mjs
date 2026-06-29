@@ -62,6 +62,14 @@ async function main() {
     assert.equal(configureResult.status.state, "idle");
     assert.equal(configureResult.status.percent, 100);
     assert.equal(configureResult.status.accelerator, "cpu");
+    assert.equal(configureResult.status.currentFile, undefined);
+
+    const idleStatusEvents = [];
+    for await (const event of registeredTool.executor.execute({ action: "status" }, toolCtx)) {
+      idleStatusEvents.push(event);
+    }
+    const idleStatusResult = idleStatusEvents.find(event => event.type === "result")?.value;
+    assert.equal(idleStatusResult.currentFile, undefined);
 
     const dbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
     assert.match(dbText, /QuasarPump/);

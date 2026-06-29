@@ -815,7 +815,7 @@ Status responses include:
 | `state` | `pending`, `idle`, `indexing`, or an error state. |
 | `percent` | Ingestion progress percentage. |
 | `processedFiles` / `totalFiles` | Current scan progress. |
-| `currentFile` | Current markdown file being processed. |
+| `currentFile` | Current markdown file being processed while `state` is `indexing`; omitted once indexing is idle, pending, or errored. |
 | `nvidiaAvailable` | Whether `nvidia-smi` is visible on the host. |
 | `accelerated` | Whether the current ingestion backend is GPU-accelerated. |
 | `accelerator` | `nvidia` or `cpu`. |

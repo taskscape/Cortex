@@ -182,6 +182,11 @@ test("workspace RAG configuration panel saves paths and shows indexing progress"
   await expect(page.locator("#workspace-rag-status")).toContainText("indexing");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
   await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");
+
+  await page.evaluate(async () => window.matbotTransport.callTool("workspace_rag", { action: "reindex_now" }));
+  await expect(page.locator("#workspace-rag-status")).toContainText("idle");
+  await expect(page.locator("#workspace-rag-current-file")).toHaveText("");
+  await expect(page.locator("#workspace-rag-current-file")).toHaveAttribute("title", "");
 });
 
 test("remembered facts persist across conversations and are used in later answers", async ({ page, isMobile }) => {

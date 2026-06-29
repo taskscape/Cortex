@@ -72,12 +72,14 @@ function workspaceRagConfigResponse() {
 
 function setWorkspaceRagStatusForActive(overrides = {}) {
   const context = activeRagContext();
-  workspaceRagStatus = {
+  const nextStatus = {
     ...workspaceRagStatus,
     contextName: context.name,
     paths: context.paths,
     ...overrides
   };
+  if (nextStatus.state !== "indexing") delete nextStatus.currentFile;
+  workspaceRagStatus = nextStatus;
 }
 
 sessions.set("s0", {
@@ -767,7 +769,7 @@ async function handleTool(res, name, rawInput) {
       return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
     }
     if (input.action === "reindex_now") {
-      workspaceRagStatus = { ...workspaceRagStatus, state: "idle", processedFiles: 3, totalFiles: 3, percent: 100, message: "Indexed 3 markdown file(s)." };
+      setWorkspaceRagStatusForActive({ state: "idle", processedFiles: 3, totalFiles: 3, percent: 100, message: "Indexed 3 markdown file(s)." });
       return json(res, 200, workspaceRagStatus);
     }
     if (input.action === "search") {

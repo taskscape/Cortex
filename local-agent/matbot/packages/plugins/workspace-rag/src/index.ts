@@ -599,8 +599,10 @@ class WorkspaceRagManager {
         return seen.has(`${docContextId}:${normalizePathForId(doc.path)}`);
       });
       await this.writeDb(workspace, db);
+      const idleStatus = { ...this.statuses.get(workspace.id)! };
+      delete idleStatus.currentFile;
       this.statuses.set(workspace.id, {
-        ...this.statuses.get(workspace.id)!,
+        ...idleStatus,
         state: 'idle',
         processedFiles: allFiles.length,
         percent: 100,
