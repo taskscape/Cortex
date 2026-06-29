@@ -812,7 +812,7 @@ Status responses include:
 
 | Field | Meaning |
 | --- | --- |
-| `state` | `pending`, `indexing`, `ready`, or an error state. |
+| `state` | `pending`, `idle`, `indexing`, or an error state. |
 | `percent` | Ingestion progress percentage. |
 | `processedFiles` / `totalFiles` | Current scan progress. |
 | `currentFile` | Current markdown file being processed. |
