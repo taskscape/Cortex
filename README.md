@@ -209,6 +209,134 @@ it can be loaded when the user asks for deeper thought, challenges an answer,
 expresses skepticism, or when an assistant response itself shows signs of an
 unresolved anomaly.
 
+### Scheduled And Unattended Actions
+
+Cortex can run scheduled work without an attended browser tab, but the Matbot
+Node process must stay alive. The browser is only the control surface. Closing
+the browser does not stop an already running Cortex process; stopping the Matbot
+process does stop the scheduler.
+
+The built-in scheduling path is the optional `background` plugin. It exposes:
+
+- `background`: starts a prompt in a child Matbot process. With `interval`, it
+  creates a recurring schedule.
+- `every_action`: lists, suspends, resumes, or cancels recurring schedules.
+
+Recurring schedules are stored in the active workspace and are re-armed when
+Cortex starts again. They do not run while the computer is asleep, powered off,
+or while the Matbot process is stopped. Missed intervals are not caught up by an
+external service; the in-process scheduler resumes after Cortex is running.
+
+Scheduled prompts can use whatever tools are loaded in the same workspace. The
+common unattended-action stack is:
+
+| Plugin | What it enables | Notes |
+| --- | --- | --- |
+| `./packages/plugins/background` | Recurring and detached prompt jobs. | Required for Cortex-managed schedules. |
+| `./packages/plugins/http` | Fetch pages, APIs, and remote resources. | Uses plain HTTP fetch; it does not render JavaScript-heavy pages. |
+| `./packages/plugins/bash` | Execute shell scripts from a scheduled prompt. | Spawns `bash -c`; Windows needs `bash.exe` in PATH, such as Git Bash or WSL. |
+| `./packages/plugins/docker-bash` | Execute shell scripts in Docker. | Prefer this for risky or untrusted command automation. |
+
+For native Windows command execution, add a dedicated PowerShell/cmd tool or
+wrap the work in a script that `bash` can call. The current `bash` plugin is not
+a PowerShell runner.
+
+To enable Cortex-managed schedules, insert the needed plugins in the active
+workspace's `matbot.yaml` before the existing `frontend/web` entry, then restart
+Cortex:
+
+```yaml
+plugins:
+  # existing plugins above...
+  - ./packages/plugins/background
+  - ./packages/plugins/http
+  - ./packages/plugins/bash
+  - ./packages/plugins/frontend/web
+```
+
+Start Cortex without opening a browser:
+
+```powershell
+.\scripts\run.ps1 -NoBrowser
+```
+
+For unattended operation, run that command from Windows Task Scheduler, a Windows
+service wrapper such as WinSW or NSSM, PM2, or another supervisor that starts the
+process at logon/boot and restarts it if it exits. A basic Task Scheduler
+registration looks like this:
+
+```powershell
+$action = New-ScheduledTaskAction `
+  -Execute "powershell.exe" `
+  -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Projects\Cortex\scripts\run.ps1" -NoBrowser -NoRestartMatbot'
+
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+
+$settings = New-ScheduledTaskSettingsSet `
+  -RestartCount 3 `
+  -RestartInterval (New-TimeSpan -Minutes 1) `
+  -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+Register-ScheduledTask `
+  -TaskName "Cortex Local Agent" `
+  -Action $action `
+  -Trigger $trigger `
+  -Settings $settings `
+  -Description "Start Cortex without opening the browser."
+```
+
+You can create and manage schedules through chat, or through the WebUI tool HTTP
+endpoint while Cortex is running. Example recurring page retrieval:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:19778/tools/background" `
+  -ContentType "application/json" `
+  -Body '{
+    "name": "hourly-page-check",
+    "interval": "1h",
+    "provider": "openai",
+    "output": "scheduled-page-check.md",
+    "prompt": "Fetch https://example.com with the http tool, summarize the page status, and write the result to the requested output."
+  }'
+```
+
+List recurring schedules:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:19778/tools/every_action" `
+  -ContentType "application/json" `
+  -Body '{"action":"list"}'
+```
+
+Suspend, resume, or cancel a schedule:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" -ContentType "application/json" -Body '{"action":"suspend","id":"<schedule-id>"}'
+Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" -ContentType "application/json" -Body '{"action":"resume","id":"<schedule-id>"}'
+Invoke-RestMethod -Method Post -Uri "http://localhost:19778/tools/every_action" -ContentType "application/json" -Body '{"action":"cancel","id":"<schedule-id>"}'
+```
+
+For deterministic automation, Windows Task Scheduler can also call Cortex tools
+directly instead of asking a model to decide what to do. For example, a scheduled
+PowerShell script can call `POST /tools/http` or `POST /tools/bash` as long as
+Cortex is already running. Direct tool calls are non-interactive; they cannot
+answer prompts that expect a live UI user.
+
+Security rules for unattended actions:
+
+- Keep the WebUI bound to localhost unless an authentication layer is added.
+- Do not expose port `19778` to a LAN or the internet with command tools loaded.
+- Run Cortex under a least-privilege Windows account.
+- Prefer `docker-bash` for command execution that does not need host access.
+- Restrict allowed file roots through `local-agent\config\workspaces.json` and
+  `local-agent\config\security-policy.json`.
+- Treat `POST /tools/<name>` as powerful local automation, especially when
+  `bash`, `docker-bash`, file access, or provider-backed tools are enabled.
+
 ### Workspace System
 
 A Cortex workspace is a boot-scoped runtime context. It controls:
@@ -362,7 +490,7 @@ Useful `run.ps1` switches:
 | `-SkipBuild` | Do not run builds. |
 | `-SkipDocker` | Do not start the Mem0 Docker stack. |
 | `-SkipHealth` | Do not run health checks. |
-| `-NoBrowser` | Start services but do not open a browser. |
+| `-NoBrowser` | Start services but do not open a browser. Use this for unattended/local-service operation. |
 | `-NoStart` | Check install/build state without starting services. |
 | `-NoRestartMatbot` | Reuse an already-running WebUI process instead of restarting it. |
 | `-WebPort 19779` | Start the WebUI on a different port. |
@@ -905,11 +1033,14 @@ loaded by the default `matbot.yaml`:
 | `whoami` | Reports the current security principal. |
 
 To activate one, add its specifier to the active workspace's `plugins:` list and
-restart Cortex. For example:
+restart Cortex. For scheduled unattended actions, add the scheduler plus the
+tools the scheduled prompts are allowed to use:
 
 ```yaml
 plugins:
   - ./packages/plugins/background
+  - ./packages/plugins/http
+  - ./packages/plugins/bash
 ```
 
 ### Adding Plugins At Runtime
