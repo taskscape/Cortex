@@ -12,6 +12,36 @@ async function openExperts(page) {
   await page.locator("#expert-toggle-btn").click();
 }
 
+async function inputMetaTypography(locator) {
+  return locator.evaluate(el => {
+    const style = getComputedStyle(el);
+    return {
+      color: style.color,
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight
+    };
+  });
+}
+
+test("model label and expert selector use the same input meta typography", async ({ page }) => {
+  await page.goto("/");
+
+  const modelLabel = page.locator("#input-meta .input-meta-label", { hasText: "Model:" });
+  const expertMenu = page.locator("#expert-menu");
+  const expertToggle = page.locator("#expert-toggle-btn");
+  const modelTypography = await inputMetaTypography(modelLabel);
+
+  expect(await inputMetaTypography(expertMenu)).toEqual(modelTypography);
+  expect(await inputMetaTypography(expertToggle)).toEqual(modelTypography);
+
+  await expertToggle.click();
+  expect(await inputMetaTypography(expertToggle)).toEqual(modelTypography);
+
+  await page.locator("#expert-enabled").check();
+  expect(await inputMetaTypography(expertToggle)).toEqual(modelTypography);
+});
+
 test("loads the shell, providers, conversations, files, plugins, and skills", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop sidebar coverage");
   await page.goto("/");
