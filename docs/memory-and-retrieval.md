@@ -1,0 +1,197 @@
+# Memory And Retrieval
+
+> Part of the [Cortex Local Agent documentation](../README.md).
+
+Cortex has several related but distinct retrieval layers.
+
+## Memory ("remember my name")
+
+The `cognition` plugin's `remember_fact` tool captures durable user facts into
+the `remembered_facts` store. The automatic trigger for this lives in the
+combination of `skills`, `triggers`, and `cognition`: the trigger notices
+messages that look memory-worthy, then invokes `remember_fact` as a silent side
+effect. The model does not need to reply with a tool result for the fact to be
+stored.
+
+Example user messages that should become durable facts:
+
+```text
+Memorize my name: Maciej Zagozda
+Remember that I prefer PowerShell on Windows
+My Siemens docs are in C:\Projects\Siemens\docs
+```
+
+For the name example, the intended path is:
+
+1. The user asks Cortex to memorize the name.
+2. `triggers` classifies the message as matching the memory trigger.
+3. `remember_fact` extracts the actual fact: `The user's name is Maciej Zagozda.`
+4. The fact is written to `remembered_facts` with session/message provenance.
+5. A later conversation can retrieve it through `contextual_search`.
+
+Recall and storage are separate. A fact can be correctly stored but not appear
+in an answer if the model does not call retrieval or if the needed memory context
+is not injected. This is why `contextual_search` now searches raw
+`remembered_facts` directly instead of waiting for `dream_time`.
+
+`dream_time` is slower consolidation, not immediate recall. It processes
+unassigned remembered facts and, when a fact strongly matches a skill, merges it
+into skill markdown so it becomes part of the long-term skills/knowledge layer.
+
+The default provider was changed to `gpt-4o` because weaker models previously
+produced spurious refusals such as "I can't store personal information" even
+when the user explicitly asked Cortex to remember a harmless name. The extraction
+prompt in `packages/plugins/cognition/src/remember/tool.ts` is tuned so explicit
+"remember" or "memorize" requests store the fact, not the instruction.
+
+If name recall fails, inspect the store directly with
+`remembered_facts_action`. If the fact exists there, the storage side worked and
+the issue is retrieval/injection/model behavior. If it does not exist, check
+that `skills`, `triggers`, and `cognition` are loaded in the active workspace.
+
+## `remembered_facts`
+
+`remembered_facts` is the raw durable memory store written by `remember_fact`.
+It is best for facts explicitly worth remembering, such as names, stable
+preferences, decisions, project facts, and reusable troubleshooting outcomes.
+
+Document shape:
+
+```ts
+interface RememberedFact {
+  id: string;
+  version: string;
+  fact: string;
+  sessionId: string;
+  messageId: string;
+  createdAt: string;
+  dreamSkill?: string;
+  ignoreUntil?: string;
+}
+```
+
+Explore remembered facts from PowerShell:
+
+```powershell
+$body = @{
+  action = "query"
+  query = @{
+    limit = 50
+    sort = @(@{ field = "createdAt"; dir = "desc" })
+  }
+} | ConvertTo-Json -Depth 8
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:19778/tools/remembered_facts_action `
+  -ContentType "application/json" `
+  -Body $body |
+  ConvertTo-Json -Depth 8
+```
+
+Search by substring:
+
+```json
+{
+  "action": "query",
+  "query": {
+    "where": {
+      "op": "stringContains",
+      "field": "fact",
+      "value": "Maciej"
+    },
+    "limit": 10
+  }
+}
+```
+
+Read one fact:
+
+```json
+{
+  "action": "get",
+  "id": "remembered-fact-id"
+}
+```
+
+Create or replace manually:
+
+```json
+{
+  "action": "set",
+  "data": {
+    "fact": "The user's preferred shell on Windows is PowerShell.",
+    "sessionId": "manual",
+    "messageId": "manual",
+    "createdAt": "2026-06-28T00:00:00.000Z"
+  }
+}
+```
+
+Correct safely with compare-and-swap:
+
+```json
+{
+  "action": "cas",
+  "id": "remembered-fact-id",
+  "expected": "version-from-get",
+  "data": {
+    "fact": "The user's name is Maciej Zagozda.",
+    "sessionId": "original-session-id",
+    "messageId": "original-message-id",
+    "createdAt": "2026-06-28T06:12:37.262Z"
+  }
+}
+```
+
+Delete:
+
+```json
+{
+  "action": "delete",
+  "id": "remembered-fact-id",
+  "expected": "version-from-get"
+}
+```
+
+Omit `expected` only when you intentionally want an unconditional delete.
+
+## `KnowledgeIndex`
+
+`KnowledgeIndex` is the runtime retrieval service interface used by plugins.
+In this repository, `hybrid-knowledge-index` registers an implementation that
+queries Mem0 and file-index, ranks results, and deduplicates them.
+
+Skills also mirror saved skill content into the active `KnowledgeIndex`.
+`KnowledgeIndex` is not the same as `remembered_facts`: facts are stored raw in
+`remembered_facts`; skills and indexed entries are searched through
+`KnowledgeIndex`; `contextual_search` bridges both.
+
+## Workspace RAG Retrieval
+
+Workspace RAG is scoped to the active Cortex workspace and its active RAG
+context. It is file-backed markdown retrieval with per-workspace persistence.
+It injects relevant snippets automatically before each model turn and can also
+be queried by `workspace_rag` and `contextual_search`.
+
+## `contextual_search` Retrieval
+
+Use `contextual_search` when the model needs local context before answering. It
+searches remembered facts, the active `KnowledgeIndex`, and workspace RAG. This
+is why a remembered name can be found before `dream_time` has merged that fact
+into a skill.
+
+## `memory-policy.json`
+
+`local-agent\config\memory-policy.json` documents what Cortex should treat as
+durable memory:
+
+- durable kinds: `preference`, `decision`, `project-fact`,
+  `troubleshooting-outcome`, `domain-term`, `implementation-note`;
+- do not store: raw file content, secrets, temporary command output, large logs,
+  duplicate index content;
+- promotion requires: explicit user request, stable fact, reusable decision, or
+  confirmed recurring solution.
+
+It is a policy file for humans and future automation. The active memory tools
+still enforce their own schemas and prompts.
