@@ -273,6 +273,24 @@ test("composer expert panel asks all experts and renders synthesis", async ({ pa
   await expect(answer).toContainText("Synthesis for design, finance, engineering");
   await expect(page.locator("#expert-status")).toContainText("Complete");
   await expect(page.locator("#input")).toHaveValue("");
+
+  const sid = await page.locator(".session-item.active").getAttribute("data-sid");
+  const stored = await page.evaluate(async sessionId => {
+    const response = await fetch("/tools/session_action", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "get", sessionId })
+    });
+    return response.json();
+  }, sid);
+  expect(stored.messages.filter(message => message.role === "user").at(-1).content[0].text).toContain("Should the panel ship this feature?");
+  expect(stored.messages.filter(message => message.role === "assistant").at(-1).content[0].text).toContain("Synthesis for design, finance, engineering");
+
+  await page.reload();
+  await expect(page.locator(".message.user").last()).toContainText("Experts: all");
+  const reloadedAnswer = page.locator(".message.assistant").last();
+  await expect(reloadedAnswer).toContainText("Design Expert answer");
+  await expect(reloadedAnswer).toContainText("Synthesis for design, finance, engineering");
 });
 
 test("composer expert panel can run selected experts without synthesis", async ({ page, isMobile }) => {

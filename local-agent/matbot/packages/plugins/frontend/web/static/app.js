@@ -653,6 +653,7 @@ function formatExpertPanelResult(result) {
 }
 
 async function runExpertPanelFromUi() {
+  if (expertPanelBusy) return;
   const question = inputEl.value.trim();
   const mode = expertModeEl?.value || 'parallel';
   const synthesize = expertSynthesizeEl?.checked !== false;
@@ -676,28 +677,33 @@ async function runExpertPanelFromUi() {
   inputEl.value = '';
   inputEl.style.height = 'auto';
 
-  const userBubble = appendUserBubble(expertUserSummary(question, experts, mode, synthesize));
-  const assistantWrap = createAssistantWrap('assistant', userBubble);
-  const inner = document.createElement('div');
-  inner.className = 'md-body';
-  inner.textContent = 'Consulting experts...';
-  assistantWrap.appendChild(inner);
-  scrollMessagesToBottom();
-
   try {
-    const input = { action: 'ask', question, mode, synthesize, maxCitationsPerExpert: 5 };
+    if (!currentSessionId) {
+      const { id } = await apiNewSession();
+      currentSessionId = id;
+      location.hash = id;
+    }
+    if (streamSessionId !== currentSessionId) connectSessionStream(currentSessionId);
+
+    const input = { question, mode, synthesize, maxCitationsPerExpert: 5, provider: providerSel.value };
     if (experts.length) input.experts = experts;
-    const result = await callTool('expert_panel', input);
-    inner.innerHTML = md(formatExpertPanelResult(result));
-    setExpertStatus('Complete.');
+    const result = await T.submitExpertPanel(currentSessionId, input);
+    if (result?.session) {
+      if (result.traceId) foldedTraces.add(result.traceId);
+      renderSession(result.session);
+    }
+    if (result?.isError) {
+      setExpertStatus(result.error || 'Expert panel failed.', true);
+    } else {
+      setExpertStatus('Complete.');
+    }
   } catch (err) {
     const message = err?.message ?? String(err);
-    inner.innerHTML = md(`Expert panel failed: ${message}`);
+    showSubmitError(expertUserSummary(question, experts, mode, synthesize), message);
     setExpertStatus(message, true);
   } finally {
     expertPanelBusy = false;
     updateExpertControlsState();
-    scrollMessagesToBottom();
   }
 }
 

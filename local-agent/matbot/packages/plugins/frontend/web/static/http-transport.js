@@ -10,6 +10,7 @@
 //   createSession()                                -> Promise<{ id }>
 //   sessionBusy(id)                                -> Promise<boolean>
 //   submit(sid, { content, provider, concatQueue }) -> Promise<{ queued, traceId }>  (throws on failure)
+//   submitExpertPanel(sid, body)                   -> Promise<{ traceId, session, result?, isError }>
 //   sessionEvents(sid, signal)                     -> AsyncIterable<PipelineEvent>   all turn output for the session
 //   answerPrompt(sid, body)                        -> Promise<void>    body = { answer } | { cancel: true }
 //   abort(sid)                                     -> Promise<void>
@@ -74,6 +75,18 @@
       throw new Error(data.error || ('HTTP ' + res.status));
     }
     return res.json().catch(() => ({}));
+  }
+
+  async function submitExpertPanel(sid, body) {
+    const res = await fetch('/sessions/' + sid + '/expert-panel', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
   }
 
   // One persistent GET /events/sessions/:id carrying ALL turns for the session, demuxed by the
@@ -214,7 +227,7 @@
 
   window.matbotTransport = {
     hostRuntime: 'node',
-    callTool, createSession, sessionBusy, submit,
+    callTool, createSession, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
     listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
   };

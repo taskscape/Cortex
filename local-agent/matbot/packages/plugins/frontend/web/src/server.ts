@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type {
-  MatbotPlugin, Principal, Session, Store, ToolRegistry, FileStore, Vault,
+  MatbotPlugin, Principal, Session, Store, ToolRegistry, FileStore, Vault, Message, MessageContent,
   FormField, PromptFn, SessionRunner, PluginRegistryEvent,
 } from '@matatbread/matbot-core';
-import { createSession, PromptCancelledError, runAs, tryCurrentPrincipal } from '@matatbread/matbot-core';
+import { appendMessage, createMessage, createSession, PromptCancelledError, runAs, tryCurrentPrincipal } from '@matatbread/matbot-core';
 import type { SkillManager } from '@matatbread/matbot-skills';
 import { sseComment, sseEvent } from './sse-writer.js';
 import { promises } from "node:fs";
@@ -83,6 +83,16 @@ interface DirectToolInvocation {
   provider?:  string;
 }
 
+interface ExpertPanelSubmitBody {
+  question:               string;
+  provider:               string;
+  experts?:               string[];
+  mode?:                  'parallel' | 'review' | 'debate';
+  synthesize?:            boolean;
+  maxCitationsPerExpert?: number;
+  traceId?:               string;
+}
+
 // Last-resort anonymous identity, used only when no boot principal is established and no resolver
 // override is registered (e.g. tests, or a realm with no carrier).
 const ANONYMOUS_WEB_USER: Principal = {
@@ -148,6 +158,116 @@ const nonInteractivePrompt: PromptFn = ((p: string | FormField, def?: string) =>
     : Promise.reject(new Error(`Non-interactive context (use /submit for interactive prompts): "${typeof p === 'string' ? p : p.label}"`));
 }) as PromptFn;
 
+function normaliseExpertPanelSubmitBody(value: unknown): { ok: true; body: ExpertPanelSubmitBody } | { ok: false; error: string } {
+  if (!isRecord(value)) return { ok: false, error: 'Request body must be an object.' };
+
+  const question = typeof value.question === 'string' ? value.question.trim() : '';
+  if (!question) return { ok: false, error: '"question" is required.' };
+
+  const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
+  if (!provider) return { ok: false, error: '"provider" is required.' };
+
+  const mode = value.mode === 'review' || value.mode === 'debate' || value.mode === 'parallel'
+    ? value.mode
+    : 'parallel';
+
+  let experts: string[] | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, 'experts')) {
+    if (!Array.isArray(value.experts)) return { ok: false, error: '"experts" must be an array of expert ids.' };
+    experts = value.experts
+      .filter((item): item is string => typeof item === 'string')
+      .map(item => item.trim())
+      .filter(Boolean);
+  }
+
+  const maxCitationsPerExpert = typeof value.maxCitationsPerExpert === 'number'
+    ? value.maxCitationsPerExpert
+    : undefined;
+
+  return {
+    ok: true,
+    body: {
+      question,
+      provider,
+      mode,
+      ...(experts !== undefined ? { experts } : {}),
+      ...(typeof value.synthesize === 'boolean' ? { synthesize: value.synthesize } : {}),
+      ...(maxCitationsPerExpert !== undefined ? { maxCitationsPerExpert } : {}),
+      ...(typeof value.traceId === 'string' && value.traceId.trim() ? { traceId: value.traceId.trim() } : {}),
+    },
+  };
+}
+
+function expertUserSummary(question: string, selected: readonly string[] | undefined, mode: string, synthesize: boolean): string {
+  return [
+    `Expert panel (${mode})`,
+    `Experts: ${selected && selected.length ? selected.join(', ') : 'all'}`,
+    `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
+    '',
+    question,
+  ].join('\n');
+}
+
+function textValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function formatExpertPanelResult(result: unknown): string {
+  const record = isRecord(result) ? result : {};
+  const lines = [
+    '## Expert panel',
+    `Mode: ${textValue(record.mode, 'parallel')}`,
+  ];
+
+  const opinions = Array.isArray(record.experts) ? record.experts : [];
+  for (const rawOpinion of opinions) {
+    const opinion = isRecord(rawOpinion) ? rawOpinion : {};
+    lines.push('', `### ${textValue(opinion.title, textValue(opinion.expertId, 'Expert'))}`, textValue(opinion.answer, '(No answer returned.)'));
+    const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
+    if (citations.length) {
+      lines.push('', 'Citations:');
+      for (const rawCitation of citations) {
+        const citation = isRecord(rawCitation) ? rawCitation : {};
+        const title = textValue(citation.title, textValue(citation.id, textValue(citation.path, 'source')));
+        const path = typeof citation.path === 'string' && citation.path ? ` - ${citation.path}` : '';
+        lines.push(`- ${title}${path}`);
+      }
+    }
+  }
+
+  if (typeof record.synthesis === 'string' && record.synthesis) {
+    lines.push('', '### Synthesis', record.synthesis);
+  }
+
+  if (!opinions.length && !record.synthesis) {
+    lines.push('', 'No expert response was returned.');
+  }
+
+  return lines.join('\n');
+}
+
+function expertPanelUsage(result: unknown): { inputTokens: number; outputTokens: number } | null {
+  const record = isRecord(result) ? result : {};
+  const opinions = Array.isArray(record.experts) ? record.experts : [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  for (const rawOpinion of opinions) {
+    const opinion = isRecord(rawOpinion) ? rawOpinion : {};
+    const usage = isRecord(opinion.usage) ? opinion.usage : {};
+    if (typeof usage.inputTokens === 'number') inputTokens += usage.inputTokens;
+    if (typeof usage.outputTokens === 'number') outputTokens += usage.outputTokens;
+  }
+
+  return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
+}
+
+function titleFromQuestion(question: string): string | undefined {
+  const words = question.trim().split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
+  if (!words) return undefined;
+  return words.length > 60 ? `${words.slice(0, 60)}...` : words;
+}
+
 export function createWebServer(deps: WebServerDeps) {
   const origin = deps.cors ?? '*';
   const resolvePrincipal = deps.resolvePrincipal ?? defaultWebPrincipal;
@@ -161,6 +281,9 @@ export function createWebServer(deps: WebServerDeps) {
   // Sessions with a live server-owned busy tracker (see the submit handler). One transient tracker
   // per busy period drives the idle broadcast independently of any client events stream.
   const busyTrackers = new Set<string>();
+  // Expert-panel composer submissions persist their own messages outside the model runner. Keep them
+  // single-writer per session so they do not interleave with another forced panel run.
+  const expertPanelBusySessions = new Set<string>();
   // session ID → the parked prompt's settlers. `resolve` delivers an answer (applying the default
   // fallback); `cancel` rejects it with PromptCancelledError — the "give up" path.
   const pendingPrompts = new Map<string, { resolve: (answer: string) => void; cancel: () => void }>();
@@ -318,6 +441,28 @@ export function createWebServer(deps: WebServerDeps) {
     return { ok: true, invocation };
   }
 
+  async function appendSessionMessages(
+    sessionId: string,
+    messages: readonly Message[],
+    shapeSession?: (session: Session) => Session,
+  ): Promise<Session | null> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = await deps.store.get(sessionId);
+      if (!current) return null;
+      const shaped = shapeSession ? shapeSession(current) : current;
+      const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
+      const saved = await deps.store.cas(sessionId, current.version, next);
+      if (saved.ok) return saved.doc;
+    }
+
+    const current = await deps.store.get(sessionId);
+    if (!current) return null;
+    const shaped = shapeSession ? shapeSession(current) : current;
+    const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
+    await deps.store.set(sessionId, next);
+    return next;
+  }
+
   function static200(res: ServerResponse, contentType: string, path: string) {
     return async () => {
       const body = await readFile(new URL(path, import.meta.url), "utf-8");
@@ -439,6 +584,9 @@ export function createWebServer(deps: WebServerDeps) {
       const targetId  = body.sessionId ?? sessionId;
       const session   = await deps.store.get(targetId);
       if (!session) { json(res, 404, { error: 'Session not found' }); return; }
+      if (expertPanelBusySessions.has(targetId)) {
+        json(res, 409, { error: 'Session is busy running an expert panel.' }); return;
+      }
 
       const traceId = body.traceId ?? crypto.randomUUID();
 
@@ -514,6 +662,138 @@ export function createWebServer(deps: WebServerDeps) {
       } catch (e) {
         if (isTracker) busyTrackers.delete(targetId);
         json(res, 500, { error: String(e) });
+      }
+      return;
+    }
+
+    // --- POST /sessions/:id/expert-panel ---
+    // Deterministic composer-triggered expert-panel turn. This intentionally does not ask the model
+    // to decide whether to call a tool; it persists the user prompt and formatted expert answer as
+    // ordinary session messages while running the existing expert_panel tool with real context.
+    const expertPanelSubmitMatch = /^\/sessions\/([^/]+)\/expert-panel$/.exec(url);
+    if (method === 'POST' && expertPanelSubmitMatch) {
+      const sessionId = expertPanelSubmitMatch[1]!;
+
+      let raw: string;
+      try { raw = await readBody(req); }
+      catch (e) { json(res, 400, { error: String(e) }); return; }
+
+      let parsed: unknown;
+      try { parsed = raw ? JSON.parse(raw) : {}; }
+      catch { json(res, 400, { error: 'Invalid JSON' }); return; }
+
+      const normalised = normaliseExpertPanelSubmitBody(parsed);
+      if (!normalised.ok) { json(res, 400, { error: normalised.error }); return; }
+
+      const body = normalised.body;
+      const session = await deps.store.get(sessionId);
+      if (!session) { json(res, 404, { error: 'Session not found' }); return; }
+      if (deps.run.status(sessionId).busy || expertPanelBusySessions.has(sessionId)) {
+        json(res, 409, { error: 'Session is busy.' }); return;
+      }
+
+      const tool = deps.tools?.resolve('expert_panel');
+      if (!tool) { json(res, 404, { error: 'Tool "expert_panel" not found' }); return; }
+
+      const traceId = body.traceId ?? crypto.randomUUID();
+      const synthesize = body.synthesize !== false;
+      const selectedExperts = body.experts?.length ? body.experts : undefined;
+      const input = {
+        action: 'ask',
+        question: body.question,
+        mode: body.mode ?? 'parallel',
+        synthesize,
+        maxCitationsPerExpert: body.maxCitationsPerExpert ?? 5,
+        ...(selectedExperts !== undefined ? { experts: selectedExperts } : {}),
+      };
+      const userContent: MessageContent[] = [{
+        type: 'text',
+        text: expertUserSummary(body.question, selectedExperts, input.mode, synthesize),
+      }];
+      const userMessage = createMessage({
+        role: 'user',
+        content: userContent,
+        traceId,
+        providerName: body.provider,
+        metadata: { expertPanel: { mode: input.mode, synthesize, experts: selectedExperts ?? 'all' } },
+      });
+
+      expertPanelBusySessions.add(sessionId);
+      const ac = new AbortController();
+      req.on('aborted', () => ac.abort());
+
+      try {
+        let committed = await appendSessionMessages(sessionId, [userMessage], current => {
+          if (current.title || current.messages.some(message => message.role === 'user')) return current;
+          const title = titleFromQuestion(body.question);
+          return title ? { ...current, title } : current;
+        });
+        if (!committed) { json(res, 404, { error: 'Session not found' }); return; }
+
+        sendToSession(sessionId, sseEvent('queued', {
+          type: 'queued',
+          content: userContent,
+          queued: 0,
+          concatQueue: false,
+          traceId,
+          rootTraceId: traceId,
+        }));
+
+        let result: unknown;
+        let errorMessage: string | undefined;
+        const markers: MessageContent[] = [];
+        let stdout = '';
+        let stderr = '';
+
+        try {
+          for await (const ev of tool.executor.execute(input, makeToolCtx(ac, principal, { session: committed, provider: body.provider }))) {
+            if (ev.type === 'result') result = ev.value;
+            else if (ev.type === 'stdout') stdout += ev.chunk;
+            else if (ev.type === 'stderr') stderr += ev.chunk;
+            else if (ev.type === 'marker') markers.push({ type: 'marker', creator: ev.creator, data: ev.data });
+            else if (ev.type === 'error') errorMessage = ev.message;
+          }
+        } catch (e) {
+          errorMessage = e instanceof Error ? e.message : String(e);
+        }
+
+        const assistantText = errorMessage
+          ? `Expert panel failed: ${errorMessage}`
+          : formatExpertPanelResult(result);
+        const assistantMessage = createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: assistantText }],
+          traceId,
+          providerName: body.provider,
+          metadata: { expertPanel: { result, ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) } },
+        });
+
+        const messagesToAppend: Message[] = [];
+        if (markers.length > 0) {
+          messagesToAppend.push(createMessage({ role: 'marker', content: markers, traceId }));
+        }
+        messagesToAppend.push(assistantMessage);
+
+        committed = await appendSessionMessages(sessionId, messagesToAppend);
+        if (!committed) { json(res, 404, { error: 'Session not found' }); return; }
+
+        if (markers.length > 0) {
+          sendToSession(sessionId, sseEvent('marker', { type: 'marker', content: markers, traceId }));
+        }
+        sendToSession(sessionId, sseEvent('text-delta', { type: 'text-delta', delta: assistantText, traceId }));
+        const usage = expertPanelUsage(result);
+        if (usage) sendToSession(sessionId, sseEvent('usage', { type: 'usage', ...usage, traceId }));
+        sendToSession(sessionId, sseEvent('done', { type: 'done', session: committed, traceId }));
+
+        json(res, 200, {
+          traceId,
+          session: committed,
+          ...(result !== undefined ? { result } : {}),
+          ...(errorMessage !== undefined ? { isError: true, error: errorMessage } : { isError: false }),
+        });
+      } finally {
+        expertPanelBusySessions.delete(sessionId);
+        ac.abort();
       }
       return;
     }

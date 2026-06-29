@@ -271,6 +271,147 @@ function extractHarnessFact(text) {
   return text.trim();
 }
 
+function createHarnessMessage(role, content, traceId, providerName, metadata) {
+  return {
+    id: `m-${traceId}-${role}-${Math.random().toString(36).slice(2, 8)}`,
+    traceId,
+    role,
+    content,
+    createdAt: now(),
+    ...(providerName ? { providerName } : {}),
+    ...(metadata ? { metadata } : {})
+  };
+}
+
+function titleFromQuestion(question) {
+  const words = String(question || "").trim().split(/\s+/).filter(Boolean).slice(0, 8).join(" ");
+  if (!words) return undefined;
+  return words.length > 60 ? `${words.slice(0, 60)}...` : words;
+}
+
+function appendSessionMessages(sessionId, messages, shapeSession) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+  const shaped = shapeSession ? shapeSession(session) : session;
+  const next = {
+    ...shaped,
+    version: `v${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    messages: [...shaped.messages, ...messages],
+    updatedAt: now()
+  };
+  sessions.set(sessionId, next);
+  return next;
+}
+
+function normaliseExpertPanelBody(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "Request body must be an object." };
+  const question = typeof value.question === "string" ? value.question.trim() : "";
+  if (!question) return { ok: false, error: '"question" is required.' };
+  const provider = typeof value.provider === "string" ? value.provider.trim() : "";
+  if (!provider) return { ok: false, error: '"provider" is required.' };
+  const mode = value.mode === "review" || value.mode === "debate" || value.mode === "parallel" ? value.mode : "parallel";
+  let experts;
+  if (Object.hasOwn(value, "experts")) {
+    if (!Array.isArray(value.experts)) return { ok: false, error: '"experts" must be an array of expert ids.' };
+    experts = value.experts.filter(item => typeof item === "string").map(item => item.trim()).filter(Boolean);
+  }
+  return {
+    ok: true,
+    body: {
+      question,
+      provider,
+      mode,
+      ...(experts !== undefined ? { experts } : {}),
+      ...(typeof value.synthesize === "boolean" ? { synthesize: value.synthesize } : {}),
+      ...(typeof value.maxCitationsPerExpert === "number" ? { maxCitationsPerExpert: value.maxCitationsPerExpert } : {}),
+      ...(typeof value.traceId === "string" && value.traceId.trim() ? { traceId: value.traceId.trim() } : {})
+    }
+  };
+}
+
+function expertUserSummary(question, selected, mode, synthesize) {
+  return [
+    `Expert panel (${mode})`,
+    `Experts: ${selected && selected.length ? selected.join(", ") : "all"}`,
+    `Synthesize decision: ${synthesize ? "yes" : "no"}`,
+    "",
+    question
+  ].join("\n");
+}
+
+function textValue(value, fallback = "") {
+  return typeof value === "string" ? value : fallback;
+}
+
+function expertPanelResult(input) {
+  const requested = Array.isArray(input.experts) && input.experts.length
+    ? input.experts
+    : expertConfigs.map(expert => expert.id);
+  const unknown = requested.filter(id => !expertConfigs.some(expert => expert.id === id));
+  if (unknown.length) return { error: `Unknown expert(s): ${unknown.join(", ")}` };
+  const opinions = requested.map(id => {
+    const expert = expertConfigs.find(item => item.id === id);
+    return {
+      expertId: expert.id,
+      title: expert.title,
+      answer: `${expert.title} answer for "${input.question}" in ${input.mode ?? "parallel"} mode.`,
+      citations: [{
+        id: `${expert.id}-source`,
+        path: `knowledge/${expert.id}/panel-probe.md`,
+        title: "panel-probe.md",
+        score: 1
+      }],
+      usage: { inputTokens: 3, outputTokens: 4 }
+    };
+  });
+  const response = {
+    question: input.question,
+    mode: input.mode ?? "parallel",
+    experts: opinions
+  };
+  if (input.synthesize !== false) {
+    response.synthesis = `Synthesis for ${requested.join(", ")}.`;
+  }
+  return { result: response };
+}
+
+function formatExpertPanelResult(result) {
+  const record = result && typeof result === "object" && !Array.isArray(result) ? result : {};
+  const lines = ["## Expert panel", `Mode: ${textValue(record.mode, "parallel")}`];
+  const opinions = Array.isArray(record.experts) ? record.experts : [];
+  for (const rawOpinion of opinions) {
+    const opinion = rawOpinion && typeof rawOpinion === "object" && !Array.isArray(rawOpinion) ? rawOpinion : {};
+    lines.push("", `### ${textValue(opinion.title, textValue(opinion.expertId, "Expert"))}`, textValue(opinion.answer, "(No answer returned.)"));
+    const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
+    if (citations.length) {
+      lines.push("", "Citations:");
+      for (const rawCitation of citations) {
+        const citation = rawCitation && typeof rawCitation === "object" && !Array.isArray(rawCitation) ? rawCitation : {};
+        const title = textValue(citation.title, textValue(citation.id, textValue(citation.path, "source")));
+        const suffix = typeof citation.path === "string" && citation.path ? ` - ${citation.path}` : "";
+        lines.push(`- ${title}${suffix}`);
+      }
+    }
+  }
+  if (typeof record.synthesis === "string" && record.synthesis) lines.push("", "### Synthesis", record.synthesis);
+  if (!opinions.length && !record.synthesis) lines.push("", "No expert response was returned.");
+  return lines.join("\n");
+}
+
+function expertPanelUsage(result) {
+  const record = result && typeof result === "object" && !Array.isArray(result) ? result : {};
+  const opinions = Array.isArray(record.experts) ? record.experts : [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const rawOpinion of opinions) {
+    const opinion = rawOpinion && typeof rawOpinion === "object" && !Array.isArray(rawOpinion) ? rawOpinion : {};
+    const usage = opinion.usage && typeof opinion.usage === "object" && !Array.isArray(opinion.usage) ? opinion.usage : {};
+    if (typeof usage.inputTokens === "number") inputTokens += usage.inputTokens;
+    if (typeof usage.outputTokens === "number") outputTokens += usage.outputTokens;
+  }
+  return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
+}
+
 const server = createServer(async (req, res) => {
   try {
     await handle(req, res);
@@ -375,6 +516,70 @@ async function handle(req, res) {
     if (!session) return json(res, 404, { error: "Session not found" });
     void runTurn(sessionId, traceId, body);
     return json(res, 200, { queued: 0, traceId });
+  }
+
+  const expertPanelSubmit = /^\/sessions\/([^/]+)\/expert-panel$/.exec(url.pathname);
+  if (method === "POST" && expertPanelSubmit) {
+    const sessionId = decodeURIComponent(expertPanelSubmit[1]);
+    const session = sessions.get(sessionId);
+    if (!session) return json(res, 404, { error: "Session not found" });
+    if (busy.get(sessionId)) return json(res, 409, { error: "Session is busy." });
+
+    const normalised = normaliseExpertPanelBody(await readJson(req));
+    if (!normalised.ok) return json(res, 400, { error: normalised.error });
+    const body = normalised.body;
+    const traceId = body.traceId ?? `trace-${traceSeq++}`;
+    const synthesize = body.synthesize !== false;
+    const selectedExperts = body.experts?.length ? body.experts : undefined;
+    const input = {
+      action: "ask",
+      question: body.question,
+      mode: body.mode ?? "parallel",
+      synthesize,
+      maxCitationsPerExpert: body.maxCitationsPerExpert ?? 5,
+      ...(selectedExperts ? { experts: selectedExperts } : {})
+    };
+    const userContent = [{
+      type: "text",
+      text: expertUserSummary(body.question, selectedExperts, input.mode, synthesize)
+    }];
+    const userMessage = createHarnessMessage(
+      "user",
+      userContent,
+      traceId,
+      body.provider,
+      { expertPanel: { mode: input.mode, synthesize, experts: selectedExperts ?? "all" } }
+    );
+    let committed = appendSessionMessages(sessionId, [userMessage], current => {
+      if (current.title || current.messages.some(message => message.role === "user")) return current;
+      const title = titleFromQuestion(body.question);
+      return title ? { ...current, title } : current;
+    });
+    await waitForSessionStream(sessionId);
+    sendSession(sessionId, "queued", { type: "queued", content: userContent, queued: 0, concatQueue: false, traceId, rootTraceId: traceId });
+    await sleep(10);
+
+    const panel = expertPanelResult(input);
+    const assistantText = panel.error
+      ? `Expert panel failed: ${panel.error}`
+      : formatExpertPanelResult(panel.result);
+    const assistant = createHarnessMessage(
+      "assistant",
+      [{ type: "text", text: assistantText }],
+      traceId,
+      body.provider,
+      { expertPanel: panel.error ? { error: panel.error } : { result: panel.result } }
+    );
+    committed = appendSessionMessages(sessionId, [assistant]);
+    sendSession(sessionId, "text-delta", { type: "text-delta", delta: assistantText, traceId });
+    const usage = expertPanelUsage(panel.result);
+    if (usage) sendSession(sessionId, "usage", { type: "usage", ...usage, traceId });
+    sendSession(sessionId, "done", { type: "done", session: committed, traceId });
+    return json(res, 200, {
+      traceId,
+      session: committed,
+      ...(panel.result ? { result: panel.result, isError: false } : { isError: true, error: panel.error })
+    });
   }
 
   const abort = /^\/sessions\/([^/]+)\/abort$/.exec(url.pathname);
@@ -621,35 +826,9 @@ async function handleTool(res, name, rawInput) {
   }
   if (name === "expert_panel") {
     if (input.action === "list") return json(res, 200, { experts: expertConfigs });
-    const requested = Array.isArray(input.experts) && input.experts.length
-      ? input.experts
-      : expertConfigs.map(expert => expert.id);
-    const unknown = requested.filter(id => !expertConfigs.some(expert => expert.id === id));
-    if (unknown.length) return json(res, 400, { error: `Unknown expert(s): ${unknown.join(", ")}` });
-    const opinions = requested.map(id => {
-      const expert = expertConfigs.find(item => item.id === id);
-      return {
-        expertId: expert.id,
-        title: expert.title,
-        answer: `${expert.title} answer for "${input.question}" in ${input.mode ?? "parallel"} mode.`,
-        citations: [{
-          id: `${expert.id}-source`,
-          path: `knowledge/${expert.id}/panel-probe.md`,
-          title: "panel-probe.md",
-          score: 1
-        }],
-        usage: { inputTokens: 3, outputTokens: 4 }
-      };
-    });
-    const response = {
-      question: input.question,
-      mode: input.mode ?? "parallel",
-      experts: opinions
-    };
-    if (input.synthesize !== false) {
-      response.synthesis = `Synthesis for ${requested.join(", ")}.`;
-    }
-    return json(res, 200, response);
+    const panel = expertPanelResult(input);
+    if (panel.error) return json(res, 400, { error: panel.error });
+    return json(res, 200, panel.result);
   }
   if (name === "skill_action") {
     if (input.action === "list") return json(res, 200, { skills: [...skills.values()].map(({ name: skillName }) => ({ name: skillName })) });

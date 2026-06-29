@@ -1445,7 +1445,8 @@ Should we ship this feature?
 ```
 
 That summary is intentional. It records which panel settings were used for that
-turn.
+turn. The summary is stored as the user message for the expert-panel turn, so it
+survives reloads and remains available as context for later normal chat turns.
 
 ### Running Selected Experts
 
@@ -1500,6 +1501,8 @@ answer has:
 - an optional `Synthesis` section.
 
 The status line in the popup changes to `Complete.` after a successful run.
+The panel answer is stored as a normal assistant message in the active session.
+Reloading the WebUI re-renders the same expert-panel turn from session history.
 
 ### Model Selector And Expert Providers
 
@@ -1569,14 +1572,20 @@ separate chatbot processes.
 
 Flow:
 
-1. The WebUI calls the `expert_panel` tool with the question and selected panel
-   options.
-2. The plugin selects requested experts or all configured experts.
-3. Each expert retrieves text snippets from its own configured roots.
-4. Each expert receives an independent `services.singleTurn(...)` call with its
+1. The WebUI submits a forced expert-panel turn to
+   `POST /sessions/:id/expert-panel`.
+2. The web frontend persists the panel settings summary as a normal user
+   message in the active session and emits it through the session event stream.
+3. The server calls the `expert_panel` tool with the question, selected panel
+   options, current provider, and real session context.
+4. The plugin selects requested experts or all configured experts.
+5. Each expert retrieves text snippets from its own configured roots.
+6. Each expert receives an independent `services.singleTurn(...)` call with its
    system prompt, question, and expert-scoped citations.
-5. If `synthesize` is `true`, a final orchestrator call collates consensus,
+7. If `synthesize` is `true`, a final orchestrator call collates consensus,
    disagreement, assumptions, risks, and recommendation.
+8. The formatted panel result is persisted as a normal assistant message and
+   rendered from the same session transcript used by ordinary chat.
 
 This keeps design, finance, and engineering knowledge isolated while still
 running inside one Matbot process.

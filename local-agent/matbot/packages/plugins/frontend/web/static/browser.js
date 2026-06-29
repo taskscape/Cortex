@@ -11,7 +11,7 @@
 // The in-process transport is server.ts re-expressed without HTTP: per-session subscribe, the busy
 // tracker, prompt parking, and the buffered tool-call ctx, all ported faithfully.
 
-import { createSession, currentPrincipal, PromptCancelledError, watchPlugins } from '@matatbread/matbot-core';
+import { appendMessage, createMessage, createSession, currentPrincipal, PromptCancelledError, watchPlugins } from '@matatbread/matbot-core';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 
 // ── In-process transport ──────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ function makeInProcessTransport(services) {
   const statusListeners = new Set();
   const busyState = new Map();
   const busyTrackers = new Set();
+  const expertPanelBusySessions = new Set();
   function updateBusy(sid) {
     const busy = run.status(sid).busy;
     if ((busyState.get(sid) ?? false) === busy) return;
@@ -52,7 +53,7 @@ function makeInProcessTransport(services) {
       : Promise.reject(new Error(`Non-interactive context (use submit for interactive prompts): "${typeof p === 'string' ? p : p.label}"`));
   };
 
-  function makeToolCtx(ac) {
+  function makeToolCtx(ac, invocation = {}) {
     const now = new Date().toISOString();
     const stubSession = {
       id: crypto.randomUUID(), version: crypto.randomUUID(),
@@ -62,16 +63,117 @@ function makeInProcessTransport(services) {
     };
     return {
       callId:       crypto.randomUUID(),
-      session:      stubSession,
+      session:      invocation.session ?? stubSession,
       signal:       ac.signal,
       vault:        services.vault,
       loadPlugin:   services.loadPlugin.bind(services),
       unloadPlugin: services.unloadPlugin.bind(services),
       prompt:       nonInteractivePrompt,
+      ...(invocation.provider !== undefined ? { provider: invocation.provider } : {}),
       ...(services.workdir    !== undefined ? { workdir:    services.workdir    } : {}),
       ...(services.files      !== undefined ? { files:      services.files      } : {}),
       ...(services.configPath !== undefined ? { configPath: services.configPath } : {}),
     };
+  }
+
+  function normaliseExpertPanelBody(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, error: 'Request body must be an object.' };
+    const question = typeof value.question === 'string' ? value.question.trim() : '';
+    if (!question) return { ok: false, error: '"question" is required.' };
+    const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
+    if (!provider) return { ok: false, error: '"provider" is required.' };
+    const mode = value.mode === 'review' || value.mode === 'debate' || value.mode === 'parallel' ? value.mode : 'parallel';
+    let experts;
+    if (Object.prototype.hasOwnProperty.call(value, 'experts')) {
+      if (!Array.isArray(value.experts)) return { ok: false, error: '"experts" must be an array of expert ids.' };
+      experts = value.experts.filter(item => typeof item === 'string').map(item => item.trim()).filter(Boolean);
+    }
+    return {
+      ok: true,
+      body: {
+        question,
+        provider,
+        mode,
+        ...(experts !== undefined ? { experts } : {}),
+        ...(typeof value.synthesize === 'boolean' ? { synthesize: value.synthesize } : {}),
+        ...(typeof value.maxCitationsPerExpert === 'number' ? { maxCitationsPerExpert: value.maxCitationsPerExpert } : {}),
+        ...(typeof value.traceId === 'string' && value.traceId.trim() ? { traceId: value.traceId.trim() } : {}),
+      },
+    };
+  }
+
+  function expertUserSummary(question, selected, mode, synthesize) {
+    return [
+      `Expert panel (${mode})`,
+      `Experts: ${selected && selected.length ? selected.join(', ') : 'all'}`,
+      `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
+      '',
+      question,
+    ].join('\n');
+  }
+
+  function textValue(value, fallback = '') {
+    return typeof value === 'string' ? value : fallback;
+  }
+
+  function formatExpertPanelResult(result) {
+    const record = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
+    const lines = ['## Expert panel', `Mode: ${textValue(record.mode, 'parallel')}`];
+    const opinions = Array.isArray(record.experts) ? record.experts : [];
+    for (const rawOpinion of opinions) {
+      const opinion = rawOpinion && typeof rawOpinion === 'object' && !Array.isArray(rawOpinion) ? rawOpinion : {};
+      lines.push('', `### ${textValue(opinion.title, textValue(opinion.expertId, 'Expert'))}`, textValue(opinion.answer, '(No answer returned.)'));
+      const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
+      if (citations.length) {
+        lines.push('', 'Citations:');
+        for (const rawCitation of citations) {
+          const citation = rawCitation && typeof rawCitation === 'object' && !Array.isArray(rawCitation) ? rawCitation : {};
+          const title = textValue(citation.title, textValue(citation.id, textValue(citation.path, 'source')));
+          const path = typeof citation.path === 'string' && citation.path ? ` - ${citation.path}` : '';
+          lines.push(`- ${title}${path}`);
+        }
+      }
+    }
+    if (typeof record.synthesis === 'string' && record.synthesis) lines.push('', '### Synthesis', record.synthesis);
+    if (!opinions.length && !record.synthesis) lines.push('', 'No expert response was returned.');
+    return lines.join('\n');
+  }
+
+  function expertPanelUsage(result) {
+    const record = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
+    const opinions = Array.isArray(record.experts) ? record.experts : [];
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for (const rawOpinion of opinions) {
+      const opinion = rawOpinion && typeof rawOpinion === 'object' && !Array.isArray(rawOpinion) ? rawOpinion : {};
+      const usage = opinion.usage && typeof opinion.usage === 'object' && !Array.isArray(opinion.usage) ? opinion.usage : {};
+      if (typeof usage.inputTokens === 'number') inputTokens += usage.inputTokens;
+      if (typeof usage.outputTokens === 'number') outputTokens += usage.outputTokens;
+    }
+    return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
+  }
+
+  function titleFromQuestion(question) {
+    const words = question.trim().split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
+    if (!words) return undefined;
+    return words.length > 60 ? `${words.slice(0, 60)}...` : words;
+  }
+
+  async function appendSessionMessages(sessionId, messages, shapeSession) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const current = await services.sessions.get(sessionId);
+      if (!current) return null;
+      const shaped = shapeSession ? shapeSession(current) : current;
+      const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
+      const saved = await services.sessions.cas(sessionId, current.version, next);
+      if (saved.ok) return saved.doc;
+    }
+    const current = await services.sessions.get(sessionId);
+    if (!current) return null;
+    const shaped = shapeSession ? shapeSession(current) : current;
+    const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
+    await services.sessions.set(sessionId, next);
+    return next;
   }
 
   // Two failure modes the UI depends on (see the plan's contract):
@@ -158,6 +260,115 @@ function makeInProcessTransport(services) {
     } catch (e) {
       if (isTracker) busyTrackers.delete(sid);
       throw e;
+    }
+  }
+
+  async function submitExpertPanel(sid, rawBody) {
+    const normalised = normaliseExpertPanelBody(rawBody);
+    if (!normalised.ok) throw new Error(normalised.error);
+    const body = normalised.body;
+    const session = await services.sessions.get(sid);
+    if (!session) throw new Error('Session not found');
+    if (run.status(sid).busy || expertPanelBusySessions.has(sid)) throw new Error('Session is busy.');
+
+    const tool = services.tools.resolve('expert_panel');
+    if (!tool) throw new Error('Tool "expert_panel" not found (404)');
+
+    const traceId = body.traceId ?? crypto.randomUUID();
+    const synthesize = body.synthesize !== false;
+    const selectedExperts = body.experts && body.experts.length ? body.experts : undefined;
+    const input = {
+      action: 'ask',
+      question: body.question,
+      mode: body.mode ?? 'parallel',
+      synthesize,
+      maxCitationsPerExpert: body.maxCitationsPerExpert ?? 5,
+      ...(selectedExperts !== undefined ? { experts: selectedExperts } : {}),
+    };
+    const userContent = [{
+      type: 'text',
+      text: expertUserSummary(body.question, selectedExperts, input.mode, synthesize),
+    }];
+    const userMessage = createMessage({
+      role: 'user',
+      content: userContent,
+      traceId,
+      providerName: body.provider,
+      metadata: { expertPanel: { mode: input.mode, synthesize, experts: selectedExperts ?? 'all' } },
+    });
+
+    expertPanelBusySessions.add(sid);
+    const ac = new AbortController();
+    try {
+      let committed = await appendSessionMessages(sid, [userMessage], current => {
+        if (current.title || current.messages.some(message => message.role === 'user')) return current;
+        const title = titleFromQuestion(body.question);
+        return title ? { ...current, title } : current;
+      });
+      if (!committed) throw new Error('Session not found');
+
+      for (const inject of hub(sid)) inject({
+        type: 'queued',
+        content: userContent,
+        queued: 0,
+        concatQueue: false,
+        traceId,
+        rootTraceId: traceId,
+      });
+
+      let result;
+      let errorMessage;
+      const markers = [];
+      let stdout = '';
+      let stderr = '';
+
+      try {
+        for await (const ev of tool.executor.execute(input, makeToolCtx(ac, { session: committed, provider: body.provider }))) {
+          if (ev.type === 'result') result = ev.value;
+          else if (ev.type === 'stdout') stdout += ev.chunk;
+          else if (ev.type === 'stderr') stderr += ev.chunk;
+          else if (ev.type === 'marker') markers.push({ type: 'marker', creator: ev.creator, data: ev.data });
+          else if (ev.type === 'error') errorMessage = ev.message;
+        }
+      } catch (e) {
+        errorMessage = e instanceof Error ? e.message : String(e);
+      }
+
+      const assistantText = errorMessage
+        ? `Expert panel failed: ${errorMessage}`
+        : formatExpertPanelResult(result);
+      const assistantMessage = createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: assistantText }],
+        traceId,
+        providerName: body.provider,
+        metadata: { expertPanel: { result, ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) } },
+      });
+      const messagesToAppend = [];
+      if (markers.length) messagesToAppend.push(createMessage({ role: 'marker', content: markers, traceId }));
+      messagesToAppend.push(assistantMessage);
+      committed = await appendSessionMessages(sid, messagesToAppend);
+      if (!committed) throw new Error('Session not found');
+
+      if (markers.length) {
+        for (const inject of hub(sid)) inject({ type: 'marker', content: markers, traceId });
+      }
+      for (const inject of hub(sid)) inject({ type: 'text-delta', delta: assistantText, traceId });
+      const usage = expertPanelUsage(result);
+      if (usage) {
+        for (const inject of hub(sid)) inject({ type: 'usage', ...usage, traceId });
+      }
+      for (const inject of hub(sid)) inject({ type: 'done', session: committed, traceId });
+
+      return {
+        traceId,
+        session: committed,
+        ...(result !== undefined ? { result } : {}),
+        ...(errorMessage !== undefined ? { isError: true, error: errorMessage } : { isError: false }),
+      };
+    } finally {
+      expertPanelBusySessions.delete(sid);
+      ac.abort();
     }
   }
 
@@ -299,7 +510,7 @@ function makeInProcessTransport(services) {
 
   return {
     hostRuntime: 'browser',
-    callTool, createSession: createSessionFn, sessionBusy, submit,
+    callTool, createSession: createSessionFn, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
     listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
   };
