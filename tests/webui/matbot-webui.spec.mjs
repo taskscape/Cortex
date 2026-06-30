@@ -231,8 +231,8 @@ test("remembered facts persist across conversations and are used in later answer
   await page.keyboard.press("Shift+Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
-  const facts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", { action: "list" }));
-  expect(facts.facts.some(fact => fact.fact.includes("Maciej Zagozda"))).toBeTruthy();
+  const facts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", { action: "query", query: {} }));
+  expect(facts.items.some(fact => fact.fact.includes("Maciej Zagozda"))).toBeTruthy();
 
   await page.locator("#new-btn").click();
   await page.locator("#input").fill("What is my name?");
@@ -240,7 +240,7 @@ test("remembered facts persist across conversations and are used in later answer
   await expect(page.locator(".message.assistant").last()).toContainText("Maciej Zagozda");
 });
 
-test("memory sidebar affordance opens the standalone memory browser", async ({ page, isMobile }) => {
+test("memory sidebar affordance opens the in-page memory browser", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory browser coverage");
   await page.goto("/");
   await page.locator("#new-btn").click();
@@ -253,45 +253,48 @@ test("memory sidebar affordance opens the standalone memory browser", async ({ p
   await openMemorySection(page);
   await expect(page.locator("#memory-browser-btn")).toBeVisible();
 
-  const popupPromise = page.waitForEvent("popup");
+  const popups = [];
+  page.on("popup", popup => popups.push(popup));
   await page.locator("#memory-browser-btn").click();
-  const memoryPage = await popupPromise;
+  await expect(page.locator("#memory-browser-overlay")).toHaveClass(/open/);
+  await expect(page.locator("#memory-browser-title")).toHaveText("Memories");
 
-  await expect(memoryPage.locator("h1")).toHaveText("Memories");
-  await expect(memoryPage).toHaveURL(/127\.0\.0\.1:\d+\//);
-  await memoryPage.locator("#search-input").fill("Violet");
-  await memoryPage.locator("#search-input").press("Enter");
-  await expect(memoryPage.locator("#memory-list")).toContainText("memory browser launcher token is Violet");
+  await page.locator("#memory-browser-search").fill("Violet");
+  await page.locator("#memory-browser-search").press("Enter");
+  await expect(page.locator("#memory-browser-list")).toContainText("memory browser launcher token is Violet");
+  await page.waitForTimeout(100);
+  expect(popups).toHaveLength(0);
   await expect(page.locator("#memory-browser-status")).toHaveText("");
 });
 
-test("standalone memory browser can create, edit, search, and delete memories", async ({ page, isMobile }) => {
+test("in-page memory browser can create, edit, search, and delete memories", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory browser CRUD coverage");
   await page.goto("/");
-  const { url } = await page.evaluate(async () => window.matbotTransport.callTool("open_memory_browser", {}));
-  await page.goto(url);
 
-  await expect(page.locator("h1")).toHaveText("Memories");
-  await page.locator("#new-fact").fill("The memory browser CRUD probe is Copper.");
-  await page.locator("#add-memory-btn").click();
-  await expect(page.locator("#status")).toContainText("Added");
-  await expect(page.locator("#memory-list")).toContainText("CRUD probe is Copper");
-  await expect(page.locator("#fact-input")).toHaveValue("The memory browser CRUD probe is Copper.");
+  await openMemorySection(page);
+  await page.locator("#memory-browser-btn").click();
+  await expect(page.locator("#memory-browser-overlay")).toHaveClass(/open/);
 
-  await page.locator("#fact-input").fill("The memory browser CRUD probe is Copper, revised.");
-  await page.locator("#dream-skill").fill("Operations");
-  await page.locator("#save-btn").click();
-  await expect(page.locator("#status")).toContainText("Saved");
-  await expect(page.locator("#memory-state")).toHaveText("processed");
+  await page.locator("#memory-browser-new-fact").fill("The memory browser CRUD probe is Copper.");
+  await page.locator("#memory-browser-add").click();
+  await expect(page.locator("#memory-browser-panel-status")).toContainText("Added");
+  await expect(page.locator("#memory-browser-list")).toContainText("CRUD probe is Copper");
+  await expect(page.locator("#memory-browser-fact-input")).toHaveValue("The memory browser CRUD probe is Copper.");
 
-  await page.locator("#search-input").fill("Copper, revised");
-  await page.locator("#search-input").press("Enter");
-  await expect(page.locator("#memory-list")).toContainText("Copper, revised");
+  await page.locator("#memory-browser-fact-input").fill("The memory browser CRUD probe is Copper, revised.");
+  await page.locator("#memory-browser-dream-skill").fill("Operations");
+  await page.locator("#memory-browser-save").click();
+  await expect(page.locator("#memory-browser-panel-status")).toContainText("Saved");
+  await expect(page.locator("#memory-browser-state")).toHaveText("processed");
+
+  await page.locator("#memory-browser-search").fill("Copper, revised");
+  await page.locator("#memory-browser-search").press("Enter");
+  await expect(page.locator("#memory-browser-list")).toContainText("Copper, revised");
 
   page.once("dialog", dialog => dialog.accept());
-  await page.locator("#delete-btn").click();
-  await expect(page.locator("#status")).toContainText("Deleted");
-  await expect(page.locator("#memory-list")).not.toContainText("Copper, revised");
+  await page.locator("#memory-browser-delete").click();
+  await expect(page.locator("#memory-browser-panel-status")).toContainText("Deleted");
+  await expect(page.locator("#memory-browser-list")).not.toContainText("Copper, revised");
 });
 
 test("direct cognition tool calls can receive session and provider context", async ({ page, isMobile }) => {
@@ -324,8 +327,8 @@ test("direct cognition tool calls can receive session and provider context", asy
   expect(rememberResult.ok).toBe(true);
   expect(rememberResult.markers?.[0]?.creator).toBe("remember_fact");
 
-  const facts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", { action: "list" }));
-  expect(facts.facts.some(fact => fact.fact.includes("Helix"))).toBeTruthy();
+  const facts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", { action: "query", query: {} }));
+  expect(facts.items.some(fact => fact.fact.includes("Helix"))).toBeTruthy();
 
   const dreamRun = await page.evaluate(async () => window.matbotTransport.callTool("dream_time", {
     $context: { provider: "openai" },

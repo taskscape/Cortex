@@ -298,6 +298,77 @@ function extractHarnessFact(text) {
   return text.trim();
 }
 
+function nextRememberedFactVersion() {
+  return `v${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function fieldValue(record, field) {
+  if (Array.isArray(field)) return field.reduce((value, key) => value?.[key], record);
+  return record?.[field];
+}
+
+function matchesRememberedFactFilter(record, filter) {
+  if (!filter || typeof filter !== "object" || Array.isArray(filter)) return true;
+  const value = fieldValue(record, filter.field);
+  switch (filter.op) {
+    case "eq": return value === filter.value;
+    case "neq": return value !== undefined && value !== null && value !== filter.value;
+    case "lt": return value < filter.value;
+    case "lte": return value <= filter.value;
+    case "gt": return value > filter.value;
+    case "gte": return value >= filter.value;
+    case "in": return Array.isArray(filter.value) && filter.value.includes(value);
+    case "nin": return value !== undefined && value !== null && Array.isArray(filter.value) && !filter.value.includes(value);
+    case "exists": return filter.value ? value !== undefined && value !== null : value === undefined || value === null;
+    case "stringContains": return typeof value === "string" && String(value).toLowerCase().includes(String(filter.value ?? "").toLowerCase());
+    case "arrayContains": return Array.isArray(value) && value.includes(filter.value);
+    case "and": return Array.isArray(filter.clauses) && filter.clauses.every(clause => matchesRememberedFactFilter(record, clause));
+    case "or": return Array.isArray(filter.clauses) && filter.clauses.some(clause => matchesRememberedFactFilter(record, clause));
+    case "not": return !matchesRememberedFactFilter(record, filter.clause);
+    default: return true;
+  }
+}
+
+function queryRememberedFacts(query = {}) {
+  let items = [...rememberedFacts.values()];
+  if (query.where) items = items.filter(item => matchesRememberedFactFilter(item, query.where));
+  if (Array.isArray(query.sort)) {
+    items = [...items].sort((a, b) => {
+      for (const spec of query.sort) {
+        const av = fieldValue(a, spec.field);
+        const bv = fieldValue(b, spec.field);
+        const cmp = String(av ?? "").localeCompare(String(bv ?? ""));
+        if (cmp !== 0) return spec.dir === "desc" ? -cmp : cmp;
+      }
+      return String(a.id).localeCompare(String(b.id));
+    });
+  }
+  const total = items.length;
+  const limit = Number.isInteger(query.limit) ? Math.max(0, query.limit) : total;
+  const offset = Math.max(0, Number(query.cursor ?? 0) || 0);
+  const pageItems = items.slice(offset, offset + limit);
+  const nextOffset = offset + pageItems.length;
+  return {
+    items: pageItems,
+    total,
+    ...(nextOffset < total ? { cursor: String(nextOffset) } : {})
+  };
+}
+
+function rememberedFactFromData(id, data) {
+  const fact = String(data?.fact ?? "").trim();
+  if (!fact) return null;
+  return {
+    ...data,
+    id,
+    version: nextRememberedFactVersion(),
+    fact,
+    sessionId: String(data?.sessionId ?? "manual"),
+    messageId: String(data?.messageId ?? "manual"),
+    createdAt: String(data?.createdAt ?? now())
+  };
+}
+
 function createHarnessMessage(role, content, traceId, providerName, metadata) {
   return {
     id: `m-${traceId}-${role}-${Math.random().toString(36).slice(2, 8)}`,
@@ -937,10 +1008,34 @@ async function handleTool(res, name, rawInput) {
   }
   if (name === "remembered_facts_action") {
     if (input.action === "list") return json(res, 200, { facts: [...rememberedFacts.values()] });
+    if (input.action === "query") return json(res, 200, queryRememberedFacts(input.query ?? {}));
     if (input.action === "get") return json(res, 200, rememberedFacts.get(input.id) ?? null);
+    if (input.action === "set") {
+      const id = input.id ? String(input.id) : `fact-${rememberedFactSeq++}`;
+      const doc = rememberedFactFromData(id, input.data);
+      if (!doc) return json(res, 400, { error: 'set requires data.fact.' });
+      rememberedFacts.set(id, doc);
+      return json(res, 200, doc);
+    }
+    if (input.action === "cas") {
+      const current = rememberedFacts.get(input.id);
+      if (!input.id) return json(res, 400, { error: 'cas requires "id".' });
+      if (!input.expected) return json(res, 400, { error: 'cas requires "expected".' });
+      if (!input.data) return json(res, 400, { error: 'cas requires "data".' });
+      if (!current || current.version !== input.expected) {
+        return json(res, 200, { ok: false, current: current ?? null });
+      }
+      const doc = rememberedFactFromData(input.id, input.data);
+      if (!doc) return json(res, 400, { error: 'cas requires data.fact.' });
+      rememberedFacts.set(input.id, doc);
+      return json(res, 200, { ok: true, doc });
+    }
     if (input.action === "delete") {
-      rememberedFacts.delete(input.id);
-      return json(res, 200, { ok: true });
+      const current = rememberedFacts.get(input.id);
+      if (current && input.expected !== undefined && input.expected !== current.version) {
+        return json(res, 200, { ok: true, deleted: false });
+      }
+      return json(res, 200, { ok: true, deleted: rememberedFacts.delete(input.id) });
     }
   }
   if (name === "remember_fact") {
