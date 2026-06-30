@@ -3,6 +3,7 @@ param(
     [switch]$SkipInstall,
     [switch]$SkipBuild,
     [switch]$SkipDocker,
+    [switch]$SkipCudaIngestion,
     [switch]$SkipHealth,
     [switch]$NoBrowser,
     [switch]$NoStart,
@@ -165,6 +166,9 @@ if (-not $NoStart) {
     if ($SkipDocker) {
         $startArgs.SkipDocker = $true
     }
+    if ($SkipCudaIngestion) {
+        $startArgs.SkipCudaIngestion = $true
+    }
     if ($NoRestartMatbot) {
         $startArgs.NoRestartMatbot = $true
     }
@@ -182,6 +186,9 @@ if (-not $SkipHealth) {
         Wait-HttpOk "file-broker" "http://localhost:8878/health" $HealthTimeoutSec | Out-Null
         if (-not $SkipDocker) {
             Wait-HttpOk "mem0" "http://localhost:8888/docs" $HealthTimeoutSec | Out-Null
+            if (-not $SkipCudaIngestion -and $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
+                Wait-HttpOk "workspace-rag-cuda" "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" $HealthTimeoutSec | Out-Null
+            }
         }
         $webReady = Wait-HttpOk "matbot-web" $WebUrl $HealthTimeoutSec
     }

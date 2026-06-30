@@ -8,6 +8,10 @@ $checks = @(
     @{ Name = "mem0"; Url = "http://localhost:8888/docs" }
 )
 
+if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
+    $checks += @{ Name = "workspace-rag-cuda"; Url = "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" }
+}
+
 foreach ($check in $checks) {
     try {
         $response = Invoke-WebRequest -Method Get -Uri $check.Url -TimeoutSec 5 -UseBasicParsing

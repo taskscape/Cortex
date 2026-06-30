@@ -1,6 +1,7 @@
 param(
     [switch]$SkipDocker,
     [switch]$SkipBuild,
+    [switch]$SkipCudaIngestion,
     [switch]$NoRestartMatbot,
     [string]$MatbotCommand = $env:MATBOT_COMMAND
 )
@@ -37,16 +38,87 @@ function Stop-PortListeners($Port, $Name) {
     }
 }
 
+function Test-CudaIngestionAvailable {
+    if ($SkipCudaIngestion -or $env:CORTEX_RAG_DISABLE_CUDA) {
+        return $false
+    }
+    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    try {
+        & nvidia-smi -L *> $null
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+
+    try {
+        $runtimes = docker info --format "{{json .Runtimes}}" 2>$null
+        return $runtimes -match '"nvidia"'
+    }
+    catch {
+        return $false
+    }
+}
+
+function Wait-CudaEmbeddingReady($Url, $TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Method Get -Uri "$Url/health" -TimeoutSec 5 -UseBasicParsing
+            $body = $response.Content | ConvertFrom-Json
+            if ($body.ok -and $body.cudaAvailable) {
+                Write-Host "workspace-rag-cuda: ok ($($body.device), $($body.model))"
+                return $true
+            }
+            $lastError = if ($body.message) { $body.message } else { "CUDA not reported as available" }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Warning "workspace-rag-cuda: unavailable after $TimeoutSec seconds ($lastError). Ingestion will use CPU."
+    return $false
+}
+
 if (-not $SkipBuild) {
     npm run build
 }
 
 if (-not $SkipDocker) {
     if (Get-Command docker -ErrorAction SilentlyContinue) {
-        docker compose -f $ComposeFile up -d
+        if (Test-CudaIngestionAvailable) {
+            Write-Host "CUDA-capable Docker runtime detected. Starting Mem0 stack with workspace-rag CUDA embeddings."
+            docker compose -f $ComposeFile --profile cuda up -d
+            if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
+                $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
+            }
+            if (-not (Wait-CudaEmbeddingReady $env:CORTEX_RAG_CUDA_EMBEDDING_URL 180)) {
+                $env:CORTEX_RAG_DISABLE_CUDA = "1"
+                Remove-Item Env:CORTEX_RAG_CUDA_EMBEDDING_URL -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            Write-Host "CUDA-capable Docker runtime not detected. Starting Mem0 stack without CUDA ingestion."
+            docker compose -f $ComposeFile up -d
+            if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
+                $env:CORTEX_RAG_DISABLE_CUDA = "1"
+            }
+        }
     }
     else {
         Write-Warning "Docker CLI not found. Skipping Mem0 dependency startup."
+        if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
+            $env:CORTEX_RAG_DISABLE_CUDA = "1"
+        }
     }
 }
 
@@ -110,5 +182,7 @@ Write-Host "Local agent services requested."
 Write-Host "File index:  http://localhost:8877"
 Write-Host "File broker: http://localhost:8878"
 Write-Host "Mem0:        $env:MEM0_BASE_URL"
+$ragCudaUrl = if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) { $env:CORTEX_RAG_CUDA_EMBEDDING_URL } else { "disabled" }
+Write-Host "RAG CUDA:    $ragCudaUrl"
 Write-Host "Hybrid KnowledgeIndex plugin: local-agent\matbot\plugins\hybrid-knowledge-index\dist\index.js"
 Write-Host "Workspace policy: local-agent\config\workspaces.json"

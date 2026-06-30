@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+process.env.CORTEX_RAG_DISABLE_CUDA = "1";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
 
 async function main() {
@@ -62,6 +63,8 @@ async function main() {
     assert.equal(configureResult.status.state, "idle");
     assert.equal(configureResult.status.percent, 100);
     assert.equal(configureResult.status.accelerator, "cpu");
+    assert.equal(configureResult.status.accelerated, false);
+    assert.equal(configureResult.status.embeddingBackend, "hash-cpu");
     assert.equal(configureResult.status.currentFile, undefined);
 
     const idleStatusEvents = [];

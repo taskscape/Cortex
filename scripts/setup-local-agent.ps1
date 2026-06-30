@@ -37,7 +37,7 @@ if (-not (Test-Command wsl)) {
     Write-Warning "WSL was not found. Docker Desktop WSL2 integration may be unavailable."
 }
 
-foreach ($port in @(8877, 8878, 8888, 3000)) {
+foreach ($port in @(8877, 8878, 8888, 8890, 3000)) {
     if (-not (Test-PortFree $port)) {
         Write-Warning "Port $port is already in use."
     }

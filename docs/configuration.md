@@ -84,6 +84,10 @@ POSTGRES_PASSWORD=CHANGE_ME
 NEO4J_PASSWORD=CHANGE_ME
 NEO4J_AUTH=neo4j/CHANGE_ME
 OPENAI_API_KEY=CHANGE_ME
+
+# Optional CUDA embedding service for workspace-rag.
+WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
 ```
 
 The Postgres and Neo4j passwords are baked into their Docker volumes on first
@@ -369,8 +373,12 @@ The WebUI exposes the active context through the workspace settings page:
 3. Enter one absolute markdown folder path per line.
 4. Click `Save` to persist and return to chat, or `Cancel` to discard changes.
 
-The status line displays state, percentage, CPU/NVIDIA status, a human message,
-and the currently processed file name when indexing is active.
+The status line displays state, percentage, CPU/CUDA status, a human message,
+and the currently processed file name when indexing is active. Open the
+workspace gear in the WebUI to see this line; it reads `CUDA` only when the
+current ingestion backend is actually using the CUDA embedding service. If the
+machine exposes NVIDIA hardware but the CUDA embedding service is unavailable,
+it reads `CPU (NVIDIA detected)`.
 
 The same operations are available through the `workspace_rag` tool:
 
@@ -430,13 +438,36 @@ Status responses include:
 | `processedFiles` / `totalFiles` | Current scan progress. |
 | `currentFile` | Current markdown file being processed while `state` is `indexing`; omitted once indexing is idle, pending, or errored. |
 | `nvidiaAvailable` | Whether `nvidia-smi` is visible on the host. |
+| `cudaAvailable` | Whether the configured embedding service reported CUDA support at launch. |
 | `accelerated` | Whether the current ingestion backend is GPU-accelerated. |
 | `accelerator` | `nvidia` or `cpu`. |
+| `embeddingBackend` | `cuda-http` when CUDA embeddings are active, otherwise `hash-cpu`. |
+| `embeddingModel` | Active embedding model or CPU vectorizer name. |
+| `embeddingDimensions` | Vector dimensions used by the current backend. |
+| `cudaServiceUrl` | CUDA embedding service URL when configured/probed. |
+| `accelerationMessage` | Human-readable launch-time CUDA/CPU decision. |
 | `message` | Human-readable status message. |
 
-The current built-in vectorizer is CPU-based. It detects NVIDIA availability for
-reporting, but `accelerated` remains `false` and `accelerator` reports `cpu`
-until a GPU embedding backend is added.
+The built-in CPU fallback uses a 384-dimensional token hash vectorizer. CUDA
+support is provided by the `workspace-rag-cuda` Docker service, exposed on
+`http://localhost:8890` by default. The launch scripts start that service with
+Docker Compose profile `cuda` only when `nvidia-smi -L` succeeds and Docker
+reports the `nvidia` runtime. The plugin then probes `/health`; it enables CUDA
+only if that endpoint reports `cudaAvailable: true`. Otherwise ingestion stays
+on CPU and reports the reason through `accelerationMessage`.
+
+To force CPU ingestion even on CUDA-capable hardware:
+
+```powershell
+$env:CORTEX_RAG_DISABLE_CUDA = "1"
+.\scripts\run.ps1
+```
+
+To skip the CUDA service from the launcher without changing the environment:
+
+```powershell
+.\scripts\run.ps1 -SkipCudaIngestion
+```
 
 ## Expert Panel Configuration
 

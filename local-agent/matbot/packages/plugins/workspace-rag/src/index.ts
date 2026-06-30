@@ -21,6 +21,28 @@ const VECTOR_DIMS = 384;
 const SCAN_INTERVAL_MS = 60_000;
 const MAX_CHUNK_CHARS = 1800;
 const MAX_CONTEXT_CHUNKS = 4;
+const DEFAULT_CUDA_EMBEDDING_URL = 'http://localhost:8890';
+const CPU_VECTOR_BACKEND = 'hash-cpu';
+const CPU_VECTOR_MODEL = 'token-hash-v1';
+
+type Accelerator = 'nvidia' | 'cpu';
+type VectorizerBackend = 'hash-cpu' | 'cuda-http';
+
+interface VectorizerMetadata {
+  backend: VectorizerBackend;
+  model: string;
+  dimensions: number;
+}
+
+interface VectorizerRuntime extends VectorizerMetadata {
+  accelerated: boolean;
+  accelerator: Accelerator;
+}
+
+interface TextVectorizer {
+  readonly info: VectorizerRuntime;
+  embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]>;
+}
 
 interface WorkspaceRegistry {
   active: string;
@@ -68,6 +90,7 @@ interface IndexedDocument {
   contextId?: string;
   path: string;
   hash: string;
+  vectorizer?: VectorizerMetadata;
   updatedAt: string;
   chunks: VectorChunk[];
 }
@@ -89,8 +112,14 @@ interface IngestionStatus {
   lastIndexedAt?: string;
   message?: string;
   nvidiaAvailable: boolean;
+  cudaAvailable: boolean;
   accelerated: boolean;
-  accelerator: 'nvidia' | 'cpu';
+  accelerator: Accelerator;
+  embeddingBackend: VectorizerBackend;
+  embeddingModel: string;
+  embeddingDimensions: number;
+  cudaServiceUrl?: string;
+  accelerationMessage?: string;
 }
 
 interface SearchHit {
@@ -205,6 +234,190 @@ function vectorize(text: string): number[] {
   }
   const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
   return norm > 0 ? vector.map(value => value / norm) : vector;
+}
+
+function cpuVectorizerInfo(): VectorizerRuntime {
+  return {
+    backend: CPU_VECTOR_BACKEND,
+    model: CPU_VECTOR_MODEL,
+    dimensions: VECTOR_DIMS,
+    accelerated: false,
+    accelerator: 'cpu',
+  };
+}
+
+function vectorizerMetadata(info: VectorizerRuntime): VectorizerMetadata {
+  return {
+    backend: info.backend,
+    model: info.model,
+    dimensions: info.dimensions,
+  };
+}
+
+function normalizeDocumentVectorizer(doc: IndexedDocument): VectorizerMetadata {
+  return doc.vectorizer ?? {
+    backend: CPU_VECTOR_BACKEND,
+    model: CPU_VECTOR_MODEL,
+    dimensions: VECTOR_DIMS,
+  };
+}
+
+function vectorizerIdentity(info: VectorizerMetadata): string {
+  return `${info.backend}:${info.model}:${info.dimensions}`;
+}
+
+function documentMatchesVectorizer(doc: IndexedDocument, info: VectorizerRuntime): boolean {
+  return vectorizerIdentity(normalizeDocumentVectorizer(doc)) === vectorizerIdentity(info);
+}
+
+class HashCpuVectorizer implements TextVectorizer {
+  readonly info = cpuVectorizerInfo();
+
+  async embed(texts: readonly string[]): Promise<number[][]> {
+    return texts.map(text => vectorize(text));
+  }
+}
+
+interface CudaHealthResponse {
+  ok?: boolean;
+  cudaAvailable?: boolean;
+  device?: string;
+  model?: string;
+  dimensions?: number;
+  message?: string;
+}
+
+interface VectorizerLaunchState {
+  vectorizer: TextVectorizer;
+  nvidiaAvailable: boolean;
+  cudaAvailable: boolean;
+  cudaServiceUrl?: string;
+  accelerationMessage: string;
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function normalizeBaseUrl(value: string | undefined): string {
+  return (value?.trim() || DEFAULT_CUDA_EMBEDDING_URL).replace(/\/+$/, '');
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeCudaEmbeddingService(baseUrl: string): Promise<CudaHealthResponse> {
+  try {
+    const response = await fetchWithTimeout(`${baseUrl}/health`, 1500);
+    if (!response.ok) {
+      return { ok: false, cudaAvailable: false, message: `Embedding service returned HTTP ${response.status}.` };
+    }
+    const body = await response.json() as CudaHealthResponse;
+    const result: CudaHealthResponse = {
+      ok: body.ok === true,
+      cudaAvailable: body.cudaAvailable === true,
+    };
+    if (typeof body.device === 'string') result.device = body.device;
+    if (typeof body.model === 'string') result.model = body.model;
+    if (typeof body.dimensions === 'number' && Number.isFinite(body.dimensions)) result.dimensions = body.dimensions;
+    if (typeof body.message === 'string') result.message = body.message;
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, cudaAvailable: false, message: `Embedding service unavailable: ${message}` };
+  }
+}
+
+class CudaHttpVectorizer implements TextVectorizer {
+  readonly info: VectorizerRuntime;
+  private readonly baseUrl: string;
+
+  constructor(baseUrl: string, model: string, dimensions: number) {
+    this.baseUrl = baseUrl;
+    this.info = {
+      backend: 'cuda-http',
+      model,
+      dimensions,
+      accelerated: true,
+      accelerator: 'nvidia',
+    };
+  }
+
+  async embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const request: RequestInit = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts }),
+    };
+    if (signal) request.signal = signal;
+    const response = await fetch(`${this.baseUrl}/embed`, request);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`CUDA embedding service HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    }
+    const body = await response.json() as { embeddings?: unknown; dimensions?: unknown; model?: unknown };
+    if (!Array.isArray(body.embeddings)) throw new Error('CUDA embedding service returned no embeddings array.');
+    if (body.embeddings.length !== texts.length) {
+      throw new Error(`CUDA embedding service returned ${body.embeddings.length} embeddings for ${texts.length} text(s).`);
+    }
+    return body.embeddings.map((embedding, index) => {
+      if (!Array.isArray(embedding)) throw new Error(`CUDA embedding ${index} is not an array.`);
+      const vector = embedding.map(value => Number(value));
+      if (vector.length !== this.info.dimensions) {
+        throw new Error(`CUDA embedding ${index} has ${vector.length} dimensions; expected ${this.info.dimensions}.`);
+      }
+      if (vector.some(value => !Number.isFinite(value))) {
+        throw new Error(`CUDA embedding ${index} contains a non-finite value.`);
+      }
+      return vector;
+    });
+  }
+}
+
+async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
+  const nvidiaAvailable = await detectNvidia();
+  if (isTruthyEnv(process.env['CORTEX_RAG_DISABLE_CUDA'])) {
+    return {
+      vectorizer: new HashCpuVectorizer(),
+      nvidiaAvailable,
+      cudaAvailable: false,
+      accelerationMessage: 'CUDA ingestion disabled by CORTEX_RAG_DISABLE_CUDA.',
+    };
+  }
+
+  const cudaServiceUrl = normalizeBaseUrl(
+    process.env['CORTEX_RAG_CUDA_EMBEDDING_URL'] ?? process.env['CORTEX_RAG_EMBEDDING_URL'],
+  );
+  const probe = await probeCudaEmbeddingService(cudaServiceUrl);
+  if (probe.ok && probe.cudaAvailable && probe.model && probe.dimensions && probe.dimensions > 0) {
+    const device = probe.device ? ` on ${probe.device}` : '';
+    return {
+      vectorizer: new CudaHttpVectorizer(cudaServiceUrl, probe.model, probe.dimensions),
+      nvidiaAvailable,
+      cudaAvailable: true,
+      cudaServiceUrl,
+      accelerationMessage: `CUDA embedding backend active${device}.`,
+    };
+  }
+
+  const reason = probe.message ?? (nvidiaAvailable
+    ? 'CUDA embedding service is not ready.'
+    : 'NVIDIA GPU was not detected by nvidia-smi.');
+  return {
+    vectorizer: new HashCpuVectorizer(),
+    nvidiaAvailable,
+    cudaAvailable: false,
+    cudaServiceUrl,
+    accelerationMessage: `Using CPU hash vectorizer. ${reason}`,
+  };
 }
 
 function cosine(a: readonly number[], b: readonly number[]): number {
@@ -345,7 +558,11 @@ class WorkspaceRagManager {
   private readonly scanInFlight = new Set<string>();
   private readonly scanQueued = new Set<string>();
   private timer: ReturnType<typeof setInterval> | undefined;
+  private vectorizer: TextVectorizer = new HashCpuVectorizer();
   private nvidiaAvailable = false;
+  private cudaAvailable = false;
+  private cudaServiceUrl: string | undefined;
+  private accelerationMessage = 'Using CPU hash vectorizer.';
   private disposed = false;
   private readonly activeConfigPath: string;
 
@@ -354,7 +571,12 @@ class WorkspaceRagManager {
   }
 
   async start(): Promise<void> {
-    this.nvidiaAvailable = await detectNvidia();
+    const launch = await createLaunchVectorizer();
+    this.vectorizer = launch.vectorizer;
+    this.nvidiaAvailable = launch.nvidiaAvailable;
+    this.cudaAvailable = launch.cudaAvailable;
+    this.cudaServiceUrl = launch.cudaServiceUrl;
+    this.accelerationMessage = launch.accelerationMessage;
     await this.scanAll();
     this.timer = setInterval(() => void this.scanAll(), SCAN_INTERVAL_MS);
   }
@@ -449,9 +671,10 @@ class WorkspaceRagManager {
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
     const db = await this.readDb(workspace);
-    const queryVector = vectorize(query);
+    const queryVector = (await this.embedTexts([query], signal))[0] ?? [];
     const hits: SearchHit[] = [];
     for (const doc of db.documents) {
+      if (!documentMatchesVectorizer(doc, this.vectorizer.info)) continue;
       const docContextId = doc.contextId ?? 'default';
       if (!doc.id.startsWith('knowledge:') && docContextId !== active.id) continue;
       for (const chunk of doc.chunks) {
@@ -479,16 +702,21 @@ class WorkspaceRagManager {
     const db = await this.readDb(workspace);
     const id = `knowledge:${context.id}:${entry.id}`;
     const existing = db.documents.findIndex(doc => doc.id === id);
+    const chunks = chunkMarkdown(entry.content);
+    const vectors = await this.embedTexts(
+      chunks.map(text => `${entry.summary}\n${entry.entities.join(' ')}\n${text}`),
+    );
     const document: IndexedDocument = {
       id,
       contextId: context.id,
       path: entry.source.uuid,
       hash: entry.contentHash ?? sha256(entry.content),
+      vectorizer: vectorizerMetadata(this.vectorizer.info),
       updatedAt: nowIso(),
-      chunks: chunkMarkdown(entry.content).map((text, index) => ({
+      chunks: chunks.map((text, index) => ({
         id: `${id}:${index}`,
         text,
-        vector: vectorize(`${entry.summary}\n${entry.entities.join(' ')}\n${text}`),
+        vector: vectors[index] ?? [],
       })),
     };
     if (existing >= 0) db.documents[existing] = document;
@@ -529,13 +757,12 @@ class WorkspaceRagManager {
           processedFiles: 0,
           percent: 0,
           message: 'No markdown folders configured.',
-          nvidiaAvailable: this.nvidiaAvailable,
-          accelerated: false,
-          accelerator: 'cpu',
+          ...this.accelerationStatusFields(),
         });
         return;
       }
 
+      const acceleration = this.accelerationStatusFields();
       const contextFiles = await Promise.all(config.contexts.map(async context => ({
         context,
         files: (await Promise.all(context.paths.map(collectMarkdownFiles))).flat(),
@@ -554,9 +781,7 @@ class WorkspaceRagManager {
         processedFiles: 0,
         percent: allFiles.length === 0 ? 100 : 0,
         message: allFiles.length === 0 ? 'No markdown files found.' : 'Indexing markdown files.',
-        nvidiaAvailable: this.nvidiaAvailable,
-        accelerated: false,
-        accelerator: 'cpu',
+        ...acceleration,
       });
 
       for (const { context, file } of allFiles) {
@@ -569,20 +794,24 @@ class WorkspaceRagManager {
         try { content = await readFile(file, 'utf8'); } catch { continue; }
         const hash = sha256(content);
         const existing = byContextPath.get(contextPathKey);
-        if (existing?.hash === hash) continue;
+        if (existing?.hash === hash && documentMatchesVectorizer(existing, this.vectorizer.info)) continue;
         const fileStat = await stat(file).catch(() => null);
         const chunks = chunkMarkdown(content);
+        const vectors = await this.embedTexts(
+          chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
+        );
         const docId = stableId(contextPathKey);
         const doc: IndexedDocument = {
           id: docId,
           contextId: context.id,
           path: normalized,
           hash,
+          vectorizer: vectorizerMetadata(this.vectorizer.info),
           updatedAt: fileStat?.mtime.toISOString() ?? nowIso(),
           chunks: chunks.map((text, index) => ({
             id: `${docId}:${index}`,
             text,
-            vector: vectorize(`${path.basename(file)}\n${extractSummary(content)}\n${text}`),
+            vector: vectors[index] ?? [],
           })),
         };
         const index = db.documents.findIndex(item => item.id === doc.id);
@@ -608,9 +837,7 @@ class WorkspaceRagManager {
         percent: 100,
         lastIndexedAt: nowIso(),
         message: allFiles.length === 0 ? 'No markdown files found.' : `Indexed ${allFiles.length} markdown file(s).`,
-        nvidiaAvailable: this.nvidiaAvailable,
-        accelerated: false,
-        accelerator: 'cpu',
+        ...this.accelerationStatusFields(),
       });
     } catch (error) {
       const previous = this.statuses.get(workspace.id);
@@ -623,13 +850,40 @@ class WorkspaceRagManager {
         processedFiles: previous?.processedFiles ?? 0,
         percent: previous?.percent ?? 0,
         message: error instanceof Error ? error.message : String(error),
-        nvidiaAvailable: this.nvidiaAvailable,
-        accelerated: false,
-        accelerator: 'cpu',
+        ...this.accelerationStatusFields(),
       });
     } finally {
       this.scanInFlight.delete(workspace.id);
     }
+  }
+
+  private accelerationStatusFields(): Pick<
+    IngestionStatus,
+    | 'nvidiaAvailable'
+    | 'cudaAvailable'
+    | 'accelerated'
+    | 'accelerator'
+    | 'embeddingBackend'
+    | 'embeddingModel'
+    | 'embeddingDimensions'
+    | 'cudaServiceUrl'
+    | 'accelerationMessage'
+  > {
+    return {
+      nvidiaAvailable: this.nvidiaAvailable,
+      cudaAvailable: this.cudaAvailable,
+      accelerated: this.vectorizer.info.accelerated,
+      accelerator: this.vectorizer.info.accelerator,
+      embeddingBackend: this.vectorizer.info.backend,
+      embeddingModel: this.vectorizer.info.model,
+      embeddingDimensions: this.vectorizer.info.dimensions,
+      ...(this.cudaServiceUrl ? { cudaServiceUrl: this.cudaServiceUrl } : {}),
+      accelerationMessage: this.accelerationMessage,
+    };
+  }
+
+  private async embedTexts(texts: readonly string[], signal?: AbortSignal): Promise<number[][]> {
+    return this.vectorizer.embed(texts, signal);
   }
 
   private updateProgress(workspaceId: string, processed: number, total: number, currentFile: string): void {
@@ -662,9 +916,7 @@ class WorkspaceRagManager {
       processedFiles: 0,
       percent: active.paths.length > 0 ? 100 : 0,
       message: active.paths.length > 0 ? 'Waiting for next scan.' : 'No markdown folders configured.',
-      nvidiaAvailable: this.nvidiaAvailable,
-      accelerated: false,
-      accelerator: 'cpu',
+      ...this.accelerationStatusFields(),
     };
     this.statuses.set(workspace.id, status);
     return status;

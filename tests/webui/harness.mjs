@@ -56,8 +56,13 @@ let workspaceRagStatus = {
   percent: 100,
   message: "Indexed 2 markdown file(s).",
   nvidiaAvailable: false,
+  cudaAvailable: false,
   accelerated: false,
-  accelerator: "cpu"
+  accelerator: "cpu",
+  embeddingBackend: "hash-cpu",
+  embeddingModel: "token-hash-v1",
+  embeddingDimensions: 384,
+  accelerationMessage: "Using CPU hash vectorizer."
 };
 
 function activeRagContext() {

@@ -799,11 +799,14 @@ function setWorkspaceRagStatus(text, isError = false) {
 function renderWorkspaceRagStatus(status) {
   if (!status) return;
   if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = Math.max(0, Math.min(100, status.percent ?? 0)) + '%';
-  const accel = status.accelerated ? 'NVIDIA' : 'CPU';
+  const accel = status.accelerated
+    ? `CUDA · ${status.embeddingModel || 'GPU embeddings'}`
+    : (status.nvidiaAvailable ? 'CPU (NVIDIA detected)' : 'CPU');
   const state = status.state || 'idle';
   const percent = Math.max(0, Math.min(100, status.percent ?? 0));
   const message = status.message ? ' · ' + status.message : '';
-  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${message}`, state === 'error');
+  const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
+  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${message}${accelerationMessage}`, state === 'error');
   if (workspaceRagCurrentFileEl) {
     const currentFile = typeof status.currentFile === 'string' && status.currentFile.trim()
       ? status.currentFile.trim()

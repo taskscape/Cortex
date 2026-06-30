@@ -35,6 +35,20 @@ services:
       neo4j:
         condition: service_started
 
+  workspace-rag-cuda:
+    profiles: ["cuda"]
+    build:
+      context: .
+      dockerfile: Dockerfile.workspace-rag-cuda
+    image: matbot/workspace-rag-cuda:latest
+    platform: linux/amd64
+    gpus: all
+    environment:
+      EMBEDDING_MODEL: ${WORKSPACE_RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_BATCH_SIZE: ${WORKSPACE_RAG_EMBEDDING_BATCH_SIZE:-32}
+    ports:
+      - "8890:8000"
+
   postgres:
     image: pgvector/pgvector:pg16
     environment:
