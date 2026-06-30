@@ -857,8 +857,8 @@ function renderWorkspaceRagStatus(status) {
     : (status.nvidiaAvailable ? 'CPU (NVIDIA detected)' : 'CPU');
   const state = status.state || 'idle';
   const percent = Math.max(0, Math.min(100, status.percent ?? 0));
-  const storage = status.storageBackend === 'qdrant-sqlite'
-    ? ' · Qdrant+SQLite'
+  const storage = status.storageBackend === 'postgres-pgvector'
+    ? ' · Postgres/pgvector'
     : (status.storageBackend === 'json' ? ' · JSON' : '');
   const message = status.message ? ' · ' + status.message : '';
   const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';

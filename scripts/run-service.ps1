@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $MatbotRoot = Join-Path $Root "local-agent\matbot"
 $ComposeFile = Join-Path $Root "local-agent\docker\mem0\docker-compose.yml"
+$DockerEnvFile = Join-Path (Split-Path $ComposeFile) ".env"
 $LogsRoot = Join-Path $Root "local-agent\logs"
 
 function Write-ServiceLog($Message) {
@@ -103,27 +104,60 @@ function Wait-CudaEmbeddingReady($Url, $TimeoutSec) {
     return $false
 }
 
-function Wait-QdrantReady($Url, $TimeoutSec) {
+function Get-DockerEnvValue($Name) {
+    if (-not (Test-Path -LiteralPath $DockerEnvFile)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $DockerEnvFile) {
+        if ($line -match "^\s*$([regex]::Escape($Name))\s*=\s*(.*)\s*$") {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return $null
+}
+
+function Resolve-ConfigValue($SpecificName, $BaseName, $DefaultValue = $null) {
+    $specific = [Environment]::GetEnvironmentVariable($SpecificName)
+    if ($specific) { return $specific }
+    $base = [Environment]::GetEnvironmentVariable($BaseName)
+    if ($base) { return $base }
+    $fileValue = Get-DockerEnvValue $BaseName
+    if ($fileValue) { return $fileValue }
+    return $DefaultValue
+}
+
+function Set-PostgresRagEnv {
+    if (-not $env:CORTEX_RAG_POSTGRES_HOST) { $env:CORTEX_RAG_POSTGRES_HOST = Resolve-ConfigValue "CORTEX_RAG_POSTGRES_HOST" "POSTGRES_HOST" "localhost" }
+    if (-not $env:CORTEX_RAG_POSTGRES_PORT) { $env:CORTEX_RAG_POSTGRES_PORT = Resolve-ConfigValue "CORTEX_RAG_POSTGRES_PORT" "POSTGRES_PORT" "5432" }
+    if (-not $env:CORTEX_RAG_POSTGRES_DB) { $env:CORTEX_RAG_POSTGRES_DB = Resolve-ConfigValue "CORTEX_RAG_POSTGRES_DB" "POSTGRES_DB" "mem0" }
+    if (-not $env:CORTEX_RAG_POSTGRES_USER) { $env:CORTEX_RAG_POSTGRES_USER = Resolve-ConfigValue "CORTEX_RAG_POSTGRES_USER" "POSTGRES_USER" "mem0" }
+    if (-not $env:CORTEX_RAG_POSTGRES_PASSWORD) { $env:CORTEX_RAG_POSTGRES_PASSWORD = Resolve-ConfigValue "CORTEX_RAG_POSTGRES_PASSWORD" "POSTGRES_PASSWORD" }
+}
+
+function Wait-PostgresReady($HostName, $Port, $TimeoutSec) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $lastError = $null
 
     while ((Get-Date) -lt $deadline) {
+        $client = $null
         try {
-            $response = Invoke-WebRequest -Method Get -Uri "$Url/readyz" -TimeoutSec 5 -UseBasicParsing
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
-                Write-ServiceLog "qdrant ready ($Url)"
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $task = $client.ConnectAsync($HostName, [int]$Port)
+            if ($task.Wait(5000) -and $client.Connected) {
+                Write-ServiceLog "postgres ready ($HostName`:$Port)"
                 return $true
             }
-            $lastError = "HTTP $($response.StatusCode)"
+            $lastError = "connection timed out"
         }
         catch {
             $lastError = $_.Exception.Message
+        }
+        finally {
+            if ($client) { $client.Dispose() }
         }
 
         Start-Sleep -Seconds 2
     }
 
-    Write-Warning "qdrant unavailable after $TimeoutSec seconds ($lastError). Workspace RAG will fall back to JSON unless CORTEX_RAG_STORAGE forces Qdrant."
+    Write-Warning "postgres unavailable after $TimeoutSec seconds ($lastError). Workspace RAG will fall back to JSON unless CORTEX_RAG_STORAGE forces Postgres."
     return $false
 }
 
@@ -146,9 +180,7 @@ function Start-NodeService($Name, $Port, $ScriptPath, $OutLog, $ErrLog) {
 Set-Location $Root
 New-Item -ItemType Directory -Force -Path $LogsRoot | Out-Null
 
-if (-not $env:CORTEX_RAG_QDRANT_URL) {
-    $env:CORTEX_RAG_QDRANT_URL = "http://localhost:6333"
-}
+Set-PostgresRagEnv
 
 $fileIndexOutput = Join-Path $Root "local-agent\file-index\dist\server.js"
 $fileBrokerOutput = Join-Path $Root "local-agent\file-broker\dist\server.js"
@@ -167,7 +199,7 @@ if (-not $SkipDocker) {
         if (Test-CudaIngestionAvailable) {
             Write-ServiceLog "Starting Mem0 Docker stack with workspace-rag CUDA embeddings"
             docker compose -f $ComposeFile --profile cuda up -d
-            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
+            Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
             }
@@ -179,7 +211,7 @@ if (-not $SkipDocker) {
         else {
             Write-ServiceLog "Starting Mem0 Docker stack without CUDA ingestion"
             docker compose -f $ComposeFile up -d
-            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
+            Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
                 $env:CORTEX_RAG_DISABLE_CUDA = "1"
             }

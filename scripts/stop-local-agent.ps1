@@ -11,7 +11,7 @@ foreach ($port in @(8877, 8878, 19778)) {
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
     $ComposeFile = Join-Path $Root "local-agent\docker\mem0\docker-compose.yml"
-    docker compose -f $ComposeFile down
+    docker compose -f $ComposeFile down --remove-orphans
 }
 
 Write-Host "Local agent services stopped."

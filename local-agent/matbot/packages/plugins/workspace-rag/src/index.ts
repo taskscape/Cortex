@@ -123,11 +123,13 @@ interface IngestionStatus {
   embeddingDimensions: number;
   cudaServiceUrl?: string;
   accelerationMessage?: string;
-  storageBackend: 'json' | 'qdrant-sqlite';
+  storageBackend: 'json' | 'postgres-pgvector';
   storageMessage: string;
-  qdrantUrl?: string;
-  qdrantCollection?: string;
-  sqlitePath?: string;
+  postgresHost?: string;
+  postgresPort?: number;
+  postgresDatabase?: string;
+  postgresSchema?: string;
+  postgresTables?: string[];
   legacyJsonPath?: string;
 }
 
@@ -166,6 +168,16 @@ async function exists(filePath: string): Promise<boolean> {
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
+}
+
+function countNulChars(text: string): number {
+  let count = 0;
+  for (let index = text.indexOf('\0'); index !== -1; index = text.indexOf('\0', index + 1)) count++;
+  return count;
+}
+
+function stripNulChars(text: string): string {
+  return text.includes('\0') ? text.replace(/\0/g, '') : text;
 }
 
 function stableId(text: string): string {
@@ -570,6 +582,8 @@ class WorkspaceRagManager {
   private readonly scanInFlight = new Set<string>();
   private readonly scanQueued = new Set<string>();
   private readonly scanPromises = new Map<string, Promise<void>>();
+  private backgroundScanPromise: Promise<void> | undefined;
+  private backgroundScanQueued = false;
   private timer: ReturnType<typeof setInterval> | undefined;
   private vectorizer: TextVectorizer = new HashCpuVectorizer();
   private storage: RagStorage | undefined;
@@ -605,9 +619,26 @@ class WorkspaceRagManager {
   }
 
   private startBackgroundScan(reason: string): void {
-    void this.scanAll().catch(error => {
-      console.warn(`[workspace-rag] background scan failed (${reason}): ${errorMessage(error)}`);
-    });
+    if (this.disposed) return;
+    if (this.backgroundScanPromise) {
+      this.backgroundScanQueued = true;
+      return;
+    }
+    this.backgroundScanPromise = this.runBackgroundScans(reason)
+      .finally(() => { this.backgroundScanPromise = undefined; });
+  }
+
+  private async runBackgroundScans(reason: string): Promise<void> {
+    let scanReason = reason;
+    do {
+      this.backgroundScanQueued = false;
+      try {
+        await this.scanAll();
+      } catch (error) {
+        console.warn(`[workspace-rag] background scan failed (${scanReason}): ${errorMessage(error)}`);
+      }
+      scanReason = 'queued';
+    } while (!this.disposed && this.backgroundScanQueued);
   }
 
   currentWorkspaceId(): string {
@@ -720,15 +751,18 @@ class WorkspaceRagManager {
     const config = await this.readConfig(workspace);
     const context = activeContext(config);
     const id = `knowledge:${context.id}:${entry.id}`;
-    const chunks = chunkMarkdown(entry.content);
+    const content = stripNulChars(entry.content);
+    const summary = stripNulChars(entry.summary);
+    const entities = entry.entities.map(stripNulChars);
+    const chunks = chunkMarkdown(content);
     const vectors = await this.embedTexts(
-      chunks.map(text => `${entry.summary}\n${entry.entities.join(' ')}\n${text}`),
+      chunks.map(text => `${summary}\n${entities.join(' ')}\n${text}`),
     );
     const document: IndexedDocument = {
       id,
       contextId: context.id,
       path: entry.source.uuid,
-      hash: entry.contentHash ?? sha256(entry.content),
+      hash: entry.contentHash ?? sha256(content),
       vectorizer: vectorizerMetadata(this.vectorizer.info),
       updatedAt: nowIso(),
       chunks: chunks.map((text, index) => ({
@@ -750,7 +784,27 @@ class WorkspaceRagManager {
 
   async scanAll(): Promise<void> {
     if (this.disposed) return;
-    await Promise.all((await this.listWorkspaces()).map(workspace => this.requestScanWorkspace(workspace)));
+    for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
+      if (this.disposed) return;
+      await this.requestScanWorkspace(workspace);
+    }
+  }
+
+  async scanCurrent(): Promise<void> {
+    if (this.disposed) return;
+    await this.requestScanWorkspace(await this.currentWorkspace());
+  }
+
+  private workspacesActiveFirst(workspaces: WorkspaceRef[]): WorkspaceRef[] {
+    const current = this.currentWorkspaceId();
+    return workspaces
+      .map((workspace, index) => ({ workspace, index }))
+      .sort((left, right) => {
+        const leftPriority = left.workspace.active || left.workspace.id === current ? 0 : 1;
+        const rightPriority = right.workspace.active || right.workspace.id === current ? 0 : 1;
+        return leftPriority - rightPriority || left.index - right.index;
+      })
+      .map(item => item.workspace);
   }
 
   private async requestScanWorkspace(workspace: WorkspaceRef): Promise<void> {
@@ -885,6 +939,15 @@ class WorkspaceRagManager {
           });
           continue;
         }
+        const nulCharsRemoved = countNulChars(content);
+        if (nulCharsRemoved > 0) {
+          content = stripNulChars(content);
+          await this.log(workspace, 'file_sanitized', {
+            file,
+            nulCharsRemoved,
+            reason: 'postgres_text_columns_do_not_accept_nul',
+          });
+        }
         const hash = sha256(content);
         const existing = byContextPath.get(contextPathKey);
         if (existing?.hash === hash && documentMatchesVectorizer(existing, this.vectorizer.info)) continue;
@@ -1007,9 +1070,11 @@ class WorkspaceRagManager {
     IngestionStatus,
     | 'storageBackend'
     | 'storageMessage'
-    | 'qdrantUrl'
-    | 'qdrantCollection'
-    | 'sqlitePath'
+    | 'postgresHost'
+    | 'postgresPort'
+    | 'postgresDatabase'
+    | 'postgresSchema'
+    | 'postgresTables'
     | 'legacyJsonPath'
   > {
     return this.storage?.describe(workspace) ?? {
@@ -1207,7 +1272,7 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager): Tool {
             return;
           }
           if (action === 'reindex_now') {
-            await manager.scanAll();
+            await manager.scanCurrent();
             yield { type: 'result', value: await manager.statusCurrent() };
             return;
           }

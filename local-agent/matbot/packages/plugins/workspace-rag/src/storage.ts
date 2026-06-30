@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { Pool } from 'pg';
+import type { Pool as PgPool, PoolClient, PoolConfig } from 'pg';
 
 const DATA_FILE = 'index.json';
-const SQLITE_FILE = 'index.sqlite';
-const DEFAULT_QDRANT_URL = 'http://localhost:6333';
-const QDRANT_UPSERT_BATCH_SIZE = 512;
-const QDRANT_SEARCH_LIMIT = 200;
+const DEFAULT_POSTGRES_HOST = 'localhost';
+const DEFAULT_POSTGRES_PORT = 5432;
+const DEFAULT_POSTGRES_DB = 'mem0';
+const DEFAULT_POSTGRES_USER = 'mem0';
+const DEFAULT_POSTGRES_SCHEMA = 'workspace_rag';
+const POSTGRES_UPSERT_BATCH_SIZE = 1024;
+const POSTGRES_SEARCH_LIMIT = 200;
 
-export type RagStorageKind = 'json' | 'qdrant-sqlite';
+export type RagStorageKind = 'json' | 'postgres-pgvector';
 export type VectorizerBackend = 'hash-cpu' | 'cuda-http';
 
 export interface VectorizerMetadata {
@@ -83,9 +86,11 @@ export interface RagStorageSummary {
 export interface RagStorageStatus {
   storageBackend: RagStorageKind;
   storageMessage: string;
-  qdrantUrl?: string;
-  qdrantCollection?: string;
-  sqlitePath?: string;
+  postgresHost?: string;
+  postgresPort?: number;
+  postgresDatabase?: string;
+  postgresSchema?: string;
+  postgresTables?: string[];
   legacyJsonPath?: string;
 }
 
@@ -156,11 +161,6 @@ function normalizePathForId(filePath: string): string {
   return path.resolve(filePath).replace(/\\/g, '/');
 }
 
-function stableUuid(text: string): string {
-  const hex = sha256(text);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
-
 async function exists(filePath: string): Promise<boolean> {
   try { await access(filePath); return true; } catch { return false; }
 }
@@ -184,10 +184,6 @@ function dataDir(workspace: WorkspaceRefLike): string {
 
 function legacyJsonPath(workspace: WorkspaceRefLike): string {
   return path.join(dataDir(workspace), DATA_FILE);
-}
-
-function sqlitePath(workspace: WorkspaceRefLike): string {
-  return path.join(dataDir(workspace), SQLITE_FILE);
 }
 
 function sourceTypeForDocument(doc: Pick<IndexedDocument, 'id'>): 'file' | 'knowledge' {
@@ -311,6 +307,14 @@ class JsonRagStorage implements RagStorage {
   }
 }
 
+interface PostgresConfig {
+  poolConfig: PoolConfig;
+  host: string;
+  port: number;
+  database: string;
+  schema: string;
+}
+
 interface DocumentRow {
   id: string;
   workspace_id: string;
@@ -326,68 +330,61 @@ interface DocumentRow {
 
 interface ChunkRow {
   id: string;
-  point_id: string;
-  document_id: string;
-  workspace_id: string;
-  context_id: string | null;
   path: string;
-  chunk_index: number;
   text: string;
-  source_type: 'file' | 'knowledge';
+  score: number;
 }
 
-interface QdrantPoint {
-  id: string;
-  vector: number[];
-  payload: Record<string, string | number>;
-}
-
-interface QdrantSearchResult {
-  id: string | number;
-  score?: number;
-}
-
-class QdrantSQLiteRagStorage implements RagStorage {
-  readonly kind = 'qdrant-sqlite' as const;
-  private readonly dbs = new Map<string, DatabaseSync>();
-  private readonly baseUrl: string;
-  private readonly collection: string;
+class PostgresPgvectorRagStorage implements RagStorage {
+  readonly kind = 'postgres-pgvector' as const;
+  private readonly pool: PgPool;
+  private readonly schemaName: string;
+  private readonly schemaSql: string;
+  private readonly documentsTableName: string;
+  private readonly chunksTableName: string;
+  private readonly documentsTableSql: string;
+  private readonly chunksTableSql: string;
   private readonly vectorizer: VectorizerMetadata;
+  private readonly config: PostgresConfig;
 
-  private constructor(baseUrl: string, collection: string, vectorizer: VectorizerMetadata) {
-    this.baseUrl = baseUrl;
-    this.collection = collection;
+  private constructor(config: PostgresConfig, vectorizer: VectorizerMetadata) {
+    this.config = config;
     this.vectorizer = vectorizer;
+    this.pool = new Pool(config.poolConfig);
+    this.schemaName = config.schema;
+    this.schemaSql = quoteIdentifier(config.schema);
+    this.documentsTableName = `documents_${vectorizer.dimensions}`;
+    this.chunksTableName = `chunks_${vectorizer.dimensions}`;
+    this.documentsTableSql = `${this.schemaSql}.${quoteIdentifier(this.documentsTableName)}`;
+    this.chunksTableSql = `${this.schemaSql}.${quoteIdentifier(this.chunksTableName)}`;
   }
 
-  static async open(baseUrl: string, vectorizer: VectorizerMetadata, collection?: string): Promise<QdrantSQLiteRagStorage> {
-    const storage = new QdrantSQLiteRagStorage(
-      normalizeBaseUrl(baseUrl),
-      sanitizeCollectionName(collection ?? defaultCollectionName(vectorizer)),
-      vectorizer,
-    );
-    await storage.ensureCollection();
+  static async open(vectorizer: VectorizerMetadata): Promise<PostgresPgvectorRagStorage> {
+    const storage = new PostgresPgvectorRagStorage(postgresConfigFromEnv(), vectorizer);
+    await storage.initialize();
     return storage;
   }
 
-  describe(workspace?: WorkspaceRefLike): RagStorageStatus {
+  describe(_workspace?: WorkspaceRefLike): RagStorageStatus {
     return {
       storageBackend: this.kind,
-      storageMessage: 'Qdrant vectors with SQLite metadata/chunk storage active.',
-      qdrantUrl: this.baseUrl,
-      qdrantCollection: this.collection,
-      ...(workspace ? { sqlitePath: sqlitePath(workspace) } : {}),
+      storageMessage: 'Postgres pgvector storage active for workspace RAG metadata, chunks, and vectors.',
+      postgresHost: this.config.host,
+      postgresPort: this.config.port,
+      postgresDatabase: this.config.database,
+      postgresSchema: this.schemaName,
+      postgresTables: [this.documentsTableName, this.chunksTableName],
     };
   }
 
   async listDocumentInfo(workspace: WorkspaceRefLike): Promise<StoredDocumentInfo[]> {
-    const db = this.db(workspace);
-    const rows = db.prepare(`
+    const result = await this.pool.query<DocumentRow>(`
       SELECT id, context_id, path, hash, vectorizer_backend, vectorizer_model,
              vectorizer_dimensions, updated_at, source_type
-      FROM documents
-    `).all() as unknown as DocumentRow[];
-    return rows.map(row => ({
+      FROM ${this.documentsTableSql}
+      WHERE workspace_id = $1
+    `, [postgresText(workspace.id)]);
+    return result.rows.map(row => ({
       id: row.id,
       path: row.path,
       hash: row.hash,
@@ -404,38 +401,8 @@ class QdrantSQLiteRagStorage implements RagStorage {
 
   async upsertDocuments(workspace: WorkspaceRefLike, documents: IndexedDocument[]): Promise<void> {
     if (documents.length === 0) return;
-    const db = this.db(workspace);
-    const records: Array<{ doc: IndexedDocument; pointIds: string[] }> = [];
-    const points: QdrantPoint[] = [];
-    for (const doc of documents) {
-      const existingPointIds = this.pointIdsForDocument(db, doc.id);
-      if (existingPointIds.length > 0) await this.deletePoints(existingPointIds);
-
-      const docPoints = doc.chunks.map((chunk, index): QdrantPoint => {
-        const sourceType = sourceTypeForDocument(doc);
-        const pointId = stableUuid(`${workspace.id}:${chunk.id}`);
-        return {
-          id: pointId,
-          vector: chunk.vector,
-          payload: {
-            workspace_id: workspace.id,
-            context_id: doc.contextId ?? 'default',
-            document_id: doc.id,
-            chunk_id: chunk.id,
-            path: doc.path,
-            chunk_index: index,
-            source_type: sourceType,
-            vectorizer: vectorizerIdentity(doc.vectorizer ?? this.vectorizer),
-          },
-        };
-      });
-      points.push(...docPoints);
-      records.push({ doc, pointIds: docPoints.map(point => point.id) });
-    }
-
-    await this.upsertPoints(points);
-    for (const record of records) {
-      this.replaceDocument(db, workspace, record.doc, record.pointIds);
+    for (let start = 0; start < documents.length; start += POSTGRES_UPSERT_BATCH_SIZE) {
+      await this.upsertDocumentBatch(workspace, documents.slice(start, start + POSTGRES_UPSERT_BATCH_SIZE));
     }
   }
 
@@ -444,13 +411,12 @@ class QdrantSQLiteRagStorage implements RagStorage {
     configuredContextIds: ReadonlySet<string>,
     seenContextPathKeys: ReadonlySet<string>,
   ): Promise<void> {
-    const db = this.db(workspace);
-    const rows = db.prepare(`
-      SELECT id, context_id, path, source_type
-      FROM documents
-      WHERE workspace_id = ? AND source_type = 'file'
-    `).all(workspace.id) as unknown as Array<Pick<DocumentRow, 'id' | 'context_id' | 'path' | 'source_type'>>;
-    const staleIds = rows
+    const result = await this.pool.query<Pick<DocumentRow, 'id' | 'context_id' | 'path'>>(`
+      SELECT id, context_id, path
+      FROM ${this.documentsTableSql}
+      WHERE workspace_id = $1 AND source_type = 'file'
+    `, [postgresText(workspace.id)]);
+    const staleIds = result.rows
       .filter(row => {
         if (!path.isAbsolute(row.path)) return false;
         const contextId = row.context_id ?? 'default';
@@ -459,110 +425,92 @@ class QdrantSQLiteRagStorage implements RagStorage {
       })
       .map(row => row.id);
     if (staleIds.length === 0) return;
-
-    const pointIds = staleIds.flatMap(id => this.pointIdsForDocument(db, id));
-    await this.deletePoints(pointIds);
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const deleteChunks = db.prepare('DELETE FROM chunks WHERE document_id = ?');
-      const deleteDoc = db.prepare('DELETE FROM documents WHERE id = ?');
-      for (const id of staleIds) {
-        deleteChunks.run(id);
-        deleteDoc.run(id);
-      }
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+    await this.pool.query(`DELETE FROM ${this.documentsTableSql} WHERE workspace_id = $1 AND id = ANY($2::text[])`, [
+      postgresText(workspace.id),
+      staleIds.map(postgresText),
+    ]);
   }
 
   async flush(_workspace: WorkspaceRefLike): Promise<void> {
-    // Qdrant and SQLite are updated incrementally per document.
+    // Postgres commits each document batch transaction as ingestion proceeds.
   }
 
   async summary(workspace: WorkspaceRefLike): Promise<RagStorageSummary> {
-    const db = this.db(workspace);
-    const documents = db.prepare('SELECT COUNT(*) AS count FROM documents WHERE workspace_id = ?')
-      .get(workspace.id) as unknown as { count: number };
-    const chunkSummary = db.prepare(`
-      SELECT COUNT(*) AS chunks, COALESCE(SUM(LENGTH(text)), 0) AS textChars
-      FROM chunks
-      WHERE workspace_id = ?
-    `).get(workspace.id) as unknown as { chunks: number; textChars: number };
+    const documents = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM ${this.documentsTableSql} WHERE workspace_id = $1`,
+      [postgresText(workspace.id)],
+    );
+    const chunks = await this.pool.query<{ chunks: string; textchars: string }>(`
+      SELECT COUNT(*)::text AS chunks, COALESCE(SUM(LENGTH(text)), 0)::text AS textchars
+      FROM ${this.chunksTableSql}
+      WHERE workspace_id = $1
+    `, [postgresText(workspace.id)]);
+    const chunkCount = Number(chunks.rows[0]?.chunks ?? 0);
     return {
-      documents: documents.count,
-      chunks: chunkSummary.chunks,
-      textChars: chunkSummary.textChars,
-      vectorValues: chunkSummary.chunks * this.vectorizer.dimensions,
+      documents: Number(documents.rows[0]?.count ?? 0),
+      chunks: chunkCount,
+      textChars: Number(chunks.rows[0]?.textchars ?? 0),
+      vectorValues: chunkCount * this.vectorizer.dimensions,
     };
   }
 
   async search(
     workspace: WorkspaceRefLike,
     activeContext: RagContextLike,
-    _vectorizer: VectorizerMetadata,
+    vectorizer: VectorizerMetadata,
     queryVector: readonly number[],
     limit: number,
     signal: AbortSignal,
   ): Promise<SearchHit[]> {
     if (signal.aborted || queryVector.length !== this.vectorizer.dimensions) return [];
     const wanted = clampLimit(limit);
-    const searchLimit = Math.min(QDRANT_SEARCH_LIMIT, Math.max(wanted * 25, 50));
-    const [fileResults, knowledgeResults] = await Promise.all([
-      this.searchPoints(queryVector, searchLimit, [
-        matchCondition('workspace_id', workspace.id),
-        matchCondition('context_id', activeContext.id),
-        matchCondition('source_type', 'file'),
-      ], signal),
-      this.searchPoints(queryVector, searchLimit, [
-        matchCondition('workspace_id', workspace.id),
-        matchCondition('source_type', 'knowledge'),
-      ], signal),
+    const searchLimit = Math.min(POSTGRES_SEARCH_LIMIT, Math.max(wanted * 25, 50));
+    const result = await this.pool.query<ChunkRow>(`
+      SELECT id, path, text, GREATEST(0, 1 - (embedding <=> $1::vector))::float8 AS score
+      FROM ${this.chunksTableSql}
+      WHERE workspace_id = $2
+        AND vectorizer_backend = $3
+        AND vectorizer_model = $4
+        AND vectorizer_dimensions = $5
+        AND (
+          (source_type = 'file' AND context_id = $6)
+          OR source_type = 'knowledge'
+        )
+      ORDER BY embedding <=> $1::vector
+      LIMIT $7
+    `, [
+      toPgVector(queryVector),
+      postgresText(workspace.id),
+      postgresText(vectorizer.backend),
+      postgresText(vectorizer.model),
+      vectorizer.dimensions,
+      postgresText(activeContext.id),
+      searchLimit,
     ]);
-    const scores = new Map<string, number>();
-    for (const result of [...fileResults, ...knowledgeResults]) {
-      const pointId = String(result.id);
-      const score = typeof result.score === 'number' && Number.isFinite(result.score) ? result.score : 0;
-      if (score <= 0) continue;
-      const existing = scores.get(pointId);
-      if (existing === undefined || score > existing) scores.set(pointId, score);
-    }
-    const ordered = [...scores.entries()].sort((a, b) => b[1] - a[1]);
-    const chunks = this.chunksByPointId(this.db(workspace), ordered.map(([pointId]) => pointId));
-    const hits: SearchHit[] = [];
-    for (const [pointId, score] of ordered) {
-      const chunk = chunks.get(pointId);
-      if (!chunk) continue;
-      hits.push({
+    return result.rows
+      .filter(row => row.score > 0)
+      .slice(0, wanted)
+      .map(row => ({
         workspaceId: workspace.id,
         contextName: activeContext.name,
-        path: chunk.path,
-        chunkId: chunk.id,
-        score,
-        text: chunk.text,
-      });
-      if (hits.length >= wanted) break;
-    }
-    return hits;
+        path: row.path,
+        chunkId: row.id,
+        score: row.score,
+        text: row.text,
+      }));
   }
 
   async close(): Promise<void> {
-    for (const db of this.dbs.values()) db.close();
-    this.dbs.clear();
+    await this.pool.end();
   }
 
-  private db(workspace: WorkspaceRefLike): DatabaseSync {
-    const existing = this.dbs.get(workspace.id);
-    if (existing) return existing;
-    const filePath = sqlitePath(workspace);
-    mkdirSync(path.dirname(filePath), { recursive: true });
-    const db = new DatabaseSync(filePath);
-    db.exec('PRAGMA journal_mode=WAL');
-    db.exec('PRAGMA synchronous=NORMAL');
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS documents (
-        id TEXT PRIMARY KEY NOT NULL,
+  private async initialize(): Promise<void> {
+    await this.pool.query('SELECT 1');
+    await this.ensureVectorExtension();
+    await this.pool.query(`CREATE SCHEMA IF NOT EXISTS ${this.schemaSql}`);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS ${this.documentsTableSql} (
+        id TEXT NOT NULL,
         workspace_id TEXT NOT NULL,
         context_id TEXT,
         path TEXT NOT NULL,
@@ -571,169 +519,127 @@ class QdrantSQLiteRagStorage implements RagStorage {
         vectorizer_model TEXT NOT NULL,
         vectorizer_dimensions INTEGER NOT NULL,
         updated_at TEXT NOT NULL,
-        source_type TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS chunks (
-        id TEXT PRIMARY KEY NOT NULL,
-        point_id TEXT UNIQUE NOT NULL,
+        source_type TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, id)
+      )
+    `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS ${this.chunksTableSql} (
+        id TEXT NOT NULL,
         document_id TEXT NOT NULL,
         workspace_id TEXT NOT NULL,
         context_id TEXT,
         path TEXT NOT NULL,
         chunk_index INTEGER NOT NULL,
         text TEXT NOT NULL,
-        source_type TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_workspace_rag_documents_context_path
-        ON documents (workspace_id, context_id, path);
-      CREATE INDEX IF NOT EXISTS idx_workspace_rag_documents_source
-        ON documents (workspace_id, source_type);
-      CREATE INDEX IF NOT EXISTS idx_workspace_rag_chunks_document
-        ON chunks (document_id);
-      CREATE INDEX IF NOT EXISTS idx_workspace_rag_chunks_point
-        ON chunks (point_id);
+        embedding vector(${this.vectorizer.dimensions}) NOT NULL,
+        vectorizer_backend TEXT NOT NULL,
+        vectorizer_model TEXT NOT NULL,
+        vectorizer_dimensions INTEGER NOT NULL,
+        source_type TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, id),
+        FOREIGN KEY (workspace_id, document_id) REFERENCES ${this.documentsTableSql}(workspace_id, id) ON DELETE CASCADE
+      )
     `);
-    this.dbs.set(workspace.id, db);
-    return db;
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_docs_${this.vectorizer.dimensions}_workspace_context_path`)} ON ${this.documentsTableSql} (workspace_id, context_id, path)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_docs_${this.vectorizer.dimensions}_source`)} ON ${this.documentsTableSql} (workspace_id, source_type)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_chunks_${this.vectorizer.dimensions}_document`)} ON ${this.chunksTableSql} (workspace_id, document_id)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_chunks_${this.vectorizer.dimensions}_filters`)} ON ${this.chunksTableSql} (workspace_id, context_id, source_type)`);
+    await this.ensureVectorIndex();
   }
 
-  private pointIdsForDocument(db: DatabaseSync, documentId: string): string[] {
-    const rows = db.prepare('SELECT point_id FROM chunks WHERE document_id = ?').all(documentId) as unknown as Array<{ point_id: string }>;
-    return rows.map(row => row.point_id);
+  private async ensureVectorExtension(): Promise<void> {
+    const extension = await this.pool.query<{ exists: boolean }>("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS exists");
+    if (extension.rows[0]?.exists) return;
+    await this.pool.query('CREATE EXTENSION IF NOT EXISTS vector');
   }
 
-  private replaceDocument(db: DatabaseSync, workspace: WorkspaceRefLike, doc: IndexedDocument, pointIds: string[]): void {
+  private async ensureVectorIndex(): Promise<void> {
+    try {
+      await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_chunks_${this.vectorizer.dimensions}_embedding_hnsw`)} ON ${this.chunksTableSql} USING hnsw (embedding vector_cosine_ops)`);
+    } catch (error) {
+      console.warn(`[workspace-rag] failed to create pgvector HNSW index; exact vector search remains available: ${errorMessage(error)}`);
+    }
+  }
+
+  private async upsertDocumentBatch(workspace: WorkspaceRefLike, documents: IndexedDocument[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const documentIds = documents.map(doc => postgresText(doc.id));
+      if (documentIds.length > 0) {
+        await client.query(`DELETE FROM ${this.chunksTableSql} WHERE workspace_id = $1 AND document_id = ANY($2::text[])`, [
+          postgresText(workspace.id),
+          documentIds,
+        ]);
+      }
+
+      for (const doc of documents) {
+        try {
+          await client.query(`
+            INSERT INTO ${this.documentsTableSql} (
+              id, workspace_id, context_id, path, hash, vectorizer_backend, vectorizer_model,
+              vectorizer_dimensions, updated_at, source_type
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (workspace_id, id) DO UPDATE SET
+              context_id = EXCLUDED.context_id,
+              path = EXCLUDED.path,
+              hash = EXCLUDED.hash,
+              vectorizer_backend = EXCLUDED.vectorizer_backend,
+              vectorizer_model = EXCLUDED.vectorizer_model,
+              vectorizer_dimensions = EXCLUDED.vectorizer_dimensions,
+              updated_at = EXCLUDED.updated_at,
+              source_type = EXCLUDED.source_type
+          `, documentValues(workspace, doc, this.vectorizer));
+        } catch (error) {
+          throw new Error(
+            `Postgres pgvector document insert failed for workspace="${workspace.id}", document="${doc.id}", path="${doc.path}". ` +
+            `Original error: ${errorMessage(error)}`,
+          );
+        }
+        await this.insertChunks(client, workspace, doc);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async insertChunks(client: PoolClient, workspace: WorkspaceRefLike, doc: IndexedDocument): Promise<void> {
     const metadata = doc.vectorizer ?? this.vectorizer;
     const sourceType = sourceTypeForDocument(doc);
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare('DELETE FROM chunks WHERE document_id = ?').run(doc.id);
-      db.prepare(`
-        INSERT OR REPLACE INTO documents (
-          id, workspace_id, context_id, path, hash, vectorizer_backend, vectorizer_model,
-          vectorizer_dimensions, updated_at, source_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        doc.id,
-        workspace.id,
-        doc.contextId ?? null,
-        doc.path,
-        doc.hash,
-        metadata.backend,
-        metadata.model,
-        metadata.dimensions,
-        doc.updatedAt,
-        sourceType,
-      );
-      const insertChunk = db.prepare(`
-        INSERT OR REPLACE INTO chunks (
-          id, point_id, document_id, workspace_id, context_id, path, chunk_index, text, source_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      doc.chunks.forEach((chunk, index) => {
-        insertChunk.run(
-          chunk.id,
-          pointIds[index] ?? stableUuid(`${workspace.id}:${chunk.id}`),
-          doc.id,
-          workspace.id,
-          doc.contextId ?? null,
-          doc.path,
+    for (let index = 0; index < doc.chunks.length; index++) {
+      const chunk = doc.chunks[index]!;
+      try {
+        await client.query(`
+          INSERT INTO ${this.chunksTableSql} (
+            id, document_id, workspace_id, context_id, path, chunk_index, text, embedding,
+            vectorizer_backend, vectorizer_model, vectorizer_dimensions, source_type
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12)
+        `, [
+          postgresText(chunk.id),
+          postgresText(doc.id),
+          postgresText(workspace.id),
+          postgresNullableText(doc.contextId),
+          postgresText(doc.path),
           index,
-          chunk.text,
-          sourceType,
-        );
-      });
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-
-  private chunksByPointId(db: DatabaseSync, pointIds: string[]): Map<string, ChunkRow> {
-    if (pointIds.length === 0) return new Map();
-    const placeholders = pointIds.map(() => '?').join(', ');
-    const rows = db.prepare(`
-      SELECT id, point_id, document_id, workspace_id, context_id, path, chunk_index, text, source_type
-      FROM chunks
-      WHERE point_id IN (${placeholders})
-    `).all(...pointIds) as unknown as ChunkRow[];
-    return new Map(rows.map(row => [row.point_id, row]));
-  }
-
-  private async ensureCollection(): Promise<void> {
-    const collectionPath = `/collections/${encodeURIComponent(this.collection)}`;
-    try {
-      const current = await this.request<{ result?: { config?: { params?: { vectors?: { size?: number } } } } }>('GET', collectionPath);
-      const size = current.result?.config?.params?.vectors?.size;
-      if (typeof size === 'number' && size !== this.vectorizer.dimensions) {
+          postgresText(chunk.text),
+          toPgVector(chunk.vector),
+          postgresText(metadata.backend),
+          postgresText(metadata.model),
+          metadata.dimensions,
+          postgresText(sourceType),
+        ]);
+      } catch (error) {
         throw new Error(
-          `Qdrant collection ${this.collection} has vector size ${size}; expected ${this.vectorizer.dimensions}. ` +
-          'Set CORTEX_RAG_QDRANT_COLLECTION to a different collection or recreate the existing one.',
+          `Postgres pgvector chunk insert failed for workspace="${workspace.id}", document="${doc.id}", ` +
+          `path="${doc.path}", chunkIndex=${index}, chunkId="${chunk.id}". Original error: ${errorMessage(error)}`,
         );
       }
-      return;
-    } catch (error) {
-      if (!errorMessage(error).includes('HTTP 404')) throw error;
     }
-    await this.request('PUT', collectionPath, {
-      vectors: {
-        size: this.vectorizer.dimensions,
-        distance: 'Cosine',
-      },
-    });
-  }
-
-  private async upsertPoints(points: QdrantPoint[]): Promise<void> {
-    for (let start = 0; start < points.length; start += QDRANT_UPSERT_BATCH_SIZE) {
-      const batch = points.slice(start, start + QDRANT_UPSERT_BATCH_SIZE);
-      await this.request('PUT', `/collections/${encodeURIComponent(this.collection)}/points?wait=true`, { points: batch });
-    }
-  }
-
-  private async deletePoints(pointIds: string[]): Promise<void> {
-    for (let start = 0; start < pointIds.length; start += QDRANT_UPSERT_BATCH_SIZE) {
-      const batch = pointIds.slice(start, start + QDRANT_UPSERT_BATCH_SIZE);
-      if (batch.length > 0) {
-        await this.request('POST', `/collections/${encodeURIComponent(this.collection)}/points/delete?wait=true`, { points: batch });
-      }
-    }
-  }
-
-  private async searchPoints(
-    vector: readonly number[],
-    limit: number,
-    must: unknown[],
-    signal: AbortSignal,
-  ): Promise<QdrantSearchResult[]> {
-    const response = await this.request<{ result?: QdrantSearchResult[] }>(
-      'POST',
-      `/collections/${encodeURIComponent(this.collection)}/points/search`,
-      {
-        vector,
-        limit,
-        filter: { must },
-        with_payload: false,
-        with_vector: false,
-      },
-      signal,
-    );
-    return Array.isArray(response.result) ? response.result : [];
-  }
-
-  private async request<T = unknown>(method: string, apiPath: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-    const request: RequestInit = { method };
-    if (body !== undefined) {
-      request.headers = { 'Content-Type': 'application/json' };
-      request.body = JSON.stringify(body);
-    }
-    if (signal) request.signal = signal;
-    const response = await fetch(`${this.baseUrl}${apiPath}`, request);
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`Qdrant ${method} ${apiPath} failed with HTTP ${response.status}: ${text.slice(0, 500)}`);
-    }
-    return (text ? JSON.parse(text) : undefined) as T;
   }
 }
 
@@ -743,36 +649,110 @@ export async function createRagStorage(vectorizer: VectorizerMetadata): Promise<
     return new JsonRagStorage('Legacy JSON workspace RAG storage forced by CORTEX_RAG_STORAGE.');
   }
 
-  const qdrantUrl = normalizeBaseUrl(process.env['CORTEX_RAG_QDRANT_URL'] ?? DEFAULT_QDRANT_URL);
-  const collection = process.env['CORTEX_RAG_QDRANT_COLLECTION'];
+  if (mode === 'qdrant' || mode === 'qdrant-sqlite') {
+    console.warn('[workspace-rag] CORTEX_RAG_STORAGE=qdrant-sqlite is deprecated; using postgres-pgvector.');
+  }
+
   try {
-    return await QdrantSQLiteRagStorage.open(qdrantUrl, vectorizer, collection);
+    return await PostgresPgvectorRagStorage.open(vectorizer);
   } catch (error) {
-    if (mode === 'qdrant' || mode === 'qdrant-sqlite') throw error;
-    const message = `Qdrant unavailable at ${qdrantUrl}; using legacy JSON storage. ${errorMessage(error)}`;
+    if (mode === 'postgres' || mode === 'pgvector' || mode === 'postgres-pgvector') throw error;
+    const message = `Postgres pgvector unavailable; using legacy JSON storage. ${errorMessage(error)}`;
     console.warn(`[workspace-rag] ${message}`);
     return new JsonRagStorage(message);
   }
+}
+
+function postgresConfigFromEnv(): PostgresConfig {
+  const connectionString = process.env['CORTEX_RAG_POSTGRES_URL']?.trim();
+  const host = process.env['CORTEX_RAG_POSTGRES_HOST']?.trim() || process.env['POSTGRES_HOST']?.trim() || DEFAULT_POSTGRES_HOST;
+  const port = numberEnv(process.env['CORTEX_RAG_POSTGRES_PORT'] ?? process.env['POSTGRES_PORT'], DEFAULT_POSTGRES_PORT);
+  const database = process.env['CORTEX_RAG_POSTGRES_DB']?.trim() || process.env['POSTGRES_DB']?.trim() || DEFAULT_POSTGRES_DB;
+  const user = process.env['CORTEX_RAG_POSTGRES_USER']?.trim() || process.env['POSTGRES_USER']?.trim() || DEFAULT_POSTGRES_USER;
+  const password = process.env['CORTEX_RAG_POSTGRES_PASSWORD'] ?? process.env['POSTGRES_PASSWORD'];
+  const schema = sanitizeSqlIdentifier(process.env['CORTEX_RAG_POSTGRES_SCHEMA']?.trim() || DEFAULT_POSTGRES_SCHEMA);
+  const poolConfig: PoolConfig = {
+    max: 8,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 3_000,
+  };
+  if (connectionString) {
+    poolConfig.connectionString = connectionString;
+    const parsed = parsePostgresUrl(connectionString);
+    return {
+      poolConfig,
+      host: parsed.host || host,
+      port: parsed.port || port,
+      database: parsed.database || database,
+      schema,
+    };
+  }
+  poolConfig.host = host;
+  poolConfig.port = port;
+  poolConfig.database = database;
+  poolConfig.user = user;
+  if (password !== undefined && password !== '') poolConfig.password = password;
+  return { poolConfig, host, port, database, schema };
+}
+
+function parsePostgresUrl(value: string): { host?: string; port?: number; database?: string } {
+  try {
+    const parsed = new URL(value);
+    return {
+      ...(parsed.hostname ? { host: parsed.hostname } : {}),
+      ...(parsed.port ? { port: Number(parsed.port) } : {}),
+      ...(parsed.pathname && parsed.pathname !== '/' ? { database: decodeURIComponent(parsed.pathname.slice(1)) } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function documentValues(workspace: WorkspaceRefLike, doc: IndexedDocument, fallbackVectorizer: VectorizerMetadata): unknown[] {
+  const metadata = doc.vectorizer ?? fallbackVectorizer;
+  return [
+    postgresText(doc.id),
+    postgresText(workspace.id),
+    postgresNullableText(doc.contextId),
+    postgresText(doc.path),
+    postgresText(doc.hash),
+    postgresText(metadata.backend),
+    postgresText(metadata.model),
+    metadata.dimensions,
+    postgresText(doc.updatedAt),
+    postgresText(sourceTypeForDocument(doc)),
+  ];
+}
+
+function postgresText(value: string): string {
+  return value.includes('\0') ? value.replace(/\0/g, '') : value;
+}
+
+function postgresNullableText(value: string | undefined | null): string | null {
+  return value === undefined || value === null ? null : postgresText(value);
+}
+
+function toPgVector(vector: readonly number[]): string {
+  return `[${vector.map(value => Number.isFinite(value) ? value : 0).join(',')}]`;
 }
 
 function clampLimit(limit: number): number {
   return Math.max(1, Math.min(Math.floor(limit), 12));
 }
 
-function normalizeBaseUrl(value: string): string {
-  return value.trim().replace(/\/+$/, '') || DEFAULT_QDRANT_URL;
+function numberEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function sanitizeCollectionName(value: string): string {
-  const sanitized = value.replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 255);
-  return sanitized || 'cortex_workspace_rag';
+function sanitizeSqlIdentifier(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9_]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48);
+  if (!sanitized) return DEFAULT_POSTGRES_SCHEMA;
+  if (/^[0-9]/.test(sanitized)) return `_${sanitized}`;
+  return sanitized;
 }
 
-function defaultCollectionName(vectorizer: VectorizerMetadata): string {
-  const hash = sha256(vectorizerIdentity(vectorizer)).slice(0, 12);
-  return `cortex_workspace_rag_${vectorizer.dimensions}_${hash}`;
-}
-
-function matchCondition(key: string, value: string): unknown {
-  return { key, match: { value } };
+function quoteIdentifier(value: string): string {
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value)) throw new Error(`Unsafe SQL identifier: ${value}`);
+  return `"${value}"`;
 }

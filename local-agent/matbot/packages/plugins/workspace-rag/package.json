@@ -11,10 +11,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-plugin-api": "workspace:*"
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "pg": "^8.22.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",
+    "@types/pg": "^8.20.0",
     "typescript": "catalog:"
   }
 }

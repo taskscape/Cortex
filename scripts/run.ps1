@@ -91,6 +91,35 @@ function Wait-HttpOk($Name, $Url, $TimeoutSec) {
     return $false
 }
 
+function Wait-TcpOk($Name, $HostName, $Port, $TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    while ((Get-Date) -lt $deadline) {
+        $client = $null
+        try {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $task = $client.ConnectAsync($HostName, [int]$Port)
+            if ($task.Wait(5000) -and $client.Connected) {
+                Write-Host "${Name}: ok ($HostName`:$Port)"
+                return $true
+            }
+            $lastError = "connection timed out"
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        finally {
+            if ($client) { $client.Dispose() }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Warning "${Name}: unavailable after $TimeoutSec seconds ($lastError)"
+    return $false
+}
+
 function Ensure-Pnpm {
     if (Test-Command pnpm) {
         return
@@ -186,7 +215,9 @@ if (-not $SkipHealth) {
         Wait-HttpOk "file-broker" "http://localhost:8878/health" $HealthTimeoutSec | Out-Null
         if (-not $SkipDocker) {
             Wait-HttpOk "mem0" "http://localhost:8888/docs" $HealthTimeoutSec | Out-Null
-            Wait-HttpOk "qdrant" "$env:CORTEX_RAG_QDRANT_URL/readyz" $HealthTimeoutSec | Out-Null
+            $postgresHost = if ($env:CORTEX_RAG_POSTGRES_HOST) { $env:CORTEX_RAG_POSTGRES_HOST } else { "localhost" }
+            $postgresPort = if ($env:CORTEX_RAG_POSTGRES_PORT) { [int]$env:CORTEX_RAG_POSTGRES_PORT } else { 5432 }
+            Wait-TcpOk "postgres" $postgresHost $postgresPort $HealthTimeoutSec | Out-Null
             if (-not $SkipCudaIngestion -and $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 Wait-HttpOk "workspace-rag-cuda" "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" $HealthTimeoutSec | Out-Null
             }

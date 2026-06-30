@@ -3,10 +3,8 @@
   "contexts": [
     {
       "id": "default",
-      "name": "Private",
-      "paths": [
-        "C:\\Projects\\Obsidian"
-      ]
+      "name": "Default",
+      "paths": []
     }
   ]
 }

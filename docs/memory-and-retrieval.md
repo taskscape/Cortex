@@ -173,10 +173,10 @@ Workspace RAG is scoped to the active Cortex workspace and its active RAG
 context. It is file-backed markdown retrieval with per-workspace persistence.
 It injects relevant snippets automatically before each model turn and can also
 be queried by `workspace_rag` and `contextual_search`. In normal Docker-backed
-startup, vectors are stored in Qdrant while document hashes, chunk text, and
-Qdrant point ids are stored in the workspace's `.data\workspace-rag\index.sqlite`.
-The older `.data\workspace-rag\index.json` file is retained only as a fallback
-or diagnostic storage mode.
+startup, Postgres/pgvector stores vectors, document hashes, chunk text, and
+metadata in the `workspace_rag` schema. The older
+`.data\workspace-rag\index.json` file is retained only as a fallback or
+diagnostic storage mode.
 
 ## `contextual_search` Retrieval
 

@@ -20,7 +20,7 @@ async function main() {
     await writeFile(configPath, "plugins:\n  - ./packages/plugins/workspace-rag\n", "utf8");
     await writeFile(
       path.join(docsDir, "retrieval-probe.md"),
-      "# Retrieval Probe\n\nThe QuasarPump calibration value is 42. Use the amber valve before startup.",
+      "# Retrieval Probe\n\nThe QuasarPump calibration value is 42.\0 Use the amber valve before startup.",
       "utf8",
     );
     await writeFile(
@@ -77,6 +77,10 @@ async function main() {
 
     const dbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
     assert.match(dbText, /QuasarPump/);
+    assert.doesNotMatch(dbText, /\\u0000/);
+    const ingestionLog = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "ingestion.log"), "utf8");
+    assert.match(ingestionLog, /"event":"file_sanitized"/);
+    assert.match(ingestionLog, /"nulCharsRemoved":1/);
 
     const searchEvents = [];
     for await (const event of registeredTool.executor.execute({

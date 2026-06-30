@@ -24,13 +24,12 @@ Default local endpoints:
 | File index | `http://localhost:8877` | `local-agent\file-index` |
 | File broker | `http://localhost:8878` | `local-agent\file-broker` |
 | Mem0 API | `http://localhost:8888` | `local-agent\docker\mem0` |
-| Qdrant | `http://localhost:6333` | `local-agent\docker\mem0` |
 | Cortex WebUI | `http://localhost:19778` | `local-agent\matbot\packages\plugins\frontend\web` |
 
 Startup flow:
 
 1. `scripts\run.ps1` checks install/build state.
-2. It starts file-index, file-broker, and the Mem0/Qdrant Docker stack unless skipped.
+2. It starts file-index, file-broker, and the Mem0/Postgres/Neo4j Docker stack unless skipped.
 3. It starts or restarts the Matbot WebUI process.
 4. Matbot finds `matbot.yaml`, then loads `cortex-workspaces.json`.
 5. The active workspace selects the actual `matbot.yaml` and `.env`.
@@ -60,11 +59,10 @@ Persistence is deliberately split:
 | Provider secrets | One Cortex workspace | that workspace's `.env` |
 | Sessions, files, stores, memories, skills | One Cortex workspace | that workspace's `.data` |
 | Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
-| Workspace RAG metadata/chunks | One Cortex workspace | `.data\workspace-rag\index.sqlite` |
-| Workspace RAG vectors | Cortex local Docker stack | Qdrant `workspace-rag-qdrant` volume |
+| Workspace RAG vectors/metadata/chunks | Cortex local Docker stack | Postgres/pgvector schema and tables |
 | Workspace RAG JSON fallback | One Cortex workspace | `.data\workspace-rag\index.json` |
 | File-index data | Host service | `local-agent\file-index\data\index.json` |
-| Mem0/Postgres/Neo4j/Qdrant | Docker stack | Docker volumes |
+| Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
 
 ## Core Systems
 
@@ -318,7 +316,7 @@ A Cortex workspace is a boot-scoped runtime context. It controls:
 - sessions and files;
 - remembered facts and tool stores;
 - skills and knowledge;
-- workspace RAG folders, SQLite chunk metadata, and Qdrant vectors.
+- workspace RAG folders and Postgres/pgvector index data.
 
 Switching workspaces restarts the Matbot process intentionally. Providers,
 plugins, vaults, stores, hooks, and session runners are initialized at boot, so a

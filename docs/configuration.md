@@ -23,7 +23,7 @@ providers, plugins, workspaces, or RAG folders.
 | `local-agent\config\path-mapping.json` | Windows, WSL, and Docker path prefix mappings. |
 | `local-agent\config\memory-policy.json` | Human policy for durable memory: what to store, avoid, and promote. |
 | `local-agent\config\experts.json` | Expert panel definitions and knowledge roots. |
-| `local-agent\docker\mem0\.env` | Docker Compose secrets for Mem0/Postgres/Neo4j; Qdrant itself does not require secrets in the local stack. Gitignored. |
+| `local-agent\docker\mem0\.env` | Docker Compose secrets for Mem0/Postgres/Neo4j. Gitignored. |
 | `local-agent\docker\mem0\.env.example` | Committed template for Mem0 environment variables. |
 | `package.json` | Root npm scripts and npm workspaces. |
 
@@ -50,9 +50,14 @@ Additional runtime environment variables:
 | `FILE_BROKER_BASE_URL` | `http://localhost:8878` | URL used by local file tools. |
 | `MEM0_BASE_URL` | `http://localhost:8888` | URL used by Mem0 retrieval. |
 | `MEM0_USER_ID` | `local-agent` | User id used by hybrid Mem0 retrieval. |
-| `CORTEX_RAG_QDRANT_URL` | `http://localhost:6333` | Qdrant REST URL used by workspace RAG vector storage. Set by the launch scripts. |
-| `CORTEX_RAG_QDRANT_COLLECTION` | derived from embedding backend/model/dimensions | Override the Qdrant collection name for workspace RAG. |
-| `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Qdrant+SQLite and falls back to JSON; `qdrant-sqlite` forces Qdrant; `json` forces legacy JSON. |
+| `CORTEX_RAG_POSTGRES_URL` | unset | Optional full Postgres connection string for workspace RAG storage. Overrides the individual `CORTEX_RAG_POSTGRES_*` values. |
+| `CORTEX_RAG_POSTGRES_HOST` | `localhost` | Postgres host used by workspace RAG. Set by the launch scripts from Docker environment values when possible. |
+| `CORTEX_RAG_POSTGRES_PORT` | `5432` | Postgres port used by workspace RAG. |
+| `CORTEX_RAG_POSTGRES_DB` | `mem0` | Postgres database used by workspace RAG. |
+| `CORTEX_RAG_POSTGRES_USER` | `mem0` | Postgres user used by workspace RAG. |
+| `CORTEX_RAG_POSTGRES_PASSWORD` | `POSTGRES_PASSWORD` or Docker `.env` | Postgres password used by workspace RAG. |
+| `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
+| `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
 | `MATBOT_WEB_PORT` | `19778` | WebUI port. Set by `run.ps1 -WebPort`. |
 | `MATBOT_COMMAND` | unset | Optional command consumed by `start-local-agent.ps1` to launch Matbot. |
 | `MATBOT_PRINCIPAL` | unset | Boot identity override for Matbot. Accepts an id or JSON `{ "id", "type" }`. |
@@ -73,13 +78,12 @@ file and from process environment variables.
 
 Do not commit real `.env` files or secret values.
 
-## Mem0 And Qdrant Docker
+## Mem0 And Postgres Docker
 
 `local-agent\docker\mem0\docker-compose.yml` reads
-`local-agent\docker\mem0\.env` for Mem0/Postgres/Neo4j secrets. Qdrant is also
-started by this Compose file and persists vectors in the
-`workspace-rag-qdrant` Docker volume, but it does not need secrets in the local
-stack. The expected template is:
+`local-agent\docker\mem0\.env` for Mem0/Postgres/Neo4j secrets. The same
+Postgres service also stores workspace RAG vectors, metadata, and chunk text
+through pgvector. The expected template is:
 
 ```dotenv
 MEM0_BASE_URL=http://localhost:8888
@@ -98,8 +102,8 @@ WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
 
 The Postgres and Neo4j passwords are baked into their Docker volumes on first
 start. If you rotate them after the stack has already started, recreate the
-volumes. This also removes Qdrant vectors because Compose volume cleanup removes
-all volumes declared by this stack:
+volumes. This also removes Mem0 and workspace RAG Postgres data because Compose
+volume cleanup removes all volumes declared by this stack:
 
 ```powershell
 docker compose -f local-agent\docker\mem0\docker-compose.yml down -v
@@ -360,20 +364,19 @@ Concepts:
 | Context | A named set of local markdown folders inside one Cortex workspace. |
 | Active context | The context injected into conversations and edited by the WebUI settings page. |
 | Paths | Absolute local folders. Only files with the `.md` extension are indexed. |
-| Vector DB | Qdrant collection shared by the local stack; vectors are filtered by workspace/context metadata. |
-| Metadata DB | Per-workspace SQLite database at `.data\workspace-rag\index.sqlite` containing document hashes, chunk text, and Qdrant point ids. |
-| JSON fallback | Legacy local index at `.data\workspace-rag\index.json`, used only when `CORTEX_RAG_STORAGE=json` or Qdrant is unavailable in `auto` mode. |
+| Vector and metadata DB | Postgres/pgvector tables in the `workspace_rag` schema by default. Dimension-specific tables such as `documents_384` and `chunks_384` hold document hashes, chunk text, metadata, and vectors. |
+| JSON fallback | Legacy local index at `.data\workspace-rag\index.json`, used only when `CORTEX_RAG_STORAGE=json` or Postgres/pgvector is unavailable in `auto` mode. |
 
 The ingestion manager:
 
-- scans all workspaces in `cortex-workspaces.json`, not only the currently selected workspace;
+- scans the active workspace first, then scans inactive workspaces from `cortex-workspaces.json` serially in the background;
 - indexes markdown files under configured paths;
-- chunks markdown, hashes document content, stores chunk text/metadata in SQLite, and stores vectors in Qdrant;
+- chunks markdown, hashes document content, and stores chunk text, metadata, and vectors in Postgres/pgvector;
 - re-indexes changed files when the markdown hash changes;
 - removes deleted markdown files from the index;
 - writes changed documents incrementally, so ingestion does not serialize one giant JSON file at the end;
 - continues in the background while the WebUI is open;
-- rescans configured folders every minute after the initial pass;
+- rescans configured folders every minute after the initial pass, coalescing overlapping timer scans instead of running them concurrently;
 - restarts ingestion for the current workspace immediately when saved paths change.
 
 The WebUI exposes the active context through the workspace settings page:
@@ -389,7 +392,7 @@ Open the workspace gear in the WebUI to see this line; it reads `CUDA` only when
 the current ingestion backend is actually using the CUDA embedding service. If
 the machine exposes NVIDIA hardware but the CUDA embedding service is
 unavailable, it reads `CPU (NVIDIA detected)`. The storage label reads
-`Qdrant+SQLite` for the scalable backend or `JSON` for the fallback backend.
+`Postgres/pgvector` for the scalable backend or `JSON` for the fallback backend.
 
 The same operations are available through the `workspace_rag` tool:
 
@@ -440,6 +443,10 @@ The same operations are available through the `workspace_rag` tool:
 { "action": "reindex_now" }
 ```
 
+`reindex_now` reindexes the current workspace. Background scans may still index
+inactive workspaces later, but they are serialized so a large inactive workspace
+cannot run concurrently with the active workspace scan.
+
 Status responses include:
 
 | Field | Meaning |
@@ -457,11 +464,13 @@ Status responses include:
 | `embeddingDimensions` | Vector dimensions used by the current backend. |
 | `cudaServiceUrl` | CUDA embedding service URL when configured/probed. |
 | `accelerationMessage` | Human-readable launch-time CUDA/CPU decision. |
-| `storageBackend` | `qdrant-sqlite` for Qdrant vectors plus SQLite metadata, or `json` for the legacy fallback. |
+| `storageBackend` | `postgres-pgvector` for Postgres vectors, metadata, and chunk text, or `json` for the legacy fallback. |
 | `storageMessage` | Human-readable storage selection/fallback reason. |
-| `qdrantUrl` | Qdrant REST URL when Qdrant+SQLite is active. |
-| `qdrantCollection` | Qdrant collection used by the active embedding backend. |
-| `sqlitePath` | Per-workspace SQLite metadata/chunk database path when Qdrant+SQLite is active. |
+| `postgresHost` | Postgres host when Postgres/pgvector is active. |
+| `postgresPort` | Postgres port when Postgres/pgvector is active. |
+| `postgresDatabase` | Postgres database when Postgres/pgvector is active. |
+| `postgresSchema` | Postgres schema when Postgres/pgvector is active. |
+| `postgresTables` | Dimension-specific document and chunk table names when Postgres/pgvector is active. |
 | `legacyJsonPath` | Per-workspace JSON index path when JSON fallback is active. |
 | `message` | Human-readable status message. |
 
@@ -486,11 +495,11 @@ To skip the CUDA service from the launcher without changing the environment:
 .\scripts\run.ps1 -SkipCudaIngestion
 ```
 
-To force the scalable Qdrant+SQLite storage backend and fail fast if Qdrant is
-not reachable:
+To force the scalable Postgres/pgvector storage backend and fail fast if
+Postgres is not reachable:
 
 ```powershell
-$env:CORTEX_RAG_STORAGE = "qdrant-sqlite"
+$env:CORTEX_RAG_STORAGE = "postgres-pgvector"
 .\scripts\run.ps1
 ```
 

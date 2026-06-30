@@ -5,9 +5,27 @@ $checks = @(
     @{ Name = "file-broker"; Url = "http://localhost:8878/health" },
     # mem0/mem0-api-server exposes no /health route; its Swagger UI at /docs
     # returning 200 confirms the API is up and serving.
-    @{ Name = "mem0"; Url = "http://localhost:8888/docs" },
-    @{ Name = "qdrant"; Url = "$(if ($env:CORTEX_RAG_QDRANT_URL) { $env:CORTEX_RAG_QDRANT_URL } else { 'http://localhost:6333' })/readyz" }
+    @{ Name = "mem0"; Url = "http://localhost:8888/docs" }
 )
+
+function Test-Tcp($Name, $HostName, $Port) {
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $task = $client.ConnectAsync($HostName, [int]$Port)
+        if ($task.Wait(5000) -and $client.Connected) {
+            Write-Host "$($Name): ok ($HostName`:$Port)"
+            return
+        }
+        Write-Warning "$($Name): unavailable (connection timed out)"
+    }
+    catch {
+        Write-Warning "$($Name): unavailable ($($_.Exception.Message))"
+    }
+    finally {
+        if ($client) { $client.Dispose() }
+    }
+}
 
 if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
     $checks += @{ Name = "workspace-rag-cuda"; Url = "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" }
@@ -27,3 +45,7 @@ foreach ($check in $checks) {
         Write-Warning "$($check.Name): unavailable ($($_.Exception.Message))"
     }
 }
+
+$postgresHost = if ($env:CORTEX_RAG_POSTGRES_HOST) { $env:CORTEX_RAG_POSTGRES_HOST } else { "localhost" }
+$postgresPort = if ($env:CORTEX_RAG_POSTGRES_PORT) { [int]$env:CORTEX_RAG_POSTGRES_PORT } else { 5432 }
+Test-Tcp "postgres" $postgresHost $postgresPort
