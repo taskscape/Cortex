@@ -44,7 +44,7 @@ lives under [`docs/`](docs):
 | Document | Contents |
 | --- | --- |
 | [Architecture And Core Systems](docs/architecture.md) | How requests move through the system; the plugin, memory, inner-voice, scheduling, workspace, RAG, and expert systems. |
-| [Commands](docs/commands.md) | PowerShell scripts, `run.ps1` switches, and npm scripts. |
+| [Commands](docs/commands.md) | Purpose of every PowerShell script, launcher/service startup paths, `run.ps1` switches, and npm scripts. |
 | [Configuration Reference](docs/configuration.md) | Configuration files, secrets/environment, Mem0 Docker, host file access, Matbot runtime, providers, workspaces, workspace RAG, and expert panel config. |
 | [Plugins And Tools](docs/plugins-and-tools.md) | Active and bundled plugins, adding plugins at runtime, and the `powershell`, `file_broker_action`, `workspace_action`, `skill_action`, `contextual_search`, `expert_panel`, and cognition tools. |
 | [Memory And Retrieval](docs/memory-and-retrieval.md) | The "remember my name" flow, `remembered_facts`, `KnowledgeIndex`, workspace RAG, `contextual_search`, and `memory-policy.json`. |

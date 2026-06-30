@@ -1,5 +1,5 @@
 {
-  "active": "default",
+  "active": "private",
   "workspaces": [
     {
       "id": "default",
@@ -7,6 +7,13 @@
       "configPath": "matbot.yaml",
       "createdAt": "2026-06-28T17:18:02.608Z",
       "updatedAt": "2026-06-28T17:18:02.608Z"
+    },
+    {
+      "id": "private",
+      "name": "Private",
+      "configPath": "workspaces/private/matbot.yaml",
+      "createdAt": "2026-06-30T11:41:34.683Z",
+      "updatedAt": "2026-06-30T11:41:34.683Z"
     }
   ]
 }

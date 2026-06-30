@@ -22,6 +22,7 @@ const SCAN_INTERVAL_MS = 60_000;
 const MAX_CHUNK_CHARS = 1800;
 const MAX_CONTEXT_CHUNKS = 4;
 const DEFAULT_CUDA_EMBEDDING_URL = 'http://localhost:8890';
+const CUDA_EMBED_REQUEST_LIMIT = 256;
 const CPU_VECTOR_BACKEND = 'hash-cpu';
 const CPU_VECTOR_MODEL = 'token-hash-v1';
 
@@ -352,6 +353,15 @@ class CudaHttpVectorizer implements TextVectorizer {
 
   async embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]> {
     if (texts.length === 0) return [];
+    const embeddings: number[][] = [];
+    for (let start = 0; start < texts.length; start += CUDA_EMBED_REQUEST_LIMIT) {
+      const batch = texts.slice(start, start + CUDA_EMBED_REQUEST_LIMIT);
+      embeddings.push(...await this.embedBatch(batch, start, signal));
+    }
+    return embeddings;
+  }
+
+  private async embedBatch(texts: readonly string[], offset: number, signal?: AbortSignal): Promise<number[][]> {
     const request: RequestInit = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -369,13 +379,14 @@ class CudaHttpVectorizer implements TextVectorizer {
       throw new Error(`CUDA embedding service returned ${body.embeddings.length} embeddings for ${texts.length} text(s).`);
     }
     return body.embeddings.map((embedding, index) => {
-      if (!Array.isArray(embedding)) throw new Error(`CUDA embedding ${index} is not an array.`);
+      const embeddingIndex = offset + index;
+      if (!Array.isArray(embedding)) throw new Error(`CUDA embedding ${embeddingIndex} is not an array.`);
       const vector = embedding.map(value => Number(value));
       if (vector.length !== this.info.dimensions) {
-        throw new Error(`CUDA embedding ${index} has ${vector.length} dimensions; expected ${this.info.dimensions}.`);
+        throw new Error(`CUDA embedding ${embeddingIndex} has ${vector.length} dimensions; expected ${this.info.dimensions}.`);
       }
       if (vector.some(value => !Number.isFinite(value))) {
-        throw new Error(`CUDA embedding ${index} contains a non-finite value.`);
+        throw new Error(`CUDA embedding ${embeddingIndex} contains a non-finite value.`);
       }
       return vector;
     });

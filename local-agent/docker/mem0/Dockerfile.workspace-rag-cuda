@@ -1,7 +1,7 @@
 # CUDA-enabled embedding service for the workspace-rag plugin.
 # The tag can be overridden at build time if the local driver/runtime policy changes.
 ARG PYTORCH_TAG=2.5.1-cuda12.4-cudnn9-runtime
-FROM --platform=linux/amd64 pytorch/pytorch:${PYTORCH_TAG}
+FROM pytorch/pytorch:${PYTORCH_TAG}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,6 +17,7 @@ COPY workspace-rag-cuda/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY workspace-rag-cuda/app.py ./app.py
+COPY workspace-rag-cuda/healthcheck.py ./healthcheck.py
 
 # Preload the default model into the image layer so the first run does not need
 # to download it before the health check can pass.
@@ -30,17 +31,6 @@ PY
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=20 CMD python - <<'PY'
-import json
-import sys
-import urllib.request
-
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    sys.exit(0 if body.get("ok") and body.get("cudaAvailable") else 1)
-except Exception:
-    sys.exit(1)
-PY
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=20 CMD ["python", "healthcheck.py"]
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
