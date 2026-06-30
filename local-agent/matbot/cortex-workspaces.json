@@ -14,6 +14,13 @@
       "configPath": "workspaces/private/matbot.yaml",
       "createdAt": "2026-06-30T11:41:34.683Z",
       "updatedAt": "2026-06-30T11:41:34.683Z"
+    },
+    {
+      "id": "default-2",
+      "name": "Default",
+      "configPath": "workspaces/default-2/matbot.yaml",
+      "createdAt": "2026-06-30T11:58:26.616Z",
+      "updatedAt": "2026-06-30T11:58:26.616Z"
     }
   ]
 }

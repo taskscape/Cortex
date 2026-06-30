@@ -62,7 +62,9 @@ let workspaceRagStatus = {
   embeddingBackend: "hash-cpu",
   embeddingModel: "token-hash-v1",
   embeddingDimensions: 384,
-  accelerationMessage: "Using CPU hash vectorizer."
+  accelerationMessage: "Using CPU hash vectorizer.",
+  storageBackend: "json",
+  storageMessage: "Legacy JSON workspace RAG storage active."
 };
 
 function activeRagContext() {

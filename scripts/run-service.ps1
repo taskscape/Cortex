@@ -103,6 +103,30 @@ function Wait-CudaEmbeddingReady($Url, $TimeoutSec) {
     return $false
 }
 
+function Wait-QdrantReady($Url, $TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Method Get -Uri "$Url/readyz" -TimeoutSec 5 -UseBasicParsing
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                Write-ServiceLog "qdrant ready ($Url)"
+                return $true
+            }
+            $lastError = "HTTP $($response.StatusCode)"
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Warning "qdrant unavailable after $TimeoutSec seconds ($lastError). Workspace RAG will fall back to JSON unless CORTEX_RAG_STORAGE forces Qdrant."
+    return $false
+}
+
 function Start-NodeService($Name, $Port, $ScriptPath, $OutLog, $ErrLog) {
     if (Test-PortListening $Port) {
         Write-ServiceLog "$Name already listening on http://localhost:$Port"
@@ -122,6 +146,10 @@ function Start-NodeService($Name, $Port, $ScriptPath, $OutLog, $ErrLog) {
 Set-Location $Root
 New-Item -ItemType Directory -Force -Path $LogsRoot | Out-Null
 
+if (-not $env:CORTEX_RAG_QDRANT_URL) {
+    $env:CORTEX_RAG_QDRANT_URL = "http://localhost:6333"
+}
+
 $fileIndexOutput = Join-Path $Root "local-agent\file-index\dist\server.js"
 $fileBrokerOutput = Join-Path $Root "local-agent\file-broker\dist\server.js"
 if (-not (Test-Path -LiteralPath $fileIndexOutput)) {
@@ -139,6 +167,7 @@ if (-not $SkipDocker) {
         if (Test-CudaIngestionAvailable) {
             Write-ServiceLog "Starting Mem0 Docker stack with workspace-rag CUDA embeddings"
             docker compose -f $ComposeFile --profile cuda up -d
+            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
             if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
             }
@@ -150,6 +179,7 @@ if (-not $SkipDocker) {
         else {
             Write-ServiceLog "Starting Mem0 Docker stack without CUDA ingestion"
             docker compose -f $ComposeFile up -d
+            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
             if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
                 $env:CORTEX_RAG_DISABLE_CUDA = "1"
             }

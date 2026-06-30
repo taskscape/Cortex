@@ -10,6 +10,7 @@ import process                               from 'node:process';
 let webServer: Awaited<ReturnType<typeof createWebServer>> | undefined;
 let toolRegistry: ToolRegistry | undefined;
 const port = Number(process.env['MATBOT_WEB_PORT'] ?? 19778); // 19778 is "MB" in hex, a cute easter egg :)
+const listenRetryTimeoutMs = Number(process.env['MATBOT_WEB_LISTEN_RETRY_TIMEOUT_MS'] ?? 15000);
 
 // Mint a shareable URL for a stored file — but only one this server actually serves: a file marked
 // `allowed` (default-deny). The path mirrors the GET /files/<namespace>/<name> route in server.ts.
@@ -82,23 +83,32 @@ export const plugin: MatbotPluginSpec = {
     });
 
     await new Promise<void>((resolve, reject) => {
-      webServer!.server.once('error', (ex) => {
-        if ((ex as any).code === 'EADDRINUSE') {
-          console.warn(`[frontend-web] Port ${port} is already in use. Ignoring error and continuing without starting web server.`);
-          webServer?.close();
-          webServer = undefined;
-          resolve();
-        } else {
+      const server = webServer!.server;
+      const startedAt = Date.now();
+      let warned = false;
+      const listen = () => {
+        const onError = (ex: Error & { code?: string }) => {
+          if (ex.code === 'EADDRINUSE' && Date.now() - startedAt < listenRetryTimeoutMs) {
+            if (!warned) {
+              warned = true;
+              console.warn(`[frontend-web] Port ${port} is already in use. Waiting for it to become available.`);
+            }
+            setTimeout(listen, 250);
+            return;
+          }
           reject(ex);
-        }
-      });
-      webServer!.server.listen(port, '0.0.0.0', () => {
-        process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
-        resolve();
-      });
+        };
+        server.once('error', onError);
+        server.listen(port, '0.0.0.0', () => {
+          server.off('error', onError);
+          process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
+          resolve();
+        });
+      };
+      listen();
     });
 
-    // Only advertise URL minting when a server is actually serving (not on EADDRINUSE).
+    // Only advertise URL minting after the server is actually serving.
     if (webServer) { services.tools.register(urlForResourceTool); toolRegistry = services.tools; }
   },
 

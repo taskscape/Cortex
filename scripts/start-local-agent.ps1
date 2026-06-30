@@ -89,6 +89,34 @@ function Wait-CudaEmbeddingReady($Url, $TimeoutSec) {
     return $false
 }
 
+function Wait-QdrantReady($Url, $TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Method Get -Uri "$Url/readyz" -TimeoutSec 5 -UseBasicParsing
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                Write-Host "qdrant: ok ($Url)"
+                return $true
+            }
+            $lastError = "HTTP $($response.StatusCode)"
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Warning "qdrant: unavailable after $TimeoutSec seconds ($lastError). Workspace RAG will fall back to JSON unless CORTEX_RAG_STORAGE forces Qdrant."
+    return $false
+}
+
+if (-not $env:CORTEX_RAG_QDRANT_URL) {
+    $env:CORTEX_RAG_QDRANT_URL = "http://localhost:6333"
+}
+
 if (-not $SkipBuild) {
     npm run build
 }
@@ -98,6 +126,7 @@ if (-not $SkipDocker) {
         if (Test-CudaIngestionAvailable) {
             Write-Host "CUDA-capable Docker runtime detected. Starting Mem0 stack with workspace-rag CUDA embeddings."
             docker compose -f $ComposeFile --profile cuda up -d
+            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
             if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
             }
@@ -109,6 +138,7 @@ if (-not $SkipDocker) {
         else {
             Write-Host "CUDA-capable Docker runtime not detected. Starting Mem0 stack without CUDA ingestion."
             docker compose -f $ComposeFile up -d
+            Wait-QdrantReady $env:CORTEX_RAG_QDRANT_URL 120 | Out-Null
             if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
                 $env:CORTEX_RAG_DISABLE_CUDA = "1"
             }
@@ -182,6 +212,7 @@ Write-Host "Local agent services requested."
 Write-Host "File index:  http://localhost:8877"
 Write-Host "File broker: http://localhost:8878"
 Write-Host "Mem0:        $env:MEM0_BASE_URL"
+Write-Host "Qdrant:      $env:CORTEX_RAG_QDRANT_URL"
 $ragCudaUrl = if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) { $env:CORTEX_RAG_CUDA_EMBEDDING_URL } else { "disabled" }
 Write-Host "RAG CUDA:    $ragCudaUrl"
 Write-Host "Hybrid KnowledgeIndex plugin: local-agent\matbot\plugins\hybrid-knowledge-index\dist\index.js"

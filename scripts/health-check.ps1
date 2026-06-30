@@ -5,7 +5,8 @@ $checks = @(
     @{ Name = "file-broker"; Url = "http://localhost:8878/health" },
     # mem0/mem0-api-server exposes no /health route; its Swagger UI at /docs
     # returning 200 confirms the API is up and serving.
-    @{ Name = "mem0"; Url = "http://localhost:8888/docs" }
+    @{ Name = "mem0"; Url = "http://localhost:8888/docs" },
+    @{ Name = "qdrant"; Url = "$(if ($env:CORTEX_RAG_QDRANT_URL) { $env:CORTEX_RAG_QDRANT_URL } else { 'http://localhost:6333' })/readyz" }
 )
 
 if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) {

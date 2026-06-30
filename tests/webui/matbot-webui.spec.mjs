@@ -207,10 +207,8 @@ test("workspace RAG configuration panel saves paths and shows indexing progress"
   await page.locator("#workspace-context-name").fill("Engineering Notes");
   await page.locator("#workspace-rag-paths").fill("C:\\Projects\\Cortex\\docs\nD:\\Knowledge");
   await page.locator("#workspace-rag-save-btn").click();
-  await expect(page.locator("#workspace-settings-screen")).not.toHaveClass(/open/);
-  await expect(page.locator("#input-area")).toBeVisible();
-
-  await page.locator("#workspace-config-btn").click();
+  await expect(page.locator("#workspace-settings-screen")).toHaveClass(/open/);
+  await expect(page.locator("#input-area")).not.toBeVisible();
   await expect(page.locator("#workspace-rag-status")).toContainText("indexing");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
   await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");

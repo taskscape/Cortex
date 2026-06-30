@@ -1,0 +1,12 @@
+{
+  "activeContextId": "default",
+  "contexts": [
+    {
+      "id": "default",
+      "name": "Private",
+      "paths": [
+        "C:\\Projects\\Obsidian"
+      ]
+    }
+  ]
+}

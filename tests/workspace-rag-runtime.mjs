@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 process.env.CORTEX_RAG_DISABLE_CUDA = "1";
+process.env.CORTEX_RAG_STORAGE = "json";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
 
 async function main() {

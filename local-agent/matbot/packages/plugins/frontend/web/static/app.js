@@ -206,6 +206,7 @@ let expertPanelBusy = false;
 let workspaceState = { active: 'default', workspaces: [] };
 let workspaceRagPoll = null;
 let workspaceRagConfig = null;
+let workspaceRagLoadSeq = 0;
 let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
@@ -688,6 +689,11 @@ function workspaceStateHasActiveId(state, id) {
   return state?.active === id || Boolean(state?.workspaces?.some(workspace => workspace.id === id && workspace.active));
 }
 
+function isWorkspaceFetchFailure(error) {
+  const message = String(error?.message || error || '');
+  return error instanceof TypeError || /failed to fetch|networkerror|fetch failed/i.test(message);
+}
+
 async function waitForWorkspaceRestart(workspaceId) {
   const startedAt = Date.now();
   let sawUnavailable = false;
@@ -718,6 +724,10 @@ function activeWorkspace() {
          workspaceState.workspaces.find(w => w.id === workspaceState.active) ??
          workspaceState.workspaces[0] ??
          { id: 'default', name: 'Default', active: true };
+}
+
+function activeWorkspaceId() {
+  return activeWorkspace().id || workspaceState.active || 'default';
 }
 
 function setWorkspacePopoverOpen(open) {
@@ -759,7 +769,13 @@ function renderWorkspaces() {
       if (workspace.active) { setWorkspacePopoverOpen(false); return; }
       try {
         setWorkspaceStatus('Switching...');
-        const result = await T.switchWorkspace(workspace.id);
+        let result;
+        try {
+          result = await T.switchWorkspace(workspace.id);
+        } catch (e) {
+          if (!isWorkspaceFetchFailure(e)) throw e;
+          result = { active: workspace.id, restarting: true };
+        }
         if (result?.restarting) {
           setWorkspaceStatus('Restarting...');
           await waitForWorkspaceRestart(workspace.id);
@@ -780,8 +796,9 @@ async function loadWorkspaces() {
   if (!T.listWorkspaces || !workspaceToggleBtn) return;
   try {
     workspaceState = await T.listWorkspaces();
+    workspaceRagConfig = null;
     renderWorkspaces();
-    void loadWorkspaceRagConfig();
+    if (workspaceSettingsScreenEl?.classList.contains('open')) void loadWorkspaceRagConfig();
     setWorkspaceStatus('');
   } catch (e) {
     setWorkspaceStatus('Workspace API unavailable.', true);
@@ -833,15 +850,19 @@ function setWorkspaceRagStatus(text, isError = false) {
 
 function renderWorkspaceRagStatus(status) {
   if (!status) return;
+  if (status.workspaceId && status.workspaceId !== activeWorkspaceId()) return;
   if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = Math.max(0, Math.min(100, status.percent ?? 0)) + '%';
   const accel = status.accelerated
     ? `CUDA · ${status.embeddingModel || 'GPU embeddings'}`
     : (status.nvidiaAvailable ? 'CPU (NVIDIA detected)' : 'CPU');
   const state = status.state || 'idle';
   const percent = Math.max(0, Math.min(100, status.percent ?? 0));
+  const storage = status.storageBackend === 'qdrant-sqlite'
+    ? ' · Qdrant+SQLite'
+    : (status.storageBackend === 'json' ? ' · JSON' : '');
   const message = status.message ? ' · ' + status.message : '';
   const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
-  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${message}${accelerationMessage}`, state === 'error');
+  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${storage}${message}${accelerationMessage}`, state === 'error');
   if (workspaceRagCurrentFileEl) {
     const currentFile = typeof status.currentFile === 'string' && status.currentFile.trim()
       ? status.currentFile.trim()
@@ -864,6 +885,17 @@ function renderWorkspaceRagConfig(config) {
   if (workspaceRagPathsEl) workspaceRagPathsEl.value = Array.isArray(active?.paths ?? config?.paths) ? (active?.paths ?? config.paths).join('\n') : '';
 }
 
+function resetWorkspaceRagConfigForm() {
+  workspaceRagConfig = null;
+  if (workspaceContextNameEl) workspaceContextNameEl.value = activeWorkspace().name || '';
+  if (workspaceRagPathsEl) workspaceRagPathsEl.value = '';
+  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = '0%';
+  if (workspaceRagCurrentFileEl) {
+    workspaceRagCurrentFileEl.textContent = '';
+    workspaceRagCurrentFileEl.title = '';
+  }
+}
+
 async function loadWorkspaceRagStatus() {
   try {
     const status = await callTool('workspace_rag', { action: 'status' });
@@ -878,14 +910,21 @@ async function loadWorkspaceRagStatus() {
 }
 
 async function loadWorkspaceRagConfig() {
+  const loadSeq = ++workspaceRagLoadSeq;
+  const workspaceId = activeWorkspaceId();
+  resetWorkspaceRagConfigForm();
+  setWorkspaceRagStatus('Loading workspace settings...');
   try {
     const [config, status] = await Promise.all([
       callTool('workspace_rag', { action: 'get_config' }),
       callTool('workspace_rag', { action: 'status' }),
     ]);
+    if (loadSeq !== workspaceRagLoadSeq || workspaceId !== activeWorkspaceId()) return;
+    if (status?.workspaceId && status.workspaceId !== workspaceId) return;
     renderWorkspaceRagConfig(config);
     renderWorkspaceRagStatus(status);
   } catch (e) {
+    if (loadSeq !== workspaceRagLoadSeq) return;
     setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
     if (workspaceRagCurrentFileEl) {
       workspaceRagCurrentFileEl.textContent = '';
@@ -914,7 +953,6 @@ workspaceRagSaveBtn?.addEventListener('click', async () => {
     const result = await callTool('workspace_rag', { action: 'configure', contextId, contextName, paths });
     renderWorkspaceRagConfig(result.config);
     renderWorkspaceRagStatus(result.status);
-    setWorkspaceSettingsOpen(false);
   } catch (e) {
     setWorkspaceRagStatus(String(e.message || e), true);
   }

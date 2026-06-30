@@ -186,6 +186,7 @@ if (-not $SkipHealth) {
         Wait-HttpOk "file-broker" "http://localhost:8878/health" $HealthTimeoutSec | Out-Null
         if (-not $SkipDocker) {
             Wait-HttpOk "mem0" "http://localhost:8888/docs" $HealthTimeoutSec | Out-Null
+            Wait-HttpOk "qdrant" "$env:CORTEX_RAG_QDRANT_URL/readyz" $HealthTimeoutSec | Out-Null
             if (-not $SkipCudaIngestion -and $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 Wait-HttpOk "workspace-rag-cuda" "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" $HealthTimeoutSec | Out-Null
             }

@@ -67,7 +67,7 @@ can be read on its own.
 | `scripts\` | PowerShell setup, run, stop, and health-check commands. |
 | `local-agent\file-index` | JSON-backed file index with keyword search, metadata, hashing, exclusions, and likely-secret skipping. |
 | `local-agent\file-broker` | Policy-aware file access service for listing, reading, and approved writes with diffs and backups. |
-| `local-agent\docker\mem0` | Docker Compose stack for Mem0, Postgres/pgvector, and Neo4j. |
+| `local-agent\docker\mem0` | Docker Compose stack for Mem0, Qdrant, Postgres/pgvector, and Neo4j. |
 | `local-agent\config` | Host-side configuration for file roots, security policy, path mapping, memory policy, and expert definitions. |
 | `local-agent\knowledge` | Minimal file-backed knowledge samples for the default experts. |
 | `local-agent\matbot` | Matbot runtime checkout, Cortex WebUI, providers, plugins, workspace registry, and per-workspace data. |
@@ -85,11 +85,11 @@ the significant languages, runtimes, and libraries used by each module.
 | `scripts\` | Windows PowerShell | `.ps1` setup/run/health scripts; [WinSW](https://github.com/winsw/winsw) wraps Matbot as a Windows service; Windows service control (`services.msc`, `Get-Service`). |
 | `local-agent\file-index` | TypeScript, Node.js | Built-in `node:http` server (no web framework); `minimatch` for glob exclusions; `node:crypto` hashing; JSON-file persistence. |
 | `local-agent\file-broker` | TypeScript, Node.js | Built-in `node:http` server; no runtime dependencies; unified diffs and file backups; JSON policy files. |
-| `local-agent\docker\mem0` | YAML, Python (upstream image), Dockerfile | Docker Compose stack; Mem0 API server (patched to add `psycopg`, `langchain-neo4j`, `rank-bm25`); optional `workspace-rag-cuda` embedding service under the `cuda` profile; Postgres 16 with `pgvector`; Neo4j 5; Mem0 API runs `linux/arm64` under QEMU on amd64. |
+| `local-agent\docker\mem0` | YAML, Python (upstream image), Dockerfile | Docker Compose stack; Mem0 API server (patched to add `psycopg`, `langchain-neo4j`, `rank-bm25`); Qdrant vector database for workspace RAG; optional `workspace-rag-cuda` embedding service under the `cuda` profile; Postgres 16 with `pgvector`; Neo4j 5; Mem0 API runs `linux/arm64` under QEMU on amd64. |
 | `local-agent\matbot` (runtime) | TypeScript (strict), Node.js >= 24 | pnpm monorepo; agentic runner, plugin loader, hooks, stores; provider communication via raw `fetch` + SSE (no provider SDKs); `Store` compare-and-swap persistence. |
 | Matbot WebUI (`packages\plugins\frontend\web`) | TypeScript (server), vanilla JavaScript (client) | Node HTTP + Server-Sent Events server; framework-free `app.js`/`index.html`/CSS; `localStorage` and Web Crypto in the browser. |
 | Provider adapter (`packages\plugins\providers\openai-compat`) | TypeScript | OpenAI-compatible chat-completions adapter; streaming and tool calls over `fetch` + SSE; works with OpenAI and any compatible endpoint. |
-| `workspace-rag` plugin | TypeScript, Node.js | Markdown chunking and SHA-256 content hashing; local JSON vector index; CPU hash vectorizer fallback; optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds. |
+| `workspace-rag` plugin | TypeScript, Node.js | Markdown chunking and SHA-256 content hashing; Qdrant vector storage with per-workspace SQLite metadata/chunk text; legacy JSON fallback; CPU hash vectorizer fallback; optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds. |
 | Retrieval plugins (`hybrid-knowledge-index`, `persist-ki-bge`, `rumsfeld`) | TypeScript | `KnowledgeIndex` implementations querying Mem0 and file-index; optional BGE reranking in `persist-ki-bge`; `contextual_search` tool. |
 | `expert-panel` plugin | TypeScript, Node.js | Tool-based multi-expert orchestration over the Matbot single-turn API; per-expert file retrieval and optional synthesis. |
 | `tests` | JavaScript (`.mjs`), TypeScript | Node built-in test runner (`node --test`); Playwright for WebUI tests with a fake Matbot harness. |
