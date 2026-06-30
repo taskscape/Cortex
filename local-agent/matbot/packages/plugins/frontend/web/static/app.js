@@ -174,6 +174,8 @@ const workspaceRagProgressBarEl = document.getElementById('workspace-rag-progres
 const workspaceRagStatusEl = document.getElementById('workspace-rag-status');
 const workspaceRagCurrentFileEl = document.getElementById('workspace-rag-current-file');
 const workspaceRagSaveBtn = document.getElementById('workspace-rag-save-btn');
+const memoryBrowserBtn = document.getElementById('memory-browser-btn');
+const memoryBrowserStatusEl = document.getElementById('memory-browser-status');
 let expertPanelExperts = [];
 let expertPanelBusy = false;
 let workspaceState = { active: 'default', workspaces: [] };
@@ -309,6 +311,39 @@ async function refreshProviderSelect() {
 
 async function callTool(toolName, input) {
   return T.callTool(toolName, input);
+}
+
+// ── Memory browser ───────────────────────────────────────────────────────────
+
+function setMemoryBrowserStatus(text, isError = false) {
+  if (!memoryBrowserStatusEl) return;
+  memoryBrowserStatusEl.textContent = text || '';
+  memoryBrowserStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+if (T.hostRuntime !== 'node') {
+  memoryBrowserBtn?.closest('.sidebar-section')?.remove();
+} else {
+  memoryBrowserBtn?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    setMemoryBrowserStatus('Opening...');
+    const popup = window.open('about:blank', '_blank');
+    try {
+      const result = await callTool('open_memory_browser', {});
+      const url = result && typeof result.url === 'string' ? result.url : '';
+      if (!url) throw new Error('Memory browser did not return a URL.');
+      if (popup && !popup.closed) {
+        popup.location.href = url;
+        popup.focus();
+      } else {
+        window.open(url, '_blank');
+      }
+      setMemoryBrowserStatus('');
+    } catch (err) {
+      if (popup && !popup.closed) popup.close();
+      setMemoryBrowserStatus(String(err?.message || err), true);
+    }
+  });
 }
 
 // ── Cortex workspaces ───────────────────────────────────────────────────────

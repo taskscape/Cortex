@@ -15,6 +15,7 @@ The active default plugin list is in `local-agent\matbot\matbot.yaml`.
 | `./packages/plugins/triggers` | Data-driven automatic tool triggers. | Trigger management and automatic `remember_fact` firing. |
 | `./packages/plugins/rumsfeld` | Context lookup tool. | `contextual_search`. |
 | `./packages/plugins/cognition` | Durable memory, inner voice, dream-time stores/tools. | `remember_fact`, `remembered_facts_action`, `dream_time`, `dream_runs_action`, `ask_inner_voice`, `cognition_config`. |
+| `./packages/plugins/memory-browser` | Standalone local browser for remembered facts. | `open_memory_browser`, browser UI on `http://127.0.0.1:19779`. |
 | `./packages/plugins/workspace` | Matbot workspace file abstraction. | `workspace_action`, WebUI file upload/delete/list. |
 | `./plugins/expert-panel` | Multi-perspective expert orchestration. | `expert_panel`. |
 | `./packages/plugins/frontend/web` | Cortex WebUI HTTP/SSE server. | Browser UI and HTTP tool endpoints. |

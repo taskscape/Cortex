@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cortex Memory Browser</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app-shell">
+    <aside class="sidebar">
+      <header class="sidebar-header">
+        <div>
+          <h1>Memories</h1>
+          <p id="count-label">Loading...</p>
+        </div>
+        <button id="refresh-btn" type="button">Refresh</button>
+      </header>
+
+      <form id="search-form" class="search-form">
+        <input id="search-input" type="search" placeholder="Search remembered facts" autocomplete="off">
+        <select id="state-filter" aria-label="Memory state">
+          <option value="all">All</option>
+          <option value="unprocessed">Unprocessed</option>
+          <option value="processed">Processed</option>
+          <option value="ignored">Ignored</option>
+        </select>
+      </form>
+
+      <section class="new-memory">
+        <textarea id="new-fact" rows="3" placeholder="Add a remembered fact manually"></textarea>
+        <button id="add-memory-btn" type="button">Add Memory</button>
+      </section>
+
+      <div id="status" class="status" role="status"></div>
+      <div id="memory-list" class="memory-list"></div>
+      <button id="load-more-btn" class="load-more" type="button">Load More</button>
+    </aside>
+
+    <section class="detail" aria-live="polite">
+      <div id="empty-detail" class="empty-detail">
+        <h2>Select a memory</h2>
+        <p>Browse, edit, or delete remembered facts stored by Cortex.</p>
+      </div>
+
+      <form id="detail-form" class="detail-form hidden">
+        <div class="detail-header">
+          <div>
+            <div id="memory-state" class="memory-state"></div>
+            <h2 id="memory-title">Memory</h2>
+          </div>
+          <div class="detail-actions">
+            <button id="delete-btn" type="button" class="danger">Delete</button>
+            <button id="save-btn" type="submit" class="primary">Save</button>
+          </div>
+        </div>
+
+        <label>
+          Fact
+          <textarea id="fact-input" rows="7"></textarea>
+        </label>
+
+        <div class="field-grid">
+          <label>
+            Session
+            <input id="session-id" type="text" readonly>
+          </label>
+          <label>
+            Message
+            <input id="message-id" type="text" readonly>
+          </label>
+          <label>
+            Created
+            <input id="created-at" type="text" readonly>
+          </label>
+          <label>
+            Version
+            <input id="version" type="text" readonly>
+          </label>
+          <label>
+            Dream Skill
+            <input id="dream-skill" type="text" placeholder="Unset">
+          </label>
+          <label>
+            Ignore Until
+            <input id="ignore-until" type="text" placeholder="Unset">
+          </label>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

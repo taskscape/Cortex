@@ -166,6 +166,7 @@ plugins:
   - ./packages/plugins/triggers
   - ./packages/plugins/rumsfeld
   - ./packages/plugins/cognition
+  - ./packages/plugins/memory-browser
   - ./packages/plugins/workspace
   - ./plugins/expert-panel
   - ./packages/plugins/frontend/web

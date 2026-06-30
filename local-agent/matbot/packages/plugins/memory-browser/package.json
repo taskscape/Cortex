@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-memory-browser",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "Standalone local browser for Cortex remembered facts.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}
