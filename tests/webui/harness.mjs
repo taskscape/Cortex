@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const staticRoot = path.join(root, "local-agent/matbot/packages/plugins/frontend/web/static");
+const memoryBrowserStaticRoot = path.join(root, "local-agent/matbot/packages/plugins/memory-browser/static");
 const port = Number(process.env.MATBOT_WEBUI_TEST_PORT ?? 19787);
+const memoryBrowserPort = Number(process.env.MATBOT_MEMORY_BROWSER_TEST_PORT ?? port + 1);
+const memoryBrowserUrl = `http://127.0.0.1:${memoryBrowserPort}`;
 
 const now = () => new Date().toISOString();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -163,6 +166,13 @@ const loadedPlugins = [
       { name: "ask_inner_voice", description: "Ask the configured inner voice critic." },
       { name: "cognition_config", description: "Configure cognition providers." }
     ]
+  },
+  {
+    name: "@matatbread/matbot-memory-browser",
+    specifier: "./packages/plugins/memory-browser",
+    description: "Standalone local browser for remembered facts.",
+    types: ["frontend", "tools"],
+    tools: [{ name: "open_memory_browser", description: "Return the local URL for the memory browser." }]
   },
   {
     name: "@matatbread/matbot-rumsfeld",
@@ -438,12 +448,35 @@ const server = createServer(async (req, res) => {
   }
 });
 
+const memoryBrowserServer = createServer(async (req, res) => {
+  try {
+    await handleMemoryBrowser(req, res);
+  } catch (error) {
+    if (!res.headersSent) json(res, 500, { error: String(error) });
+    else res.end();
+  }
+});
+
 server.listen(port, "127.0.0.1", () => {
   console.log(`matbot webui test harness -> http://127.0.0.1:${port}`);
 });
 
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
-process.on("SIGINT", () => server.close(() => process.exit(0)));
+memoryBrowserServer.listen(memoryBrowserPort, "127.0.0.1", () => {
+  console.log(`memory browser test harness -> ${memoryBrowserUrl}`);
+});
+
+function shutdown() {
+  let pending = 2;
+  const done = () => {
+    pending -= 1;
+    if (pending === 0) process.exit(0);
+  };
+  server.close(done);
+  memoryBrowserServer.close(done);
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 async function handle(req, res) {
   const method = req.method ?? "GET";
@@ -638,8 +671,99 @@ async function handle(req, res) {
   json(res, 404, { error: "Not found" });
 }
 
+async function handleMemoryBrowser(req, res) {
+  const method = req.method ?? "GET";
+  const url = new URL(req.url ?? "/", memoryBrowserUrl);
+  if (method === "GET" && url.pathname === "/") return memoryBrowserFile(res, "text/html; charset=utf-8", "index.html");
+  if (method === "GET" && url.pathname === "/app.js") return memoryBrowserFile(res, "application/javascript; charset=utf-8", "app.js");
+  if (method === "GET" && url.pathname === "/style.css") return memoryBrowserFile(res, "text/css; charset=utf-8", "style.css");
+  if (method === "GET" && url.pathname === "/api/health") return json(res, 200, { status: "ok" });
+
+  if (method === "GET" && url.pathname === "/api/memories") {
+    const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    const state = url.searchParams.get("state") ?? "all";
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 50) || 50));
+    const offset = Math.max(0, Number(url.searchParams.get("cursor") ?? 0) || 0);
+    let items = [...rememberedFacts.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    if (q) items = items.filter(item => String(item.fact ?? "").toLowerCase().includes(q));
+    if (state === "unprocessed") items = items.filter(item => !item.dreamSkill);
+    if (state === "processed") items = items.filter(item => Boolean(item.dreamSkill));
+    if (state === "ignored") items = items.filter(item => Boolean(item.ignoreUntil));
+    const pageItems = items.slice(offset, offset + limit);
+    const nextOffset = offset + pageItems.length;
+    return json(res, 200, {
+      items: pageItems,
+      total: items.length,
+      ...(nextOffset < items.length ? { cursor: String(nextOffset) } : {})
+    });
+  }
+
+  if (method === "POST" && url.pathname === "/api/memories") {
+    const input = await readJson(req);
+    const fact = String(input.fact ?? "").trim();
+    if (!fact) return json(res, 400, { error: '"fact" is required.' });
+    const id = `fact-${rememberedFactSeq++}`;
+    const doc = {
+      id,
+      version: "v1",
+      fact,
+      sessionId: String(input.sessionId ?? "manual"),
+      messageId: String(input.messageId ?? "manual"),
+      createdAt: now()
+    };
+    rememberedFacts.set(id, doc);
+    return json(res, 201, doc);
+  }
+
+  const memoryMatch = /^\/api\/memories\/([^/]+)$/.exec(url.pathname);
+  if (memoryMatch) {
+    const id = decodeURIComponent(memoryMatch[1]);
+    const current = rememberedFacts.get(id);
+    if (method === "GET") return current ? json(res, 200, current) : json(res, 404, { error: "Memory not found." });
+
+    if (method === "PATCH") {
+      const input = await readJson(req);
+      if (!current) return json(res, 404, { error: "Memory not found." });
+      if (input.expected !== current.version) return json(res, 409, { error: "Version conflict.", current });
+      const next = {
+        ...current,
+        version: `v${Date.now()}`,
+        fact: String(input.fact ?? current.fact).trim()
+      };
+      if (!next.fact) return json(res, 400, { error: '"fact" must be a non-empty string.' });
+      if (Object.hasOwn(input, "dreamSkill")) {
+        if (input.dreamSkill === null || input.dreamSkill === "") delete next.dreamSkill;
+        else next.dreamSkill = String(input.dreamSkill);
+      }
+      if (Object.hasOwn(input, "ignoreUntil")) {
+        if (input.ignoreUntil === null || input.ignoreUntil === "") delete next.ignoreUntil;
+        else next.ignoreUntil = String(input.ignoreUntil);
+      }
+      rememberedFacts.set(id, next);
+      return json(res, 200, next);
+    }
+
+    if (method === "DELETE") {
+      const input = await readJson(req);
+      if (current && input.expected !== undefined && input.expected !== current.version) {
+        return json(res, 200, { deleted: false });
+      }
+      const deleted = rememberedFacts.delete(id);
+      return json(res, 200, { deleted });
+    }
+  }
+
+  return json(res, 404, { error: "Not found" });
+}
+
 async function file(res, contentType, name) {
   const body = await readFile(path.join(staticRoot, name), "utf8");
+  res.writeHead(200, { "content-type": contentType, "content-length": Buffer.byteLength(body) });
+  res.end(body);
+}
+
+async function memoryBrowserFile(res, contentType, name) {
+  const body = await readFile(path.join(memoryBrowserStaticRoot, name), "utf8");
   res.writeHead(200, { "content-type": contentType, "content-length": Buffer.byteLength(body) });
   res.end(body);
 }
@@ -651,6 +775,9 @@ async function handleTool(res, name, rawInput) {
 
   if (name === "provider") {
     return json(res, 200, { providers: [{ name: "openai" }, { name: "Local" }, { name: "panel-test" }] });
+  }
+  if (name === "open_memory_browser") {
+    return json(res, 200, { url: memoryBrowserUrl });
   }
   if (name === "session_action") {
     if (input.action === "list") {
