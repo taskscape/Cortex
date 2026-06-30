@@ -357,6 +357,46 @@ function slugifyWorkspaceName(name: string): string {
   return slug || `workspace-${Date.now().toString(36)}`;
 }
 
+function isPathLikeSpecifier(value: string): boolean {
+  return value.startsWith('.') || value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function absolutizeNodeOptionValue(flag: string, value: string, baseDir: string): string {
+  if (!isPathLikeSpecifier(value)) return value;
+  const absolute = path.isAbsolute(value) ? value : path.resolve(baseDir, value);
+  return flag === '--import' || flag === '--loader' || flag === '--experimental-loader'
+    ? pathToFileURL(absolute).href
+    : absolute;
+}
+
+function absolutizeNodeExecArgv(args: readonly string[], baseDir: string): string[] {
+  const pathValueFlags = new Set([
+    '--env-file',
+    '--env-file-if-exists',
+    '--experimental-loader',
+    '--import',
+    '--loader',
+    '--require',
+    '-r',
+  ]);
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const eq = arg.indexOf('=');
+    if (eq > 0) {
+      const flag = arg.slice(0, eq);
+      const value = arg.slice(eq + 1);
+      out.push(pathValueFlags.has(flag) ? `${flag}=${absolutizeNodeOptionValue(flag, value, baseDir)}` : arg);
+      continue;
+    }
+    out.push(arg);
+    if (pathValueFlags.has(arg) && i + 1 < args.length) {
+      out.push(absolutizeNodeOptionValue(arg, args[++i]!, baseDir));
+    }
+  }
+  return out;
+}
+
 function absolutizeLocalConfigSpecifiers(text: string, configDir: string): string {
   return text.replace(
     /^(\s*(?:-\s+|module:\s+))(['"]?)(\.{1,2}[\\/][^#\r\n'"]+)\2(\s*(?:#.*)?$)/gm,
@@ -819,6 +859,7 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
 }
 
 async function main(): Promise<void> {
+  const initialCwd = process.cwd();
   const serverMode = process.argv[2] === 'start';
   const restartDelay = Number(process.env['CORTEX_RESTART_DELAY_MS'] ?? '0');
   if (serverMode && Number.isFinite(restartDelay) && restartDelay > 0) await sleep(restartDelay);
@@ -864,7 +905,7 @@ async function main(): Promise<void> {
     // Resolve relative paths against INIT_CWD (set by pnpm/npm to the directory
     // from which the user ran the package manager) so --config foo.yaml lands
     // next to the user's project, not inside the CLI package directory.
-    const userCwd = process.env['INIT_CWD'] ?? process.cwd();
+    const userCwd = process.env['INIT_CWD'] ?? initialCwd;
     const requestedConfigPath = opts.config === './matbot.yaml'
       ? (await findUp('matbot.yaml')) ?? path.resolve(userCwd, 'matbot.yaml')
       : path.isAbsolute(opts.config) ? opts.config : path.resolve(userCwd, opts.config);
@@ -1204,14 +1245,16 @@ async function main(): Promise<void> {
         }, 250);
         return;
       }
-      const entry = process.argv[1] ?? fileURLToPath(import.meta.url);
-      const args = [...process.execArgv, entry, ...process.argv.slice(2)];
+      const entryArg = process.argv[1] ?? fileURLToPath(import.meta.url);
+      const entry = path.isAbsolute(entryArg) ? entryArg : path.resolve(initialCwd, entryArg);
+      const args = [...absolutizeNodeExecArgv(process.execArgv, initialCwd), entry, ...process.argv.slice(2)];
       const child = spawn(process.execPath, args, {
         cwd: path.dirname(workspaceManager.getRegistryPath()),
         detached: true,
         stdio: 'ignore',
         env: {
           ...process.env,
+          INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
           CORTEX_WORKSPACE_ID: workspaceId,
           CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
           CORTEX_RESTART_DELAY_MS: '900',

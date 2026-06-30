@@ -680,6 +680,34 @@ function setWorkspaceStatus(text, isError = false) {
   workspaceStatusEl.classList.toggle('error', Boolean(isError));
 }
 
+function workspaceRestartSleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function workspaceStateHasActiveId(state, id) {
+  return state?.active === id || Boolean(state?.workspaces?.some(workspace => workspace.id === id && workspace.active));
+}
+
+async function waitForWorkspaceRestart(workspaceId) {
+  const startedAt = Date.now();
+  let sawUnavailable = false;
+  await workspaceRestartSleep(350);
+  while (Date.now() - startedAt < 30000) {
+    try {
+      const nextState = await T.listWorkspaces();
+      if (workspaceStateHasActiveId(nextState, workspaceId) && (sawUnavailable || Date.now() - startedAt >= 1200)) {
+        workspaceState = nextState;
+        renderWorkspaces();
+        return;
+      }
+    } catch (_e) {
+      sawUnavailable = true;
+    }
+    await workspaceRestartSleep(500);
+  }
+  throw new Error('Timed out waiting for workspace restart. Refresh once Cortex is back online.');
+}
+
 function workspaceInitial(name) {
   const trimmed = String(name || 'Default').trim();
   return (trimmed[0] || 'C').toUpperCase();
@@ -731,8 +759,15 @@ function renderWorkspaces() {
       if (workspace.active) { setWorkspacePopoverOpen(false); return; }
       try {
         setWorkspaceStatus('Switching...');
-        await T.switchWorkspace(workspace.id);
-        setTimeout(() => window.location.reload(), 1600);
+        const result = await T.switchWorkspace(workspace.id);
+        if (result?.restarting) {
+          setWorkspaceStatus('Restarting...');
+          await waitForWorkspaceRestart(workspace.id);
+          window.location.reload();
+        } else {
+          await loadWorkspaces();
+          setWorkspacePopoverOpen(false);
+        }
       } catch (e) {
         setWorkspaceStatus(String(e.message || e), true);
       }

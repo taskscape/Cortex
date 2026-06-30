@@ -190,7 +190,7 @@
   }
 
   async function listWorkspaces() {
-    const res = await fetch('/workspaces');
+    const res = await fetch('/workspaces', { cache: 'no-store' });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
     return data;
