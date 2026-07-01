@@ -18,7 +18,7 @@
 //   fileEvents(signal)                             -> AsyncIterable<{ namespace, name, size }>
 //   skillEvents(signal)                            -> AsyncIterable<{ type: 'saved'|'deleted', name }>
 //   openFile(namespace, path)                      -> void
-//   listWorkspaces/createWorkspace/renameWorkspace/switchWorkspace -> Promise<any>
+//   listWorkspaces/createWorkspace/renameWorkspace/checkWorkspaceDelete/deleteWorkspace/switchWorkspace -> Promise<any>
 
 (function () {
   // Split a growing SSE buffer into complete events, returning the unparsed tail. `data:` lines only.
@@ -218,6 +218,28 @@
     return data;
   }
 
+  async function deleteWorkspace(id) {
+    const res = await fetch('/workspaces/' + encodeURIComponent(id), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) {
+      const error = new Error(data.reason || data.error || ('HTTP ' + res.status));
+      error.details = data;
+      throw error;
+    }
+    return data;
+  }
+
+  async function checkWorkspaceDelete(id) {
+    const res = await fetch('/workspaces/' + encodeURIComponent(id) + '/delete-check', { cache: 'no-store' });
+    const data = await res.json();
+    if (!res.ok) {
+      const error = new Error(data.reason || data.error || ('HTTP ' + res.status));
+      error.details = data;
+      throw error;
+    }
+    return data;
+  }
+
   async function switchWorkspace(id) {
     const res = await fetch('/workspaces/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
     const data = await res.json();
@@ -229,6 +251,6 @@
     hostRuntime: 'node',
     callTool, createSession, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
-    listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
+    listWorkspaces, createWorkspace, renameWorkspace, checkWorkspaceDelete, deleteWorkspace, switchWorkspace,
   };
 })();

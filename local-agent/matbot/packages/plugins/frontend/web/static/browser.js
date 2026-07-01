@@ -503,6 +503,14 @@ function makeInProcessTransport(services) {
     if (id === 'default') return { id, name, configPath: 'matbot.yaml', active: true };
     throw new Error(`Unknown workspace "${id}".`);
   }
+  async function deleteWorkspace(id) {
+    if (id === 'default') throw new Error('Cannot delete the active workspace.');
+    throw new Error(`Unknown workspace "${id}".`);
+  }
+  async function checkWorkspaceDelete(id) {
+    if (id === 'default') throw new Error('Cannot delete the active workspace.');
+    throw new Error(`Unknown workspace "${id}".`);
+  }
   async function switchWorkspace(id) {
     if (id === 'default') return { active: 'default', restarting: false };
     throw new Error(`Unknown workspace "${id}".`);
@@ -512,7 +520,7 @@ function makeInProcessTransport(services) {
     hostRuntime: 'browser',
     callTool, createSession: createSessionFn, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
-    listWorkspaces, createWorkspace, renameWorkspace, switchWorkspace,
+    listWorkspaces, createWorkspace, renameWorkspace, checkWorkspaceDelete, deleteWorkspace, switchWorkspace,
   };
 }
 

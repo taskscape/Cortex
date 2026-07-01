@@ -30,13 +30,14 @@ import { FilesystemStore }                 from '@matatbread/matbot-storage-file
 import { FilesystemFileStore }             from '@matatbread/matbot-files-node';
 import { createBuiltinTools, createProviderTool, classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
 import { LookupKnowledgeIndex }               from '@matatbread/matbot-knowledge';
-import { access, copyFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFileSync, closeSync, mkdirSync, openSync } from 'node:fs';
+import { access, copyFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createInterface }                 from 'node:readline/promises';
 import { createRequire }                   from 'node:module';
 import { fileURLToPath, pathToFileURL }     from 'node:url';
 import process                             from 'node:process';
 import path                                from 'node:path';
-import { spawn }                           from 'node:child_process';
+import { spawn, type ChildProcess }        from 'node:child_process';
 
 // Prefix all console output with ISO timestamp + PID so parent and spawned
 // background processes are distinguishable in shared terminal output.
@@ -338,6 +339,7 @@ interface CortexWorkspaceManager {
   list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }>;
   create(name: string): Promise<CortexWorkspaceSummary>;
   rename(id: string, name: string): Promise<CortexWorkspaceSummary>;
+  delete(id: string): Promise<{ id: string; deleted: true }>;
   switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
@@ -355,6 +357,11 @@ function slugifyWorkspaceName(name: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 48);
   return slug || `workspace-${Date.now().toString(36)}`;
+}
+
+function pathIsInsideOrEqual(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function isPathLikeSpecifier(value: string): boolean {
@@ -395,6 +402,23 @@ function absolutizeNodeExecArgv(args: readonly string[], baseDir: string): strin
     }
   }
   return out;
+}
+
+function nodeEntrySpecifier(entryArg: string, baseDir: string, childCwd: string): string {
+  const absolute = entryArg.startsWith('file:')
+    ? fileURLToPath(entryArg)
+    : path.isAbsolute(entryArg) ? entryArg : path.resolve(baseDir, entryArg);
+  const relative = path.relative(childCwd, absolute);
+  return relative !== '' && !path.isAbsolute(relative) ? relative : pathToFileURL(absolute).href;
+}
+
+function matbotLogPaths(registryPath: string): { out: string; err: string } {
+  const logsDir = path.resolve(path.dirname(registryPath), '..', 'logs');
+  mkdirSync(logsDir, { recursive: true });
+  return {
+    out: path.join(logsDir, 'matbot.out.log'),
+    err: path.join(logsDir, 'matbot.err.log'),
+  };
 }
 
 function absolutizeLocalConfigSpecifiers(text: string, configDir: string): string {
@@ -488,6 +512,23 @@ class FileWorkspaceManager implements CortexWorkspaceManager {
     return this.summarize(record, record.id === registry.active);
   }
 
+  async delete(id: string): Promise<{ id: string; deleted: true }> {
+    const registry = await this.load();
+    const record = registry.workspaces.find(w => w.id === id);
+    if (record === undefined) throw new Error(`Unknown workspace "${id}".`);
+    if (record.id === registry.active) {
+      throw new Error('Cannot delete the active workspace. Switch to another workspace first.');
+    }
+    if (registry.workspaces.length <= 1) {
+      throw new Error('Cannot delete the only workspace.');
+    }
+
+    await this.deleteWorkspaceDirectoryIfOwned(record);
+    registry.workspaces = registry.workspaces.filter(w => w.id !== id);
+    await this.save(registry);
+    return { id, deleted: true };
+  }
+
   async switch(id: string): Promise<{ active: string; restarting: boolean }> {
     const registry = await this.load();
     if (!registry.workspaces.some(w => w.id === id)) throw new Error(`Unknown workspace "${id}".`);
@@ -524,6 +565,18 @@ class FileWorkspaceManager implements CortexWorkspaceManager {
 
   private summarize(record: CortexWorkspaceRecord, active: boolean): CortexWorkspaceSummary {
     return { ...record, active };
+  }
+
+  private async deleteWorkspaceDirectoryIfOwned(record: CortexWorkspaceRecord): Promise<void> {
+    const rootDir = path.dirname(this.rootConfigPath);
+    const workspacesDir = path.resolve(rootDir, 'workspaces');
+    const expectedWorkspaceDir = path.resolve(workspacesDir, record.id);
+    const configPath = path.resolve(path.dirname(this.registryPath), record.configPath);
+    const configDir = path.dirname(configPath);
+
+    if (!pathIsInsideOrEqual(expectedWorkspaceDir, workspacesDir)) return;
+    if (!pathIsInsideOrEqual(configDir, expectedWorkspaceDir)) return;
+    await rm(expectedWorkspaceDir, { recursive: true, force: true });
   }
 
   private async load(): Promise<CortexWorkspaceRegistry> {
@@ -1238,6 +1291,7 @@ async function main(): Promise<void> {
     workspaceManager.setRestarter(async (workspaceId: string) => {
       if (!serverMode) return;
       if (process.env['CORTEX_SERVICE_SUPERVISED'] === '1') {
+        console.error(`[matbot] workspace switch to "${workspaceId}" requested service-supervised restart`);
         setTimeout(() => {
           void teardownPlugins()
             .then(async () => { await activeStorageBackend?.close?.(); process.exit(42); })
@@ -1246,20 +1300,34 @@ async function main(): Promise<void> {
         return;
       }
       const entryArg = process.argv[1] ?? fileURLToPath(import.meta.url);
-      const entry = path.isAbsolute(entryArg) ? entryArg : path.resolve(initialCwd, entryArg);
+      const childCwd = path.dirname(workspaceManager.getRegistryPath());
+      const entry = nodeEntrySpecifier(entryArg, initialCwd, childCwd);
       const args = [...absolutizeNodeExecArgv(process.execArgv, initialCwd), entry, ...process.argv.slice(2)];
-      const child = spawn(process.execPath, args, {
-        cwd: path.dirname(workspaceManager.getRegistryPath()),
-        detached: true,
-        stdio: 'ignore',
-        env: {
-          ...process.env,
-          INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
-          CORTEX_WORKSPACE_ID: workspaceId,
-          CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
-          CORTEX_RESTART_DELAY_MS: '900',
-        },
-      });
+      const logs = matbotLogPaths(workspaceManager.getRegistryPath());
+      appendFileSync(
+        logs.out,
+        `[${new Date().toISOString()} ${_pid}] [matbot] restarting into workspace "${workspaceId}"\n`,
+      );
+      const outFd = openSync(logs.out, 'a');
+      const errFd = openSync(logs.err, 'a');
+      let child: ChildProcess;
+      try {
+        child = spawn(process.execPath, args, {
+          cwd: childCwd,
+          detached: true,
+          stdio: ['ignore', outFd, errFd],
+          env: {
+            ...process.env,
+            INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
+            CORTEX_WORKSPACE_ID: workspaceId,
+            CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
+            CORTEX_RESTART_DELAY_MS: '900',
+          },
+        });
+      } finally {
+        closeSync(outFd);
+        closeSync(errFd);
+      }
       child.unref();
       setTimeout(() => {
         void teardownPlugins()

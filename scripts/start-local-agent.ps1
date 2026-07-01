@@ -231,8 +231,9 @@ if ($MatbotCommand) {
         if (Test-PortListening $matbotWebPort) {
             Stop-PortListeners $matbotWebPort "Matbot web UI"
         }
+        $interactiveMatbotCommand = "Remove-Item Env:CORTEX_SERVICE_SUPERVISED -ErrorAction SilentlyContinue; $MatbotCommand"
         Start-Process -FilePath "powershell" `
-            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $MatbotCommand `
+            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $interactiveMatbotCommand `
             -WorkingDirectory $Root `
             -WindowStyle Hidden `
             -RedirectStandardOutput "local-agent\logs\matbot.out.log" `

@@ -81,6 +81,7 @@ function isMessagesBottomVisible() {
 const ICON_SEND   = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M9 6v12l9-6z"/></svg>';
 const ICON_SCROLL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';
 const ICON_STOP   = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>';
+const ICON_TRASH  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>';
 
 // Morph the send button into a scroll-down button. Stop is now its own button, and the input
 // stays enabled while a turn runs (so you can type-ahead and queue), so neither is touched here.
@@ -174,6 +175,10 @@ const workspaceRagProgressBarEl = document.getElementById('workspace-rag-progres
 const workspaceRagStatusEl = document.getElementById('workspace-rag-status');
 const workspaceRagCurrentFileEl = document.getElementById('workspace-rag-current-file');
 const workspaceRagSaveBtn = document.getElementById('workspace-rag-save-btn');
+const workspaceDeleteDialogEl = document.getElementById('workspace-delete-dialog');
+const workspaceDeleteMessageEl = document.getElementById('workspace-delete-message');
+const workspaceDeleteCancelBtn = document.getElementById('workspace-delete-cancel');
+const workspaceDeleteConfirmBtn = document.getElementById('workspace-delete-confirm');
 const memoryBrowserBtn = document.getElementById('memory-browser-btn');
 const memoryBrowserStatusEl = document.getElementById('memory-browser-status');
 const memoryBrowserOverlay = document.getElementById('memory-browser-overlay');
@@ -207,6 +212,9 @@ let workspaceState = { active: 'default', workspaces: [] };
 let workspaceRagPoll = null;
 let workspaceRagConfig = null;
 let workspaceRagLoadSeq = 0;
+let workspaceSwitching = false;
+const WORKSPACE_RESTART_TIMEOUT_MS = 120000;
+const WORKSPACE_RESTART_STATUS_INTERVAL_MS = 5000;
 let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
@@ -681,6 +689,15 @@ function setWorkspaceStatus(text, isError = false) {
   workspaceStatusEl.classList.toggle('error', Boolean(isError));
 }
 
+function setWorkspaceSwitching(value) {
+  workspaceSwitching = Boolean(value);
+  if (workspaceToggleBtn) workspaceToggleBtn.disabled = workspaceSwitching;
+  if (workspaceNewBtn) workspaceNewBtn.disabled = workspaceSwitching;
+  if (workspaceRenameBtn) workspaceRenameBtn.disabled = workspaceSwitching;
+  if (workspaceConfigBtn) workspaceConfigBtn.disabled = workspaceSwitching;
+  renderWorkspaces();
+}
+
 function workspaceRestartSleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -696,9 +713,10 @@ function isWorkspaceFetchFailure(error) {
 
 async function waitForWorkspaceRestart(workspaceId) {
   const startedAt = Date.now();
+  let nextStatusAt = startedAt + WORKSPACE_RESTART_STATUS_INTERVAL_MS;
   let sawUnavailable = false;
   await workspaceRestartSleep(350);
-  while (Date.now() - startedAt < 30000) {
+  while (Date.now() - startedAt < WORKSPACE_RESTART_TIMEOUT_MS) {
     try {
       const nextState = await T.listWorkspaces();
       if (workspaceStateHasActiveId(nextState, workspaceId) && (sawUnavailable || Date.now() - startedAt >= 1200)) {
@@ -709,9 +727,14 @@ async function waitForWorkspaceRestart(workspaceId) {
     } catch (_e) {
       sawUnavailable = true;
     }
+    const now = Date.now();
+    if (now >= nextStatusAt) {
+      setWorkspaceStatus(`Restarting... ${Math.floor((now - startedAt) / 1000)}s`);
+      nextStatusAt = now + WORKSPACE_RESTART_STATUS_INTERVAL_MS;
+    }
     await workspaceRestartSleep(500);
   }
-  throw new Error('Timed out waiting for workspace restart. Refresh once Cortex is back online.');
+  throw new Error(`Timed out after ${Math.floor(WORKSPACE_RESTART_TIMEOUT_MS / 1000)} seconds waiting for workspace restart. Refresh once Cortex is back online.`);
 }
 
 function workspaceInitial(name) {
@@ -732,6 +755,7 @@ function activeWorkspaceId() {
 
 function setWorkspacePopoverOpen(open) {
   if (!workspacePopoverEl || !workspaceToggleBtn) return;
+  if (workspaceSwitching && !open) return;
   workspacePopoverEl.classList.toggle('open', open);
   workspaceToggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (open) setWorkspaceSettingsOpen(false);
@@ -739,6 +763,7 @@ function setWorkspacePopoverOpen(open) {
 
 function setWorkspaceSettingsOpen(open) {
   if (!workspaceSettingsScreenEl || !workspaceConfigBtn) return;
+  if (workspaceSwitching && open) return;
   workspaceSettingsScreenEl.classList.toggle('open', open);
   document.body.classList.toggle('workspace-settings-open', open);
   workspaceConfigBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -752,6 +777,49 @@ function setWorkspaceSettingsOpen(open) {
   }
 }
 
+function confirmWorkspaceDelete(workspace) {
+  if (!workspaceDeleteDialogEl || !workspaceDeleteMessageEl || !workspaceDeleteCancelBtn || !workspaceDeleteConfirmBtn) {
+    return Promise.resolve(false);
+  }
+  workspaceDeleteMessageEl.textContent = `Delete "${workspace.name}" and its local workspace files?`;
+  workspaceDeleteDialogEl.classList.add('open');
+  workspaceDeleteDialogEl.setAttribute('aria-hidden', 'false');
+  workspaceDeleteConfirmBtn.focus();
+
+  return new Promise(resolve => {
+    const finish = (confirmed) => {
+      workspaceDeleteDialogEl.classList.remove('open');
+      workspaceDeleteDialogEl.setAttribute('aria-hidden', 'true');
+      workspaceDeleteCancelBtn.removeEventListener('click', onCancel);
+      workspaceDeleteConfirmBtn.removeEventListener('click', onConfirm);
+      workspaceDeleteDialogEl.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKeyDown);
+      resolve(confirmed);
+    };
+    const onCancel = () => finish(false);
+    const onConfirm = () => finish(true);
+    const onBackdrop = (event) => {
+      if (event.target === workspaceDeleteDialogEl) finish(false);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') finish(false);
+    };
+    workspaceDeleteCancelBtn.addEventListener('click', onCancel);
+    workspaceDeleteConfirmBtn.addEventListener('click', onConfirm);
+    workspaceDeleteDialogEl.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKeyDown);
+  });
+}
+
+function workspaceDeleteErrorMessage(error) {
+  const details = error?.details;
+  if (details?.locked) {
+    const suffix = details.state ? ` (${details.state})` : '';
+    return `${details.reason || 'Workspace indexing is currently running or pending.'}${suffix}`;
+  }
+  return String(error?.message || error);
+}
+
 function renderWorkspaces() {
   const current = activeWorkspace();
   if (workspaceNameEl) workspaceNameEl.textContent = current.name || 'Default';
@@ -759,15 +827,22 @@ function renderWorkspaces() {
   if (!workspaceListEl) return;
   workspaceListEl.innerHTML = '';
   for (const workspace of workspaceState.workspaces) {
+    const row = document.createElement('div');
+    row.className = 'workspace-row';
+    row.dataset.workspaceId = workspace.id;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'workspace-option' + (workspace.active ? ' active' : '');
     btn.dataset.workspaceId = workspace.id;
+    btn.disabled = workspaceSwitching;
+    btn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
     btn.innerHTML = `<span class="workspace-option-name"></span><span class="workspace-option-check">${workspace.active ? '✓' : ''}</span>`;
     btn.querySelector('.workspace-option-name').textContent = workspace.name;
     btn.addEventListener('click', async () => {
+      if (workspaceSwitching) return;
       if (workspace.active) { setWorkspacePopoverOpen(false); return; }
       try {
+        setWorkspaceSwitching(true);
         setWorkspaceStatus('Switching...');
         let result;
         try {
@@ -783,12 +858,48 @@ function renderWorkspaces() {
         } else {
           await loadWorkspaces();
           setWorkspacePopoverOpen(false);
+          setWorkspaceSwitching(false);
         }
       } catch (e) {
+        setWorkspaceSwitching(false);
         setWorkspaceStatus(String(e.message || e), true);
       }
     });
-    workspaceListEl.appendChild(btn);
+    row.appendChild(btn);
+    if (!workspace.active) {
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'workspace-delete-btn';
+      deleteBtn.innerHTML = ICON_TRASH;
+      deleteBtn.title = `Delete ${workspace.name}`;
+      deleteBtn.setAttribute('aria-label', `Delete ${workspace.name}`);
+      deleteBtn.disabled = workspaceSwitching;
+      deleteBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (workspaceSwitching) return;
+        try {
+          setWorkspaceStatus('Checking workspace...');
+          await T.checkWorkspaceDelete(workspace.id);
+        } catch (e) {
+          setWorkspaceStatus(workspaceDeleteErrorMessage(e), true);
+          return;
+        }
+        const confirmed = await confirmWorkspaceDelete(workspace);
+        if (!confirmed) {
+          setWorkspaceStatus('');
+          return;
+        }
+        try {
+          setWorkspaceStatus('Deleting...');
+          await T.deleteWorkspace(workspace.id);
+          await loadWorkspaces();
+        } catch (e) {
+          setWorkspaceStatus(String(e.message || e), true);
+        }
+      });
+      row.appendChild(deleteBtn);
+    }
+    workspaceListEl.appendChild(row);
   }
 }
 
@@ -806,14 +917,17 @@ async function loadWorkspaces() {
 }
 
 workspaceToggleBtn?.addEventListener('click', () => {
+  if (workspaceSwitching) return;
   setWorkspacePopoverOpen(!workspacePopoverEl?.classList.contains('open'));
 });
 
 workspaceConfigBtn?.addEventListener('click', () => {
+  if (workspaceSwitching) return;
   setWorkspaceSettingsOpen(true);
 });
 
 workspaceNewBtn?.addEventListener('click', async () => {
+  if (workspaceSwitching) return;
   const name = prompt('New workspace name');
   if (!name || !name.trim()) return;
   try {
@@ -825,6 +939,7 @@ workspaceNewBtn?.addEventListener('click', async () => {
 });
 
 workspaceRenameBtn?.addEventListener('click', async () => {
+  if (workspaceSwitching) return;
   const current = activeWorkspace();
   const name = prompt('Rename workspace', current.name || 'Default');
   if (!name || !name.trim()) return;

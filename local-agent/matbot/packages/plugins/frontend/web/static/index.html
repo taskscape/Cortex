@@ -264,6 +264,11 @@
       box-shadow: 0 16px 48px rgba(17, 24, 39, 0.16);
     }
     #workspace-popover.open { display: flex; }
+    .workspace-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
     .workspace-option,
     .workspace-action {
       width: 100%;
@@ -280,8 +285,46 @@
       gap: 8px;
       text-align: left;
     }
+    .workspace-row .workspace-option {
+      flex: 1;
+      min-width: 0;
+    }
+    .workspace-delete-btn {
+      width: 30px;
+      height: 30px;
+      border: none;
+      border-radius: 7px;
+      background: transparent;
+      color: #9ca3af;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+    }
+    .workspace-delete-btn svg {
+      width: 15px;
+      height: 15px;
+    }
     .workspace-option:hover,
     .workspace-action:hover { background: #f3f4f6; }
+    .workspace-delete-btn:hover {
+      background: #fee2e2;
+      color: #dc2626;
+    }
+    .workspace-option:disabled,
+    .workspace-action:disabled,
+    .workspace-delete-btn:disabled,
+    #workspace-toggle-btn:disabled,
+    #workspace-config-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .workspace-option:disabled:hover,
+    .workspace-action:disabled:hover {
+      background: transparent;
+      color: #374151;
+    }
     .workspace-option.active {
       background: #eaf1ff;
       color: #1d4ed8;
@@ -307,6 +350,59 @@
       font-size: 0.78em;
     }
     #workspace-status.error { color: #dc2626; }
+    #workspace-delete-dialog {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(17, 24, 39, 0.34);
+    }
+    #workspace-delete-dialog.open { display: flex; }
+    .workspace-delete-panel {
+      width: min(360px, 100%);
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 18px 54px rgba(17, 24, 39, 0.22);
+      padding: 18px;
+    }
+    .workspace-delete-panel h2 {
+      margin: 0 0 8px;
+      font-size: 1.02rem;
+      line-height: 1.25;
+    }
+    .workspace-delete-panel p {
+      margin: 0;
+      color: #6b7280;
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+    .workspace-delete-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 18px;
+    }
+    .workspace-delete-actions button {
+      border: 1px solid #d1d5db;
+      border-radius: 7px;
+      background: #fff;
+      color: #374151;
+      cursor: pointer;
+      font: inherit;
+      min-height: 32px;
+      padding: 6px 12px;
+    }
+    .workspace-delete-actions button.danger {
+      border-color: #dc2626;
+      background: #dc2626;
+      color: #fff;
+      font-weight: 650;
+    }
+    .workspace-delete-actions button.danger:hover { background: #b91c1c; }
     #workspace-settings-screen {
       display: none;
       flex: 1;
@@ -2383,10 +2479,27 @@
       border-radius: var(--radius);
       color: var(--text-muted);
     }
+    .workspace-delete-btn {
+      border-radius: var(--radius);
+      color: var(--text-subtle);
+    }
     .workspace-option:hover,
     .workspace-action:hover {
       background: var(--surface-soft);
       color: var(--text);
+    }
+    .workspace-delete-btn:hover {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+    .workspace-option:disabled:hover,
+    .workspace-action:disabled:hover {
+      background: transparent;
+      color: var(--text-muted);
+    }
+    .workspace-delete-btn:disabled:hover {
+      background: transparent;
+      color: var(--text-subtle);
     }
     .workspace-option.active {
       background: var(--brand-soft);
@@ -3735,6 +3848,17 @@
     </div>
     <button id="scroll-down-btn" style="display:none" title="Scroll to bottom" aria-label="Scroll to bottom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
   </main>
+
+  <div id="workspace-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-delete-title" aria-hidden="true">
+    <div class="workspace-delete-panel">
+      <h2 id="workspace-delete-title">Delete workspace?</h2>
+      <p id="workspace-delete-message"></p>
+      <div class="workspace-delete-actions">
+        <button id="workspace-delete-cancel" type="button">Cancel</button>
+        <button id="workspace-delete-confirm" class="danger" type="button">Yes</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/http-transport.js"></script>
   <script src="/app.js"></script>

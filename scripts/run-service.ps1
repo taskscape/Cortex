@@ -266,9 +266,22 @@ if (-not $pnpm) {
     throw "pnpm is required but was not found in PATH for the service account."
 }
 
-Write-ServiceLog "Starting Matbot foreground process on http://localhost:$WebPort"
-Set-Location $MatbotRoot
-& $pnpm.Source start
-$exitCode = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
-Write-ServiceLog "Matbot foreground process exited with code $exitCode"
-exit $exitCode
+while ($true) {
+    if (Test-PortListening $WebPort) {
+        Stop-PortListeners $WebPort "Matbot web UI"
+    }
+
+    Write-ServiceLog "Starting Matbot foreground process on http://localhost:$WebPort"
+    Set-Location $MatbotRoot
+    & $pnpm.Source start
+    $exitCode = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
+    Write-ServiceLog "Matbot foreground process exited with code $exitCode"
+
+    if ($exitCode -eq 42) {
+        Write-ServiceLog "Workspace switch requested a Matbot restart; relaunching foreground process."
+        Start-Sleep -Milliseconds 500
+        continue
+    }
+
+    exit $exitCode
+}

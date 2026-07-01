@@ -133,6 +133,13 @@ interface IngestionStatus {
   legacyJsonPath?: string;
 }
 
+interface WorkspaceRagLockStatus {
+  locked: boolean;
+  reason?: string;
+  state?: IngestionStatus['state'];
+  message?: string;
+}
+
 interface SearchHit {
   workspaceId: string;
   contextName: string;
@@ -725,6 +732,47 @@ class WorkspaceRagManager {
     const workspace = await this.currentWorkspace();
     await this.ensureStatus(workspace);
     return this.statuses.get(workspace.id)!;
+  }
+
+  workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus {
+    const status = this.statuses.get(workspaceId);
+    if (this.scanPromises.has(workspaceId) || this.scanInFlight.has(workspaceId)) {
+      return {
+        locked: true,
+        reason: 'Workspace indexing is currently running.',
+        ...(status?.state !== undefined ? { state: status.state } : {}),
+        ...(status?.message !== undefined ? { message: status.message } : {}),
+      };
+    }
+    if (this.scanQueued.has(workspaceId)) {
+      return {
+        locked: true,
+        reason: 'Workspace indexing is queued.',
+        ...(status?.state !== undefined ? { state: status.state } : {}),
+        ...(status?.message !== undefined ? { message: status.message } : {}),
+      };
+    }
+    if (this.backgroundScanPromise) {
+      return {
+        locked: true,
+        reason: 'Workspace indexing is pending in the background queue.',
+        ...(status?.state !== undefined ? { state: status.state } : {}),
+        ...(status?.message !== undefined ? { message: status.message } : {}),
+      };
+    }
+    if (status?.state === 'indexing') {
+      return {
+        locked: true,
+        reason: 'Workspace indexing is currently running.',
+        state: status.state,
+        ...(status.message !== undefined ? { message: status.message } : {}),
+      };
+    }
+    return {
+      locked: false,
+      ...(status?.state !== undefined ? { state: status.state } : {}),
+      ...(status?.message !== undefined ? { message: status.message } : {}),
+    };
   }
 
   async configCurrent(): Promise<RagConfigView> {

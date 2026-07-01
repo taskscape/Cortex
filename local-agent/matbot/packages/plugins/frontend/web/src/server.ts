@@ -27,6 +27,7 @@ export interface WebServerDeps {
   files?:         FileStore;
   configPath?:    string;
   workspaceManager?: WorkspaceManager;
+  workspaceRagManager?: () => WorkspaceRagManager | undefined;
   /** Derives the security principal for each request. Defaults to {@link defaultWebPrincipal}. */
   resolvePrincipal?: WebPrincipalResolver;
 }
@@ -45,7 +46,27 @@ export interface WorkspaceManager {
   list(): Promise<{ active: string; workspaces: WorkspaceSummary[] }>;
   create(name: string): Promise<WorkspaceSummary>;
   rename(id: string, name: string): Promise<WorkspaceSummary>;
+  delete(id: string): Promise<{ id: string; deleted: true }>;
   switch(id: string): Promise<{ active: string; restarting: boolean }>;
+}
+
+export interface WorkspaceRagLockStatus {
+  locked: boolean;
+  reason?: string;
+  state?: string;
+  message?: string;
+}
+
+export interface WorkspaceRagManager {
+  workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus;
+}
+
+interface WorkspaceDeleteReadiness {
+  canDelete: boolean;
+  locked: boolean;
+  reason?: string;
+  state?: string;
+  message?: string;
 }
 
 /**
@@ -135,7 +156,7 @@ function corsHeaders(origin: string): Record<string, string> {
   return {
     'access-control-allow-origin':  origin,
     'access-control-allow-headers': 'content-type, authorization',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
   };
 }
 
@@ -356,6 +377,34 @@ export function createWebServer(deps: WebServerDeps) {
     broadcast(sseEvent('session-busy', { sessionId, busy }));
   }
 
+  async function workspaceDeleteReadiness(workspaceId: string): Promise<WorkspaceDeleteReadiness> {
+    if (!deps.workspaceManager) return { canDelete: false, locked: false, reason: 'Workspace manager unavailable.' };
+    const state = await deps.workspaceManager.list();
+    const workspace = state.workspaces.find(item => item.id === workspaceId);
+    if (!workspace) return { canDelete: false, locked: false, reason: `Unknown workspace "${workspaceId}".` };
+    if (workspace.active || state.active === workspaceId) {
+      return { canDelete: false, locked: false, reason: 'Cannot delete the active workspace. Switch to another workspace first.' };
+    }
+
+    const lock = deps.workspaceRagManager?.()?.workspaceLockStatus(workspaceId);
+    if (lock?.locked) {
+      return {
+        canDelete: false,
+        locked: true,
+        reason: lock.reason ?? 'Workspace indexing is currently running or pending.',
+        ...(lock.state !== undefined ? { state: lock.state } : {}),
+        ...(lock.message !== undefined ? { message: lock.message } : {}),
+      };
+    }
+
+    return {
+      canDelete: true,
+      locked: false,
+      ...(lock?.state !== undefined ? { state: lock.state } : {}),
+      ...(lock?.message !== undefined ? { message: lock.message } : {}),
+    };
+  }
+
   const server = createServer(async (req, res) => {
     const method = req.method ?? 'GET';
     const url    = req.url ?? '/';
@@ -503,6 +552,14 @@ export function createWebServer(deps: WebServerDeps) {
       json(res, 200, await deps.workspaceManager.list()); return;
     }
 
+    const workspaceDeleteCheck = /^\/workspaces\/([^/]+)\/delete-check$/.exec(url);
+    if (method === 'GET' && workspaceDeleteCheck) {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      const readiness = await workspaceDeleteReadiness(decodeURIComponent(workspaceDeleteCheck[1]!));
+      json(res, readiness.canDelete ? 200 : (readiness.locked ? 409 : 400), readiness);
+      return;
+    }
+
     if (method === 'POST' && url === '/workspaces') {
       if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       let body: { name?: unknown };
@@ -526,6 +583,23 @@ export function createWebServer(deps: WebServerDeps) {
     if (method === 'POST' && workspaceSwitch) {
       if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       json(res, 200, await deps.workspaceManager.switch(decodeURIComponent(workspaceSwitch[1]!))); return;
+    }
+
+    const workspaceDelete = /^\/workspaces\/([^/]+)$/.exec(url);
+    if (method === 'DELETE' && workspaceDelete) {
+      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      try {
+        const workspaceId = decodeURIComponent(workspaceDelete[1]!);
+        const readiness = await workspaceDeleteReadiness(workspaceId);
+        if (!readiness.canDelete) {
+          json(res, readiness.locked ? 409 : 400, readiness);
+          return;
+        }
+        json(res, 200, await deps.workspaceManager.delete(workspaceId));
+      } catch (error) {
+        json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
     }
 
     // --- GET /events --- (one multiplexed SSE stream: session busy/idle, file changes, and tool/skill/
