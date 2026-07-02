@@ -110,10 +110,11 @@ ordered, committable slices. Completed build-sequence items:
 | Source Registry MVP | Complete | `source-registry` registers `SourceRegistry` and `source_action`; sources have stable ids, versions, freshness state, health state, citation policy, health events, and access events; workspace RAG writes source records for indexed markdown and derived knowledge entries; workspace RAG retrieval hits include source ids, health/freshness state, and citation text. |
 | Connector Fabric MVP | Complete | `connector-fabric` registers `ConnectorRegistry` and `connector_action`; it seeds local connector definitions/instances for source registry, workspace RAG, file broker, MCP, and Postgres read-only; action-aware tool bindings classify read/write/admin calls; `toolcall` hooks enforce connector grants before bound tools run; `toolresult` hooks write connector audit events and redact configured sensitive fields. |
 | Source Health Monitor Primitives | Complete | `source-registry` now registers `source_health_action`; source health reports are stable store-backed records with stale, expired, degraded, down, denied, and optional unknown-freshness findings; reports include source ids, source version ids, connector health snapshots, warning counts, and critical counts; workspace RAG injects stale/unhealthy warnings in retrieved context and marker data. |
+| Structured Data Reasoning MVP | Complete | `structured-data` registers `DataCatalog`, `SqlPlanner`, and `structured_data_action`; semantic table, column, metric, and query-run records are store-backed; deterministic planning emits Postgres SELECT SQL from approved semantic inputs only; validation rejects writes, cross joins, unknown columns, and missing row caps; execution requires an approval token, runs in a read-only transaction with statement timeout, and creates query-result source records. |
 
 Remaining strategic architecture items still build on this foundation:
-structured data reasoning, workflow run ledger, automation shadow mode, context
-graph, workflow compiler, and enterprise expert-panel review records.
+workflow run ledger, automation shadow mode, context graph, workflow compiler,
+and enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -202,12 +203,46 @@ The seeded local bindings cover the current Cortex data tools:
 | Local Workspace RAG | `workspace_rag` | `status`, `get_config`, and `search` are read; configuration actions are write; `reindex_now` is admin. |
 | Local File Broker | `file_broker_action` | `health`, `list`, and `read` are read; `write` is write and redacts returned `content`. |
 | Local MCP Fabric | `mcp_action`, `mcp__*` | MCP server list is read; add/remove and delegated MCP tools are admin until per-server metadata exists. |
-| Local Postgres Read-Only | connector record only | Reserved for the structured-data reasoning SQL tool; executable query support lands in that later build slice. |
+| Local Postgres Read-Only | `structured_data_action` | Catalog and planning reads are read; semantic-model edits and approval are admin; execution is read-only and still requires a query approval token. |
 
 The CLI inserts `connector-fabric` into each Cortex workspace before
 `workspace-rag`, preserving existing local behavior through wildcard bootstrap
 grants while still allowing explicit per-principal deny grants for tests,
 operators, and future UI policy controls.
+
+### Structured Data
+
+The structured data layer gives Cortex a governed path for tables, dimensions,
+metrics, SQL preview, and approved read-only Postgres execution. It avoids
+model-authored arbitrary SQL: callers provide semantic inputs, and deterministic
+planner code emits the SQL.
+
+The `structured-data` plugin registers:
+
+- `DataCatalog`: a store-backed service for data connections, tables, columns,
+  and metric definitions.
+- `SqlPlanner`: a deterministic planner and query-run ledger for semantic SQL
+  plans, approval tokens, read-only execution, validation, and result
+  provenance.
+- `structured_data_action`: a tool with `catalog`, `register_connection`,
+  `upsert_table`, `upsert_column`, `upsert_metric`, `plan_query`,
+  `validate_sql`, `approve_query`, `execute_query`, and `runs` actions.
+
+The MVP supports Postgres only. Connections are required to be read-only and
+default to `${CORTEX_STRUCTURED_POSTGRES_URL}` for approved execution. Query
+planning only works from approved metric definitions and approved dimensions or
+filters. Generated SQL is validated before preview and before execution:
+non-SELECT statements, multiple statements, DDL/DML/session keywords, cross
+joins, and missing row caps are rejected.
+
+Every planned query is stored as a `structured_data_query_runs` record with the
+SQL hash, semantic inputs, parameters, source ids, status, and principal id.
+`approve_query` creates a one-time approval token hash on the run, and
+`execute_query` requires the token before opening a Postgres read-only
+transaction with a statement timeout. Successful executions create a
+`query_result` source record and source version so summaries can cite the query
+run, SQL hash, data connection, execution timestamp, row count, and source
+tables or metrics.
 
 ### Memory System
 
@@ -223,6 +258,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Source registry | Source identity, freshness, health, citations, and retrieval provenance. | `SourceRegistry`, `source_action` |
 | Source health monitor | Store-backed health reports and stale/unhealthy source warnings. | `source_health_action`, `source_health_reports` |
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
+| Structured data | Semantic table/metric catalog, query plans, approval tokens, and query-run provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:

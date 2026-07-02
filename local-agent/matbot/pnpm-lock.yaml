@@ -570,6 +570,25 @@ importers:
         specifier: 'catalog:'
         version: 5.9.3
 
+  packages/plugins/structured-data:
+    dependencies:
+      '@matatbread/matbot-plugin-api':
+        specifier: workspace:*
+        version: link:../../core/plugin-api
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 22.19.19
+      '@types/pg':
+        specifier: ^8.20.0
+        version: 8.20.0
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
   packages/plugins/tool-store:
     dependencies:
       '@matatbread/matbot-plugin-api':

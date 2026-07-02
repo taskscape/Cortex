@@ -1,0 +1,230 @@
+import assert from "node:assert/strict";
+
+const { plugin } = await import("../local-agent/matbot/packages/plugins/structured-data/src/index.ts");
+const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
+
+class MemoryStore {
+  constructor() {
+    this.docs = new Map();
+  }
+
+  async get(id) {
+    return this.docs.get(id) ?? null;
+  }
+
+  async set(id, value) {
+    this.docs.set(id, value);
+  }
+
+  async cas(id, expected, next) {
+    const current = this.docs.get(id) ?? null;
+    if (current === null || current.version !== expected) return { ok: false, current };
+    this.docs.set(id, next);
+    return { ok: true, doc: next };
+  }
+
+  async delete(id, expectedVersion) {
+    const current = this.docs.get(id) ?? null;
+    if (current === null) return false;
+    if (expectedVersion !== undefined && current.version !== expectedVersion) return false;
+    return this.docs.delete(id);
+  }
+
+  async query(q = {}) {
+    let items = [...this.docs.values()];
+    if (q.where !== undefined) items = items.filter(item => matches(item, q.where));
+    return { items, total: items.length };
+  }
+}
+
+function fieldValue(item, field) {
+  const parts = Array.isArray(field) ? field : [field];
+  let value = item;
+  for (const part of parts) {
+    if (value === null || typeof value !== "object") return undefined;
+    value = value[part];
+  }
+  return value;
+}
+
+function matches(item, filter) {
+  switch (filter.op) {
+    case "eq":
+      return fieldValue(item, filter.field) === filter.value;
+    case "and":
+      return filter.clauses.every(clause => matches(item, clause));
+    case "or":
+      return filter.clauses.some(clause => matches(item, clause));
+    default:
+      return true;
+  }
+}
+
+async function collectTool(tool, input) {
+  const events = [];
+  for await (const event of tool.executor.execute(input, {
+    signal: new AbortController().signal,
+    vault: {
+      async resolve(value) { return value; },
+    },
+  })) {
+    events.push(event);
+  }
+  const error = events.find(event => event.type === "error");
+  if (error !== undefined) return { error: error.message };
+  return events.find(event => event.type === "result")?.value;
+}
+
+async function main() {
+  const stores = new Map();
+  const servicesByKey = new Map();
+  const tools = new Map();
+  const services = {
+    Vault: {
+      async resolve(value) { return value; },
+    },
+    createStore(namespace) {
+      if (!stores.has(namespace)) stores.set(namespace, new MemoryStore());
+      return stores.get(namespace);
+    },
+    async register(key, value) {
+      servicesByKey.set(key, value);
+      this[key] = value;
+    },
+    get(key) {
+      return servicesByKey.get(key);
+    },
+    tools: {
+      register(tool) {
+        tools.set(tool.name, tool);
+      },
+    },
+  };
+
+  await sourceRegistryPlugin.setup(services);
+  await plugin.setup(services);
+  const catalog = services.DataCatalog;
+  const planner = services.SqlPlanner;
+  const structuredTool = tools.get("structured_data_action");
+  const sourceTool = tools.get("source_action");
+  assert.ok(catalog, "DataCatalog service should be registered");
+  assert.ok(planner, "SqlPlanner service should be registered");
+  assert.ok(structuredTool, "structured_data_action tool should be registered");
+
+  const connection = await collectTool(structuredTool, {
+    action: "register_connection",
+    connection: {
+      workspaceId: "default",
+      displayName: "Warehouse",
+      credentialRef: "${MISSING_STRUCTURED_DATA_URL}",
+      rowLimitDefault: 50,
+      timeoutMsDefault: 2500,
+      defaultSchema: "public",
+    },
+  });
+  assert.equal(connection.readOnly, true);
+  assert.equal(connection.dialect, "postgres");
+  assert.equal(connection.connectorInstanceId, "connector-instance:postgres-readonly:local");
+
+  const table = await collectTool(structuredTool, {
+    action: "upsert_table",
+    table: {
+      workspaceId: "default",
+      connectionId: connection.id,
+      schemaName: "public",
+      tableName: "orders",
+      displayName: "Orders",
+      primaryKey: ["id"],
+      columns: [
+        { tableId: "ignored", name: "id", dataType: "string", role: "identifier", nullable: false },
+        { tableId: "ignored", name: "order_date", dataType: "date", role: "dimension", nullable: false },
+        { tableId: "ignored", name: "status", dataType: "string", role: "dimension", nullable: false },
+        { tableId: "ignored", name: "amount", dataType: "number", role: "measure", nullable: false },
+      ],
+    },
+  });
+  assert.equal(table.tableName, "orders");
+
+  const catalogView = await collectTool(structuredTool, { action: "catalog" });
+  const storedTable = catalogView.tables.find(item => item.id === table.id);
+  const orderDate = catalogView.columns.find(item => item.tableId === table.id && item.name === "order_date");
+  const status = catalogView.columns.find(item => item.tableId === table.id && item.name === "status");
+  assert.ok(storedTable.sourceId, "cataloged tables should have source records");
+  assert.ok(orderDate);
+  assert.ok(status);
+
+  const metric = await collectTool(structuredTool, {
+    action: "upsert_metric",
+    metric: {
+      workspaceId: "default",
+      name: "total_revenue",
+      businessName: "Total Revenue",
+      baseTableId: table.id,
+      expression: "amount",
+      aggregation: "sum",
+      allowedDimensions: [orderDate.id],
+      allowedFilters: [status.id],
+    },
+  });
+  assert.equal(metric.name, "total_revenue");
+
+  const plan = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      dimensions: [orderDate.id],
+      filters: [{ columnId: status.id, op: "eq", value: "paid" }],
+      limit: 200,
+    },
+  });
+  assert.equal(plan.queryRun.status, "planned");
+  assert.match(plan.queryRun.sql, /SELECT "order_date" AS "order_date", sum\("amount"\) AS "total_revenue"/);
+  assert.match(plan.queryRun.sql, /FROM "public"\."orders"/);
+  assert.match(plan.queryRun.sql, /WHERE "status" = \$1/);
+  assert.match(plan.queryRun.sql, /LIMIT 50/);
+  assert.deepEqual(plan.queryRun.parameters, ["paid"]);
+  assert.equal(plan.validation.valid, true);
+  assert.match(plan.rowCapWarning, /Requested limit 200 exceeds row cap 50/);
+  assert.deepEqual(plan.queryRun.sourceIds, [storedTable.sourceId]);
+
+  const badWrite = await collectTool(structuredTool, { action: "validate_sql", sql: "DELETE FROM public.orders WHERE id = 1" });
+  assert.equal(badWrite.valid, false);
+  assert.equal(badWrite.readOnly, false);
+  assert.ok(badWrite.reasons.some(reason => reason.includes("Only SELECT")));
+
+  const missingLimit = await collectTool(structuredTool, { action: "validate_sql", sql: "SELECT id FROM public.orders" });
+  assert.equal(missingLimit.valid, false);
+  assert.ok(missingLimit.reasons.some(reason => reason.includes("explicit LIMIT")));
+
+  const unknownDimension = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      dimensions: ["not_a_column"],
+    },
+  });
+  assert.match(unknownDimension.error, /Unknown dimension column/);
+
+  const approval = await collectTool(structuredTool, { action: "approve_query", queryRunId: plan.queryRun.id });
+  assert.equal(approval.queryRun.status, "approved");
+  assert.equal(typeof approval.approvalToken, "string");
+
+  const badExecution = await collectTool(structuredTool, {
+    action: "execute_query",
+    queryRunId: plan.queryRun.id,
+    approvalToken: "wrong-token",
+  });
+  assert.match(badExecution.error, /Invalid approval token/);
+
+  const runs = await collectTool(structuredTool, { action: "runs" });
+  assert.equal(runs.runs.length, 1);
+  assert.equal(runs.runs[0].status, "approved");
+
+  const sources = await collectTool(sourceTool, { action: "list" });
+  assert.ok(sources.sources.some(source => source.id === storedTable.sourceId && source.sourceKind === "table"));
+}
+
+await main();
+console.log("structured-data plans governed SQL from semantic catalog records and rejects unsafe queries");

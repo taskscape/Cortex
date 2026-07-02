@@ -30,6 +30,7 @@ plugins:
   - ./plugins/file-broker
   - ./packages/plugins/source-registry
   - ./packages/plugins/connector-fabric
+  - ./packages/plugins/structured-data
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers

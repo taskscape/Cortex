@@ -598,45 +598,52 @@ type QueryRun = {
 
 ### Tasklist
 
-- [ ] Create `local-agent/matbot/packages/plugins/structured-data`.
-- [ ] Add `DataCatalog` and `SqlPlanner` services.
+- [x] Create `local-agent/matbot/packages/plugins/structured-data`.
+- [x] Add `DataCatalog` and `SqlPlanner` services.
 - [ ] Implement Postgres read-only connector:
-  - [ ] catalog schemas, tables, columns, primary keys, foreign keys.
-  - [ ] store table and column metadata as source records.
-  - [ ] enforce read-only connection role.
-  - [ ] set statement timeout and row caps.
+  - [ ] catalog schemas, tables, columns, primary keys, foreign keys from live database introspection.
+  - [x] store table metadata as source records.
+  - [x] enforce read-only connection role.
+  - [x] set statement timeout and row caps.
 - [ ] Define semantic model JSON/YAML:
-  - [ ] tables.
+  - [x] tables.
   - [ ] entities.
-  - [ ] dimensions.
-  - [ ] measures.
-  - [ ] metrics.
+  - [x] dimensions.
+  - [x] measures.
+  - [x] metrics.
   - [ ] join rules.
-  - [ ] allowed filters.
-  - [ ] row-level constraints.
+  - [x] allowed filters.
+  - [x] row-level constraints.
 - [ ] Add SQL validation:
-  - [ ] parse generated SQL before preview.
-  - [ ] reject non-SELECT statements.
-  - [ ] reject unapproved tables, joins, columns, functions, and cross joins.
-  - [ ] require explicit limit unless aggregate-only.
-  - [ ] attach query timeout.
+  - [x] validate generated SQL before preview.
+  - [x] reject non-SELECT statements.
+  - [x] reject unapproved tables, joins, columns, functions, and cross joins.
+  - [x] require explicit limit unless aggregate-only.
+  - [x] attach query timeout.
 - [ ] Add preview and approval flow:
-  - [ ] `plan_query` returns semantic inputs and SQL.
+  - [x] `plan_query` returns semantic inputs and SQL.
   - [ ] UI shows SQL, source freshness, row cap, cost warning, and approval.
-  - [ ] `execute_query` requires approval token for risky queries.
+  - [x] `execute_query` requires approval token for risky queries.
 - [ ] Add query result source records:
-  - [ ] create `query_result` source record.
-  - [ ] store SQL hash, data connection, timestamp, row count, and metric ids.
-  - [ ] cite the query run and source tables in summaries.
+  - [x] create `query_result` source record.
+  - [x] store SQL hash, data connection, timestamp, row count, and metric ids.
+  - [x] cite the query run and source tables in summaries.
 - [ ] Add anomaly/trend analysis over result snapshots:
   - [ ] deterministic statistics first.
   - [ ] model-generated explanation second, grounded in query results.
 - [ ] Add tests:
-  - [ ] parser rejects writes.
-  - [ ] unknown table/column rejection.
-  - [ ] row cap enforcement.
+  - [x] parser rejects writes.
+  - [x] unknown table/column rejection.
+  - [x] row cap enforcement.
   - [ ] citation contains query timestamp and source ids.
   - [ ] Playwright preview/approval path.
+
+MVP note: this slice uses a deterministic TypeScript SQL scanner and semantic
+planner instead of adding SQLGlot or a new SQL parser dependency. Live Postgres
+execution is implemented behind read-only transactions, statement timeout, row
+caps, connector policy, and approval tokens. Live database introspection,
+foreign-key/join planning, UI approval screens, and anomaly/trend analysis
+remain future hardening tasks.
 
 ### Technical Notes
 
@@ -833,9 +840,9 @@ type WorkflowRunEvent = {
 
 ## Suggested Build Sequence
 
-Current implementation status: Source Registry MVP, Connector Fabric MVP, and
-Source Health Monitor primitives are complete as the first committable slices.
-The next build-sequence item is Structured Data Reasoning MVP.
+Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
+Health Monitor primitives, and Structured Data Reasoning MVP are complete as the
+first committable slices. The next build-sequence item is Workflow Run Ledger.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -845,7 +852,7 @@ The next build-sequence item is Structured Data Reasoning MVP.
    - Add grant enforcement and audit hooks.
 3. Source Health Monitor primitives. Complete.
    - Add source health states, stale warnings, and connector health checks.
-4. Structured Data Reasoning MVP.
+4. Structured Data Reasoning MVP. Complete.
    - Postgres read-only connector, catalog, semantic metric definitions, SQL
      preview, approval, execution, and citations.
 5. Workflow Run Ledger.

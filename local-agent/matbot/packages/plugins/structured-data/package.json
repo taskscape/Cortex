@@ -1,0 +1,22 @@
+{
+  "name": "@matatbread/matbot-structured-data",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "Structured data catalog, deterministic SQL planning, read-only Postgres execution, and query result provenance.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/pg": "^8.20.0",
+    "typescript": "catalog:"
+  }
+}

@@ -1037,7 +1037,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
     { id: 'connector-instance:workspace-rag:local', definitionId: 'connector-definition:workspace-rag', type: 'workspace-rag', workspaceId: 'local', displayName: 'Local Workspace RAG', scopes: ['workspace-rag:read', 'workspace-rag:write', 'workspace-rag:admin'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:file-broker:local', definitionId: 'connector-definition:file-broker', type: 'file-broker', workspaceId: 'local', displayName: 'Local File Broker', scopes: ['file-broker:read', 'file-broker:write'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:mcp:local', definitionId: 'connector-definition:mcp', type: 'mcp', workspaceId: 'local', displayName: 'Local MCP Fabric', scopes: ['mcp:read', 'mcp:admin'], readEnabled: true, writeEnabled: true },
-    { id: 'connector-instance:postgres-readonly:local', definitionId: 'connector-definition:postgres-readonly', type: 'postgres-readonly', workspaceId: 'local', displayName: 'Local Postgres Read-Only', scopes: ['postgres:read'], readEnabled: true, writeEnabled: false },
+    { id: 'connector-instance:postgres-readonly:local', definitionId: 'connector-definition:postgres-readonly', type: 'postgres-readonly', workspaceId: 'local', displayName: 'Local Postgres Read-Only', scopes: ['postgres:read'], readEnabled: true, writeEnabled: true },
   ];
 
   for (const instance of instances) {
@@ -1136,6 +1136,30 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       sensitiveFields: ['apiKey', 'accessToken', 'authorization'],
       description: 'Delegated MCP server tools registered as mcp__<server>__<tool>.',
     },
+    {
+      connectorInstanceId: 'connector-instance:postgres-readonly:local',
+      toolName: 'structured_data_action',
+      capability: 'read',
+      sourceTypes: ['table', 'metric', 'query_result'],
+      sensitivity: 'confidential',
+      requiredScopes: ['postgres:read'],
+      inputActionField: 'action',
+      actionCapabilities: {
+        catalog: 'read',
+        validate_sql: 'read',
+        plan_query: 'read',
+        runs: 'read',
+        execute_query: 'read',
+        register_connection: 'admin',
+        upsert_table: 'admin',
+        upsert_column: 'admin',
+        upsert_metric: 'admin',
+        approve_query: 'admin',
+      },
+      approvalPolicyId: 'structured-data-admin',
+      sensitiveFields: ['rows', 'parameters', 'credentialRef', 'approvalToken'],
+      description: 'Governed structured data catalog, semantic SQL planning, and approved read-only query execution.',
+    },
   ];
 
   for (const binding of bindings) await registry.upsertToolBinding(binding);
@@ -1173,8 +1197,10 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
     {
       connectorInstanceId: 'connector-instance:postgres-readonly:local',
       principalId: '*',
-      scopes: ['postgres:read'],
-      allowedTools: [],
+      scopes: ['*'],
+      allowedTools: ['structured_data_action'],
+      approvalRules: ['structured-data-admin'],
+      sensitiveFields: ['rows', 'parameters', 'credentialRef', 'approvalToken'],
     },
   ];
 

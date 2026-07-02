@@ -58,6 +58,7 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_PASSWORD` | `POSTGRES_PASSWORD` or Docker `.env` | Postgres password used by workspace RAG. |
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
+| `CORTEX_STRUCTURED_POSTGRES_URL` | unset | Optional Postgres connection string used by the `structured-data` plugin for approved read-only semantic SQL execution. Use a database role with read-only privileges. |
 | `MATBOT_WEB_PORT` | `19778` | WebUI port. Set by `run.ps1 -WebPort`. |
 | `MATBOT_COMMAND` | unset | Optional command consumed by `start-local-agent.ps1` to launch Matbot. |
 | `MATBOT_PRINCIPAL` | unset | Boot identity override for Matbot. Accepts an id or JSON `{ "id", "type" }`. |
@@ -178,6 +179,7 @@ plugins:
   - ./plugins/file-broker
   - ./packages/plugins/source-registry
   - ./packages/plugins/connector-fabric
+  - ./packages/plugins/structured-data
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
@@ -206,6 +208,8 @@ example, `hybrid-knowledge-index` registers `KnowledgeIndex` before `rumsfeld`
 uses it, `source-registry` loads before `workspace-rag` so indexed markdown gets
 durable source ids, and `connector-fabric` loads before `workspace-rag` so
 connector-bound tool calls can be checked and audited from the first turn.
+`structured-data` loads after source and connector services so semantic SQL
+plans can create source records and run through connector policy.
 `frontend/web` loads last so the WebUI sees the complete tool and plugin catalog.
 
 ## Providers
@@ -342,8 +346,8 @@ Matbot process with `CORTEX_WORKSPACE_ID`.
 
 The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
 conversation. It is installed by default in `matbot.yaml`, and the CLI ensures
-`source-registry`, `connector-fabric`, and `workspace-rag` are present in every
-workspace config when Matbot starts.
+`source-registry`, `connector-fabric`, `structured-data`, and `workspace-rag`
+are present in every workspace config when Matbot starts.
 
 RAG configuration lives next to the active workspace config:
 

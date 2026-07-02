@@ -164,6 +164,23 @@ async function main() {
   assert.equal(dynamicMcp.allowed, true);
   assert.equal(dynamicMcp.capability, "admin");
 
+  const structuredPlan = await registry.evaluateToolCall({
+    toolName: "structured_data_action",
+    input: { action: "plan_query" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(structuredPlan.allowed, true);
+  assert.equal(structuredPlan.capability, "read");
+
+  const structuredAdmin = await registry.evaluateToolCall({
+    toolName: "structured_data_action",
+    input: { action: "upsert_metric" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(structuredAdmin.allowed, true);
+  assert.equal(structuredAdmin.capability, "admin");
+  assert.equal(structuredAdmin.approvalPolicyId, "structured-data-admin");
+
   await registry.upsertGrant({
     connectorInstanceId: "connector-instance:workspace-rag:local",
     principalId: "system",
