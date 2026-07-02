@@ -92,7 +92,7 @@ There are three common plugin categories in this repository:
 | Category | Examples | Pattern |
 | --- | --- | --- |
 | Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
-| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, and policy-aware host-file access. |
+| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `connector-fabric`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, connector policy/audit, and policy-aware host-file access. |
 | Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
 
 Bundled plugins may exist in the tree without being active. They become active
@@ -108,11 +108,12 @@ ordered, committable slices. Completed build-sequence items:
 | Item | Status | Implemented behavior |
 | --- | --- | --- |
 | Source Registry MVP | Complete | `source-registry` registers `SourceRegistry` and `source_action`; sources have stable ids, versions, freshness state, health state, citation policy, health events, and access events; workspace RAG writes source records for indexed markdown and derived knowledge entries; workspace RAG retrieval hits include source ids, health/freshness state, and citation text. |
+| Connector Fabric MVP | Complete | `connector-fabric` registers `ConnectorRegistry` and `connector_action`; it seeds local connector definitions/instances for source registry, workspace RAG, file broker, MCP, and Postgres read-only; action-aware tool bindings classify read/write/admin calls; `toolcall` hooks enforce connector grants before bound tools run; `toolresult` hooks write connector audit events and redact configured sensitive fields. |
 
-Remaining strategic architecture items still build on this foundation: connector
-fabric, source health monitor primitives beyond workspace RAG, structured data
-reasoning, workflow run ledger, automation shadow mode, context graph, workflow
-compiler, and enterprise expert-panel review records.
+Remaining strategic architecture items still build on this foundation: source
+health monitor primitives beyond workspace RAG, structured data reasoning,
+workflow run ledger, automation shadow mode, context graph, workflow compiler,
+and enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -140,6 +141,42 @@ freshness, and citation text. The per-turn screen hook includes that metadata in
 the injected RAG context and in durable marker data, so a later audit can connect
 an answer back to the exact source registry record.
 
+### Connector Fabric
+
+The connector fabric is Cortex's policy and audit layer around tools that read
+or write governed systems. The MVP is store-backed and local-first: it records
+connector definitions, connector instances, grants, tool bindings, sync cursors,
+health events, and audit events.
+
+The `connector-fabric` plugin registers:
+
+- `ConnectorRegistry`: a service for connector metadata, grants, health, sync
+  cursors, policy evaluation, and audit event writes.
+- `connector_action`: an inspection/admin tool with `list`, `get`,
+  `list_tools`, `grants`, `set_grant`, `set_sync`, `health`, `test_health`, and
+  `list_audit` actions.
+- `toolcall` and `toolresult` hooks. The `toolcall` hook rejects connector-bound
+  tool calls when no active grant allows the effective principal, tool, action,
+  capability, and approval policy. The `toolresult` hook records allowed/error
+  audit events, extracts returned source ids, hashes input/result payloads, and
+  redacts configured sensitive result fields before they are persisted or shown
+  to the model.
+
+The seeded local bindings cover the current Cortex data tools:
+
+| Connector instance | Bound tools | Capability handling |
+| --- | --- | --- |
+| Local Source Registry | `source_action` | Read-only source provenance inspection. |
+| Local Workspace RAG | `workspace_rag` | `status`, `get_config`, and `search` are read; configuration actions are write; `reindex_now` is admin. |
+| Local File Broker | `file_broker_action` | `health`, `list`, and `read` are read; `write` is write and redacts returned `content`. |
+| Local MCP Fabric | `mcp_action`, `mcp__*` | MCP server list is read; add/remove and delegated MCP tools are admin until per-server metadata exists. |
+| Local Postgres Read-Only | connector record only | Reserved for the structured-data reasoning SQL tool; executable query support lands in that later build slice. |
+
+The CLI inserts `connector-fabric` into each Cortex workspace before
+`workspace-rag`, preserving existing local behavior through wildcard bootstrap
+grants while still allowing explicit per-principal deny grants for tests,
+operators, and future UI policy controls.
+
 ### Memory System
 
 Cortex memory is not a single bucket. It is several layers with different jobs:
@@ -152,6 +189,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | KnowledgeIndex | Search interface over skills, Mem0, and file-index results. | `KnowledgeIndex` service |
 | Workspace RAG | Markdown files configured for the current workspace. | `workspace_rag` |
 | Source registry | Source identity, freshness, health, citations, and retrieval provenance. | `SourceRegistry`, `source_action` |
+| Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:

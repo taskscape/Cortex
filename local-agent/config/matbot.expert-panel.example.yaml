@@ -29,6 +29,7 @@ plugins:
   - ./plugins/hybrid-knowledge-index
   - ./plugins/file-broker
   - ./packages/plugins/source-registry
+  - ./packages/plugins/connector-fabric
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers

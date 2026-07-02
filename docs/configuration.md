@@ -177,6 +177,7 @@ plugins:
   - ./plugins/hybrid-knowledge-index
   - ./plugins/file-broker
   - ./packages/plugins/source-registry
+  - ./packages/plugins/connector-fabric
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
@@ -202,8 +203,10 @@ Optional top-level keys supported by the loader:
 
 Plugin order matters when one plugin provides a service consumed by another. For
 example, `hybrid-knowledge-index` registers `KnowledgeIndex` before `rumsfeld`
-uses it, and `frontend/web` loads last so the WebUI sees the complete tool and
-plugin catalog.
+uses it, `source-registry` loads before `workspace-rag` so indexed markdown gets
+durable source ids, and `connector-fabric` loads before `workspace-rag` so
+connector-bound tool calls can be checked and audited from the first turn.
+`frontend/web` loads last so the WebUI sees the complete tool and plugin catalog.
 
 ## Providers
 
@@ -338,8 +341,9 @@ Matbot process with `CORTEX_WORKSPACE_ID`.
 ## Workspace RAG Configuration
 
 The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
-conversation. It is installed by default in `matbot.yaml`, and the CLI ensures it
-is present in every workspace config when Matbot starts.
+conversation. It is installed by default in `matbot.yaml`, and the CLI ensures
+`source-registry`, `connector-fabric`, and `workspace-rag` are present in every
+workspace config when Matbot starts.
 
 RAG configuration lives next to the active workspace config:
 

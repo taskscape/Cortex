@@ -194,29 +194,30 @@ type ConnectorGrant = {
 
 ### Tasklist
 
-- [ ] Create `local-agent/matbot/packages/plugins/connector-fabric`.
-- [ ] Define `ConnectorRegistry` service types and augment `MatbotServices`.
-- [ ] Implement store-backed CRUD for connector definitions, instances, grants,
+- [x] Create `local-agent/matbot/packages/plugins/connector-fabric`.
+- [x] Define `ConnectorRegistry` service types and augment `MatbotServices`.
+- [x] Implement store-backed CRUD for connector definitions, instances, grants,
   sync cursors, and health.
-- [ ] Add `connector_action` with actions: `list`, `get`, `test_health`,
+- [x] Add `connector_action` with actions: `list`, `get`, `test_health`,
   `set_grant`, `set_sync`, `list_tools`, `list_audit`.
 - [ ] Wrap MCP tools with connector metadata and register proxy tools using
   stable names such as `connector_<instance>_<tool>`.
-- [ ] Add policy evaluation in a `toolcall` hook:
-  - [ ] Resolve current principal.
-  - [ ] Resolve connector instance and grant.
-  - [ ] Deny unavailable, expired, disabled, or out-of-scope tools.
-  - [ ] Require approval for write/admin tools.
+- [x] Add policy evaluation in a `toolcall` hook:
+  - [x] Resolve current principal.
+  - [x] Resolve connector instance and grant.
+  - [x] Deny unavailable, expired, disabled, or out-of-scope tools.
+  - [x] Require approval for write/admin tools.
   - [ ] Enforce per-tool timeout and rate budget.
-- [ ] Add audit capture in a `toolresult` hook:
-  - [ ] connector id, tool name, principal id, input hash, result status,
-    duration, source ids, model provider, trace id.
-  - [ ] redaction for sensitive fields before model-visible result.
+- [x] Add audit capture in a `toolresult` hook:
+  - [x] connector id, tool name, principal id, input hash, result status,
+    duration, source ids, and model provider.
+  - [ ] trace id once Matbot tool hook contexts expose it.
+  - [x] redaction for sensitive fields before model-visible result.
 - [ ] Implement first native connector adapters:
-  - [ ] local file-index/file-broker adapter.
-  - [ ] workspace RAG adapter.
+  - [x] local file-index/file-broker adapter.
+  - [x] workspace RAG adapter.
   - [ ] Postgres read-only adapter.
-  - [ ] MCP adapter.
+  - [x] MCP adapter.
 - [ ] Add incremental sync cursor support.
   - [ ] For Microsoft 365, model delta-token style cursor state.
   - [ ] For event APIs such as Slack, model enqueue-and-ack behavior.
@@ -227,7 +228,14 @@ type ConnectorGrant = {
   - [ ] source freshness.
   - [ ] schema or permission drift.
 - [ ] Add Playwright coverage for connector list, health, and approval prompts.
-- [ ] Add Node tests for grant enforcement and audit event recording.
+- [x] Add Node tests for grant enforcement and audit event recording.
+
+MVP note: the implemented MCP adapter binds `mcp_action` and the delegated
+`mcp__*` tool-name prefix to connector policy and audit. Generated stable
+`connector_<instance>_<tool>` proxy tools remain a future hardening task once
+per-server MCP trust metadata exists. The Postgres read-only connector is
+represented as a connector definition/instance for policy continuity; executable
+read-only SQL support lands in the Structured Data Reasoning MVP.
 
 ### Technical Notes
 
@@ -825,13 +833,14 @@ type WorkflowRunEvent = {
 
 ## Suggested Build Sequence
 
-Current implementation status: Source Registry MVP is complete as the first
-committable slice. The next build-sequence item is Connector Fabric MVP.
+Current implementation status: Source Registry MVP and Connector Fabric MVP are
+complete as the first committable slices. The next build-sequence item is Source
+Health Monitor primitives.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
      health, and workflows all depend on stable source ids.
-2. Connector Fabric MVP.
+2. Connector Fabric MVP. Complete.
    - Wrap existing local file, workspace RAG, MCP, and Postgres read-only paths.
    - Add grant enforcement and audit hooks.
 3. Source Health Monitor primitives.

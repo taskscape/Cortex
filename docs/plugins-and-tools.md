@@ -11,6 +11,7 @@ The active default plugin list is in `local-agent\matbot\matbot.yaml`.
 | `./plugins/hybrid-knowledge-index` | Registers Matbot `KnowledgeIndex` backed by Mem0 and file-index. | Service consumed by retrieval tools. |
 | `./plugins/file-broker` | Client for the local file-broker HTTP service. | `file_broker_action`. |
 | `./packages/plugins/source-registry` | Source provenance, freshness, health, citation policy, and source events. | `SourceRegistry`, `source_action`. |
+| `./packages/plugins/connector-fabric` | Connector records, grants, health, tool bindings, and audit events for connector-backed tools. | `ConnectorRegistry`, `connector_action`, connector policy/audit hooks. |
 | `./packages/plugins/workspace-rag` | Workspace-scoped markdown RAG. | `workspace_rag`, automatic per-turn RAG context. |
 | `./packages/plugins/skills` | Persistent markdown skills/playbooks. | `skill_action`, skill editor UI. |
 | `./packages/plugins/triggers` | Data-driven automatic tool triggers. | Trigger management and automatic `remember_fact` firing. |
