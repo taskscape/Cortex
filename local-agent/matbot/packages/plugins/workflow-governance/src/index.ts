@@ -1,0 +1,1303 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { PLUGIN_API_VERSION, tryCurrentPrincipal } from '@matatbread/matbot-plugin-api';
+import type {
+  MatbotMachine,
+  MatbotPluginSpec,
+  Principal,
+  Store,
+  StoreQuery,
+  Tool,
+  ToolCallContext,
+  ToolContext,
+  ToolEvent,
+  ToolResultContext,
+} from '@matatbread/matbot-plugin-api';
+
+declare module '@matatbread/matbot-plugin-api' {
+  interface MatbotServices {
+    readonly WorkflowRegistry?: WorkflowRegistry;
+    readonly WorkflowRunner?: WorkflowRunner;
+  }
+}
+
+export type WorkflowRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+export type WorkflowRunMode = 'dry_run' | 'shadow' | 'approval_gated' | 'execute';
+export type WorkflowRunStatus = 'created' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled';
+export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected';
+export type WorkflowActionStatus = 'proposed' | 'approved' | 'rejected' | 'blocked' | 'executed';
+export type ConnectorCapability = 'read' | 'write' | 'admin';
+
+export interface ValidationError {
+  path: string;
+  message: string;
+}
+
+export interface ApprovalGate {
+  id: string;
+  type: 'action' | 'stale_source' | 'low_confidence' | 'cost' | 'risk';
+  message?: string;
+  threshold?: number;
+  requiredRiskLevel?: WorkflowRiskLevel;
+}
+
+export interface RequiredEvidence {
+  name: string;
+  sourceKind?: string;
+  freshnessSlaSeconds?: number;
+  minCitations?: number;
+}
+
+export interface WorkflowEvalCase {
+  id: string;
+  version: string;
+  workflowId: string;
+  workspaceId: string;
+  name: string;
+  inputs: Record<string, unknown>;
+  expected: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type WorkflowEvalCaseInput = {
+  id?: string;
+  name: string;
+  inputs?: Record<string, unknown>;
+  expected?: Record<string, unknown>;
+};
+
+export interface WorkflowDefinition {
+  id: string;
+  version: string;
+  workspaceId: string;
+  name: string;
+  ownerPrincipalId: string;
+  inputSchema: Record<string, unknown>;
+  allowedSourceIds: string[];
+  allowedConnectorInstanceIds: string[];
+  allowedTools: string[];
+  requiredEvidence: RequiredEvidence[];
+  riskLevel: WorkflowRiskLevel;
+  approvalGates: ApprovalGate[];
+  dryRunDefault: boolean;
+  tests: WorkflowEvalCaseInput[];
+  successMetrics: string[];
+  createdAt: string;
+  updatedAt: string;
+  description?: string;
+  triggerSchema?: Record<string, unknown>;
+}
+
+export type WorkflowDefinitionInput = {
+  id?: string;
+  workspaceId: string;
+  name: string;
+  ownerPrincipalId?: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  triggerSchema?: Record<string, unknown>;
+  allowedSourceIds?: string[];
+  allowedConnectorInstanceIds?: string[];
+  allowedTools?: string[];
+  requiredEvidence?: RequiredEvidence[];
+  riskLevel?: WorkflowRiskLevel;
+  approvalGates?: ApprovalGate[];
+  dryRunDefault?: boolean;
+  tests?: WorkflowEvalCaseInput[];
+  successMetrics?: string[];
+};
+
+export interface WorkflowVersion {
+  id: string;
+  version: string;
+  workflowId: string;
+  workflowVersion: string;
+  workspaceId: string;
+  definition: WorkflowDefinition;
+  createdAt: string;
+}
+
+export interface EvidenceReference {
+  sourceId: string;
+  citationText?: string;
+  sourceVersionId?: string;
+  observedAt?: string;
+  healthState?: string;
+  stalenessState?: string;
+  warning?: string;
+}
+
+export interface ActionProposal {
+  id: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  capability: ConnectorCapability;
+  status: WorkflowActionStatus;
+  sourceIds: string[];
+  requiresApproval: boolean;
+  reason?: string;
+  connectorInstanceId?: string;
+  riskLevel?: WorkflowRiskLevel;
+  confidence?: number;
+  costEstimateUsd?: number;
+}
+
+export type ActionProposalInput = {
+  id?: string;
+  toolName: string;
+  input?: Record<string, unknown>;
+  capability?: ConnectorCapability;
+  sourceIds?: string[];
+  reason?: string;
+  connectorInstanceId?: string;
+  riskLevel?: WorkflowRiskLevel;
+  confidence?: number;
+  costEstimateUsd?: number;
+};
+
+export interface ExecutedAction {
+  id: string;
+  proposalId: string;
+  toolName: string;
+  status: 'succeeded' | 'failed';
+  executedAt: string;
+  resultHash?: string;
+  error?: string;
+}
+
+export interface WorkflowRun {
+  id: string;
+  version: string;
+  workflowId: string;
+  workflowVersion: string;
+  workspaceId: string;
+  principalId: string;
+  mode: WorkflowRunMode;
+  status: WorkflowRunStatus;
+  inputs: Record<string, unknown>;
+  evidenceSourceIds: string[];
+  evidenceSourceVersions: EvidenceReference[];
+  proposedActions: ActionProposal[];
+  executedActions: ExecutedAction[];
+  labels: string[];
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+}
+
+export interface WorkflowRunEvent {
+  id: string;
+  version: string;
+  runId: string;
+  sequence: number;
+  eventType: string;
+  timestamp: string;
+  payload: Record<string, unknown>;
+  principalId?: string;
+  toolCallId?: string;
+  sourceIds?: string[];
+}
+
+export interface WorkflowApproval {
+  id: string;
+  version: string;
+  runId: string;
+  workflowId: string;
+  status: WorkflowApprovalStatus;
+  requestedAt: string;
+  updatedAt: string;
+  gateId?: string;
+  proposalId?: string;
+  principalId?: string;
+  decidedAt?: string;
+  decidedByPrincipalId?: string;
+  reason?: string;
+  message?: string;
+}
+
+export type StartWorkflowInput = {
+  workflowId?: string;
+  workflowName?: string;
+  workflowVersion?: string;
+  workspaceId: string;
+  mode?: WorkflowRunMode;
+  inputs?: Record<string, unknown>;
+  evidenceSourceIds?: string[];
+  proposedActions?: ActionProposalInput[];
+  labels?: string[];
+};
+
+export type WorkflowPolicyDecision = {
+  allowed: boolean;
+  active: boolean;
+  reason?: string;
+  run?: WorkflowRun;
+  capability?: ConnectorCapability;
+};
+
+export interface WorkflowRegistry {
+  stableWorkflowId(workspaceId: string, name: string): string;
+  stableWorkflowVersionId(workflowId: string, workflowVersion: string): string;
+  validateDefinition(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[];
+  upsertDefinition(input: WorkflowDefinitionInput): Promise<{ definition: WorkflowDefinition; version: WorkflowVersion; validation: ValidationError[] }>;
+  getDefinition(id: string): Promise<WorkflowDefinition | null>;
+  getVersion(id: string): Promise<WorkflowVersion | null>;
+  definitionByName(workspaceId: string, name: string): Promise<WorkflowDefinition | null>;
+  queryDefinitions(query?: StoreQuery): Promise<WorkflowDefinition[]>;
+  queryVersions(query?: StoreQuery): Promise<WorkflowVersion[]>;
+  queryEvalCases(query?: StoreQuery): Promise<WorkflowEvalCase[]>;
+}
+
+export interface WorkflowRunner {
+  startRun(input: StartWorkflowInput): Promise<WorkflowRun>;
+  approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
+  rejectRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
+  labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun>;
+  recordToolResult(runId: string, toolName: string, result: unknown, isError: boolean, durationMs?: number): Promise<void>;
+  inspectRun(runId: string): Promise<{ run: WorkflowRun | null; events: WorkflowRunEvent[]; approvals: WorkflowApproval[] }>;
+  listRuns(query?: StoreQuery): Promise<WorkflowRun[]>;
+  listApprovals(query?: StoreQuery): Promise<WorkflowApproval[]>;
+  evaluateToolPolicy(toolName: string, input: unknown, principal?: Principal): Promise<WorkflowPolicyDecision>;
+}
+
+interface SourceRegistryLike {
+  getSource(id: string): Promise<{
+    id: string;
+    workspaceId: string;
+    sourceKind: string;
+    title: string;
+    healthState: string;
+    stalenessState: string;
+    freshnessSlaSeconds?: number;
+  } | null>;
+  resolveCitation(sourceId: string, versionId?: string): Promise<{
+    sourceId: string;
+    text: string;
+    versionId?: string;
+    observedAt?: string;
+  }>;
+  sourceVersions?(sourceId?: string): Promise<Array<{ id: string; observedAt: string }>>;
+  recordAccess(input: {
+    sourceId: string;
+    action: 'read' | 'retrieve' | 'cite' | 'write' | 'delete' | 'health_check';
+    allowed: boolean;
+    principalId?: string;
+    workflowRunId?: string;
+    message?: string;
+  }): Promise<unknown>;
+}
+
+interface ConnectorRegistryLike {
+  evaluateToolCall(input: {
+    toolName: string;
+    input: unknown;
+    principal?: Principal;
+  }): Promise<{
+    bound: boolean;
+    allowed: boolean;
+    capability?: ConnectorCapability;
+    reason?: string;
+    connectorInstance?: { id: string; workspaceId: string };
+  }>;
+}
+
+export const WORKFLOW_DEFINITION_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  required: ['workspaceId', 'name'],
+  properties: {
+    workspaceId: { type: 'string', minLength: 1 },
+    name: { type: 'string', minLength: 1 },
+    ownerPrincipalId: { type: 'string' },
+    description: { type: 'string' },
+    inputSchema: { type: 'object' },
+    triggerSchema: { type: 'object' },
+    allowedSourceIds: { type: 'array', items: { type: 'string' } },
+    allowedConnectorInstanceIds: { type: 'array', items: { type: 'string' } },
+    allowedTools: { type: 'array', items: { type: 'string' } },
+    requiredEvidence: { type: 'array', items: { type: 'object' } },
+    riskLevel: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
+    approvalGates: { type: 'array', items: { type: 'object' } },
+    dryRunDefault: { type: 'boolean' },
+    tests: { type: 'array', items: { type: 'object' } },
+    successMetrics: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+const DEFINITION_STORE = 'workflow_definitions';
+const VERSION_STORE = 'workflow_versions';
+const RUN_STORE = 'workflow_runs';
+const EVENT_STORE = 'workflow_run_events';
+const APPROVAL_STORE = 'workflow_approvals';
+const EVAL_CASE_STORE = 'workflow_eval_cases';
+const RISK_ORDER: WorkflowRiskLevel[] = ['low', 'medium', 'high', 'critical'];
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function hashId(prefix: string, parts: readonly string[]): string {
+  const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
+  return `${prefix}:${hash}`;
+}
+
+function hashPayload(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortForJson(value));
+}
+
+function sortForJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortForJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, sortForJson(item)]));
+  }
+  return value;
+}
+
+function normalizeName(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
+}
+
+function uniq(values: readonly string[]): string[] {
+  return [...new Set(values.map(value => value.trim()).filter(Boolean))];
+}
+
+function principalId(): string {
+  return tryCurrentPrincipal()?.id ?? 'system';
+}
+
+function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
+  return store.query(query ?? {}).then(result => result.items);
+}
+
+function riskAtLeast(value: WorkflowRiskLevel, required: WorkflowRiskLevel): boolean {
+  return RISK_ORDER.indexOf(value) >= RISK_ORDER.indexOf(required);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optional<T>(value: T | undefined): { include: false } | { include: true; value: T } {
+  return value === undefined ? { include: false } : { include: true, value };
+}
+
+function withOptional<T extends Record<string, unknown>, K extends string, V>(
+  base: T,
+  key: K,
+  value: V | undefined,
+): T & Partial<Record<K, V>> {
+  const opt = optional(value);
+  return (opt.include ? { ...base, [key]: opt.value } : base) as T & Partial<Record<K, V>>;
+}
+
+function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path = '$'): ValidationError[] {
+  const errors: ValidationError[] = [];
+  const expectedType = schema['type'];
+  if (typeof expectedType === 'string') {
+    const typeOk =
+      (expectedType === 'object' && isPlainRecord(value))
+      || (expectedType === 'array' && Array.isArray(value))
+      || (expectedType === 'string' && typeof value === 'string')
+      || (expectedType === 'number' && typeof value === 'number' && Number.isFinite(value))
+      || (expectedType === 'integer' && Number.isInteger(value))
+      || (expectedType === 'boolean' && typeof value === 'boolean');
+    if (!typeOk) {
+      errors.push({ path, message: `Expected ${expectedType}.` });
+      return errors;
+    }
+  }
+
+  if (typeof schema['minLength'] === 'number' && typeof value === 'string' && value.length < schema['minLength']) {
+    errors.push({ path, message: `Expected at least ${schema['minLength']} character(s).` });
+  }
+
+  if (Array.isArray(schema['enum']) && !schema['enum'].includes(value)) {
+    errors.push({ path, message: `Expected one of: ${schema['enum'].join(', ')}.` });
+  }
+
+  if (isPlainRecord(value) && isPlainRecord(schema['properties'])) {
+    const required = Array.isArray(schema['required']) ? schema['required'].filter((item): item is string => typeof item === 'string') : [];
+    for (const key of required) {
+      if (!(key in value)) errors.push({ path: `${path}.${key}`, message: 'Required field is missing.' });
+    }
+    for (const [key, childSchema] of Object.entries(schema['properties'])) {
+      if (key in value && isPlainRecord(childSchema)) {
+        errors.push(...validateSchemaValue(childSchema, value[key], `${path}.${key}`));
+      }
+    }
+  }
+
+  if (Array.isArray(value) && isPlainRecord(schema['items'])) {
+    value.forEach((item, index) => {
+      errors.push(...validateSchemaValue(schema['items'] as Record<string, unknown>, item, `${path}[${index}]`));
+    });
+  }
+
+  return errors;
+}
+
+function validateDefinitionShape(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[] {
+  const errors = validateSchemaValue(WORKFLOW_DEFINITION_SCHEMA, input);
+  if (input.inputSchema !== undefined && !isPlainRecord(input.inputSchema)) {
+    errors.push({ path: '$.inputSchema', message: 'inputSchema must be a JSON Schema object.' });
+  }
+  if (input.inputSchema !== undefined && input.inputSchema['type'] !== undefined && input.inputSchema['type'] !== 'object') {
+    errors.push({ path: '$.inputSchema.type', message: 'Workflow inputSchema must describe an object.' });
+  }
+  if (input.triggerSchema !== undefined && !isPlainRecord(input.triggerSchema)) {
+    errors.push({ path: '$.triggerSchema', message: 'triggerSchema must be a JSON Schema object.' });
+  }
+  for (const [index, gate] of (input.approvalGates ?? []).entries()) {
+    if (!gate.id) errors.push({ path: `$.approvalGates[${index}].id`, message: 'Approval gate id is required.' });
+    if (!['action', 'stale_source', 'low_confidence', 'cost', 'risk'].includes(gate.type)) {
+      errors.push({ path: `$.approvalGates[${index}].type`, message: 'Unsupported approval gate type.' });
+    }
+  }
+  for (const [index, evidence] of (input.requiredEvidence ?? []).entries()) {
+    if (!evidence.name) errors.push({ path: `$.requiredEvidence[${index}].name`, message: 'Required evidence name is required.' });
+  }
+  return errors;
+}
+
+function normalizeDefinition(input: WorkflowDefinitionInput, existing: WorkflowDefinition | null): WorkflowDefinition {
+  const timestamp = nowIso();
+  const name = input.name.trim();
+  const id = input.id ?? existing?.id ?? hashId('workflow-definition', [input.workspaceId, normalizeName(name)]);
+  const definition: WorkflowDefinition = {
+    id,
+    version: randomUUID(),
+    workspaceId: input.workspaceId,
+    name,
+    ownerPrincipalId: input.ownerPrincipalId ?? existing?.ownerPrincipalId ?? principalId(),
+    inputSchema: input.inputSchema ?? existing?.inputSchema ?? { type: 'object' },
+    allowedSourceIds: uniq(input.allowedSourceIds ?? existing?.allowedSourceIds ?? []),
+    allowedConnectorInstanceIds: uniq(input.allowedConnectorInstanceIds ?? existing?.allowedConnectorInstanceIds ?? []),
+    allowedTools: uniq(input.allowedTools ?? existing?.allowedTools ?? []),
+    requiredEvidence: input.requiredEvidence ?? existing?.requiredEvidence ?? [],
+    riskLevel: input.riskLevel ?? existing?.riskLevel ?? 'low',
+    approvalGates: input.approvalGates ?? existing?.approvalGates ?? [],
+    dryRunDefault: input.dryRunDefault ?? existing?.dryRunDefault ?? true,
+    tests: input.tests ?? existing?.tests ?? [],
+    successMetrics: uniq(input.successMetrics ?? existing?.successMetrics ?? []),
+    createdAt: existing?.createdAt ?? timestamp,
+    updatedAt: timestamp,
+    ...(input.description ?? existing?.description !== undefined ? { description: (input.description ?? existing?.description)! } : {}),
+    ...(input.triggerSchema ?? existing?.triggerSchema !== undefined ? { triggerSchema: (input.triggerSchema ?? existing?.triggerSchema)! } : {}),
+  };
+  return definition;
+}
+
+class StoreBackedWorkflowRegistry implements WorkflowRegistry {
+  private readonly definitions: Store<WorkflowDefinition>;
+  private readonly versions: Store<WorkflowVersion>;
+  private readonly evalCases: Store<WorkflowEvalCase>;
+
+  constructor(definitions: Store<WorkflowDefinition>, versions: Store<WorkflowVersion>, evalCases: Store<WorkflowEvalCase>) {
+    this.definitions = definitions;
+    this.versions = versions;
+    this.evalCases = evalCases;
+  }
+
+  stableWorkflowId(workspaceId: string, name: string): string {
+    return hashId('workflow-definition', [workspaceId, normalizeName(name)]);
+  }
+
+  stableWorkflowVersionId(workflowId: string, workflowVersion: string): string {
+    return hashId('workflow-version', [workflowId, workflowVersion]);
+  }
+
+  validateDefinition(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[] {
+    return validateDefinitionShape(input);
+  }
+
+  async upsertDefinition(input: WorkflowDefinitionInput): Promise<{ definition: WorkflowDefinition; version: WorkflowVersion; validation: ValidationError[] }> {
+    const candidateId = input.id ?? this.stableWorkflowId(input.workspaceId, input.name);
+    const existing = await this.definitions.get(candidateId);
+    const definition = normalizeDefinition(input, existing);
+    const validation = this.validateDefinition(definition);
+    if (validation.length > 0) return { definition, version: this.previewVersion(definition), validation };
+    await this.definitions.set(definition.id, definition);
+    const version = this.previewVersion(definition);
+    await this.versions.set(version.id, version);
+    for (const test of definition.tests) {
+      const evalCase: WorkflowEvalCase = {
+        id: test.id ?? hashId('workflow-eval-case', [definition.id, test.name]),
+        version: randomUUID(),
+        workflowId: definition.id,
+        workspaceId: definition.workspaceId,
+        name: test.name,
+        inputs: test.inputs ?? {},
+        expected: test.expected ?? {},
+        createdAt: definition.createdAt,
+        updatedAt: definition.updatedAt,
+      };
+      await this.evalCases.set(evalCase.id, evalCase);
+    }
+    return { definition, version, validation };
+  }
+
+  getDefinition(id: string): Promise<WorkflowDefinition | null> {
+    return this.definitions.get(id);
+  }
+
+  getVersion(id: string): Promise<WorkflowVersion | null> {
+    return this.versions.get(id);
+  }
+
+  async definitionByName(workspaceId: string, name: string): Promise<WorkflowDefinition | null> {
+    const definitions = await this.queryDefinitions({
+      where: {
+        op: 'and',
+        clauses: [
+          { op: 'eq', field: 'workspaceId', value: workspaceId },
+          { op: 'eq', field: 'name', value: name.trim() },
+        ],
+      },
+    });
+    return definitions[0] ?? this.definitions.get(this.stableWorkflowId(workspaceId, name));
+  }
+
+  queryDefinitions(query?: StoreQuery): Promise<WorkflowDefinition[]> {
+    return queryAll(this.definitions, query);
+  }
+
+  queryVersions(query?: StoreQuery): Promise<WorkflowVersion[]> {
+    return queryAll(this.versions, query);
+  }
+
+  queryEvalCases(query?: StoreQuery): Promise<WorkflowEvalCase[]> {
+    return queryAll(this.evalCases, query);
+  }
+
+  private previewVersion(definition: WorkflowDefinition): WorkflowVersion {
+    return {
+      id: this.stableWorkflowVersionId(definition.id, definition.version),
+      version: randomUUID(),
+      workflowId: definition.id,
+      workflowVersion: definition.version,
+      workspaceId: definition.workspaceId,
+      definition,
+      createdAt: definition.updatedAt,
+    };
+  }
+}
+
+class StoreBackedWorkflowRunner implements WorkflowRunner {
+  private readonly registry: WorkflowRegistry;
+  private readonly runs: Store<WorkflowRun>;
+  private readonly events: Store<WorkflowRunEvent>;
+  private readonly approvals: Store<WorkflowApproval>;
+  private readonly sourceRegistry: SourceRegistryLike | undefined;
+  private readonly connectorRegistry: ConnectorRegistryLike | undefined;
+
+  constructor(
+    registry: WorkflowRegistry,
+    runs: Store<WorkflowRun>,
+    events: Store<WorkflowRunEvent>,
+    approvals: Store<WorkflowApproval>,
+    sourceRegistry: SourceRegistryLike | undefined,
+    connectorRegistry: ConnectorRegistryLike | undefined,
+  ) {
+    this.registry = registry;
+    this.runs = runs;
+    this.events = events;
+    this.approvals = approvals;
+    this.sourceRegistry = sourceRegistry;
+    this.connectorRegistry = connectorRegistry;
+  }
+
+  async startRun(input: StartWorkflowInput): Promise<WorkflowRun> {
+    const definition = await this.resolveDefinition(input);
+    const mode = input.mode ?? (definition.dryRunDefault ? 'dry_run' : 'approval_gated');
+    const timestamp = nowIso();
+    let run: WorkflowRun = {
+      id: randomUUID(),
+      version: randomUUID(),
+      workflowId: definition.id,
+      workflowVersion: definition.version,
+      workspaceId: definition.workspaceId,
+      principalId: principalId(),
+      mode,
+      status: 'created',
+      inputs: input.inputs ?? {},
+      evidenceSourceIds: uniq(input.evidenceSourceIds ?? []),
+      evidenceSourceVersions: [],
+      proposedActions: [],
+      executedActions: [],
+      labels: uniq(input.labels ?? []),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    await this.runs.set(run.id, run);
+    await this.appendEvent(run, 'run_created', { mode, workflowId: definition.id, workflowVersion: definition.version });
+
+    const inputErrors = validateSchemaValue(definition.inputSchema, run.inputs);
+    if (inputErrors.length > 0) {
+      run = await this.updateRun({ ...run, status: 'failed', error: 'Workflow inputs failed schema validation.', finishedAt: nowIso(), updatedAt: nowIso() });
+      await this.appendEvent(run, 'input_validation_failed', { errors: inputErrors });
+      return run;
+    }
+    await this.appendEvent(run, 'inputs_validated', { inputHash: hashPayload(run.inputs) });
+
+    const evidence = await this.resolveEvidence(definition, run);
+    run = await this.updateRun({ ...run, evidenceSourceVersions: evidence.references, updatedAt: nowIso() });
+    await this.appendEvent(run, 'evidence_resolved', {
+      sourceIds: run.evidenceSourceIds,
+      references: evidence.references,
+      warnings: evidence.warnings,
+    }, run.evidenceSourceIds);
+
+    const proposedActions = await this.normalizeProposals(definition, run, input.proposedActions ?? [], mode);
+    run = await this.updateRun({
+      ...run,
+      status: 'running',
+      startedAt: nowIso(),
+      proposedActions,
+      updatedAt: nowIso(),
+    });
+    await this.appendEvent(run, 'actions_proposed', { proposedActions });
+
+    if (mode === 'dry_run') {
+      run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
+      await this.appendEvent(run, 'dry_run_completed', { proposedActionCount: proposedActions.length });
+      return run;
+    }
+    if (mode === 'shadow') {
+      run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
+      await this.appendEvent(run, 'shadow_recommendation_recorded', { proposedActionCount: proposedActions.length, labels: run.labels });
+      return run;
+    }
+    const approvalRequests = await this.createApprovalRequests(definition, run, evidence.warnings);
+    if (approvalRequests.length > 0 || (mode === 'approval_gated' && proposedActions.some(action => action.requiresApproval))) {
+      run = await this.updateRun({ ...run, status: 'waiting_for_approval', updatedAt: nowIso() });
+      await this.appendEvent(run, 'approval_requested', { approvals: approvalRequests });
+      return run;
+    }
+    run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
+    await this.appendEvent(run, 'run_succeeded', { reason: 'No approval gates were triggered.' });
+    return run;
+  }
+
+  async approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
+    const run = await this.requireRun(runId);
+    const pending = await this.pendingApprovals(runId, approvalId);
+    if (pending.length === 0) throw new Error(`No pending workflow approval found for run "${runId}".`);
+    const timestamp = nowIso();
+    const decided: WorkflowApproval[] = [];
+    for (const approval of pending) {
+      const updated = withOptional({
+        ...approval,
+        version: randomUUID(),
+        status: 'approved' as const,
+        updatedAt: timestamp,
+        decidedAt: timestamp,
+        decidedByPrincipalId: principalId(),
+      }, 'reason', reason ?? approval.reason);
+      await this.approvals.set(updated.id, updated);
+      decided.push(updated);
+    }
+    const approvedProposalIds = new Set(decided.map(item => item.proposalId).filter((value): value is string => typeof value === 'string'));
+    const approveAllPending = approvalId === undefined;
+    const proposedActions = run.proposedActions.map(action =>
+      approveAllPending || approvedProposalIds.has(action.id)
+        ? { ...action, status: 'approved' as const, requiresApproval: false }
+        : action);
+    const remaining = (await this.pendingApprovals(runId)).filter(item => !decided.some(done => done.id === item.id));
+    const nextStatus: WorkflowRunStatus = remaining.length === 0 ? 'succeeded' : 'waiting_for_approval';
+    const updatedRun = await this.updateRun({
+      ...run,
+      version: randomUUID(),
+      status: nextStatus,
+      proposedActions,
+      ...(nextStatus === 'succeeded' ? { finishedAt: timestamp } : {}),
+      updatedAt: timestamp,
+    });
+    await this.appendEvent(updatedRun, 'approval_approved', { approvalIds: decided.map(item => item.id), reason: reason ?? null });
+    if (nextStatus === 'succeeded') await this.appendEvent(updatedRun, 'run_succeeded', { reason: 'All pending approvals were approved.' });
+    return { run: updatedRun, approvals: decided };
+  }
+
+  async rejectRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
+    const run = await this.requireRun(runId);
+    const pending = await this.pendingApprovals(runId, approvalId);
+    if (pending.length === 0) throw new Error(`No pending workflow approval found for run "${runId}".`);
+    const timestamp = nowIso();
+    const rejected: WorkflowApproval[] = [];
+    for (const approval of pending) {
+      const updated = withOptional({
+        ...approval,
+        version: randomUUID(),
+        status: 'rejected' as const,
+        updatedAt: timestamp,
+        decidedAt: timestamp,
+        decidedByPrincipalId: principalId(),
+      }, 'reason', reason ?? approval.reason);
+      await this.approvals.set(updated.id, updated);
+      rejected.push(updated);
+    }
+    const rejectedProposalIds = new Set(rejected.map(item => item.proposalId).filter((value): value is string => typeof value === 'string'));
+    const rejectAllPending = approvalId === undefined;
+    const proposedActions = run.proposedActions.map(action =>
+      rejectAllPending || rejectedProposalIds.has(action.id)
+        ? { ...action, status: 'rejected' as const }
+        : action);
+    const updatedRun = await this.updateRun({
+      ...run,
+      status: 'cancelled',
+      proposedActions,
+      finishedAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await this.appendEvent(updatedRun, 'approval_rejected', { approvalIds: rejected.map(item => item.id), reason: reason ?? null });
+    return { run: updatedRun, approvals: rejected };
+  }
+
+  async labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun> {
+    const run = await this.requireRun(runId);
+    if (run.mode !== 'shadow') throw new Error(`Workflow run "${runId}" is not a shadow-mode run.`);
+    const updatedRun = await this.updateRun({
+      ...run,
+      labels: uniq([...run.labels, ...labels]),
+      updatedAt: nowIso(),
+    });
+    await this.appendEvent(updatedRun, 'shadow_result_labeled', { labels, ...(note !== undefined ? { note } : {}) });
+    return updatedRun;
+  }
+
+  async recordToolResult(runId: string, toolName: string, result: unknown, isError: boolean, durationMs?: number): Promise<void> {
+    const run = await this.runs.get(runId);
+    if (run === null) return;
+    const proposal = run.proposedActions.find(action => action.toolName === toolName && action.status === 'approved');
+    if (proposal === undefined) return;
+    const executed: ExecutedAction = {
+      id: randomUUID(),
+      proposalId: proposal.id,
+      toolName,
+      status: isError ? 'failed' : 'succeeded',
+      executedAt: nowIso(),
+      resultHash: hashPayload(result),
+      ...(isError ? { error: canonicalJson(result).slice(0, 1000) } : {}),
+    };
+    const updatedRun = await this.updateRun({
+      ...run,
+      executedActions: [...run.executedActions, executed],
+      proposedActions: run.proposedActions.map(action => action.id === proposal.id ? { ...action, status: 'executed' as const } : action),
+      updatedAt: executed.executedAt,
+    });
+    await this.appendEvent(updatedRun, isError ? 'tool_execution_failed' : 'tool_executed', {
+      toolName,
+      proposalId: proposal.id,
+      resultHash: executed.resultHash,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    }, proposal.sourceIds);
+  }
+
+  async inspectRun(runId: string): Promise<{ run: WorkflowRun | null; events: WorkflowRunEvent[]; approvals: WorkflowApproval[] }> {
+    const run = await this.runs.get(runId);
+    return {
+      run,
+      events: await this.eventsForRun(runId),
+      approvals: await this.approvalsForRun(runId),
+    };
+  }
+
+  listRuns(query?: StoreQuery): Promise<WorkflowRun[]> {
+    return queryAll(this.runs, query);
+  }
+
+  listApprovals(query?: StoreQuery): Promise<WorkflowApproval[]> {
+    return queryAll(this.approvals, query);
+  }
+
+  async evaluateToolPolicy(toolName: string, input: unknown, principal?: Principal): Promise<WorkflowPolicyDecision> {
+    const workflowRunId = extractWorkflowRunId(input);
+    if (workflowRunId === undefined) return { allowed: true, active: false };
+    const run = await this.runs.get(workflowRunId);
+    if (run === null) return { allowed: false, active: true, reason: `Unknown workflow run "${workflowRunId}".` };
+    const definition = await this.registry.getDefinition(run.workflowId);
+    if (definition === null) return { allowed: false, active: true, run, reason: `Unknown workflow definition "${run.workflowId}".` };
+    if (principal !== undefined && principal.id !== run.principalId && run.principalId !== 'system') {
+      return { allowed: false, active: true, run, reason: `Workflow run "${run.id}" belongs to principal "${run.principalId}", not "${principal.id}".` };
+    }
+    const connectorDecision = this.connectorRegistry === undefined
+      ? null
+      : await this.connectorRegistry.evaluateToolCall({
+        toolName,
+        input,
+        ...(principal !== undefined ? { principal } : {}),
+      });
+    const capability = connectorDecision?.capability ?? inferCapability(input);
+    if (!definition.allowedTools.includes('*') && !definition.allowedTools.includes(toolName)) {
+      return { allowed: false, active: true, run, capability, reason: `Workflow "${definition.name}" does not allow tool "${toolName}".` };
+    }
+    const connectorId = connectorDecision?.connectorInstance?.id ?? extractConnectorInstanceId(input);
+    if (connectorId !== undefined && definition.allowedConnectorInstanceIds.length > 0 && !definition.allowedConnectorInstanceIds.includes(connectorId)) {
+      return { allowed: false, active: true, run, capability, reason: `Workflow "${definition.name}" does not allow connector "${connectorId}".` };
+    }
+    if ((run.mode === 'dry_run' || run.mode === 'shadow') && capability !== 'read') {
+      return { allowed: false, active: true, run, capability, reason: `Workflow run "${run.id}" is ${run.mode}; write/admin tool calls are not executable.` };
+    }
+    if (capability !== 'read') {
+      const approved = run.proposedActions.some(action =>
+        action.toolName === toolName && (action.status === 'approved' || action.status === 'executed'));
+      if (!approved) {
+        return { allowed: false, active: true, run, capability, reason: `Workflow run "${run.id}" has no approved proposal for write/admin tool "${toolName}".` };
+      }
+    }
+    return { allowed: true, active: true, run, capability };
+  }
+
+  private async resolveDefinition(input: StartWorkflowInput): Promise<WorkflowDefinition> {
+    const definition = input.workflowId !== undefined
+      ? await this.registry.getDefinition(input.workflowId)
+      : input.workflowName !== undefined
+        ? await this.registry.definitionByName(input.workspaceId, input.workflowName)
+        : null;
+    if (definition === null) throw new Error('workflow_action start requires a known workflowId or workflowName.');
+    if (definition.workspaceId !== input.workspaceId) throw new Error(`Workflow "${definition.id}" does not belong to workspace "${input.workspaceId}".`);
+    if (input.workflowVersion !== undefined && input.workflowVersion !== definition.version) {
+      const versionId = this.registry.stableWorkflowVersionId(definition.id, input.workflowVersion);
+      const version = await this.registry.getVersion(versionId);
+      if (version === null) throw new Error(`Unknown workflow version "${input.workflowVersion}" for workflow "${definition.id}".`);
+      return version.definition;
+    }
+    return definition;
+  }
+
+  private async resolveEvidence(definition: WorkflowDefinition, run: WorkflowRun): Promise<{ references: EvidenceReference[]; warnings: string[] }> {
+    const warnings: string[] = [];
+    const references: EvidenceReference[] = [];
+    const evidenceIds = uniq(run.evidenceSourceIds);
+    const missing = definition.requiredEvidence.filter(required => (required.minCitations ?? 1) > evidenceIds.length);
+    for (const required of missing) warnings.push(`Required evidence "${required.name}" does not meet minCitations.`);
+    for (const sourceId of evidenceIds) {
+      if (definition.allowedSourceIds.length > 0 && !definition.allowedSourceIds.includes(sourceId)) {
+        warnings.push(`Evidence source "${sourceId}" is outside the workflow allow-list.`);
+      }
+      if (this.sourceRegistry === undefined) {
+        references.push({ sourceId });
+        continue;
+      }
+      const source = await this.sourceRegistry.getSource(sourceId);
+      if (source === null) {
+        warnings.push(`Evidence source "${sourceId}" was not found.`);
+        references.push({ sourceId, warning: 'not_found' });
+        continue;
+      }
+      if (source.workspaceId !== run.workspaceId) warnings.push(`Evidence source "${sourceId}" belongs to workspace "${source.workspaceId}".`);
+      const latestVersion = await this.latestSourceVersion(sourceId);
+      const citation = await this.sourceRegistry.resolveCitation(sourceId, latestVersion?.id).catch(() => undefined);
+      await this.sourceRegistry.recordAccess({
+        sourceId,
+        action: 'read',
+        allowed: true,
+        principalId: run.principalId,
+        workflowRunId: run.id,
+        message: `Workflow run ${run.id} used source as evidence.`,
+      }).catch(() => undefined);
+      const healthWarning = source.healthState !== 'healthy' && source.healthState !== 'unknown'
+        ? `Evidence source "${sourceId}" health is ${source.healthState}.`
+        : undefined;
+      const staleWarning = source.stalenessState === 'stale' || source.stalenessState === 'expired'
+        ? `Evidence source "${sourceId}" is ${source.stalenessState}.`
+        : undefined;
+      if (healthWarning !== undefined) warnings.push(healthWarning);
+      if (staleWarning !== undefined) warnings.push(staleWarning);
+      const warning = healthWarning ?? staleWarning;
+      const sourceVersionId = citation?.versionId ?? latestVersion?.id;
+      const observedAt = citation?.observedAt ?? latestVersion?.observedAt;
+      references.push({
+        sourceId,
+        ...(citation?.text !== undefined ? { citationText: citation.text } : {}),
+        ...(sourceVersionId !== undefined ? { sourceVersionId } : {}),
+        ...(observedAt !== undefined ? { observedAt } : {}),
+        healthState: source.healthState,
+        stalenessState: source.stalenessState,
+        ...(warning !== undefined ? { warning } : {}),
+      });
+    }
+    return { references, warnings };
+  }
+
+  private async latestSourceVersion(sourceId: string): Promise<{ id: string; observedAt: string } | undefined> {
+    if (this.sourceRegistry?.sourceVersions === undefined) return undefined;
+    const versions = await this.sourceRegistry.sourceVersions(sourceId).catch(() => []);
+    return versions.sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0];
+  }
+
+  private async normalizeProposals(
+    definition: WorkflowDefinition,
+    run: WorkflowRun,
+    proposals: readonly ActionProposalInput[],
+    mode: WorkflowRunMode,
+  ): Promise<ActionProposal[]> {
+    const normalized: ActionProposal[] = [];
+    for (const proposal of proposals) {
+      const connectorDecision = this.connectorRegistry === undefined
+        ? null
+        : await this.connectorRegistry.evaluateToolCall({
+          toolName: proposal.toolName,
+          input: proposal.input ?? {},
+          principal: { id: run.principalId, type: 'user' },
+        }).catch(() => null);
+      const capability = proposal.capability ?? connectorDecision?.capability ?? inferCapability(proposal.input ?? {});
+      const connectorInstanceId = proposal.connectorInstanceId ?? connectorDecision?.connectorInstance?.id;
+      const sourceIds = uniq(proposal.sourceIds ?? []);
+      const allowedTool = definition.allowedTools.includes('*') || definition.allowedTools.includes(proposal.toolName);
+      const allowedConnector = connectorInstanceId === undefined
+        || definition.allowedConnectorInstanceIds.length === 0
+        || definition.allowedConnectorInstanceIds.includes(connectorInstanceId);
+      const blocked = !allowedTool || !allowedConnector;
+      normalized.push({
+        id: proposal.id ?? randomUUID(),
+        toolName: proposal.toolName,
+        input: { ...(proposal.input ?? {}), workflowRunId: run.id },
+        capability,
+        status: blocked ? 'blocked' : 'proposed',
+        sourceIds,
+        requiresApproval: !blocked && capability !== 'read',
+        ...(proposal.reason !== undefined ? { reason: proposal.reason } : {}),
+        ...(connectorInstanceId !== undefined ? { connectorInstanceId } : {}),
+        ...(proposal.riskLevel !== undefined ? { riskLevel: proposal.riskLevel } : {}),
+        ...(proposal.confidence !== undefined ? { confidence: proposal.confidence } : {}),
+        ...(proposal.costEstimateUsd !== undefined ? { costEstimateUsd: proposal.costEstimateUsd } : {}),
+      });
+    }
+    return normalized;
+  }
+
+  private async createApprovalRequests(definition: WorkflowDefinition, run: WorkflowRun, evidenceWarnings: string[]): Promise<WorkflowApproval[]> {
+    const requests: WorkflowApproval[] = [];
+    const timestamp = nowIso();
+    const addRequest = async (input: Omit<WorkflowApproval, 'id' | 'version' | 'runId' | 'workflowId' | 'status' | 'requestedAt' | 'updatedAt'>): Promise<void> => {
+      const approval = withOptional(withOptional(withOptional({
+        id: randomUUID(),
+        version: randomUUID(),
+        runId: run.id,
+        workflowId: run.workflowId,
+        status: 'pending' as const,
+        requestedAt: timestamp,
+        updatedAt: timestamp,
+      }, 'gateId', input.gateId), 'proposalId', input.proposalId), 'principalId', input.principalId);
+      const withMessage = withOptional(approval, 'message', input.message);
+      await this.approvals.set(withMessage.id, withMessage);
+      requests.push(withMessage);
+    };
+
+    const gates = definition.approvalGates;
+    for (const action of run.proposedActions) {
+      if (action.status === 'blocked') continue;
+      const actionGate = gates.find(gate => gate.type === 'action');
+      if (action.requiresApproval || actionGate !== undefined) {
+        await addRequest({
+          gateId: actionGate?.id ?? 'default-action-approval',
+          proposalId: action.id,
+          principalId: run.principalId,
+          message: actionGate?.message ?? `Approve proposed ${action.capability} tool call "${action.toolName}".`,
+        });
+      }
+      const lowConfidenceGate = gates.find(gate => gate.type === 'low_confidence' && action.confidence !== undefined && action.confidence < (gate.threshold ?? 0.8));
+      if (lowConfidenceGate !== undefined) {
+        await addRequest({
+          gateId: lowConfidenceGate.id,
+          proposalId: action.id,
+          principalId: run.principalId,
+          message: lowConfidenceGate.message ?? `Proposal confidence ${action.confidence} is below threshold.`,
+        });
+      }
+      const costGate = gates.find(gate => gate.type === 'cost' && action.costEstimateUsd !== undefined && action.costEstimateUsd > (gate.threshold ?? 0));
+      if (costGate !== undefined) {
+        await addRequest({
+          gateId: costGate.id,
+          proposalId: action.id,
+          principalId: run.principalId,
+          message: costGate.message ?? `Proposal cost estimate ${action.costEstimateUsd} exceeds budget.`,
+        });
+      }
+    }
+
+    const riskGate = gates.find(gate => gate.type === 'risk' && riskAtLeast(definition.riskLevel, gate.requiredRiskLevel ?? 'high'));
+    if (riskGate !== undefined) {
+      await addRequest({
+        gateId: riskGate.id,
+        principalId: run.principalId,
+        message: riskGate.message ?? `Workflow risk level ${definition.riskLevel} requires approval.`,
+      });
+    }
+    const staleGate = gates.find(gate => gate.type === 'stale_source');
+    if (staleGate !== undefined && evidenceWarnings.length > 0) {
+      await addRequest({
+        gateId: staleGate.id,
+        principalId: run.principalId,
+        message: staleGate.message ?? `Workflow evidence has freshness or health warnings: ${evidenceWarnings.join('; ')}`,
+      });
+    }
+    return requests;
+  }
+
+  private async updateRun(run: WorkflowRun): Promise<WorkflowRun> {
+    const updated = { ...run, version: randomUUID() };
+    await this.runs.set(updated.id, updated);
+    return updated;
+  }
+
+  private async requireRun(runId: string): Promise<WorkflowRun> {
+    const run = await this.runs.get(runId);
+    if (run === null) throw new Error(`Unknown workflow run "${runId}".`);
+    return run;
+  }
+
+  private async appendEvent(run: WorkflowRun, eventType: string, payload: Record<string, unknown>, sourceIds?: string[]): Promise<WorkflowRunEvent> {
+    const existing = await this.eventsForRun(run.id);
+    const event: WorkflowRunEvent = {
+      id: randomUUID(),
+      version: randomUUID(),
+      runId: run.id,
+      sequence: existing.length + 1,
+      eventType,
+      timestamp: nowIso(),
+      principalId: run.principalId,
+      payload,
+      ...(sourceIds !== undefined ? { sourceIds } : {}),
+    };
+    await this.events.set(event.id, event);
+    return event;
+  }
+
+  private async eventsForRun(runId: string): Promise<WorkflowRunEvent[]> {
+    const events = await queryAll(this.events, { where: { op: 'eq', field: 'runId', value: runId } });
+    return events.sort((left, right) => left.sequence - right.sequence);
+  }
+
+  private async approvalsForRun(runId: string): Promise<WorkflowApproval[]> {
+    return queryAll(this.approvals, { where: { op: 'eq', field: 'runId', value: runId } });
+  }
+
+  private async pendingApprovals(runId: string, approvalId?: string): Promise<WorkflowApproval[]> {
+    const approvals = await this.approvalsForRun(runId);
+    return approvals.filter(approval => approval.status === 'pending' && (approvalId === undefined || approval.id === approvalId));
+  }
+}
+
+function inferCapability(input: unknown): ConnectorCapability {
+  if (!isPlainRecord(input)) return 'read';
+  const action = String(input['action'] ?? '').toLowerCase();
+  if (/(write|update|delete|create|set_|configure|approve|reject|execute|reindex|upsert|register)/.test(action)) return 'write';
+  return 'read';
+}
+
+function extractWorkflowRunId(input: unknown): string | undefined {
+  if (!isPlainRecord(input)) return undefined;
+  if (typeof input['workflowRunId'] === 'string') return input['workflowRunId'];
+  if (isPlainRecord(input['workflow']) && typeof input['workflow']['runId'] === 'string') return input['workflow']['runId'];
+  return undefined;
+}
+
+function extractConnectorInstanceId(input: unknown): string | undefined {
+  if (!isPlainRecord(input)) return undefined;
+  if (typeof input['connectorInstanceId'] === 'string') return input['connectorInstanceId'];
+  return undefined;
+}
+
+interface WorkflowActionInput {
+  action: string;
+  definition?: WorkflowDefinitionInput;
+  workflowId?: string;
+  workflowName?: string;
+  workflowVersion?: string;
+  workspaceId?: string;
+  mode?: WorkflowRunMode;
+  inputs?: Record<string, unknown>;
+  evidenceSourceIds?: string[];
+  proposedActions?: ActionProposalInput[];
+  labels?: string[];
+  label?: string;
+  note?: string;
+  runId?: string;
+  approvalId?: string;
+  reason?: string;
+  query?: StoreQuery;
+}
+
+function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRunner): Tool {
+  return {
+    name: 'workflow_action',
+    description:
+      'Draft and validate governed workflow definitions, create dry-run/shadow/approval-gated workflow runs, inspect the run ledger, and approve or reject pending workflow actions.\n\n' +
+      'Actions: draft, validate, dry_run, start, approve, reject, label_shadow_result, inspect_run, list_runs, list_approvals.',
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'inspect_run', 'list_runs', 'list_approvals'] },
+        definition: { type: 'object' },
+        workflowId: { type: 'string' },
+        workflowName: { type: 'string' },
+        workflowVersion: { type: 'string' },
+        workspaceId: { type: 'string' },
+        mode: { type: 'string', enum: ['dry_run', 'shadow', 'approval_gated', 'execute'] },
+        inputs: { type: 'object' },
+        evidenceSourceIds: { type: 'array', items: { type: 'string' } },
+        proposedActions: { type: 'array', items: { type: 'object' } },
+        labels: { type: 'array', items: { type: 'string' } },
+        label: { type: 'string' },
+        note: { type: 'string' },
+        runId: { type: 'string' },
+        approvalId: { type: 'string' },
+        reason: { type: 'string' },
+        query: { type: 'object' },
+      },
+    },
+    executor: {
+      async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {
+        const parsed = input && typeof input === 'object' ? input as WorkflowActionInput : { action: '' };
+        try {
+          switch (parsed.action) {
+            case 'draft':
+              if (parsed.definition === undefined) { yield { type: 'error', message: 'workflow_action draft requires "definition".' }; return; }
+              yield { type: 'result', value: await registry.upsertDefinition(parsed.definition) };
+              return;
+            case 'validate':
+              if (parsed.definition !== undefined) {
+                yield { type: 'result', value: { valid: registry.validateDefinition(parsed.definition).length === 0, errors: registry.validateDefinition(parsed.definition) } };
+                return;
+              }
+              if (parsed.workflowId === undefined || parsed.inputs === undefined) {
+                yield { type: 'error', message: 'workflow_action validate requires "definition" or "workflowId" and "inputs".' };
+                return;
+              }
+              {
+                const definition = await registry.getDefinition(parsed.workflowId);
+                if (definition === null) { yield { type: 'error', message: `Unknown workflow "${parsed.workflowId}".` }; return; }
+                const errors = validateSchemaValue(definition.inputSchema, parsed.inputs);
+                yield { type: 'result', value: { valid: errors.length === 0, errors } };
+              }
+              return;
+            case 'dry_run':
+              yield { type: 'result', value: await runner.startRun(startInput(parsed, 'dry_run')) };
+              return;
+            case 'start':
+              yield { type: 'result', value: await runner.startRun(startInput(parsed, parsed.mode)) };
+              return;
+            case 'approve':
+              if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action approve requires "runId".' }; return; }
+              yield { type: 'result', value: await runner.approveRun(parsed.runId, parsed.approvalId, parsed.reason) };
+              return;
+            case 'reject':
+              if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action reject requires "runId".' }; return; }
+              yield { type: 'result', value: await runner.rejectRun(parsed.runId, parsed.approvalId, parsed.reason) };
+              return;
+            case 'label_shadow_result':
+              if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action label_shadow_result requires "runId".' }; return; }
+              yield { type: 'result', value: await runner.labelShadowResult(parsed.runId, uniq([...(parsed.labels ?? []), ...(parsed.label !== undefined ? [parsed.label] : [])]), parsed.note) };
+              return;
+            case 'inspect_run':
+              if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action inspect_run requires "runId".' }; return; }
+              yield { type: 'result', value: await runner.inspectRun(parsed.runId) };
+              return;
+            case 'list_runs':
+              yield { type: 'result', value: { runs: await runner.listRuns(parsed.query) } };
+              return;
+            case 'list_approvals':
+              yield { type: 'result', value: { approvals: await runner.listApprovals(parsed.query) } };
+              return;
+            default:
+              yield { type: 'error', message: `Unknown workflow_action "${String(parsed.action)}".` };
+          }
+        } catch (error) {
+          yield { type: 'error', message: error instanceof Error ? error.message : String(error) };
+        }
+      },
+    },
+  };
+}
+
+function startInput(parsed: WorkflowActionInput, mode?: WorkflowRunMode): StartWorkflowInput {
+  if (parsed.workspaceId === undefined) throw new Error('workflow_action start requires "workspaceId".');
+  return {
+    workspaceId: parsed.workspaceId,
+    ...(parsed.workflowId !== undefined ? { workflowId: parsed.workflowId } : {}),
+    ...(parsed.workflowName !== undefined ? { workflowName: parsed.workflowName } : {}),
+    ...(parsed.workflowVersion !== undefined ? { workflowVersion: parsed.workflowVersion } : {}),
+    ...(mode !== undefined ? { mode } : {}),
+    inputs: parsed.inputs ?? {},
+    evidenceSourceIds: parsed.evidenceSourceIds ?? [],
+    proposedActions: parsed.proposedActions ?? [],
+    labels: parsed.labels ?? [],
+  };
+}
+
+async function rejectIfWorkflowDenied(runner: WorkflowRunner, ctx: ToolCallContext): Promise<{ rejectTool: { message: string } } | undefined> {
+  const decision = await runner.evaluateToolPolicy(ctx.toolCall.name, ctx.toolCall.input, tryCurrentPrincipal() ?? undefined);
+  if (!decision.active || decision.allowed) return undefined;
+  return { rejectTool: { message: decision.reason ?? `Workflow policy denied tool "${ctx.toolCall.name}".` } };
+}
+
+async function recordWorkflowToolResult(runner: WorkflowRunner, ctx: ToolResultContext): Promise<void> {
+  const workflowRunId = extractWorkflowRunId(ctx.toolCall.input);
+  if (workflowRunId === undefined) return;
+  await runner.recordToolResult(workflowRunId, ctx.toolCall.name, ctx.result, ctx.isError, ctx.durationMs);
+}
+
+function registerWorkflowHooks(runner: WorkflowRunner, services: MatbotMachine): void {
+  services.hooks.register({
+    on: 'toolcall',
+    priority: 15,
+    async handler(ctx) {
+      return rejectIfWorkflowDenied(runner, ctx);
+    },
+  });
+
+  services.hooks.register({
+    on: 'toolresult',
+    priority: 25,
+    async handler(ctx) {
+      await recordWorkflowToolResult(runner, ctx);
+    },
+  });
+}
+
+export function createWorkflowRegistry(services: MatbotMachine): WorkflowRegistry {
+  return new StoreBackedWorkflowRegistry(
+    services.createStore<WorkflowDefinition>(DEFINITION_STORE),
+    services.createStore<WorkflowVersion>(VERSION_STORE),
+    services.createStore<WorkflowEvalCase>(EVAL_CASE_STORE),
+  );
+}
+
+export function createWorkflowRunner(services: MatbotMachine, registry: WorkflowRegistry): WorkflowRunner {
+  const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
+  const connectorRegistry = services.get('ConnectorRegistry' as never) as ConnectorRegistryLike | undefined;
+  return new StoreBackedWorkflowRunner(
+    registry,
+    services.createStore<WorkflowRun>(RUN_STORE),
+    services.createStore<WorkflowRunEvent>(EVENT_STORE),
+    services.createStore<WorkflowApproval>(APPROVAL_STORE),
+    sourceRegistry,
+    connectorRegistry,
+  );
+}
+
+export const plugin: MatbotPluginSpec = {
+  apiVersion: PLUGIN_API_VERSION,
+  manifest: {
+    description: 'Registers WorkflowRegistry, WorkflowRunner, workflow_action, and workflow-scoped connector policy hooks.',
+  },
+  async setup(services: MatbotMachine) {
+    const registry = createWorkflowRegistry(services);
+    const runner = createWorkflowRunner(services, registry);
+    await services.register('WorkflowRegistry', registry);
+    await services.register('WorkflowRunner', runner);
+    services.tools.register(createWorkflowActionTool(registry, runner));
+    registerWorkflowHooks(runner, services);
+  },
+};
+
+export default plugin;

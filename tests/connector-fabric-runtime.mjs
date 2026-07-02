@@ -130,6 +130,7 @@ async function main() {
   const definitions = await registry.queryDefinitions();
   assert.ok(definitions.some(definition => definition.id === "connector-definition:workspace-rag"));
   assert.ok(definitions.some(definition => definition.id === "connector-definition:mcp"));
+  assert.ok(definitions.some(definition => definition.id === "connector-definition:workflow-governance"));
 
   const workspaceRead = await registry.evaluateToolCall({
     toolName: "workspace_rag",
@@ -181,6 +182,23 @@ async function main() {
   assert.equal(structuredAdmin.capability, "admin");
   assert.equal(structuredAdmin.approvalPolicyId, "structured-data-admin");
 
+  const workflowStart = await registry.evaluateToolCall({
+    toolName: "workflow_action",
+    input: { action: "start" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(workflowStart.allowed, true);
+  assert.equal(workflowStart.capability, "write");
+  assert.equal(workflowStart.approvalPolicyId, "workflow-governance-admin");
+
+  const workflowApprove = await registry.evaluateToolCall({
+    toolName: "workflow_action",
+    input: { action: "approve" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(workflowApprove.allowed, true);
+  assert.equal(workflowApprove.capability, "admin");
+
   await registry.upsertGrant({
     connectorInstanceId: "connector-instance:workspace-rag:local",
     principalId: "system",
@@ -215,7 +233,7 @@ async function main() {
     session: { id: "s1", messages: [] },
     config: { provider: "test-provider" },
     signal: new AbortController().signal,
-    toolCall: { id: "call-allowed", name: "file_broker_action", input: { action: "write", path: "C:/tmp/a.txt", content: "secret" } },
+    toolCall: { id: "call-allowed", name: "file_broker_action", input: { action: "write", path: "C:/tmp/a.txt", content: "secret", workflowRunId: "workflow-run:123" } },
     tool: { name: "file_broker_action" },
     result: { ok: true, content: "secret", nested: { sourceId: "source:abc" } },
     isError: false,
@@ -231,6 +249,7 @@ async function main() {
   assert.equal(allowedAudits[0].status, "allowed");
   assert.deepEqual(allowedAudits[0].sourceIds, ["source:abc"]);
   assert.equal(allowedAudits[0].capability, "write");
+  assert.equal(allowedAudits[0].workflowRunId, "workflow-run:123");
 
   const connectorTool = tools.get("connector_action");
   const listedTools = await collectTool(connectorTool, { action: "list_tools", connectorInstanceId: "connector-instance:workspace-rag:local" });

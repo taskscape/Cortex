@@ -180,6 +180,7 @@ plugins:
   - ./packages/plugins/source-registry
   - ./packages/plugins/connector-fabric
   - ./packages/plugins/structured-data
+  - ./packages/plugins/workflow-governance
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
@@ -210,6 +211,9 @@ durable source ids, and `connector-fabric` loads before `workspace-rag` so
 connector-bound tool calls can be checked and audited from the first turn.
 `structured-data` loads after source and connector services so semantic SQL
 plans can create source records and run through connector policy.
+`workflow-governance` loads after source, connector, and structured-data services
+so workflow runs can resolve evidence, inherit connector policy metadata, and
+restrict connector-backed tool calls by workflow allow-lists.
 `frontend/web` loads last so the WebUI sees the complete tool and plugin catalog.
 
 ## Providers
@@ -346,8 +350,9 @@ Matbot process with `CORTEX_WORKSPACE_ID`.
 
 The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
 conversation. It is installed by default in `matbot.yaml`, and the CLI ensures
-`source-registry`, `connector-fabric`, `structured-data`, and `workspace-rag`
-are present in every workspace config when Matbot starts.
+`source-registry`, `connector-fabric`, `structured-data`,
+`workflow-governance`, and `workspace-rag` are present in every workspace config
+when Matbot starts.
 
 RAG configuration lives next to the active workspace config:
 

@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-workflow-governance",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "Workflow definitions, run ledger, approval gates, and workflow-scoped connector policy.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

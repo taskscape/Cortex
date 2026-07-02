@@ -202,6 +202,7 @@ export interface ConnectorAuditEvent {
   sourceIds: string[];
   toolCallId?: string;
   traceId?: string;
+  workflowRunId?: string;
   providerName?: string;
   action?: string;
   inputHash?: string;
@@ -225,6 +226,7 @@ export type ConnectorAuditInput = {
   timestamp?: string;
   toolCallId?: string;
   traceId?: string;
+  workflowRunId?: string;
   providerName?: string;
   action?: string;
   inputHash?: string;
@@ -328,6 +330,18 @@ function actionFromInput(input: unknown, field = 'action'): string | undefined {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const value = (input as Record<string, unknown>)[field];
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+function workflowRunIdFromInput(input: unknown): string | undefined {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  if (typeof record['workflowRunId'] === 'string' && record['workflowRunId'].trim() !== '') return record['workflowRunId'];
+  const workflow = record['workflow'];
+  if (workflow !== null && typeof workflow === 'object' && !Array.isArray(workflow)) {
+    const runId = (workflow as Record<string, unknown>)['runId'];
+    if (typeof runId === 'string' && runId.trim() !== '') return runId;
+  }
+  return undefined;
 }
 
 function resolveCapability(binding: ConnectorToolBinding, input: unknown): { capability: ConnectorCapability; action?: string } {
@@ -672,6 +686,7 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
       sourceIds: uniq(input.sourceIds ?? []),
       ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
       ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
+      ...(input.workflowRunId !== undefined ? { workflowRunId: input.workflowRunId } : {}),
       ...(input.providerName !== undefined ? { providerName: input.providerName } : {}),
       ...(input.action !== undefined ? { action: input.action } : {}),
       ...(input.inputHash !== undefined ? { inputHash: input.inputHash } : {}),
@@ -901,6 +916,7 @@ async function auditDeniedToolCall(registry: ConnectorRegistry, ctx: ToolCallCon
   const instance = decision.connectorInstance;
   const binding = decision.binding;
   if (instance === undefined || binding === undefined || decision.capability === undefined) return;
+  const workflowRunId = workflowRunIdFromInput(ctx.toolCall.input);
   await registry.recordAudit({
     connectorInstanceId: instance.id,
     workspaceId: instance.workspaceId,
@@ -910,6 +926,7 @@ async function auditDeniedToolCall(registry: ConnectorRegistry, ctx: ToolCallCon
     allowed: false,
     principalId: decision.principalId,
     toolCallId: ctx.toolCall.id,
+    ...(workflowRunId !== undefined ? { workflowRunId } : {}),
     providerName: ctx.config.provider,
     inputHash: hashPayload(ctx.toolCall.input),
     sourceIds: [],
@@ -927,6 +944,7 @@ async function auditToolResult(registry: ConnectorRegistry, ctx: ToolResultConte
   const redactionFields = uniq([...(binding.sensitiveFields ?? []), ...(decision.grant?.sensitiveFields ?? [])]);
   const result = redactDeep(ctx.result, redactionFields);
   const sourceIds = [...collectSourceIds(result)];
+  const workflowRunId = workflowRunIdFromInput(ctx.toolCall.input);
   await registry.recordAudit({
     connectorInstanceId: instance.id,
     workspaceId: instance.workspaceId,
@@ -937,6 +955,7 @@ async function auditToolResult(registry: ConnectorRegistry, ctx: ToolResultConte
     principalId: decision.principalId,
     sourceIds,
     toolCallId: ctx.toolCall.id,
+    ...(workflowRunId !== undefined ? { workflowRunId } : {}),
     providerName: ctx.config.provider,
     inputHash: hashPayload(ctx.toolCall.input),
     resultHash: hashPayload(result),
@@ -1028,6 +1047,15 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       capabilities: ['read' as const],
       description: 'Read-only Postgres connector slot for structured data reasoning and pgvector-backed retrieval metadata.',
     },
+    {
+      id: 'connector-definition:workflow-governance',
+      type: 'workflow-governance',
+      displayName: 'Workflow Governance',
+      protocol: 'native' as const,
+      sourceTypes: ['workflow_definition', 'workflow_run', 'workflow_approval'],
+      capabilities: ['read' as const, 'write' as const, 'admin' as const],
+      description: 'Governed workflow definitions, run ledger, approval queue, and workflow policy checks.',
+    },
   ];
 
   for (const definition of definitions) await registry.upsertDefinition(definition);
@@ -1038,6 +1066,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
     { id: 'connector-instance:file-broker:local', definitionId: 'connector-definition:file-broker', type: 'file-broker', workspaceId: 'local', displayName: 'Local File Broker', scopes: ['file-broker:read', 'file-broker:write'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:mcp:local', definitionId: 'connector-definition:mcp', type: 'mcp', workspaceId: 'local', displayName: 'Local MCP Fabric', scopes: ['mcp:read', 'mcp:admin'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:postgres-readonly:local', definitionId: 'connector-definition:postgres-readonly', type: 'postgres-readonly', workspaceId: 'local', displayName: 'Local Postgres Read-Only', scopes: ['postgres:read'], readEnabled: true, writeEnabled: true },
+    { id: 'connector-instance:workflow-governance:local', definitionId: 'connector-definition:workflow-governance', type: 'workflow-governance', workspaceId: 'local', displayName: 'Local Workflow Governance', scopes: ['workflow:read', 'workflow:write', 'workflow:admin'], readEnabled: true, writeEnabled: true },
   ];
 
   for (const instance of instances) {
@@ -1160,6 +1189,30 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       sensitiveFields: ['rows', 'parameters', 'credentialRef', 'approvalToken'],
       description: 'Governed structured data catalog, semantic SQL planning, and approved read-only query execution.',
     },
+    {
+      connectorInstanceId: 'connector-instance:workflow-governance:local',
+      toolName: 'workflow_action',
+      capability: 'read',
+      sourceTypes: ['workflow_definition', 'workflow_run', 'workflow_approval'],
+      sensitivity: 'confidential',
+      requiredScopes: ['workflow:read'],
+      inputActionField: 'action',
+      actionCapabilities: {
+        validate: 'read',
+        inspect_run: 'read',
+        list_runs: 'read',
+        list_approvals: 'read',
+        draft: 'write',
+        dry_run: 'write',
+        start: 'write',
+        label_shadow_result: 'write',
+        approve: 'admin',
+        reject: 'admin',
+      },
+      approvalPolicyId: 'workflow-governance-admin',
+      sensitiveFields: ['inputs', 'proposedActions', 'approvalToken'],
+      description: 'Governed workflow definition, run ledger, dry-run, shadow labeling, and approvals.',
+    },
   ];
 
   for (const binding of bindings) await registry.upsertToolBinding(binding);
@@ -1201,6 +1254,14 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       allowedTools: ['structured_data_action'],
       approvalRules: ['structured-data-admin'],
       sensitiveFields: ['rows', 'parameters', 'credentialRef', 'approvalToken'],
+    },
+    {
+      connectorInstanceId: 'connector-instance:workflow-governance:local',
+      principalId: '*',
+      scopes: ['*'],
+      allowedTools: ['workflow_action'],
+      approvalRules: ['workflow-governance-admin'],
+      sensitiveFields: ['inputs', 'proposedActions', 'approvalToken'],
     },
   ];
 

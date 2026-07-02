@@ -242,6 +242,7 @@ export interface SourceRegistry {
   upsertVersion(input: SourceVersionInput): Promise<SourceVersion>;
   getSource(id: string): Promise<SourceRecord | null>;
   getVersion(id: string): Promise<SourceVersion | null>;
+  sourceVersions(sourceId?: string): Promise<SourceVersion[]>;
   recordHealth(input: SourceHealthInput): Promise<SourceHealthEvent>;
   recordAccess(input: SourceAccessInput): Promise<SourceAccessEvent>;
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitation>;
@@ -463,6 +464,10 @@ class StoreBackedSourceRegistry implements SourceRegistry {
 
   getVersion(id: string): Promise<SourceVersion | null> {
     return this.versions.get(id);
+  }
+
+  sourceVersions(sourceId?: string): Promise<SourceVersion[]> {
+    return queryBySource(this.versions, sourceId);
   }
 
   async recordHealth(input: SourceHealthInput): Promise<SourceHealthEvent> {

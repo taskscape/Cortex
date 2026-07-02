@@ -757,50 +757,50 @@ type WorkflowRunEvent = {
 
 ### Tasklist
 
-- [ ] Create `local-agent/matbot/packages/plugins/workflow-governance`.
-- [ ] Define workflow schema:
-  - [ ] JSON Schema for definitions.
-  - [ ] TypeScript types.
-  - [ ] validation errors suitable for UI.
-- [ ] Add stores:
-  - [ ] `workflow_definitions`.
-  - [ ] `workflow_versions`.
-  - [ ] `workflow_runs`.
-  - [ ] `workflow_run_events`.
-  - [ ] `workflow_approvals`.
-  - [ ] `workflow_eval_cases`.
-- [ ] Implement `workflow_action`:
-  - [ ] `draft`.
-  - [ ] `validate`.
-  - [ ] `dry_run`.
-  - [ ] `start`.
-  - [ ] `approve`.
-  - [ ] `reject`.
-  - [ ] `label_shadow_result`.
-  - [ ] `inspect_run`.
-  - [ ] `list_runs`.
+- [x] Create `local-agent/matbot/packages/plugins/workflow-governance`.
+- [x] Define workflow schema:
+  - [x] JSON Schema for definitions.
+  - [x] TypeScript types.
+  - [x] validation errors suitable for UI.
+- [x] Add stores:
+  - [x] `workflow_definitions`.
+  - [x] `workflow_versions`.
+  - [x] `workflow_runs`.
+  - [x] `workflow_run_events`.
+  - [x] `workflow_approvals`.
+  - [x] `workflow_eval_cases`.
+- [x] Implement `workflow_action`:
+  - [x] `draft`.
+  - [x] `validate`.
+  - [x] `dry_run`.
+  - [x] `start`.
+  - [x] `approve`.
+  - [x] `reject`.
+  - [x] `label_shadow_result`.
+  - [x] `inspect_run`.
+  - [x] `list_runs`.
 - [ ] Implement workflow runner:
-  - [ ] load definition/version.
-  - [ ] validate typed inputs.
-  - [ ] resolve allowed sources and freshness.
+  - [x] load definition/version.
+  - [x] validate typed inputs.
+  - [x] resolve allowed sources and freshness.
   - [ ] execute steps deterministically where possible.
   - [ ] call model only for bounded reasoning steps.
-  - [ ] record every state transition as an event.
-- [ ] Add approval gates:
-  - [ ] approve proposed action before write/admin tool.
-  - [ ] approve if source is stale or unhealthy.
-  - [ ] approve if confidence below threshold.
-  - [ ] approve if cost estimate exceeds budget.
-- [ ] Add dry-run and shadow semantics:
-  - [ ] dry-run records proposed actions but never calls write tools.
-  - [ ] shadow mode records Cortex recommendation and later human label.
-  - [ ] action proposals and executed actions are separate objects.
-- [ ] Integrate with connector fabric:
-  - [ ] workflow policy restricts connector tools.
-  - [ ] connector audit events link to workflow run ids.
-- [ ] Integrate with source registry:
-  - [ ] required evidence resolves source ids and source versions.
-  - [ ] workflow output cites evidence.
+  - [x] record every state transition as an event.
+- [x] Add approval gates:
+  - [x] approve proposed action before write/admin tool.
+  - [x] approve if source is stale or unhealthy.
+  - [x] approve if confidence below threshold.
+  - [x] approve if cost estimate exceeds budget.
+- [x] Add dry-run and shadow semantics:
+  - [x] dry-run records proposed actions but never calls write tools.
+  - [x] shadow mode records Cortex recommendation and later human label.
+  - [x] action proposals and executed actions are separate objects.
+- [x] Integrate with connector fabric:
+  - [x] workflow policy restricts connector tools.
+  - [x] connector audit events link to workflow run ids.
+- [x] Integrate with source registry:
+  - [x] required evidence resolves source ids and source versions.
+  - [x] workflow output cites evidence.
 - [ ] Integrate with expert panel:
   - [ ] high-risk workflows can require structured expert reviews.
   - [ ] reviews are durable artifacts linked to the run.
@@ -811,12 +811,18 @@ type WorkflowRunEvent = {
   - [ ] shadow-mode comparison.
   - [ ] eval/test results.
 - [ ] Add test coverage:
-  - [ ] schema validation.
-  - [ ] approval gate enforcement.
-  - [ ] blocked tool outside allowed list.
-  - [ ] dry-run cannot execute write tools.
-  - [ ] run event ordering.
+  - [x] schema validation.
+  - [x] approval gate enforcement.
+  - [x] blocked tool outside allowed list.
+  - [x] dry-run cannot execute write tools.
+  - [x] run event ordering.
   - [ ] Playwright approval queue.
+
+MVP note: this slice implements the workflow run ledger, schema validation,
+approval records, source evidence references, dry-run/shadow semantics, and
+workflow-scoped connector policy. It does not yet execute arbitrary multi-step
+workflow plans or call models inside workflow steps; those remain part of the
+later workflow compiler and automation execution hardening work.
 
 ### Technical Notes
 
@@ -841,8 +847,9 @@ type WorkflowRunEvent = {
 ## Suggested Build Sequence
 
 Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
-Health Monitor primitives, and Structured Data Reasoning MVP are complete as the
-first committable slices. The next build-sequence item is Workflow Run Ledger.
+Health Monitor primitives, Structured Data Reasoning MVP, and Workflow Run
+Ledger are complete as the first committable slices. The next build-sequence
+item is Automation Shadow Mode MVP.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -855,7 +862,7 @@ first committable slices. The next build-sequence item is Workflow Run Ledger.
 4. Structured Data Reasoning MVP. Complete.
    - Postgres read-only connector, catalog, semantic metric definitions, SQL
      preview, approval, execution, and citations.
-5. Workflow Run Ledger.
+5. Workflow Run Ledger. Complete.
    - Definition schema, run state, run events, dry-run/proposed actions, approval
      gates, and tool policy hook.
 6. Automation Shadow Mode MVP.

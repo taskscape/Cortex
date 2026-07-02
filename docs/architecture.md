@@ -111,10 +111,11 @@ ordered, committable slices. Completed build-sequence items:
 | Connector Fabric MVP | Complete | `connector-fabric` registers `ConnectorRegistry` and `connector_action`; it seeds local connector definitions/instances for source registry, workspace RAG, file broker, MCP, and Postgres read-only; action-aware tool bindings classify read/write/admin calls; `toolcall` hooks enforce connector grants before bound tools run; `toolresult` hooks write connector audit events and redact configured sensitive fields. |
 | Source Health Monitor Primitives | Complete | `source-registry` now registers `source_health_action`; source health reports are stable store-backed records with stale, expired, degraded, down, denied, and optional unknown-freshness findings; reports include source ids, source version ids, connector health snapshots, warning counts, and critical counts; workspace RAG injects stale/unhealthy warnings in retrieved context and marker data. |
 | Structured Data Reasoning MVP | Complete | `structured-data` registers `DataCatalog`, `SqlPlanner`, and `structured_data_action`; semantic table, column, metric, and query-run records are store-backed; deterministic planning emits Postgres SELECT SQL from approved semantic inputs only; validation rejects writes, cross joins, unknown columns, and missing row caps; execution requires an approval token, runs in a read-only transaction with statement timeout, and creates query-result source records. |
+| Workflow Run Ledger | Complete | `workflow-governance` registers `WorkflowRegistry`, `WorkflowRunner`, and `workflow_action`; workflow definitions, versions, eval cases, runs, run events, and approvals are store-backed; runs validate typed inputs, resolve evidence source ids and versions, record ordered events, separate proposed and executed actions, support dry-run and shadow modes, request approval gates, and restrict connector tool calls by active workflow allow-lists. |
 
 Remaining strategic architecture items still build on this foundation:
-workflow run ledger, automation shadow mode, context graph, workflow compiler,
-and enterprise expert-panel review records.
+automation shadow mode, context graph, workflow compiler, and enterprise
+expert-panel review records.
 
 ### Source Registry
 
@@ -204,6 +205,7 @@ The seeded local bindings cover the current Cortex data tools:
 | Local File Broker | `file_broker_action` | `health`, `list`, and `read` are read; `write` is write and redacts returned `content`. |
 | Local MCP Fabric | `mcp_action`, `mcp__*` | MCP server list is read; add/remove and delegated MCP tools are admin until per-server metadata exists. |
 | Local Postgres Read-Only | `structured_data_action` | Catalog and planning reads are read; semantic-model edits and approval are admin; execution is read-only and still requires a query approval token. |
+| Local Workflow Governance | `workflow_action` | Validation, inspection, run lists, and approval lists are read; drafts, run starts, dry-runs, and shadow labels are write; approve/reject is admin. |
 
 The CLI inserts `connector-fabric` into each Cortex workspace before
 `workspace-rag`, preserving existing local behavior through wildcard bootstrap
@@ -244,6 +246,39 @@ transaction with a statement timeout. Successful executions create a
 run, SQL hash, data connection, execution timestamp, row count, and source
 tables or metrics.
 
+### Workflow Governance
+
+The workflow governance layer gives Cortex a durable run ledger for governed
+automation before adding broad automation execution. It is local-first and
+event-sourced: the run record is the current projection, while
+`workflow_run_events` is the ordered audit trail.
+
+The `workflow-governance` plugin registers:
+
+- `WorkflowRegistry`: a store-backed service for workflow definitions,
+  immutable definition versions, validation, and eval cases.
+- `WorkflowRunner`: a run ledger and deterministic state-transition service for
+  typed inputs, evidence resolution, proposed actions, approvals, shadow labels,
+  and workflow-scoped tool policy.
+- `workflow_action`: a tool with `draft`, `validate`, `dry_run`, `start`,
+  `approve`, `reject`, `label_shadow_result`, `inspect_run`, `list_runs`, and
+  `list_approvals` actions.
+
+Workflow definitions carry an input JSON Schema subset, source and connector
+allow-lists, allowed tools, required evidence, risk level, approval gates,
+dry-run default, eval cases, and success metrics. Runs store the definition
+version, effective principal, mode, status, typed inputs, evidence source ids,
+evidence source-version/citation references, proposed actions, executed action
+records, labels, and timestamps.
+
+Dry-run and shadow runs record proposals but do not execute write/admin tools.
+Approval-gated and execute-mode runs request approval records for proposed
+write/admin actions, stale or unhealthy evidence, low confidence, cost, and risk
+gates. A workflow policy hook rejects connector-backed tool calls carrying a
+`workflowRunId` when the tool, connector, mode, or approval state falls outside
+the active run envelope. Connector audit events now retain `workflowRunId` when
+tool inputs include it, linking connector activity back to the workflow ledger.
+
 ### Memory System
 
 Cortex memory is not a single bucket. It is several layers with different jobs:
@@ -259,6 +294,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Source health monitor | Store-backed health reports and stale/unhealthy source warnings. | `source_health_action`, `source_health_reports` |
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Structured data | Semantic table/metric catalog, query plans, approval tokens, and query-run provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action` |
+| Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, and shadow labels. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:
