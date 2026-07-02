@@ -112,10 +112,10 @@ ordered, committable slices. Completed build-sequence items:
 | Source Health Monitor Primitives | Complete | `source-registry` now registers `source_health_action`; source health reports are stable store-backed records with stale, expired, degraded, down, denied, and optional unknown-freshness findings; reports include source ids, source version ids, connector health snapshots, warning counts, and critical counts; workspace RAG injects stale/unhealthy warnings in retrieved context and marker data. |
 | Structured Data Reasoning MVP | Complete | `structured-data` registers `DataCatalog`, `SqlPlanner`, and `structured_data_action`; semantic table, column, metric, and query-run records are store-backed; deterministic planning emits Postgres SELECT SQL from approved semantic inputs only; validation rejects writes, cross joins, unknown columns, and missing row caps; execution requires an approval token, runs in a read-only transaction with statement timeout, and creates query-result source records. |
 | Workflow Run Ledger | Complete | `workflow-governance` registers `WorkflowRegistry`, `WorkflowRunner`, and `workflow_action`; workflow definitions, versions, eval cases, runs, run events, and approvals are store-backed; runs validate typed inputs, resolve evidence source ids and versions, record ordered events, separate proposed and executed actions, support dry-run and shadow modes, request approval gates, and restrict connector tool calls by active workflow allow-lists. |
+| Automation Shadow Mode MVP | Complete | `workflow-governance` now stores `workflow_shadow_comparisons`; shadow recommendations are hashed with inputs, evidence, and proposed actions, compared against human labels with deterministic accepted/rejected/mixed/unlabeled outcomes, and exposed through `compare_shadow_result` and `shadow_report` for per-workflow acceptance summaries. |
 
 Remaining strategic architecture items still build on this foundation:
-automation shadow mode, context graph, workflow compiler, and enterprise
-expert-panel review records.
+context graph, workflow compiler, and enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -261,8 +261,8 @@ The `workflow-governance` plugin registers:
   typed inputs, evidence resolution, proposed actions, approvals, shadow labels,
   and workflow-scoped tool policy.
 - `workflow_action`: a tool with `draft`, `validate`, `dry_run`, `start`,
-  `approve`, `reject`, `label_shadow_result`, `inspect_run`, `list_runs`, and
-  `list_approvals` actions.
+  `approve`, `reject`, `label_shadow_result`, `compare_shadow_result`,
+  `shadow_report`, `inspect_run`, `list_runs`, and `list_approvals` actions.
 
 Workflow definitions carry an input JSON Schema subset, source and connector
 allow-lists, allowed tools, required evidence, risk level, approval gates,
@@ -279,6 +279,27 @@ gates. A workflow policy hook rejects connector-backed tool calls carrying a
 the active run envelope. Connector audit events now retain `workflowRunId` when
 tool inputs include it, linking connector activity back to the workflow ledger.
 
+### Automation Shadow Mode
+
+Automation shadow mode uses the workflow ledger to measure recommendations
+before enabling unattended execution. A shadow run records the exact proposal
+Cortex would have made, but workflow policy still blocks write/admin tools for
+that run mode.
+
+The MVP stores one `workflow_shadow_comparisons` record per compared shadow run.
+Each comparison has a stable id derived from the run id, a recommendation hash,
+the proposed action ids, tool names, source ids, normalized human labels,
+outcome, score, and timestamps. The recommendation hash includes the workflow
+id/version, input hash, evidence source ids, and proposed action metadata, so a
+later label is tied to the recommendation that was actually shown.
+
+`compare_shadow_result` can attach labels and create or update the comparison.
+`label_shadow_result` also writes a comparison as a side effect. Labels are
+classified deterministically: accepted-style labels score `1`, rejected-style
+labels score `0`, ambiguous or conflicting labels score `0.5`, and unlabeled
+runs score `0`. `shadow_report` returns all comparisons plus aggregate counts
+and acceptance rates overall and by workflow id.
+
 ### Memory System
 
 Cortex memory is not a single bucket. It is several layers with different jobs:
@@ -294,7 +315,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Source health monitor | Store-backed health reports and stale/unhealthy source warnings. | `source_health_action`, `source_health_reports` |
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Structured data | Semantic table/metric catalog, query plans, approval tokens, and query-run provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action` |
-| Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, and shadow labels. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action` |
+| Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, shadow labels, and shadow comparison records. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:

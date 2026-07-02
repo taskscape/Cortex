@@ -844,12 +844,47 @@ later workflow compiler and automation execution hardening work.
   For relationship-heavy enterprise permissions, evaluate a Zanzibar-inspired
   service such as SpiceDB later.
 
+## 6. Automation Shadow Mode MVP
+
+### Target
+
+Use the workflow run ledger to compare Cortex recommendations with later human
+labels before enabling unattended execution. Shadow mode should preserve the
+exact recommendation, evidence, and proposed action metadata that was evaluated.
+
+### Tasklist
+
+- [x] Extend `workflow-governance` with `workflow_shadow_comparisons`.
+- [x] Add stable comparison ids derived from workflow run ids.
+- [x] Hash recommendation inputs, evidence source ids, and proposed actions.
+- [x] Store proposed action ids, tool names, source ids, human labels, outcome,
+  score, and timestamps.
+- [x] Add deterministic label classification:
+  - [x] accepted labels.
+  - [x] rejected labels.
+  - [x] mixed or ambiguous labels.
+  - [x] unlabeled runs.
+- [x] Add `workflow_action.compare_shadow_result`.
+- [x] Add `workflow_action.shadow_report`.
+- [x] Make `label_shadow_result` create or update comparison records.
+- [x] Aggregate acceptance rates overall and by workflow id.
+- [x] Keep shadow-mode write/admin tool calls blocked by workflow policy.
+- [x] Update connector-fabric action metadata for new workflow actions.
+- [x] Add Node tests for comparison records, shadow reports, and policy blocks.
+- [ ] Add WebUI shadow comparison view.
+- [ ] Add richer customer-configurable label taxonomy.
+- [ ] Add drift reports across workflow versions.
+
+MVP note: this slice keeps shadow mode deterministic and store-backed. It does
+not execute automation actions or generate model explanations for mismatches;
+those remain future workflow compiler and review-surface work.
+
 ## Suggested Build Sequence
 
 Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
 Health Monitor primitives, Structured Data Reasoning MVP, and Workflow Run
-Ledger are complete as the first committable slices. The next build-sequence
-item is Automation Shadow Mode MVP.
+Ledger, and Automation Shadow Mode MVP are complete as the first committable
+slices. The next build-sequence item is Context Graph MVP.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -865,7 +900,7 @@ item is Automation Shadow Mode MVP.
 5. Workflow Run Ledger. Complete.
    - Definition schema, run state, run events, dry-run/proposed actions, approval
      gates, and tool policy hook.
-6. Automation Shadow Mode MVP.
+6. Automation Shadow Mode MVP. Complete.
    - Use the workflow ledger to compare recommendations with human labels.
 7. Context Graph MVP.
    - Entity and relationship extraction from source records and workspace RAG,

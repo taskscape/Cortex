@@ -26,6 +26,7 @@ export type WorkflowRunStatus = 'created' | 'running' | 'waiting_for_approval' |
 export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected';
 export type WorkflowActionStatus = 'proposed' | 'approved' | 'rejected' | 'blocked' | 'executed';
 export type ConnectorCapability = 'read' | 'write' | 'admin';
+export type ShadowComparisonOutcome = 'accepted' | 'rejected' | 'mixed' | 'unlabeled';
 
 export interface ValidationError {
   path: string;
@@ -217,6 +218,45 @@ export interface WorkflowApproval {
   message?: string;
 }
 
+export interface WorkflowShadowComparison {
+  id: string;
+  version: string;
+  runId: string;
+  workflowId: string;
+  workflowVersion: string;
+  workspaceId: string;
+  principalId: string;
+  recommendationHash: string;
+  proposedActionIds: string[];
+  proposedToolNames: string[];
+  sourceIds: string[];
+  humanLabels: string[];
+  outcome: ShadowComparisonOutcome;
+  score: number;
+  comparedAt: string;
+  createdAt: string;
+  updatedAt: string;
+  note?: string;
+}
+
+export interface WorkflowShadowSummary {
+  total: number;
+  accepted: number;
+  rejected: number;
+  mixed: number;
+  unlabeled: number;
+  acceptanceRate: number;
+  byWorkflow: Array<{
+    workflowId: string;
+    total: number;
+    accepted: number;
+    rejected: number;
+    mixed: number;
+    unlabeled: number;
+    acceptanceRate: number;
+  }>;
+}
+
 export type StartWorkflowInput = {
   workflowId?: string;
   workflowName?: string;
@@ -255,6 +295,9 @@ export interface WorkflowRunner {
   approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
   rejectRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
   labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun>;
+  compareShadowRun(runId: string, labels?: string[], note?: string): Promise<{ run: WorkflowRun; comparison: WorkflowShadowComparison }>;
+  shadowComparisons(query?: StoreQuery): Promise<WorkflowShadowComparison[]>;
+  shadowSummary(query?: StoreQuery): Promise<WorkflowShadowSummary>;
   recordToolResult(runId: string, toolName: string, result: unknown, isError: boolean, durationMs?: number): Promise<void>;
   inspectRun(runId: string): Promise<{ run: WorkflowRun | null; events: WorkflowRunEvent[]; approvals: WorkflowApproval[] }>;
   listRuns(query?: StoreQuery): Promise<WorkflowRun[]>;
@@ -331,6 +374,7 @@ const RUN_STORE = 'workflow_runs';
 const EVENT_STORE = 'workflow_run_events';
 const APPROVAL_STORE = 'workflow_approvals';
 const EVAL_CASE_STORE = 'workflow_eval_cases';
+const SHADOW_COMPARISON_STORE = 'workflow_shadow_comparisons';
 const RISK_ORDER: WorkflowRiskLevel[] = ['low', 'medium', 'high', 'critical'];
 
 function nowIso(): string {
@@ -366,6 +410,53 @@ function normalizeName(value: string): string {
 
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
+}
+
+function normalizedLabels(labels: readonly string[]): string[] {
+  return uniq(labels.map(label => normalizeName(label)));
+}
+
+function classifyShadowLabels(labels: readonly string[]): { outcome: ShadowComparisonOutcome; score: number } {
+  const normalized = new Set(normalizedLabels(labels));
+  if (normalized.size === 0) return { outcome: 'unlabeled', score: 0 };
+  const accepted = [
+    'accepted',
+    'approve',
+    'approved',
+    'correct',
+    'good',
+    'useful',
+    'true_positive',
+    'would_execute',
+    'match',
+  ].some(label => normalized.has(label));
+  const rejected = [
+    'rejected',
+    'reject',
+    'incorrect',
+    'bad',
+    'not_useful',
+    'false_positive',
+    'would_not_execute',
+    'no_action',
+    'mismatch',
+  ].some(label => normalized.has(label));
+  if (accepted && rejected) return { outcome: 'mixed', score: 0.5 };
+  if (accepted) return { outcome: 'accepted', score: 1 };
+  if (rejected) return { outcome: 'rejected', score: 0 };
+  return { outcome: 'mixed', score: 0.5 };
+}
+
+function emptyShadowSummary(): WorkflowShadowSummary {
+  return {
+    total: 0,
+    accepted: 0,
+    rejected: 0,
+    mixed: 0,
+    unlabeled: 0,
+    acceptanceRate: 0,
+    byWorkflow: [],
+  };
 }
 
 function principalId(): string {
@@ -594,6 +685,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
   private readonly runs: Store<WorkflowRun>;
   private readonly events: Store<WorkflowRunEvent>;
   private readonly approvals: Store<WorkflowApproval>;
+  private readonly shadowComparisonsStore: Store<WorkflowShadowComparison>;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
   private readonly connectorRegistry: ConnectorRegistryLike | undefined;
 
@@ -602,6 +694,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     runs: Store<WorkflowRun>,
     events: Store<WorkflowRunEvent>,
     approvals: Store<WorkflowApproval>,
+    shadowComparisons: Store<WorkflowShadowComparison>,
     sourceRegistry: SourceRegistryLike | undefined,
     connectorRegistry: ConnectorRegistryLike | undefined,
   ) {
@@ -609,6 +702,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     this.runs = runs;
     this.events = events;
     this.approvals = approvals;
+    this.shadowComparisonsStore = shadowComparisons;
     this.sourceRegistry = sourceRegistry;
     this.connectorRegistry = connectorRegistry;
   }
@@ -768,7 +862,75 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       updatedAt: nowIso(),
     });
     await this.appendEvent(updatedRun, 'shadow_result_labeled', { labels, ...(note !== undefined ? { note } : {}) });
+    await this.upsertShadowComparison(updatedRun, note);
     return updatedRun;
+  }
+
+  async compareShadowRun(runId: string, labels: string[] = [], note?: string): Promise<{ run: WorkflowRun; comparison: WorkflowShadowComparison }> {
+    const run = await this.requireRun(runId);
+    if (run.mode !== 'shadow') throw new Error(`Workflow run "${runId}" is not a shadow-mode run.`);
+    let updatedRun = run;
+    const normalized = normalizedLabels(labels);
+    if (normalized.length > 0) {
+      updatedRun = await this.updateRun({
+        ...run,
+        labels: uniq([...run.labels, ...normalized]),
+        updatedAt: nowIso(),
+      });
+      await this.appendEvent(updatedRun, 'shadow_result_labeled', { labels: normalized, ...(note !== undefined ? { note } : {}) });
+    }
+    const comparison = await this.upsertShadowComparison(updatedRun, note);
+    await this.appendEvent(updatedRun, 'shadow_result_compared', {
+      comparisonId: comparison.id,
+      outcome: comparison.outcome,
+      score: comparison.score,
+      recommendationHash: comparison.recommendationHash,
+    }, comparison.sourceIds);
+    return { run: updatedRun, comparison };
+  }
+
+  shadowComparisons(query?: StoreQuery): Promise<WorkflowShadowComparison[]> {
+    return queryAll(this.shadowComparisonsStore, query);
+  }
+
+  async shadowSummary(query?: StoreQuery): Promise<WorkflowShadowSummary> {
+    const comparisons = await this.shadowComparisons(query);
+    if (comparisons.length === 0) return emptyShadowSummary();
+    const summary = emptyShadowSummary();
+    const byWorkflow = new Map<string, WorkflowShadowSummary['byWorkflow'][number]>();
+    const count = (outcome: ShadowComparisonOutcome, target: Pick<WorkflowShadowSummary, 'accepted' | 'rejected' | 'mixed' | 'unlabeled'>): void => {
+      if (outcome === 'accepted') target.accepted++;
+      else if (outcome === 'rejected') target.rejected++;
+      else if (outcome === 'mixed') target.mixed++;
+      else target.unlabeled++;
+    };
+    for (const comparison of comparisons) {
+      summary.total++;
+      count(comparison.outcome, summary);
+      let workflow = byWorkflow.get(comparison.workflowId);
+      if (workflow === undefined) {
+        workflow = {
+          workflowId: comparison.workflowId,
+          total: 0,
+          accepted: 0,
+          rejected: 0,
+          mixed: 0,
+          unlabeled: 0,
+          acceptanceRate: 0,
+        };
+        byWorkflow.set(comparison.workflowId, workflow);
+      }
+      workflow.total++;
+      count(comparison.outcome, workflow);
+    }
+    summary.acceptanceRate = summary.total === 0 ? 0 : summary.accepted / summary.total;
+    summary.byWorkflow = [...byWorkflow.values()]
+      .map(item => ({
+        ...item,
+        acceptanceRate: item.total === 0 ? 0 : item.accepted / item.total,
+      }))
+      .sort((left, right) => right.total - left.total || left.workflowId.localeCompare(right.workflowId));
+    return summary;
   }
 
   async recordToolResult(runId: string, toolName: string, result: unknown, isError: boolean, durationMs?: number): Promise<void> {
@@ -852,6 +1014,55 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       }
     }
     return { allowed: true, active: true, run, capability };
+  }
+
+  private async upsertShadowComparison(run: WorkflowRun, note?: string): Promise<WorkflowShadowComparison> {
+    if (run.mode !== 'shadow') throw new Error(`Workflow run "${run.id}" is not a shadow-mode run.`);
+    const id = hashId('workflow-shadow-comparison', [run.id]);
+    const existing = await this.shadowComparisonsStore.get(id);
+    const timestamp = nowIso();
+    const labels = normalizedLabels(run.labels);
+    const classification = classifyShadowLabels(labels);
+    const recommendation = run.proposedActions.map(action => ({
+      id: action.id,
+      toolName: action.toolName,
+      capability: action.capability,
+      inputHash: hashPayload(action.input),
+      sourceIds: action.sourceIds,
+      status: action.status,
+      connectorInstanceId: action.connectorInstanceId,
+      riskLevel: action.riskLevel,
+      confidence: action.confidence,
+      costEstimateUsd: action.costEstimateUsd,
+    }));
+    const comparison: WorkflowShadowComparison = {
+      id,
+      version: randomUUID(),
+      runId: run.id,
+      workflowId: run.workflowId,
+      workflowVersion: run.workflowVersion,
+      workspaceId: run.workspaceId,
+      principalId: run.principalId,
+      recommendationHash: hashPayload({
+        workflowId: run.workflowId,
+        workflowVersion: run.workflowVersion,
+        inputsHash: hashPayload(run.inputs),
+        evidenceSourceIds: run.evidenceSourceIds,
+        proposedActions: recommendation,
+      }),
+      proposedActionIds: run.proposedActions.map(action => action.id),
+      proposedToolNames: uniq(run.proposedActions.map(action => action.toolName)),
+      sourceIds: uniq([...run.evidenceSourceIds, ...run.proposedActions.flatMap(action => action.sourceIds)]),
+      humanLabels: labels,
+      outcome: classification.outcome,
+      score: classification.score,
+      comparedAt: timestamp,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      ...(note ?? existing?.note !== undefined ? { note: (note ?? existing?.note)! } : {}),
+    };
+    await this.shadowComparisonsStore.set(id, comparison);
+    return comparison;
   }
 
   private async resolveDefinition(input: StartWorkflowInput): Promise<WorkflowDefinition> {
@@ -1131,12 +1342,12 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
     name: 'workflow_action',
     description:
       'Draft and validate governed workflow definitions, create dry-run/shadow/approval-gated workflow runs, inspect the run ledger, and approve or reject pending workflow actions.\n\n' +
-      'Actions: draft, validate, dry_run, start, approve, reject, label_shadow_result, inspect_run, list_runs, list_approvals.',
+      'Actions: draft, validate, dry_run, start, approve, reject, label_shadow_result, compare_shadow_result, shadow_report, inspect_run, list_runs, list_approvals.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'inspect_run', 'list_runs', 'list_approvals'] },
+        action: { type: 'string', enum: ['draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'compare_shadow_result', 'shadow_report', 'inspect_run', 'list_runs', 'list_approvals'] },
         definition: { type: 'object' },
         workflowId: { type: 'string' },
         workflowName: { type: 'string' },
@@ -1196,7 +1407,18 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
               return;
             case 'label_shadow_result':
               if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action label_shadow_result requires "runId".' }; return; }
-              yield { type: 'result', value: await runner.labelShadowResult(parsed.runId, uniq([...(parsed.labels ?? []), ...(parsed.label !== undefined ? [parsed.label] : [])]), parsed.note) };
+              {
+                const run = await runner.labelShadowResult(parsed.runId, uniq([...(parsed.labels ?? []), ...(parsed.label !== undefined ? [parsed.label] : [])]), parsed.note);
+                const comparisons = await runner.shadowComparisons({ where: { op: 'eq', field: 'runId', value: run.id } });
+                yield { type: 'result', value: { run, comparison: comparisons[0] ?? null } };
+              }
+              return;
+            case 'compare_shadow_result':
+              if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action compare_shadow_result requires "runId".' }; return; }
+              yield { type: 'result', value: await runner.compareShadowRun(parsed.runId, uniq([...(parsed.labels ?? []), ...(parsed.label !== undefined ? [parsed.label] : [])]), parsed.note) };
+              return;
+            case 'shadow_report':
+              yield { type: 'result', value: { summary: await runner.shadowSummary(parsed.query), comparisons: await runner.shadowComparisons(parsed.query) } };
               return;
             case 'inspect_run':
               if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action inspect_run requires "runId".' }; return; }
@@ -1280,6 +1502,7 @@ export function createWorkflowRunner(services: MatbotMachine, registry: Workflow
     services.createStore<WorkflowRun>(RUN_STORE),
     services.createStore<WorkflowRunEvent>(EVENT_STORE),
     services.createStore<WorkflowApproval>(APPROVAL_STORE),
+    services.createStore<WorkflowShadowComparison>(SHADOW_COMPARISON_STORE),
     sourceRegistry,
     connectorRegistry,
   );

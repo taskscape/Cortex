@@ -191,6 +191,23 @@ async function main() {
   assert.equal(workflowStart.capability, "write");
   assert.equal(workflowStart.approvalPolicyId, "workflow-governance-admin");
 
+  const workflowShadowReport = await registry.evaluateToolCall({
+    toolName: "workflow_action",
+    input: { action: "shadow_report" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(workflowShadowReport.allowed, true);
+  assert.equal(workflowShadowReport.capability, "read");
+
+  const workflowShadowCompare = await registry.evaluateToolCall({
+    toolName: "workflow_action",
+    input: { action: "compare_shadow_result" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(workflowShadowCompare.allowed, true);
+  assert.equal(workflowShadowCompare.capability, "write");
+  assert.equal(workflowShadowCompare.approvalPolicyId, "workflow-governance-admin");
+
   const workflowApprove = await registry.evaluateToolCall({
     toolName: "workflow_action",
     input: { action: "approve" },

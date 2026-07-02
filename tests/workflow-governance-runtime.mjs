@@ -244,6 +244,58 @@ async function main() {
   });
   assert.match(dryRunReject, /dry_run/);
 
+  const shadow = await collectTool(workflowTool, {
+    action: "start",
+    workspaceId: "default",
+    workflowId: draft.definition.id,
+    mode: "shadow",
+    inputs: { ticketId: "T-123" },
+    evidenceSourceIds: [source.id],
+    proposedActions: [{
+      toolName: "file_broker_action",
+      input: { action: "write", path: "outbox/followup.txt", content: "hello" },
+      capability: "write",
+      connectorInstanceId: "connector-instance:file-broker:local",
+      sourceIds: [source.id],
+      confidence: 0.91,
+    }],
+  });
+  assert.equal(shadow.mode, "shadow");
+  assert.equal(shadow.status, "succeeded");
+  assert.equal(shadow.proposedActions[0].status, "proposed");
+  assert.equal(shadow.executedActions.length, 0);
+
+  const shadowReject = await services.WorkflowRunner.evaluateToolPolicy(
+    "file_broker_action",
+    { action: "write", workflowRunId: shadow.id, path: "outbox/followup.txt", content: "hello" },
+  );
+  assert.equal(shadowReject.allowed, false);
+  assert.match(shadowReject.reason, /shadow/);
+
+  const compared = await collectTool(workflowTool, {
+    action: "compare_shadow_result",
+    runId: shadow.id,
+    labels: ["accepted"],
+    note: "Human would have sent the proposed follow-up.",
+  });
+  assert.equal(compared.run.labels.includes("accepted"), true);
+  assert.equal(compared.comparison.runId, shadow.id);
+  assert.equal(compared.comparison.outcome, "accepted");
+  assert.equal(compared.comparison.score, 1);
+  assert.deepEqual(compared.comparison.proposedActionIds, [shadow.proposedActions[0].id]);
+  assert.deepEqual(compared.comparison.proposedToolNames, ["file_broker_action"]);
+  assert.deepEqual(compared.comparison.sourceIds, [source.id]);
+  assert.equal(typeof compared.comparison.recommendationHash, "string");
+
+  const shadowReport = await collectTool(workflowTool, { action: "shadow_report" });
+  assert.equal(shadowReport.summary.total, 1);
+  assert.equal(shadowReport.summary.accepted, 1);
+  assert.equal(shadowReport.summary.acceptanceRate, 1);
+  assert.equal(shadowReport.comparisons[0].runId, shadow.id);
+
+  const shadowInspection = await collectTool(workflowTool, { action: "inspect_run", runId: shadow.id });
+  assert.ok(shadowInspection.events.some(event => event.eventType === "shadow_result_compared"));
+
   const started = await collectTool(workflowTool, {
     action: "start",
     workspaceId: "default",

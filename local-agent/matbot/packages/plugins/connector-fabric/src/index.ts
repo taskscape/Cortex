@@ -1199,6 +1199,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       inputActionField: 'action',
       actionCapabilities: {
         validate: 'read',
+        shadow_report: 'read',
         inspect_run: 'read',
         list_runs: 'read',
         list_approvals: 'read',
@@ -1206,12 +1207,13 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
         dry_run: 'write',
         start: 'write',
         label_shadow_result: 'write',
+        compare_shadow_result: 'write',
         approve: 'admin',
         reject: 'admin',
       },
       approvalPolicyId: 'workflow-governance-admin',
       sensitiveFields: ['inputs', 'proposedActions', 'approvalToken'],
-      description: 'Governed workflow definition, run ledger, dry-run, shadow labeling, and approvals.',
+      description: 'Governed workflow definition, run ledger, dry-run, shadow labeling/comparison, and approvals.',
     },
   ];
 
