@@ -215,6 +215,18 @@ async function main() {
     const selectDefaultResult = selectDefaultEvents.find(event => event.type === "result")?.value;
     assert.equal(selectDefaultResult.config.contextName, "Probe Knowledge");
 
+    await services.SourceRegistry.upsertSource({
+      ...retrievalSource,
+      stalenessState: "stale",
+      healthState: "degraded",
+      knownLimitations: [...retrievalSource.knownLimitations, "Marked stale by the health monitor test."],
+    });
+    await services.SourceRegistry.recordHealth({
+      sourceId: retrievalSource.id,
+      state: "degraded",
+      message: "Health monitor test degraded this source.",
+    });
+
     const hookResult = await screenHook.handler({
       session: {
         messages: [{
@@ -229,8 +241,12 @@ async function main() {
     assert.match(hookResult.ephemeral[0].text, /Workspace RAG context/);
     assert.match(hookResult.ephemeral[0].text, /QuasarPump calibration value is 42/);
     assert.match(hookResult.ephemeral[0].text, /Source id: source:/);
+    assert.match(hookResult.ephemeral[0].text, /Warning: This source is marked degraded/);
+    assert.match(hookResult.ephemeral[0].text, /Warning: This source is stale/);
     assert.match(hookResult.ephemeral[0].text, /Citation: .*retrieval-probe\.md/);
     assert.equal(hookResult.markers[0].data.hits[0].sourceId, retrievalSource.id);
+    assert.equal(hookResult.markers[0].data.sourceWarnings.length, 2);
+    assert.deepEqual(hookResult.markers[0].data.sourceWarnings.map(warning => warning.issueType).sort(), ["degraded", "stale"]);
 
     await plugin.teardown?.();
   } finally {

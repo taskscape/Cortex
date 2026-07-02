@@ -206,6 +206,14 @@ interface SearchHit {
   citation?: SourceCitationLike;
 }
 
+interface SourceWarning {
+  path: string;
+  severity: 'warning' | 'critical';
+  issueType: 'stale' | 'expired' | 'degraded' | 'down';
+  message: string;
+  sourceId?: string;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -1612,11 +1620,51 @@ function renderContext(hits: SearchHit[]): string {
       ...(hit.sourceId !== undefined ? [`Source id: ${hit.sourceId}`] : []),
       ...(hit.sourceHealthState !== undefined ? [`Source health: ${hit.sourceHealthState}`] : []),
       ...(hit.sourceStalenessState !== undefined ? [`Source freshness: ${hit.sourceStalenessState}`] : []),
+      ...sourceWarningsForHit(hit).map(warning => `Warning: ${warning.message}`),
       ...(hit.citation !== undefined ? [`Citation: ${hit.citation.text}`] : []),
       hit.text,
     ].join('\n')),
     '[End workspace RAG context.]',
   ].join('\n\n');
+}
+
+function sourceWarningsForHit(hit: SearchHit): SourceWarning[] {
+  const warnings: SourceWarning[] = [];
+  if (hit.sourceHealthState === 'down') {
+    warnings.push({
+      path: hit.path,
+      severity: 'critical',
+      issueType: 'down',
+      message: 'This source is marked down or unavailable; verify it before relying on it.',
+      ...(hit.sourceId !== undefined ? { sourceId: hit.sourceId } : {}),
+    });
+  } else if (hit.sourceHealthState === 'degraded') {
+    warnings.push({
+      path: hit.path,
+      severity: 'warning',
+      issueType: 'degraded',
+      message: 'This source is marked degraded; verify it before relying on it.',
+      ...(hit.sourceId !== undefined ? { sourceId: hit.sourceId } : {}),
+    });
+  }
+  if (hit.sourceStalenessState === 'expired') {
+    warnings.push({
+      path: hit.path,
+      severity: 'critical',
+      issueType: 'expired',
+      message: 'This source has expired freshness; prefer newer evidence if available.',
+      ...(hit.sourceId !== undefined ? { sourceId: hit.sourceId } : {}),
+    });
+  } else if (hit.sourceStalenessState === 'stale') {
+    warnings.push({
+      path: hit.path,
+      severity: 'warning',
+      issueType: 'stale',
+      message: 'This source is stale; cite it with that limitation.',
+      ...(hit.sourceId !== undefined ? { sourceId: hit.sourceId } : {}),
+    });
+  }
+  return warnings;
 }
 
 let activeManager: WorkspaceRagManager | undefined;
@@ -1649,12 +1697,14 @@ export const plugin: MatbotPluginSpec = {
         const hits = await manager.searchCurrent(query, MAX_CONTEXT_CHUNKS, ctx.signal);
         const text = renderContext(hits);
         if (!text) return;
+        const sourceWarnings = hits.flatMap(sourceWarningsForHit);
         return {
           ephemeral: [{ type: 'text', text }],
           markers: [{
             type: 'marker',
             creator: 'workspace-rag',
             data: {
+              ...(sourceWarnings.length > 0 ? { sourceWarnings } : {}),
               hits: hits.map(hit => ({
                 path: hit.path,
                 score: hit.score,

@@ -33,6 +33,14 @@ export type SourceStalenessState = 'unknown' | 'fresh' | 'stale' | 'expired';
 export type SourceCitationPolicy = 'cite_path' | 'cite_link' | 'cite_query' | 'do_not_cite';
 export type SourceHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
 export type SourceAccessAction = 'read' | 'retrieve' | 'cite' | 'write' | 'delete' | 'health_check';
+export type SourceHealthSeverity = 'info' | 'warning' | 'critical';
+export type SourceHealthIssueType =
+  | 'stale'
+  | 'expired'
+  | 'degraded'
+  | 'down'
+  | 'permission_denied'
+  | 'unknown_freshness';
 
 export interface SourceIdentityInput {
   workspaceId: string;
@@ -176,9 +184,60 @@ export interface SourceCitation {
   observedAt?: string;
 }
 
+export interface SourceHealthFinding {
+  id: string;
+  version: string;
+  sourceId: string;
+  workspaceId: string;
+  issueType: SourceHealthIssueType;
+  severity: SourceHealthSeverity;
+  detectedAt: string;
+  message: string;
+  connectorType: string;
+  healthState: SourceHealthState;
+  stalenessState: SourceStalenessState;
+  sourceTitle?: string;
+  sourceUri?: string;
+  connectorInstanceId?: string;
+  sourceVersionId?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface SourceHealthConnectorSnapshot {
+  connectorInstanceId: string;
+  displayName: string;
+  type: string;
+  workspaceId: string;
+  healthState: SourceHealthState;
+  checkedAt?: string;
+  message?: string;
+}
+
+export interface SourceHealthReport {
+  id: string;
+  version: string;
+  generatedAt: string;
+  totalSources: number;
+  healthySources: number;
+  staleSources: number;
+  unhealthySources: number;
+  warningCount: number;
+  criticalCount: number;
+  findings: SourceHealthFinding[];
+  connectorHealth: SourceHealthConnectorSnapshot[];
+  workspaceId?: string;
+}
+
+export type SourceHealthEvaluationInput = {
+  workspaceId?: string;
+  includeUnknownFreshness?: boolean;
+  connectorHealth?: SourceHealthConnectorSnapshot[];
+};
+
 export interface SourceRegistry {
   stableSourceId(input: SourceIdentityInput): string;
   stableSourceVersionId(input: Pick<SourceVersionInput, 'sourceId' | 'contentHash' | 'schemaHash'>): string;
+  stableSourceHealthReportId(workspaceId?: string): string;
   upsertSource(input: SourceRecordInput): Promise<SourceRecord>;
   upsertVersion(input: SourceVersionInput): Promise<SourceVersion>;
   getSource(id: string): Promise<SourceRecord | null>;
@@ -190,12 +249,15 @@ export interface SourceRegistry {
   staleSources(workspaceId?: string): Promise<SourceRecord[]>;
   healthEvents(sourceId?: string): Promise<SourceHealthEvent[]>;
   accessEvents(sourceId?: string): Promise<SourceAccessEvent[]>;
+  evaluateHealth(input?: SourceHealthEvaluationInput): Promise<SourceHealthReport>;
+  healthReports(workspaceId?: string): Promise<SourceHealthReport[]>;
 }
 
 const SOURCE_STORE = 'sources';
 const VERSION_STORE = 'source_versions';
 const HEALTH_STORE = 'source_health_events';
 const ACCESS_STORE = 'source_access_events';
+const HEALTH_REPORT_STORE = 'source_health_reports';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -240,6 +302,39 @@ function effectiveStaleness(input: {
   return staleAt <= at ? 'stale' : 'fresh';
 }
 
+function severityRank(severity: SourceHealthSeverity): number {
+  switch (severity) {
+    case 'info': return 0;
+    case 'warning': return 1;
+    case 'critical': return 2;
+  }
+}
+
+function sourceNeedsAttention(source: SourceRecord): boolean {
+  return source.healthState === 'degraded'
+    || source.healthState === 'down'
+    || source.stalenessState === 'stale'
+    || source.stalenessState === 'expired'
+    || source.permissionState === 'denied';
+}
+
+function sourceHealthMessage(source: SourceRecord, issueType: SourceHealthIssueType): string {
+  switch (issueType) {
+    case 'stale':
+      return `Source "${source.title}" is stale.`;
+    case 'expired':
+      return `Source "${source.title}" has expired freshness.`;
+    case 'degraded':
+      return `Source "${source.title}" is degraded.`;
+    case 'down':
+      return `Source "${source.title}" is down or unavailable.`;
+    case 'permission_denied':
+      return `Source "${source.title}" is denied for the effective permission state.`;
+    case 'unknown_freshness':
+      return `Source "${source.title}" has unknown freshness.`;
+  }
+}
+
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   const result = await store.query(query ?? {});
   return result.items;
@@ -258,17 +353,20 @@ class StoreBackedSourceRegistry implements SourceRegistry {
   private readonly versions: Store<SourceVersion>;
   private readonly health: Store<SourceHealthEvent>;
   private readonly access: Store<SourceAccessEvent>;
+  private readonly reports: Store<SourceHealthReport>;
 
   constructor(
     sources: Store<SourceRecord>,
     versions: Store<SourceVersion>,
     health: Store<SourceHealthEvent>,
     access: Store<SourceAccessEvent>,
+    reports: Store<SourceHealthReport>,
   ) {
     this.sources = sources;
     this.versions = versions;
     this.health = health;
     this.access = access;
+    this.reports = reports;
   }
 
   stableSourceId(input: SourceIdentityInput): string {
@@ -286,6 +384,10 @@ class StoreBackedSourceRegistry implements SourceRegistry {
       input.contentHash ?? '',
       input.schemaHash ?? '',
     ]);
+  }
+
+  stableSourceHealthReportId(workspaceId?: string): string {
+    return hashId('source-health-report', [workspaceId ?? 'all']);
   }
 
   async upsertSource(input: SourceRecordInput): Promise<SourceRecord> {
@@ -456,6 +558,112 @@ class StoreBackedSourceRegistry implements SourceRegistry {
   accessEvents(sourceId?: string): Promise<SourceAccessEvent[]> {
     return queryBySource(this.access, sourceId);
   }
+
+  async evaluateHealth(input: SourceHealthEvaluationInput = {}): Promise<SourceHealthReport> {
+    const sources = await this.querySources(input.workspaceId === undefined
+      ? undefined
+      : { where: { op: 'eq', field: 'workspaceId', value: input.workspaceId } });
+    const generatedAt = nowIso();
+    const findings: SourceHealthFinding[] = [];
+
+    for (const source of sources) {
+      const sourceVersionId = await this.latestSourceVersionId(source.id);
+      for (const issueType of this.issueTypesForSource(source, input.includeUnknownFreshness === true)) {
+        const severity = this.severityForIssue(issueType);
+        findings.push({
+          id: hashId('source-health-finding', [source.id, issueType]),
+          version: randomUUID(),
+          sourceId: source.id,
+          workspaceId: source.workspaceId,
+          issueType,
+          severity,
+          detectedAt: generatedAt,
+          message: sourceHealthMessage(source, issueType),
+          connectorType: source.connectorType,
+          healthState: source.healthState,
+          stalenessState: source.stalenessState,
+          sourceTitle: source.title,
+          sourceUri: source.uri,
+          ...(source.connectorInstanceId !== undefined ? { connectorInstanceId: source.connectorInstanceId } : {}),
+          ...(sourceVersionId !== undefined ? { sourceVersionId } : {}),
+          details: {
+            permissionState: source.permissionState,
+            staleAfter: source.staleAfter ?? null,
+            lastObservedAt: source.lastObservedAt ?? null,
+            lastSuccessfulReadAt: source.lastSuccessfulReadAt ?? null,
+          },
+        });
+      }
+    }
+
+    findings.sort((left, right) => {
+      const severityDelta = severityRank(right.severity) - severityRank(left.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return left.sourceId.localeCompare(right.sourceId);
+    });
+
+    const staleSourceIds = new Set(findings
+      .filter(finding => finding.issueType === 'stale' || finding.issueType === 'expired')
+      .map(finding => finding.sourceId));
+    const unhealthySourceIds = new Set(findings
+      .filter(finding => finding.issueType === 'degraded' || finding.issueType === 'down' || finding.issueType === 'permission_denied')
+      .map(finding => finding.sourceId));
+    const attentionSourceIds = new Set(findings.map(finding => finding.sourceId));
+    const warningCount = findings.filter(finding => finding.severity === 'warning').length;
+    const criticalCount = findings.filter(finding => finding.severity === 'critical').length;
+    const report: SourceHealthReport = {
+      id: this.stableSourceHealthReportId(input.workspaceId),
+      version: randomUUID(),
+      generatedAt,
+      totalSources: sources.length,
+      healthySources: sources.filter(source => !sourceNeedsAttention(source) && !attentionSourceIds.has(source.id)).length,
+      staleSources: staleSourceIds.size,
+      unhealthySources: unhealthySourceIds.size,
+      warningCount,
+      criticalCount,
+      findings,
+      connectorHealth: input.connectorHealth ?? [],
+      ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
+    };
+    await this.reports.set(report.id, report);
+    return report;
+  }
+
+  async healthReports(workspaceId?: string): Promise<SourceHealthReport[]> {
+    return queryAll(this.reports, workspaceId === undefined
+      ? undefined
+      : { where: { op: 'eq', field: 'workspaceId', value: workspaceId } });
+  }
+
+  private async latestSourceVersionId(sourceId: string): Promise<string | undefined> {
+    const versions = await queryBySource(this.versions, sourceId);
+    versions.sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt));
+    return versions[0]?.id;
+  }
+
+  private issueTypesForSource(source: SourceRecord, includeUnknownFreshness: boolean): SourceHealthIssueType[] {
+    const issues: SourceHealthIssueType[] = [];
+    if (source.healthState === 'down') issues.push('down');
+    else if (source.healthState === 'degraded') issues.push('degraded');
+    if (source.permissionState === 'denied') issues.push('permission_denied');
+    if (source.stalenessState === 'expired') issues.push('expired');
+    else if (source.stalenessState === 'stale') issues.push('stale');
+    else if (includeUnknownFreshness && source.stalenessState === 'unknown') issues.push('unknown_freshness');
+    return issues;
+  }
+
+  private severityForIssue(issueType: SourceHealthIssueType): SourceHealthSeverity {
+    switch (issueType) {
+      case 'expired':
+      case 'down':
+      case 'permission_denied':
+        return 'critical';
+      case 'stale':
+      case 'degraded':
+      case 'unknown_freshness':
+        return 'warning';
+    }
+  }
 }
 
 interface SourceActionInput {
@@ -465,6 +673,32 @@ interface SourceActionInput {
   versionId?: string;
   workspaceId?: string;
   query?: StoreQuery;
+}
+
+interface ConnectorHealthEventLike {
+  connectorInstanceId: string;
+  state: SourceHealthState;
+  checkedAt: string;
+  message?: string;
+}
+
+interface ConnectorInstanceLike {
+  id: string;
+  displayName: string;
+  type: string;
+  workspaceId: string;
+  healthState: SourceHealthState;
+}
+
+interface ConnectorRegistryLike {
+  queryInstances(query?: StoreQuery): Promise<ConnectorInstanceLike[]>;
+  healthEvents(connectorInstanceId?: string): Promise<ConnectorHealthEventLike[]>;
+}
+
+interface SourceHealthActionInput {
+  action: string;
+  workspaceId?: string;
+  includeUnknownFreshness?: boolean;
 }
 
 function createSourceActionTool(registry: SourceRegistry): Tool {
@@ -531,24 +765,112 @@ function createSourceActionTool(registry: SourceRegistry): Tool {
   };
 }
 
+async function connectorHealthSnapshots(services: MatbotMachine): Promise<SourceHealthConnectorSnapshot[]> {
+  const connectorRegistry = services.get('ConnectorRegistry' as never) as ConnectorRegistryLike | undefined;
+  if (connectorRegistry === undefined) return [];
+  const instances = await connectorRegistry.queryInstances();
+  return Promise.all(instances.map(async instance => {
+    const events = await connectorRegistry.healthEvents(instance.id);
+    events.sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt));
+    const latest = events[0];
+    return {
+      connectorInstanceId: instance.id,
+      displayName: instance.displayName,
+      type: instance.type,
+      workspaceId: instance.workspaceId,
+      healthState: latest?.state ?? instance.healthState,
+      ...(latest?.checkedAt !== undefined ? { checkedAt: latest.checkedAt } : {}),
+      ...(latest?.message !== undefined ? { message: latest.message } : {}),
+    };
+  }));
+}
+
+function createSourceHealthActionTool(registry: SourceRegistry, services: MatbotMachine): Tool {
+  return {
+    name: 'source_health_action',
+    description:
+      'Generate and inspect Cortex source health reports. Use this before relying on retrieved evidence when you need stale-source, unhealthy-source, or connector health warnings.\n\n' +
+      'Actions:\n' +
+      "  report     - { action: 'report', workspaceId?: string, includeUnknownFreshness?: boolean }\n" +
+      "  warnings   - { action: 'warnings', workspaceId?: string, includeUnknownFreshness?: boolean }\n" +
+      "  connectors - { action: 'connectors' }\n" +
+      "  reports    - { action: 'reports', workspaceId?: string }",
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['report', 'warnings', 'connectors', 'reports'] },
+        workspaceId: { type: 'string' },
+        includeUnknownFreshness: { type: 'boolean' },
+      },
+    },
+    executor: {
+      async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {
+        const parsed = input && typeof input === 'object' ? input as SourceHealthActionInput : { action: '' };
+        try {
+          switch (parsed.action) {
+            case 'report': {
+              const report = await registry.evaluateHealth({
+                ...(parsed.workspaceId !== undefined ? { workspaceId: parsed.workspaceId } : {}),
+                includeUnknownFreshness: parsed.includeUnknownFreshness === true,
+                connectorHealth: await connectorHealthSnapshots(services),
+              });
+              yield { type: 'result', value: report };
+              return;
+            }
+            case 'warnings': {
+              const report = await registry.evaluateHealth({
+                ...(parsed.workspaceId !== undefined ? { workspaceId: parsed.workspaceId } : {}),
+                includeUnknownFreshness: parsed.includeUnknownFreshness === true,
+                connectorHealth: await connectorHealthSnapshots(services),
+              });
+              yield { type: 'result', value: {
+                reportId: report.id,
+                generatedAt: report.generatedAt,
+                warningCount: report.warningCount,
+                criticalCount: report.criticalCount,
+                findings: report.findings,
+                connectorHealth: report.connectorHealth.filter(connector => connector.healthState !== 'healthy'),
+              } };
+              return;
+            }
+            case 'connectors':
+              yield { type: 'result', value: { connectors: await connectorHealthSnapshots(services) } };
+              return;
+            case 'reports':
+              yield { type: 'result', value: { reports: await registry.healthReports(parsed.workspaceId) } };
+              return;
+            default:
+              yield { type: 'error', message: `Unknown source_health_action "${String(parsed.action)}". Expected: report, warnings, connectors, reports.` };
+          }
+        } catch (error) {
+          yield { type: 'error', message: error instanceof Error ? error.message : String(error) };
+        }
+      },
+    },
+  };
+}
+
 export function createSourceRegistry(services: MatbotMachine): SourceRegistry {
   return new StoreBackedSourceRegistry(
     services.createStore<SourceRecord>(SOURCE_STORE),
     services.createStore<SourceVersion>(VERSION_STORE),
     services.createStore<SourceHealthEvent>(HEALTH_STORE),
     services.createStore<SourceAccessEvent>(ACCESS_STORE),
+    services.createStore<SourceHealthReport>(HEALTH_REPORT_STORE),
   );
 }
 
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {
-    description: 'Registers SourceRegistry and source_action for source provenance, freshness, health, and citations.',
+    description: 'Registers SourceRegistry, source_action, and source_health_action for source provenance, freshness, health, citations, and health reports.',
   },
   async setup(services: MatbotMachine) {
     const registry = createSourceRegistry(services);
     await services.register('SourceRegistry', registry);
     services.tools.register(createSourceActionTool(registry));
+    services.tools.register(createSourceHealthActionTool(registry, services));
   },
 };
 

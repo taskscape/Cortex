@@ -108,6 +108,7 @@ async function main() {
   const registry = services.SourceRegistry;
   assert.ok(registry, "SourceRegistry service should be registered");
   assert.ok(tools.get("source_action"), "source_action tool should be registered");
+  assert.ok(tools.get("source_health_action"), "source_health_action tool should be registered");
 
   const identity = {
     workspaceId: "default",
@@ -149,6 +150,27 @@ async function main() {
   assert.equal((await registry.getSource(sourceId)).healthState, "degraded");
   await registry.recordAccess({ sourceId, action: "retrieve", allowed: true });
 
+  servicesByKey.set("ConnectorRegistry", {
+    async queryInstances() {
+      return [{
+        id: "connector-instance:workspace-rag:local",
+        displayName: "Local Workspace RAG",
+        type: "workspace-rag",
+        workspaceId: "local",
+        healthState: "healthy",
+      }];
+    },
+    async healthEvents(connectorInstanceId) {
+      assert.equal(connectorInstanceId, "connector-instance:workspace-rag:local");
+      return [{
+        connectorInstanceId,
+        state: "degraded",
+        checkedAt: "2026-01-02T00:00:00.000Z",
+        message: "index scan lagging",
+      }];
+    },
+  });
+
   const citation = await registry.resolveCitation(sourceId, versionA.id);
   assert.match(citation.text, /source\.md/);
   assert.equal(citation.versionId, versionA.id);
@@ -161,7 +183,28 @@ async function main() {
   const events = await collectTool(sourceTool, { action: "events", sourceId });
   assert.equal(events.access.length, 1);
   assert.equal(events.health.length, 1);
+
+  const healthTool = tools.get("source_health_action");
+  const report = await collectTool(healthTool, { action: "report", workspaceId: "default" });
+  assert.equal(report.totalSources, 1);
+  assert.equal(report.staleSources, 1);
+  assert.equal(report.unhealthySources, 1);
+  assert.equal(report.warningCount, 2);
+  assert.equal(report.criticalCount, 0);
+  assert.equal(report.findings.length, 2);
+  assert.deepEqual(report.findings.map(finding => finding.issueType).sort(), ["degraded", "stale"]);
+  assert.equal(report.findings[0].sourceVersionId, versionA.id);
+  assert.equal(report.connectorHealth.length, 1);
+  assert.equal(report.connectorHealth[0].healthState, "degraded");
+
+  const warnings = await collectTool(healthTool, { action: "warnings", workspaceId: "default" });
+  assert.equal(warnings.warningCount, 2);
+  assert.equal(warnings.findings.length, 2);
+  assert.equal(warnings.connectorHealth.length, 1);
+
+  const reports = await collectTool(healthTool, { action: "reports", workspaceId: "default" });
+  assert.equal(reports.reports.length, 1);
 }
 
 await main();
-console.log("source-registry stores stable source ids, versions, freshness, citations, and events");
+console.log("source-registry stores stable source ids, versions, freshness, citations, events, and health reports");

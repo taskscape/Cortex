@@ -1061,6 +1061,16 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       description: 'Inspect source registry provenance and freshness metadata.',
     },
     {
+      connectorInstanceId: 'connector-instance:source-registry:local',
+      toolName: 'source_health_action',
+      capability: 'read',
+      sourceTypes: ['source_record', 'source_health_report'],
+      sensitivity: 'internal',
+      requiredScopes: ['source-registry:read'],
+      inputActionField: 'action',
+      description: 'Generate source health reports and stale-source warnings.',
+    },
+    {
       connectorInstanceId: 'connector-instance:workspace-rag:local',
       toolName: 'workspace_rag',
       capability: 'read',
@@ -1135,7 +1145,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       connectorInstanceId: 'connector-instance:source-registry:local',
       principalId: '*',
       scopes: ['*'],
-      allowedTools: ['source_action'],
+      allowedTools: ['source_action', 'source_health_action'],
     },
     {
       connectorInstanceId: 'connector-instance:workspace-rag:local',

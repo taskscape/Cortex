@@ -356,13 +356,13 @@ type SourceVersion = {
   - [ ] citation policy as path citation by default.
 - [ ] Modify `WorkspaceRagKnowledgeIndex` results to include source ids in
   `KnowledgeEntry.source`.
-- [ ] Add source warning markers in `workspace-rag` screen hook when retrieved
+- [x] Add source warning markers in `workspace-rag` screen hook when retrieved
   context is stale or source health is degraded.
 - [ ] Add source registry entries for generated artifacts:
   - [ ] dossiers.
   - [ ] workflow definitions.
   - [ ] investigation timelines.
-  - [ ] source health reports.
+  - [x] source health reports.
 - [ ] Add UI source panels:
   - [ ] source freshness.
   - [ ] owner.
@@ -371,7 +371,7 @@ type SourceVersion = {
   - [ ] known limitations.
 - [ ] Add tests:
   - [ ] source id stability.
-  - [ ] stale-source detection.
+  - [x] stale-source detection.
   - [ ] citation resolution.
   - [ ] workspace RAG integration.
 
@@ -833,9 +833,9 @@ type WorkflowRunEvent = {
 
 ## Suggested Build Sequence
 
-Current implementation status: Source Registry MVP and Connector Fabric MVP are
-complete as the first committable slices. The next build-sequence item is Source
-Health Monitor primitives.
+Current implementation status: Source Registry MVP, Connector Fabric MVP, and
+Source Health Monitor primitives are complete as the first committable slices.
+The next build-sequence item is Structured Data Reasoning MVP.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -843,7 +843,7 @@ Health Monitor primitives.
 2. Connector Fabric MVP. Complete.
    - Wrap existing local file, workspace RAG, MCP, and Postgres read-only paths.
    - Add grant enforcement and audit hooks.
-3. Source Health Monitor primitives.
+3. Source Health Monitor primitives. Complete.
    - Add source health states, stale warnings, and connector health checks.
 4. Structured Data Reasoning MVP.
    - Postgres read-only connector, catalog, semantic metric definitions, SQL

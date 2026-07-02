@@ -109,11 +109,11 @@ ordered, committable slices. Completed build-sequence items:
 | --- | --- | --- |
 | Source Registry MVP | Complete | `source-registry` registers `SourceRegistry` and `source_action`; sources have stable ids, versions, freshness state, health state, citation policy, health events, and access events; workspace RAG writes source records for indexed markdown and derived knowledge entries; workspace RAG retrieval hits include source ids, health/freshness state, and citation text. |
 | Connector Fabric MVP | Complete | `connector-fabric` registers `ConnectorRegistry` and `connector_action`; it seeds local connector definitions/instances for source registry, workspace RAG, file broker, MCP, and Postgres read-only; action-aware tool bindings classify read/write/admin calls; `toolcall` hooks enforce connector grants before bound tools run; `toolresult` hooks write connector audit events and redact configured sensitive fields. |
+| Source Health Monitor Primitives | Complete | `source-registry` now registers `source_health_action`; source health reports are stable store-backed records with stale, expired, degraded, down, denied, and optional unknown-freshness findings; reports include source ids, source version ids, connector health snapshots, warning counts, and critical counts; workspace RAG injects stale/unhealthy warnings in retrieved context and marker data. |
 
-Remaining strategic architecture items still build on this foundation: source
-health monitor primitives beyond workspace RAG, structured data reasoning,
-workflow run ledger, automation shadow mode, context graph, workflow compiler,
-and enterprise expert-panel review records.
+Remaining strategic architecture items still build on this foundation:
+structured data reasoning, workflow run ledger, automation shadow mode, context
+graph, workflow compiler, and enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -124,9 +124,12 @@ only on matched text or file paths.
 The `source-registry` plugin registers:
 
 - `SourceRegistry`: a service for writing and querying source records, source
-  versions, health events, access events, and citation metadata.
+  versions, health events, access events, source health reports, and citation
+  metadata.
 - `source_action`: a model/UI-facing inspection tool with `list`, `get`,
   `health`, `stale`, `citation`, and `events` actions.
+- `source_health_action`: a model/UI-facing health monitor tool with `report`,
+  `warnings`, `connectors`, and `reports` actions.
 
 Workspace RAG is the first producer. During markdown ingestion it creates:
 
@@ -140,6 +143,35 @@ Workspace RAG retrieval then enriches hits with source id, source health,
 freshness, and citation text. The per-turn screen hook includes that metadata in
 the injected RAG context and in durable marker data, so a later audit can connect
 an answer back to the exact source registry record.
+
+### Source Health Monitor
+
+The source health monitor is implemented as source-registry primitives rather
+than a separate runtime dependency. It evaluates current source records into a
+stable `source_health_reports` store and keeps early rollout behavior warning
+based: retrieval is not blocked only because a source is stale or has unknown
+freshness.
+
+`source_health_action` supports:
+
+- `report`: generate and persist a source health report for all sources or one
+  workspace.
+- `warnings`: return the warning/critical findings from a freshly generated
+  report.
+- `connectors`: snapshot connector health from `ConnectorRegistry` when
+  connector-fabric is loaded.
+- `reports`: list persisted source health reports.
+
+Findings are typed as stale, expired, degraded, down, permission denied, or
+unknown freshness. Each finding carries the source id, workspace id, connector
+type, current health/freshness states, and latest source version id when one is
+available. Reports also include connector health snapshots so a source warning
+can be correlated with connector outage or degradation.
+
+Workspace RAG consumes the same source health fields during retrieval. When a
+retrieved source is stale, expired, degraded, or down, the injected context now
+contains explicit warning lines, and the durable `workspace-rag` marker contains
+the same structured `sourceWarnings` array for future UI source panels.
 
 ### Connector Fabric
 
@@ -189,6 +221,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | KnowledgeIndex | Search interface over skills, Mem0, and file-index results. | `KnowledgeIndex` service |
 | Workspace RAG | Markdown files configured for the current workspace. | `workspace_rag` |
 | Source registry | Source identity, freshness, health, citations, and retrieval provenance. | `SourceRegistry`, `source_action` |
+| Source health monitor | Store-backed health reports and stale/unhealthy source warnings. | `source_health_action`, `source_health_reports` |
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 

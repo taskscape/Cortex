@@ -139,6 +139,14 @@ async function main() {
   assert.equal(workspaceRead.allowed, true);
   assert.equal(workspaceRead.capability, "read");
 
+  const sourceHealthRead = await registry.evaluateToolCall({
+    toolName: "source_health_action",
+    input: { action: "warnings" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(sourceHealthRead.allowed, true);
+  assert.equal(sourceHealthRead.capability, "read");
+
   const workspaceWrite = await registry.evaluateToolCall({
     toolName: "workspace_rag",
     input: { action: "configure" },
