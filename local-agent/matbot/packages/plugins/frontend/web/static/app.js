@@ -211,6 +211,8 @@ let expertPanelBusy = false;
 let workspaceState = { active: 'default', workspaces: [] };
 let workspaceRagPoll = null;
 let workspaceRagConfig = null;
+let workspaceRagSavedSnapshot = null;
+let workspaceRagSaving = false;
 let workspaceRagLoadSeq = 0;
 let workspaceSwitching = false;
 const WORKSPACE_RESTART_TIMEOUT_MS = 120000;
@@ -987,6 +989,51 @@ function renderWorkspaceRagStatus(status) {
   }
 }
 
+function parseWorkspaceRagPaths(value) {
+  return String(value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function workspaceRagSnapshotFromConfig(config) {
+  const active = activeWorkspaceRagContext(config);
+  const paths = Array.isArray(active?.paths ?? config?.paths)
+    ? (active?.paths ?? config.paths).map(item => String(item))
+    : [];
+  const contextName = String(
+    active?.name || config?.contextName || activeWorkspace().name || 'Workspace',
+  ).trim() || activeWorkspace().name || 'Workspace';
+  return {
+    contextId: active?.id || config?.activeContextId || '',
+    contextName,
+    paths,
+  };
+}
+
+function currentWorkspaceRagFormSnapshot() {
+  return {
+    contextId: activeWorkspaceRagContext()?.id || workspaceRagSavedSnapshot?.contextId || '',
+    contextName: workspaceContextNameEl?.value?.trim() || activeWorkspace().name || 'Workspace',
+    paths: parseWorkspaceRagPaths(workspaceRagPathsEl?.value || ''),
+  };
+}
+
+function workspaceRagSnapshotsEqual(left, right) {
+  if (!left || !right) return false;
+  if (left.contextId !== right.contextId || left.contextName !== right.contextName) return false;
+  if (left.paths.length !== right.paths.length) return false;
+  return left.paths.every((item, index) => item === right.paths[index]);
+}
+
+function updateWorkspaceRagSaveState() {
+  if (!workspaceRagSaveBtn) return;
+  const hasLoadedConfig = Boolean(workspaceRagSavedSnapshot);
+  const dirty = hasLoadedConfig && !workspaceRagSnapshotsEqual(workspaceRagSavedSnapshot, currentWorkspaceRagFormSnapshot());
+  workspaceRagSaveBtn.disabled = workspaceRagSaving || !dirty;
+  workspaceRagSaveBtn.setAttribute('aria-disabled', workspaceRagSaveBtn.disabled ? 'true' : 'false');
+  workspaceRagSaveBtn.title = workspaceRagSaving
+    ? 'Saving...'
+    : (dirty ? 'Save changes' : 'No changes to save');
+}
+
 function activeWorkspaceRagContext(config = workspaceRagConfig) {
   if (!config) return null;
   const contexts = Array.isArray(config.contexts) ? config.contexts : [];
@@ -998,10 +1045,14 @@ function renderWorkspaceRagConfig(config) {
   const active = activeWorkspaceRagContext(config);
   if (workspaceContextNameEl) workspaceContextNameEl.value = active?.name || config?.contextName || activeWorkspace().name || '';
   if (workspaceRagPathsEl) workspaceRagPathsEl.value = Array.isArray(active?.paths ?? config?.paths) ? (active?.paths ?? config.paths).join('\n') : '';
+  workspaceRagSavedSnapshot = workspaceRagSnapshotFromConfig(config);
+  updateWorkspaceRagSaveState();
 }
 
 function resetWorkspaceRagConfigForm() {
   workspaceRagConfig = null;
+  workspaceRagSavedSnapshot = null;
+  workspaceRagSaving = false;
   if (workspaceContextNameEl) workspaceContextNameEl.value = activeWorkspace().name || '';
   if (workspaceRagPathsEl) workspaceRagPathsEl.value = '';
   if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = '0%';
@@ -1009,6 +1060,7 @@ function resetWorkspaceRagConfigForm() {
     workspaceRagCurrentFileEl.textContent = '';
     workspaceRagCurrentFileEl.title = '';
   }
+  updateWorkspaceRagSaveState();
 }
 
 async function loadWorkspaceRagStatus() {
@@ -1040,6 +1092,8 @@ async function loadWorkspaceRagConfig() {
     renderWorkspaceRagStatus(status);
   } catch (e) {
     if (loadSeq !== workspaceRagLoadSeq) return;
+    workspaceRagSavedSnapshot = null;
+    updateWorkspaceRagSaveState();
     setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
     if (workspaceRagCurrentFileEl) {
       workspaceRagCurrentFileEl.textContent = '';
@@ -1060,16 +1114,34 @@ function stopWorkspaceRagPoll() {
   }
 }
 
+workspaceContextNameEl?.addEventListener('input', updateWorkspaceRagSaveState);
+workspaceRagPathsEl?.addEventListener('input', updateWorkspaceRagSaveState);
+
 workspaceRagSaveBtn?.addEventListener('click', async () => {
-  const contextId = activeWorkspaceRagContext()?.id;
-  const contextName = workspaceContextNameEl?.value?.trim() || activeWorkspace().name || 'Workspace';
-  const paths = (workspaceRagPathsEl?.value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (workspaceRagSaving || !workspaceRagSavedSnapshot) return;
+  const nextSnapshot = currentWorkspaceRagFormSnapshot();
+  if (workspaceRagSnapshotsEqual(workspaceRagSavedSnapshot, nextSnapshot)) {
+    updateWorkspaceRagSaveState();
+    return;
+  }
+  workspaceRagSaving = true;
+  updateWorkspaceRagSaveState();
   try {
-    const result = await callTool('workspace_rag', { action: 'configure', contextId, contextName, paths });
-    renderWorkspaceRagConfig(result.config);
-    renderWorkspaceRagStatus(result.status);
+    const input = {
+      action: 'configure',
+      contextName: nextSnapshot.contextName,
+      paths: nextSnapshot.paths,
+    };
+    if (nextSnapshot.contextId) input.contextId = nextSnapshot.contextId;
+    const result = await callTool('workspace_rag', input);
+    if (result?.config) renderWorkspaceRagConfig(result.config);
+    else workspaceRagSavedSnapshot = nextSnapshot;
+    if (result?.status) renderWorkspaceRagStatus(result.status);
   } catch (e) {
     setWorkspaceRagStatus(String(e.message || e), true);
+  } finally {
+    workspaceRagSaving = false;
+    updateWorkspaceRagSaveState();
   }
 });
 

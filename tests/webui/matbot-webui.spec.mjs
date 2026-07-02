@@ -193,10 +193,14 @@ test("workspace RAG configuration panel saves paths and shows indexing progress"
   await expect(page.locator("#workspace-rag-paths")).toHaveValue(/C:\\Projects\\Cortex\\docs/);
   await expect(page.locator("#workspace-rag-status")).toContainText("idle");
   await expect(page.locator("#workspace-rag-status")).toContainText("CPU");
-  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("background-color", "rgb(37, 99, 235)");
-  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("color", "rgb(255, 255, 255)");
+  await expect(page.locator("#workspace-rag-save-btn")).toBeDisabled();
+  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("background-color", "rgb(208, 213, 221)");
+  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("color", "rgb(102, 112, 133)");
 
   await page.locator("#workspace-context-name").fill("Discarded Notes");
+  await expect(page.locator("#workspace-rag-save-btn")).toBeEnabled();
+  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("background-color", "rgb(37, 99, 235)");
+  await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("color", "rgb(255, 255, 255)");
   await page.locator("#workspace-settings-cancel-btn").click();
   await expect(page.locator("#workspace-settings-screen")).not.toHaveClass(/open/);
   await expect(page.locator("#messages")).toBeVisible();
@@ -204,11 +208,14 @@ test("workspace RAG configuration panel saves paths and shows indexing progress"
   await page.locator("#workspace-config-btn").click();
   await expect(page.locator("#workspace-settings-screen")).toHaveClass(/open/);
   await expect(page.locator("#workspace-context-name")).toHaveValue("Default");
+  await expect(page.locator("#workspace-rag-save-btn")).toBeDisabled();
   await page.locator("#workspace-context-name").fill("Engineering Notes");
   await page.locator("#workspace-rag-paths").fill("C:\\Projects\\Cortex\\docs\nD:\\Knowledge");
+  await expect(page.locator("#workspace-rag-save-btn")).toBeEnabled();
   await page.locator("#workspace-rag-save-btn").click();
   await expect(page.locator("#workspace-settings-screen")).toHaveClass(/open/);
   await expect(page.locator("#input-area")).not.toBeVisible();
+  await expect(page.locator("#workspace-rag-save-btn")).toBeDisabled();
   await expect(page.locator("#workspace-rag-status")).toContainText("indexing");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
   await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");

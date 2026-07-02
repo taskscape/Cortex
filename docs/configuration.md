@@ -384,7 +384,7 @@ The WebUI exposes the active context through the workspace settings page:
 1. Click the workspace gear in the bottom-left area.
 2. Edit `Context name`.
 3. Enter one absolute markdown folder path per line.
-4. Click `Save` to persist and return to chat, or `Cancel` to discard changes.
+4. Click `Save` to persist changes in place, or `Close` to discard changes and return to chat. `Save` is active only when the current form differs from the persisted settings.
 
 The status line displays state, percentage, CPU/CUDA status, storage backend, a
 human message, and the currently processed file name when indexing is active.
