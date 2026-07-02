@@ -140,6 +140,58 @@ interface WorkspaceRagLockStatus {
   message?: string;
 }
 
+type SourceHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
+type SourceStalenessState = 'unknown' | 'fresh' | 'stale' | 'expired';
+
+interface SourceRegistrySourceLike {
+  id: string;
+  healthState: SourceHealthState;
+  stalenessState: SourceStalenessState;
+  title?: string;
+  uri?: string;
+}
+
+interface SourceRegistryVersionLike {
+  id: string;
+}
+
+interface SourceCitationLike {
+  sourceId: string;
+  text: string;
+  policy: string;
+  uri?: string;
+  title?: string;
+  versionId?: string;
+  observedAt?: string;
+}
+
+interface SourceRegistryLike {
+  stableSourceId(input: {
+    workspaceId: string;
+    connectorType: string;
+    connectorInstanceId?: string;
+    externalId: string;
+  }): string;
+  upsertSource(input: Record<string, unknown>): Promise<SourceRegistrySourceLike>;
+  upsertVersion(input: Record<string, unknown>): Promise<SourceRegistryVersionLike>;
+  getSource(id: string): Promise<SourceRegistrySourceLike | null>;
+  recordHealth(input: {
+    sourceId: string;
+    state: SourceHealthState;
+    checkedAt?: string;
+    message?: string;
+    details?: Record<string, unknown>;
+  }): Promise<unknown>;
+  recordAccess(input: {
+    sourceId: string;
+    action: 'read' | 'retrieve' | 'cite' | 'write' | 'delete' | 'health_check';
+    allowed: boolean;
+    timestamp?: string;
+    message?: string;
+  }): Promise<unknown>;
+  resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitationLike>;
+}
+
 interface SearchHit {
   workspaceId: string;
   contextName: string;
@@ -147,6 +199,11 @@ interface SearchHit {
   chunkId: string;
   score: number;
   text: string;
+  sourceId?: string;
+  sourceVersionId?: string;
+  sourceHealthState?: SourceHealthState;
+  sourceStalenessState?: SourceStalenessState;
+  citation?: SourceCitationLike;
 }
 
 function nowIso(): string {
@@ -576,7 +633,7 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
       summary: `${hit.contextName}: ${path.basename(hit.path)}`,
       content: hit.text,
       contentHash: sha256(hit.text),
-      source: { type: 'workspace-rag', uuid: hit.path },
+      source: { type: 'workspace-rag', uuid: hit.sourceId ?? hit.path },
       confidence: hit.score,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -600,9 +657,11 @@ class WorkspaceRagManager {
   private accelerationMessage = 'Using CPU hash vectorizer.';
   private disposed = false;
   private readonly activeConfigPath: string;
+  private readonly sourceRegistry: SourceRegistryLike | undefined;
 
-  constructor(activeConfigPath: string) {
+  constructor(activeConfigPath: string, sourceRegistry?: SourceRegistryLike) {
     this.activeConfigPath = activeConfigPath;
+    this.sourceRegistry = sourceRegistry;
   }
 
   async start(): Promise<void> {
@@ -790,7 +849,8 @@ class WorkspaceRagManager {
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
     const queryVector = (await this.embedTexts([query], signal))[0] ?? [];
-    return this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
+    const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
+    return this.enrichSearchHits(workspace, active, hits);
   }
 
   async indexKnowledgeEntry(workspaceId: string, entry: KnowledgeEntry): Promise<void> {
@@ -822,6 +882,7 @@ class WorkspaceRagManager {
     const storage = this.getStorage();
     await storage.upsertDocuments(workspace, [document]);
     await storage.flush(workspace);
+    await this.registerKnowledgeSource(workspace, context, entry, document.hash);
     await this.log(workspace, 'knowledge_indexed', {
       entryId: entry.id,
       contextId: context.id,
@@ -981,6 +1042,7 @@ class WorkspaceRagManager {
         }
         let content: string;
         try { content = await readFile(file, 'utf8'); } catch (error) {
+          await this.registerFileReadFailure(workspace, context, normalized, error);
           await this.log(workspace, 'file_read_error', {
             file,
             error: errorMessage(error),
@@ -997,9 +1059,10 @@ class WorkspaceRagManager {
           });
         }
         const hash = sha256(content);
+        const fileStat = await stat(file).catch(() => null);
+        await this.registerFileSource(workspace, context, normalized, fileStat?.mtime.toISOString() ?? nowIso(), hash);
         const existing = byContextPath.get(contextPathKey);
         if (existing?.hash === hash && documentMatchesVectorizer(existing, this.vectorizer.info)) continue;
-        const fileStat = await stat(file).catch(() => null);
         const chunks = chunkMarkdown(content);
         const vectors = await this.embedTexts(
           chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
@@ -1036,6 +1099,7 @@ class WorkspaceRagManager {
         storage: storage.describe(workspace),
       });
       try {
+        await this.recordMissingFileSources(workspace, config, byContextPath, seen);
         await storage.deleteStaleFiles(workspace, configuredContextIds, seen);
         await storage.flush(workspace);
       } catch (error) {
@@ -1087,6 +1151,195 @@ class WorkspaceRagManager {
     } finally {
       this.scanInFlight.delete(workspace.id);
     }
+  }
+
+  private fileSourceExternalId(contextId: string, normalizedPath: string): string {
+    return `${contextId}:${normalizedPath}`;
+  }
+
+  private knowledgeSourceExternalId(contextId: string, entry: KnowledgeEntry): string {
+    return `${contextId}:knowledge:${entry.source.type}:${entry.source.uuid}:${entry.id}`;
+  }
+
+  private sourceId(workspace: WorkspaceRef, externalId: string): string | undefined {
+    return this.sourceRegistry?.stableSourceId({
+      workspaceId: workspace.id,
+      connectorType: 'workspace-rag',
+      externalId,
+    });
+  }
+
+  private async registerFileSource(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    normalizedPath: string,
+    updatedAt: string,
+    contentHash: string,
+  ): Promise<void> {
+    if (this.sourceRegistry === undefined) return;
+    const externalId = this.fileSourceExternalId(context.id, normalizedPath);
+    const source = await this.sourceRegistry.upsertSource({
+      workspaceId: workspace.id,
+      connectorType: 'workspace-rag',
+      externalId,
+      uri: normalizedPath,
+      title: path.basename(normalizedPath),
+      sourceKind: 'document',
+      schemaOrDocumentType: 'markdown',
+      sensitivity: 'internal',
+      permissionState: 'allowed',
+      trustLevel: 'medium',
+      citationPolicy: 'cite_path',
+      healthState: 'healthy',
+      lastObservedAt: nowIso(),
+      lastSuccessfulReadAt: nowIso(),
+      knownLimitations: [
+        'Workspace RAG currently indexes Markdown text only.',
+        'Search hits are chunk-level excerpts, not full document reads.',
+      ],
+    });
+    await this.sourceRegistry.upsertVersion({
+      sourceId: source.id,
+      contentHash,
+      observedAt: updatedAt,
+      provenance: {
+        activityId: `workspace-rag:${workspace.id}:${context.id}:scan`,
+      },
+    });
+    await this.sourceRegistry.recordHealth({
+      sourceId: source.id,
+      state: 'healthy',
+      checkedAt: nowIso(),
+      message: 'Workspace RAG read and indexed this markdown source.',
+    });
+  }
+
+  private async registerKnowledgeSource(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    entry: KnowledgeEntry,
+    contentHash: string,
+  ): Promise<void> {
+    if (this.sourceRegistry === undefined) return;
+    const externalId = this.knowledgeSourceExternalId(context.id, entry);
+    const source = await this.sourceRegistry.upsertSource({
+      workspaceId: workspace.id,
+      connectorType: 'workspace-rag',
+      externalId,
+      uri: entry.source.uuid,
+      title: entry.summary || entry.id,
+      sourceKind: 'artifact',
+      schemaOrDocumentType: entry.source.type,
+      sensitivity: 'internal',
+      permissionState: 'allowed',
+      trustLevel: 'medium',
+      citationPolicy: 'cite_path',
+      healthState: 'healthy',
+      lastObservedAt: nowIso(),
+      lastSuccessfulReadAt: nowIso(),
+      knownLimitations: ['Knowledge entries are indexed into workspace RAG as derived artifacts.'],
+    });
+    await this.sourceRegistry.upsertVersion({
+      sourceId: source.id,
+      contentHash,
+      observedAt: nowIso(),
+      provenance: {
+        activityId: `workspace-rag:${workspace.id}:${context.id}:knowledge-index`,
+      },
+    });
+  }
+
+  private async registerFileReadFailure(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    normalizedPath: string,
+    error: unknown,
+  ): Promise<void> {
+    if (this.sourceRegistry === undefined) return;
+    const externalId = this.fileSourceExternalId(context.id, normalizedPath);
+    const source = await this.sourceRegistry.upsertSource({
+      workspaceId: workspace.id,
+      connectorType: 'workspace-rag',
+      externalId,
+      uri: normalizedPath,
+      title: path.basename(normalizedPath),
+      sourceKind: 'document',
+      schemaOrDocumentType: 'markdown',
+      sensitivity: 'internal',
+      permissionState: 'partial',
+      trustLevel: 'medium',
+      citationPolicy: 'cite_path',
+      healthState: 'degraded',
+      stalenessState: 'stale',
+      lastObservedAt: nowIso(),
+      knownLimitations: ['Workspace RAG could not read this configured source during the last scan.'],
+    });
+    await this.sourceRegistry.recordHealth({
+      sourceId: source.id,
+      state: 'degraded',
+      checkedAt: nowIso(),
+      message: `Workspace RAG failed to read markdown source: ${errorMessage(error)}`,
+      details: { path: normalizedPath },
+    });
+  }
+
+  private async recordMissingFileSources(
+    workspace: WorkspaceRef,
+    config: RagConfig,
+    byContextPath: Map<string, { contextId?: string; path: string; sourceType: 'file' | 'knowledge' }>,
+    seen: Set<string>,
+  ): Promise<void> {
+    if (this.sourceRegistry === undefined) return;
+    const configuredContextIds = new Set(config.contexts.map(context => context.id));
+    for (const doc of byContextPath.values()) {
+      if (doc.sourceType !== 'file') continue;
+      if (!path.isAbsolute(doc.path)) continue;
+      const contextId = doc.contextId ?? 'default';
+      const key = `${contextId}:${normalizePathForId(doc.path)}`;
+      if (configuredContextIds.has(contextId) && seen.has(key)) continue;
+      const sourceId = this.sourceId(workspace, this.fileSourceExternalId(contextId, normalizePathForId(doc.path)));
+      if (sourceId === undefined) continue;
+      const source = await this.sourceRegistry.getSource(sourceId);
+      if (source === null) continue;
+      await this.sourceRegistry.recordHealth({
+        sourceId,
+        state: 'down',
+        checkedAt: nowIso(),
+        message: 'Workspace RAG source is no longer present in configured markdown paths.',
+        details: { path: doc.path, contextId },
+      });
+    }
+  }
+
+  private async enrichSearchHits(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    hits: SearchHit[],
+  ): Promise<SearchHit[]> {
+    const sourceRegistry = this.sourceRegistry;
+    if (sourceRegistry === undefined) return hits;
+    return Promise.all(hits.map(async hit => {
+      const externalId = this.fileSourceExternalId(context.id, normalizePathForId(hit.path));
+      const sourceId = this.sourceId(workspace, externalId);
+      if (sourceId === undefined) return hit;
+      const source = await sourceRegistry.getSource(sourceId);
+      if (source === null) return hit;
+      await sourceRegistry.recordAccess({
+        sourceId,
+        action: 'retrieve',
+        allowed: true,
+        timestamp: nowIso(),
+        message: 'Workspace RAG returned this source as retrieval context.',
+      });
+      const citation = await sourceRegistry.resolveCitation(sourceId).catch(() => undefined);
+      return {
+        ...hit,
+        sourceId,
+        sourceHealthState: source.healthState,
+        sourceStalenessState: source.stalenessState,
+        ...(citation !== undefined ? { citation } : {}),
+      };
+    }));
   }
 
   private accelerationStatusFields(): Pick<
@@ -1356,6 +1609,10 @@ function renderContext(hits: SearchHit[]): string {
     ...hits.map((hit, index) => [
       `## Source ${index + 1}: ${hit.path}`,
       `Score: ${hit.score.toFixed(3)}`,
+      ...(hit.sourceId !== undefined ? [`Source id: ${hit.sourceId}`] : []),
+      ...(hit.sourceHealthState !== undefined ? [`Source health: ${hit.sourceHealthState}`] : []),
+      ...(hit.sourceStalenessState !== undefined ? [`Source freshness: ${hit.sourceStalenessState}`] : []),
+      ...(hit.citation !== undefined ? [`Citation: ${hit.citation.text}`] : []),
       hit.text,
     ].join('\n')),
     '[End workspace RAG context.]',
@@ -1373,7 +1630,8 @@ export const plugin: MatbotPluginSpec = {
     if (services.isSubAgent()) return;
     if (!services.configPath) throw new Error('workspace-rag requires services.configPath.');
 
-    const manager = new WorkspaceRagManager(services.configPath);
+    const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
+    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry);
     activeManager = manager;
     await manager.start();
     await services.register('WorkspaceRagManager' as never, manager as never);
@@ -1393,7 +1651,19 @@ export const plugin: MatbotPluginSpec = {
         if (!text) return;
         return {
           ephemeral: [{ type: 'text', text }],
-          markers: [{ type: 'marker', creator: 'workspace-rag', data: { hits: hits.map(hit => ({ path: hit.path, score: hit.score })) } }],
+          markers: [{
+            type: 'marker',
+            creator: 'workspace-rag',
+            data: {
+              hits: hits.map(hit => ({
+                path: hit.path,
+                score: hit.score,
+                ...(hit.sourceId !== undefined ? { sourceId: hit.sourceId } : {}),
+                ...(hit.sourceHealthState !== undefined ? { sourceHealthState: hit.sourceHealthState } : {}),
+                ...(hit.sourceStalenessState !== undefined ? { sourceStalenessState: hit.sourceStalenessState } : {}),
+              })),
+            },
+          }],
         };
       },
     });

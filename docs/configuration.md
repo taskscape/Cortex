@@ -176,6 +176,7 @@ plugins:
   - ./packages/plugins/sessions
   - ./plugins/hybrid-knowledge-index
   - ./plugins/file-broker
+  - ./packages/plugins/source-registry
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers

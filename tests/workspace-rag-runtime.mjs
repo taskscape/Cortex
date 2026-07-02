@@ -6,6 +6,62 @@ import path from "node:path";
 process.env.CORTEX_RAG_DISABLE_CUDA = "1";
 process.env.CORTEX_RAG_STORAGE = "json";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
+const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
+
+class MemoryStore {
+  constructor() {
+    this.docs = new Map();
+  }
+
+  async get(id) {
+    return this.docs.get(id) ?? null;
+  }
+
+  async set(id, value) {
+    this.docs.set(id, value);
+  }
+
+  async cas(id, expected, next) {
+    const current = this.docs.get(id) ?? null;
+    if (current === null || current.version !== expected) return { ok: false, current };
+    this.docs.set(id, next);
+    return { ok: true, doc: next };
+  }
+
+  async delete(id, expectedVersion) {
+    const current = this.docs.get(id) ?? null;
+    if (current === null) return false;
+    if (expectedVersion !== undefined && current.version !== expectedVersion) return false;
+    return this.docs.delete(id);
+  }
+
+  async query(q = {}) {
+    let items = [...this.docs.values()];
+    if (q.where !== undefined) items = items.filter(item => matches(item, q.where));
+    return { items, total: items.length };
+  }
+}
+
+function fieldValue(item, field) {
+  const parts = Array.isArray(field) ? field : [field];
+  let value = item;
+  for (const part of parts) {
+    if (value === null || typeof value !== "object") return undefined;
+    value = value[part];
+  }
+  return value;
+}
+
+function matches(item, filter) {
+  switch (filter.op) {
+    case "eq":
+      return fieldValue(item, filter.field) === filter.value;
+    case "and":
+      return filter.clauses.every(clause => matches(item, clause));
+    default:
+      return true;
+  }
+}
 
 async function main() {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-workspace-rag-"));
@@ -29,15 +85,27 @@ async function main() {
       "utf8",
     );
 
-    let registeredTool;
+    const stores = new Map();
+    const servicesByKey = new Map();
+    const tools = new Map();
     let screenHook;
     const services = {
       configPath,
       isSubAgent: () => false,
-      async register() {},
+      createStore(namespace) {
+        if (!stores.has(namespace)) stores.set(namespace, new MemoryStore());
+        return stores.get(namespace);
+      },
+      async register(key, value) {
+        servicesByKey.set(key, value);
+        this[key] = value;
+      },
+      get(key) {
+        return servicesByKey.get(key);
+      },
       tools: {
         register(tool) {
-          registeredTool = tool;
+          tools.set(tool.name, tool);
         },
       },
       hooks: {
@@ -47,8 +115,12 @@ async function main() {
       },
     };
 
+    await sourceRegistryPlugin.setup(services);
     await plugin.setup(services);
+    const registeredTool = tools.get("workspace_rag");
+    const sourceTool = tools.get("source_action");
     assert.equal(registeredTool?.name, "workspace_rag");
+    assert.equal(sourceTool?.name, "source_action");
     assert.equal(screenHook?.on, "screen");
 
     const toolCtx = { signal: new AbortController().signal };
@@ -78,6 +150,17 @@ async function main() {
     const dbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
     assert.match(dbText, /QuasarPump/);
     assert.doesNotMatch(dbText, /\\u0000/);
+    const sourceListEvents = [];
+    for await (const event of sourceTool.executor.execute({ action: "list" }, toolCtx)) {
+      sourceListEvents.push(event);
+    }
+    const sourceListResult = sourceListEvents.find(event => event.type === "result")?.value;
+    const retrievalSource = sourceListResult.sources.find(source => source.uri.endsWith("retrieval-probe.md"));
+    assert.ok(retrievalSource, "workspace RAG should register indexed markdown as a source");
+    assert.equal(retrievalSource.connectorType, "workspace-rag");
+    assert.equal(retrievalSource.sourceKind, "document");
+    assert.equal(retrievalSource.healthState, "healthy");
+
     const ingestionLog = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "ingestion.log"), "utf8");
     assert.match(ingestionLog, /"event":"file_sanitized"/);
     assert.match(ingestionLog, /"nulCharsRemoved":1/);
@@ -93,6 +176,9 @@ async function main() {
     const searchResult = searchEvents.find(event => event.type === "result")?.value;
     assert.ok(searchResult.hits.length >= 1);
     assert.match(searchResult.hits[0].text, /QuasarPump calibration value is 42/);
+    assert.equal(searchResult.hits[0].sourceId, retrievalSource.id);
+    assert.equal(searchResult.hits[0].sourceHealthState, "healthy");
+    assert.match(searchResult.hits[0].citation.text, /retrieval-probe\.md/);
 
     const createContextEvents = [];
     for await (const event of registeredTool.executor.execute({
@@ -142,6 +228,9 @@ async function main() {
     });
     assert.match(hookResult.ephemeral[0].text, /Workspace RAG context/);
     assert.match(hookResult.ephemeral[0].text, /QuasarPump calibration value is 42/);
+    assert.match(hookResult.ephemeral[0].text, /Source id: source:/);
+    assert.match(hookResult.ephemeral[0].text, /Citation: .*retrieval-probe\.md/);
+    assert.equal(hookResult.markers[0].data.hits[0].sourceId, retrievalSource.id);
 
     await plugin.teardown?.();
   } finally {

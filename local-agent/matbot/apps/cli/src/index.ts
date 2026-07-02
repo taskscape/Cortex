@@ -550,7 +550,7 @@ class FileWorkspaceManager implements CortexWorkspaceManager {
     return path.resolve(path.dirname(this.registryPath), workspace.configPath);
   }
 
-  async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string): Promise<void> {
+  async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string, options: { before?: string } = {}): Promise<void> {
     const registry = await this.load();
     const rootDir = path.dirname(this.rootConfigPath);
     for (const workspace of registry.workspaces) {
@@ -559,7 +559,12 @@ class FileWorkspaceManager implements CortexWorkspaceManager {
       const specifier = path.resolve(configPath) === path.resolve(this.rootConfigPath)
         ? rootRelativeSpecifier
         : yamlSingleQuoted(yamlPath(path.resolve(rootDir, rootRelativeSpecifier)));
-      await addPluginToConfigIfMissing(configPath, specifier);
+      const beforeSpecifier = options.before === undefined
+        ? undefined
+        : path.resolve(configPath) === path.resolve(this.rootConfigPath)
+          ? options.before
+          : yamlSingleQuoted(yamlPath(path.resolve(rootDir, options.before)));
+      await addPluginToConfigIfMissing(configPath, specifier, beforeSpecifier);
     }
   }
 
@@ -609,10 +614,20 @@ class FileWorkspaceManager implements CortexWorkspaceManager {
   }
 }
 
-async function addPluginToConfigIfMissing(configPath: string, specifier: string): Promise<void> {
+async function addPluginToConfigIfMissing(configPath: string, specifier: string, beforeSpecifier?: string): Promise<void> {
   const text = await readFile(configPath, 'utf8');
   if (text.includes(`- ${specifier}`)) return;
   let updated: string;
+  if (beforeSpecifier !== undefined) {
+    const beforeLine = new RegExp(`^([ \\t]*)- ${escapeRegExp(beforeSpecifier)}[ \\t]*$`, 'm');
+    const match = beforeLine.exec(text);
+    if (match?.index !== undefined) {
+      const indent = match[1] ?? '  ';
+      updated = text.slice(0, match.index) + `${indent}- ${specifier}\n` + text.slice(match.index);
+      await writeFile(configPath, updated, 'utf8');
+      return;
+    }
+  }
   const blockMatch = text.match(/^(plugins:\s*\n(?:[ \t]+-[^\n]*\n)*)/m);
   if (blockMatch) {
     const at = blockMatch.index! + blockMatch[0].length;
@@ -621,6 +636,10 @@ async function addPluginToConfigIfMissing(configPath: string, specifier: string)
     updated = `${text.trimEnd()}\n\nplugins:\n  - ${specifier}\n`;
   }
   await writeFile(configPath, updated, 'utf8');
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
 }
 
 function printHelp(): void {
@@ -967,6 +986,9 @@ async function main(): Promise<void> {
       : path.join(path.dirname(requestedConfigPath), 'cortex-workspaces.json');
     workspaceManager = new FileWorkspaceManager(registryPath, requestedConfigPath);
     await workspaceManager.ensurePluginInAllWorkspaces('./plugins/file-broker');
+    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/source-registry', {
+      before: './packages/plugins/workspace-rag',
+    });
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workspace-rag');
     configPath = await workspaceManager.selectConfigPath();
     process.chdir(path.dirname(configPath));

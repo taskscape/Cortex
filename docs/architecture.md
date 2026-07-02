@@ -14,6 +14,7 @@ Cortex is layered rather than monolithic.
 | Provider layer | Converts Matbot messages/tools into model API requests. | `providers.openai-compat` |
 | Plugin layer | Adds capabilities such as sessions, skills, triggers, memory, RAG, expert panel, and workspace files. | `plugins:` in `matbot.yaml` |
 | Retrieval layer | Pulls context from remembered facts, KnowledgeIndex, Mem0, file-index, workspace RAG, and expert files. | `contextual_search`, `workspace_rag`, `expert_panel` |
+| Source/provenance layer | Tracks durable source ids, source versions, freshness, health, citation policy, and source access events. | `source-registry`, `source_action`, `SourceRegistry` |
 | Local services | Host-side indexing, host file access, and Mem0. | ports `8877`, `8878`, `8888` |
 | Persistence layer | Stores sessions, files, skills, facts, RAG indexes, and service data. | `.data`, Docker volumes, JSON stores |
 
@@ -58,6 +59,7 @@ Persistence is deliberately split:
 | Provider/plugin config | One Cortex workspace | that workspace's `matbot.yaml` |
 | Provider secrets | One Cortex workspace | that workspace's `.env` |
 | Sessions, files, stores, memories, skills | One Cortex workspace | that workspace's `.data` |
+| Source registry records, versions, health events, and access events | One Cortex workspace through Matbot stores | `sources`, `source_versions`, `source_health_events`, `source_access_events` |
 | Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
 | Workspace RAG vectors/metadata/chunks | Cortex local Docker stack | Postgres/pgvector schema and tables |
 | Workspace RAG JSON fallback | One Cortex workspace | `.data\workspace-rag\index.json` |
@@ -90,13 +92,53 @@ There are three common plugin categories in this repository:
 | Category | Examples | Pattern |
 | --- | --- | --- |
 | Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
-| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, and policy-aware host-file access. |
+| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, and policy-aware host-file access. |
 | Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
 
 Bundled plugins may exist in the tree without being active. They become active
 only when listed in the active workspace's `matbot.yaml`. That distinction is
 important when debugging errors like `workspace_rag plugin unavailable`: the code
 can exist on disk while the running workspace did not load it.
+
+### Strategic Architecture Progress
+
+The implementation roadmap in `strategic_architecture.md` is being delivered as
+ordered, committable slices. Completed build-sequence items:
+
+| Item | Status | Implemented behavior |
+| --- | --- | --- |
+| Source Registry MVP | Complete | `source-registry` registers `SourceRegistry` and `source_action`; sources have stable ids, versions, freshness state, health state, citation policy, health events, and access events; workspace RAG writes source records for indexed markdown and derived knowledge entries; workspace RAG retrieval hits include source ids, health/freshness state, and citation text. |
+
+Remaining strategic architecture items still build on this foundation: connector
+fabric, source health monitor primitives beyond workspace RAG, structured data
+reasoning, workflow run ledger, automation shadow mode, context graph, workflow
+compiler, and enterprise expert-panel review records.
+
+### Source Registry
+
+The source registry is Cortex's first strategic architecture primitive. It gives
+retrieval and future automation a stable source identity layer instead of relying
+only on matched text or file paths.
+
+The `source-registry` plugin registers:
+
+- `SourceRegistry`: a service for writing and querying source records, source
+  versions, health events, access events, and citation metadata.
+- `source_action`: a model/UI-facing inspection tool with `list`, `get`,
+  `health`, `stale`, `citation`, and `events` actions.
+
+Workspace RAG is the first producer. During markdown ingestion it creates:
+
+- one source record per markdown file, keyed by workspace, connector type, and
+  normalized context path;
+- one source version per content hash;
+- health events for successful reads, read failures, and sources that disappear
+  from configured markdown paths.
+
+Workspace RAG retrieval then enriches hits with source id, source health,
+freshness, and citation text. The per-turn screen hook includes that metadata in
+the injected RAG context and in durable marker data, so a later audit can connect
+an answer back to the exact source registry record.
 
 ### Memory System
 
@@ -109,6 +151,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Skills | Reusable markdown playbooks and long-term operating knowledge. | `skill_action` |
 | KnowledgeIndex | Search interface over skills, Mem0, and file-index results. | `KnowledgeIndex` service |
 | Workspace RAG | Markdown files configured for the current workspace. | `workspace_rag` |
+| Source registry | Source identity, freshness, health, citations, and retrieval provenance. | `SourceRegistry`, `source_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:
@@ -336,6 +379,7 @@ problems:
 | Host file index | Configured host roots | Broad project file search and metadata. | `file-index`, `hybrid-knowledge-index` |
 | File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` service, `file_broker_action` tool |
 | Workspace RAG | One Cortex workspace | Grounding every conversation in selected markdown folders. | `workspace-rag` |
+| Source registry | One Cortex workspace | Stable source ids, versions, freshness, health, citations, and retrieval provenance. | `source-registry` |
 | Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
 | Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
 | Expert knowledge roots | One expert definition | Isolated domain expertise. | `expert-panel` |
