@@ -105,6 +105,26 @@ When synthesis is enabled, the final answer includes:
 When synthesis is disabled, Cortex returns only the selected expert opinions.
 This is useful when you want to compare raw perspectives yourself.
 
+## Structured Reviews
+
+The same tool also supports durable business review records through
+`expert_panel` with `action: "review"`. This path is intended for Decision
+Dossiers, workflows, workflow runs, alerts, investigations, and other decisions
+that need an audit trail.
+
+A review record stores:
+
+- target type and optional target id, workflow id, workflow run id, or dossier id;
+- review mode, such as quick review, full approval review, red-team review,
+  pre-automation review, or post-incident review;
+- each expert's recommendation, confidence, evidence ids, risks, blockers,
+  mitigations, and approval checklist;
+- consensus, disagreements, blockers, mitigations, risk register, source ids,
+  status, and synthesis.
+
+Use `action: "get_review"` with a `reviewId` to retrieve one review, or
+`action: "list_reviews"` to list stored review artifacts.
+
 ## Reading The Result
 
 The answer is rendered in the normal chat transcript. A typical expert-panel
@@ -140,7 +160,14 @@ Each expert has its own knowledge roots. In the default setup:
 
 - Design knowledge lives under `local-agent\knowledge\design`.
 - Finance knowledge lives under `local-agent\knowledge\finance`.
+- Legal knowledge lives under `local-agent\knowledge\legal`.
+- Security knowledge lives under `local-agent\knowledge\security`.
+- Operations knowledge lives under `local-agent\knowledge\operations`.
+- Data quality knowledge lives under `local-agent\knowledge\data-quality`.
+- Customer impact knowledge lives under `local-agent\knowledge\customer-impact`.
+- Compliance knowledge lives under `local-agent\knowledge\compliance`.
 - Engineering knowledge lives under `local-agent\knowledge\engineering`.
+- Change management knowledge lives under `local-agent\knowledge\change-management`.
 
 When the panel runs, each expert searches only its own configured files. That
 keeps perspectives separated. For example, the Design Expert does not retrieve
@@ -200,11 +227,13 @@ Flow:
    system prompt, question, and expert-scoped citations.
 7. If `synthesize` is `true`, a final orchestrator call collates consensus,
    disagreement, assumptions, risks, and recommendation.
-8. The formatted panel result is persisted as a normal assistant message and
+8. If `action` is `review`, the plugin writes an `expert_panel_reviews` record
+   with structured expert outputs and target links.
+9. The formatted panel result is persisted as a normal assistant message and
    rendered from the same session transcript used by ordinary chat.
 
-This keeps design, finance, and engineering knowledge isolated while still
-running inside one Matbot process.
+This keeps each expert's knowledge isolated while still running inside one
+Matbot process.
 
 ## Adding Or Changing Experts
 

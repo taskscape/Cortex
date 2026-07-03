@@ -37,7 +37,7 @@ export interface ValidationError {
 
 export interface ApprovalGate {
   id: string;
-  type: 'action' | 'stale_source' | 'low_confidence' | 'cost' | 'risk';
+  type: 'action' | 'stale_source' | 'low_confidence' | 'cost' | 'risk' | 'expert_review';
   message?: string;
   threshold?: number;
   requiredRiskLevel?: WorkflowRiskLevel;
@@ -699,6 +699,7 @@ function defaultApprovalGates(riskLevel: WorkflowRiskLevel, proposals: readonly 
   }
   if (sourceIds.length > 0) gates.push({ id: 'approve-stale-source', type: 'stale_source' });
   if (riskAtLeast(riskLevel, 'high')) gates.push({ id: 'approve-risk', type: 'risk', requiredRiskLevel: 'high' });
+  if (riskAtLeast(riskLevel, 'high')) gates.push({ id: 'structured-expert-review', type: 'expert_review', requiredRiskLevel: 'high' });
   if (proposals.some(proposal => proposal.confidence !== undefined && proposal.confidence < 0.8)) {
     gates.push({ id: 'approve-low-confidence', type: 'low_confidence', threshold: 0.8 });
   }
@@ -844,7 +845,7 @@ function validateDefinitionShape(input: WorkflowDefinitionInput | WorkflowDefini
   }
   for (const [index, gate] of (input.approvalGates ?? []).entries()) {
     if (!gate.id) errors.push({ path: `$.approvalGates[${index}].id`, message: 'Approval gate id is required.' });
-    if (!['action', 'stale_source', 'low_confidence', 'cost', 'risk'].includes(gate.type)) {
+    if (!['action', 'stale_source', 'low_confidence', 'cost', 'risk', 'expert_review'].includes(gate.type)) {
       errors.push({ path: `$.approvalGates[${index}].type`, message: 'Unsupported approval gate type.' });
     }
   }
@@ -1537,6 +1538,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
         gateId: riskGate.id,
         principalId: run.principalId,
         message: riskGate.message ?? `Workflow risk level ${definition.riskLevel} requires approval.`,
+      });
+    }
+    const expertReviewGate = gates.find(gate => gate.type === 'expert_review' && riskAtLeast(definition.riskLevel, gate.requiredRiskLevel ?? 'high'));
+    if (expertReviewGate !== undefined) {
+      await addRequest({
+        gateId: expertReviewGate.id,
+        principalId: run.principalId,
+        message: expertReviewGate.message ?? `Workflow risk level ${definition.riskLevel} requires a structured expert review linked to run ${run.id}.`,
       });
     }
     const staleGate = gates.find(gate => gate.type === 'stale_source');

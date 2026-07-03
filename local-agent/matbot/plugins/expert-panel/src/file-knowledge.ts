@@ -17,7 +17,11 @@ const TEXT_EXTENSIONS = new Set([
 const MAX_FILE_BYTES = 1_000_000;
 
 export class FileExpertKnowledge {
-  constructor(private readonly expert: ExpertConfig) {}
+  private readonly expert: ExpertConfig;
+
+  constructor(expert: ExpertConfig) {
+    this.expert = expert;
+  }
 
   async search(query: string, limit: number, signal: AbortSignal): Promise<ExpertSource[]> {
     const files = await listTextFiles(this.expert.roots, signal);

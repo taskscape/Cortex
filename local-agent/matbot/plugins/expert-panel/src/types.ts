@@ -36,10 +36,31 @@ export interface ToolRegistry {
   register(tool: Tool): void;
 }
 
+export type StoreQuery =
+  | {
+      where?: StoreFilter;
+      sort?: Array<{ field: string | string[]; dir?: "asc" | "desc" }>;
+      limit?: number;
+    }
+  | undefined;
+
+export type StoreFilter =
+  | { op: "eq"; field: string | string[]; value: unknown }
+  | { op: "and"; clauses: StoreFilter[] }
+  | { op: "or"; clauses: StoreFilter[] };
+
+export interface Store<T extends { id: string; version: string }> {
+  get(id: string): Promise<T | null>;
+  set(id: string, value: T): Promise<void>;
+  query(query?: StoreQuery): Promise<{ items: T[]; total: number }>;
+}
+
 export interface MatbotMachine {
   singleTurn(req: SingleTurnRequest): Promise<CompletionResponse>;
   tools: ToolRegistry;
   providers: ReadonlyMap<string, unknown>;
+  createStore?<T extends { id: string; version: string }>(namespace: string): Store<T>;
+  register?(key: string, value: unknown): Promise<void> | void;
 }
 
 export interface MatbotPluginSpec {
@@ -82,4 +103,67 @@ export interface ExpertOpinion {
     score: number;
   }>;
   usage: { inputTokens: number; outputTokens: number };
+}
+
+export type ExpertReviewMode =
+  | "quick_review"
+  | "full_approval_review"
+  | "red_team_review"
+  | "pre_automation_review"
+  | "post_incident_review";
+
+export type ExpertReviewTargetType =
+  | "decision_dossier"
+  | "workflow"
+  | "alert"
+  | "investigation"
+  | "chat"
+  | "other";
+
+export type ExpertReviewStatus = "draft" | "under_review" | "approved" | "rejected" | "needs_changes";
+export type ExpertRecommendation = "approve" | "approve_with_changes" | "block" | "needs_more_evidence";
+export type ExpertRiskSeverity = "low" | "medium" | "high" | "critical";
+
+export interface StructuredExpertOpinion extends ExpertOpinion {
+  recommendation: ExpertRecommendation;
+  confidence: number;
+  evidenceIds: string[];
+  risks: string[];
+  blockers: string[];
+  mitigations: string[];
+  approvalChecklist: string[];
+}
+
+export interface ExpertRiskRegisterItem {
+  id: string;
+  severity: ExpertRiskSeverity;
+  description: string;
+  ownerExpertId?: string;
+  mitigation?: string;
+}
+
+export interface ExpertReviewRecord {
+  id: string;
+  version: string;
+  createdAt: string;
+  updatedAt: string;
+  question: string;
+  mode: "parallel" | "review" | "debate";
+  reviewMode: ExpertReviewMode;
+  targetType: ExpertReviewTargetType;
+  status: ExpertReviewStatus;
+  expertIds: string[];
+  experts: StructuredExpertOpinion[];
+  sourceIds: string[];
+  consensus: string[];
+  disagreements: string[];
+  blockers: string[];
+  mitigations: string[];
+  approvalChecklist: string[];
+  riskRegister: ExpertRiskRegisterItem[];
+  synthesis?: string;
+  targetId?: string;
+  workflowId?: string;
+  workflowRunId?: string;
+  dossierId?: string;
 }

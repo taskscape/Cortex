@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+await import("../local-agent/matbot/apps/cli/register.js");
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workflow-governance/src/index.ts");
 const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
 const { plugin: connectorFabricPlugin } = await import("../local-agent/matbot/packages/plugins/connector-fabric/src/index.ts");
@@ -207,6 +208,7 @@ async function main() {
   assert.deepEqual(compiled.published.definition.inputSchema.required.sort(), ["customerName", "ticketId"]);
   assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "action"));
   assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "risk"));
+  assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "expert_review"));
   assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "low_confidence"));
   assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "cost"));
   assert.equal(compiled.dryRun.mode, "dry_run");
@@ -248,6 +250,7 @@ async function main() {
         { id: "approve-action", type: "action" },
         { id: "approve-stale-source", type: "stale_source" },
         { id: "approve-risk", type: "risk", requiredRiskLevel: "high" },
+        { id: "structured-expert-review", type: "expert_review", requiredRiskLevel: "high" },
       ],
       dryRunDefault: true,
       tests: [{ name: "ticket id required", inputs: { ticketId: "T-123" }, expected: { status: "waiting_for_approval" } }],
@@ -371,7 +374,8 @@ async function main() {
 
   const pending = await collectTool(workflowTool, { action: "list_approvals" });
   const runApprovals = pending.approvals.filter(approval => approval.runId === started.id);
-  assert.ok(runApprovals.length >= 3, "action, risk, and stale-source approvals should be requested");
+  assert.ok(runApprovals.length >= 4, "action, risk, stale-source, and expert-review approvals should be requested");
+  assert.ok(runApprovals.some(approval => approval.gateId === "structured-expert-review"));
 
   const blockedOutsideTool = await services.WorkflowRunner.evaluateToolPolicy(
     "workspace_rag",

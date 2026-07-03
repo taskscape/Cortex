@@ -809,9 +809,9 @@ type WorkflowRunEvent = {
 - [x] Integrate with source registry:
   - [x] required evidence resolves source ids and source versions.
   - [x] workflow output cites evidence.
-- [ ] Integrate with expert panel:
-  - [ ] high-risk workflows can require structured expert reviews.
-  - [ ] reviews are durable artifacts linked to the run.
+- [x] Integrate with expert panel:
+  - [x] high-risk workflows can require structured expert reviews.
+  - [x] reviews are durable artifacts linked to the run.
 - [ ] Add WebUI surfaces:
   - [ ] workflow library.
   - [ ] run ledger.
@@ -942,13 +942,73 @@ source ids, input hints, and tool calls, and the compiler produces a validated
 workflow definition plus an optional dry-run. Richer model-assisted inference,
 UI review, schedules, and editable diffs remain future work.
 
+## 8. Enterprise Expert Panel Upgrade
+
+### Target
+
+Expand the existing expert panel into a governed review layer for decisions,
+workflows, alerts, and investigations, with business-role experts and durable
+structured review artifacts.
+
+### Tasklist
+
+- [x] Extend `expert_panel` actions:
+  - [x] `review`.
+  - [x] `get_review`.
+  - [x] `list_reviews`.
+- [x] Add durable `expert_panel_reviews` records:
+  - [x] review id/version/timestamps.
+  - [x] review mode and target type.
+  - [x] target id, workflow id, workflow run id, and dossier id links.
+  - [x] structured expert opinions.
+  - [x] source ids.
+  - [x] consensus and disagreements.
+  - [x] blockers and mitigations.
+  - [x] approval checklist.
+  - [x] risk register.
+  - [x] synthesis.
+- [x] Add structured expert output fields:
+  - [x] recommendation.
+  - [x] confidence.
+  - [x] evidence ids.
+  - [x] risks.
+  - [x] blockers.
+  - [x] mitigations.
+  - [x] approval checklist.
+- [x] Add business expert definitions:
+  - [x] finance.
+  - [x] legal.
+  - [x] security.
+  - [x] operations.
+  - [x] data quality.
+  - [x] customer impact.
+  - [x] compliance.
+  - [x] engineering.
+  - [x] change management.
+- [x] Add expert-specific knowledge roots for business review roles.
+- [x] Integrate with workflow governance:
+  - [x] expert reviews can link to workflow ids and workflow run ids.
+  - [x] workflows support an `expert_review` approval gate.
+  - [x] compiled high-risk workflows include a structured expert-review gate.
+- [x] Add Node tests for structured reviews, review lookup/listing, business
+  expert configuration, and workflow expert-review gates.
+- [ ] Add WebUI expert review cards for durable review records.
+- [ ] Add manual review-status editing and reviewer assignment UI.
+- [ ] Add source-registry citation resolution in expert review records.
+
+MVP note: this slice keeps structured review extraction deterministic over the
+expert answers and citations already produced by the panel. It does not yet add
+review-card UI, reviewer assignment, or direct source-registry citation
+resolution; those remain future review-surface work.
+
 ## Suggested Build Sequence
 
 Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
 Health Monitor primitives, Structured Data Reasoning MVP, Workflow Run Ledger,
 Automation Shadow Mode MVP, Context Graph MVP, and Workflow Compiler MVP are
-complete as the first committable slices. The next build-sequence item is the
-Enterprise Expert Panel upgrade.
+complete, and the Enterprise Expert Panel upgrade is now complete. All current
+build-sequence items in this document have been implemented as committable
+slices.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -972,7 +1032,7 @@ Enterprise Expert Panel upgrade.
 8. Workflow Compiler MVP. Complete.
    - Compile selected chat/investigation evidence into workflow definitions and
      tests.
-9. Enterprise Expert Panel upgrade.
+9. Enterprise Expert Panel upgrade. Complete.
    - Structured expert outputs linked to dossiers, workflows, and approvals.
 
 ## Cross-Cutting Implementation Notes

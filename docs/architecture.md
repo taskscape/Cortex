@@ -115,9 +115,9 @@ ordered, committable slices. Completed build-sequence items:
 | Automation Shadow Mode MVP | Complete | `workflow-governance` now stores `workflow_shadow_comparisons`; shadow recommendations are hashed with inputs, evidence, and proposed actions, compared against human labels with deterministic accepted/rejected/mixed/unlabeled outcomes, and exposed through `compare_shadow_result` and `shadow_report` for per-workflow acceptance summaries. |
 | Context Graph MVP | Complete | `context-graph` registers `ContextGraph` and `context_graph_action`; entities, relationship assertions, extraction runs, and Neo4j projection operations are store-backed; workspace RAG enqueues deterministic source extraction after source version writes; graph retrieval expands source-backed facts within depth/relationship budgets and filters relationships from denied sources before results reach the model. |
 | Workflow Compiler MVP | Complete | `workflow-governance` now registers `WorkflowCompiler`; `workflow_action.compile` converts selected transcript text, input hints, source ids, and tool calls into a validated workflow definition, optional published version, persisted compilation record, and optional dry-run smoke test. |
+| Enterprise Expert Panel Upgrade | Complete | `expert-panel` now supports durable structured review records through `expert_panel.review`, `get_review`, and `list_reviews`; reviews link to workflows, workflow runs, dossiers, alerts, investigations, or chats and include structured expert recommendations, confidence, evidence ids, risks, blockers, mitigations, approval checklists, risk registers, consensus, disagreements, and synthesis. |
 
-Remaining strategic architecture items still build on this foundation:
-enterprise expert-panel review records.
+All current build-sequence items in `strategic_architecture.md` are complete.
 
 ### Source Registry
 
@@ -655,3 +655,33 @@ This gives three useful behaviors:
 - citations stay scoped to each expert's configured files;
 - the orchestrator can collate consensus, disagreement, risks, assumptions, and
   a recommendation.
+
+The Enterprise Expert Panel upgrade adds a durable review path on top of the
+same isolated expert execution. `expert_panel.review` runs selected experts,
+structures each opinion into recommendation, confidence, evidence ids, risks,
+blockers, mitigations, and approval checklist fields, then stores an
+`expert_panel_reviews` artifact.
+
+Review records can link to:
+
+- decision dossiers;
+- workflow definitions;
+- workflow runs;
+- alerts;
+- investigations;
+- ordinary chat decisions.
+
+Each review also stores consensus, disagreements, blockers, mitigations, a risk
+register, source ids, synthesis text, target metadata, review mode, and review
+status. `expert_panel.get_review` and `expert_panel.list_reviews` expose those
+records for audit and future review surfaces.
+
+Default business review roles now include finance, legal, security, operations,
+data quality, customer impact, compliance, engineering, and change management.
+Each role has its own knowledge root and system prompt, preserving the expert
+isolation model.
+
+Workflow governance recognizes an `expert_review` approval gate. Compiled
+high-risk workflows include this gate by default, and expert reviews can carry
+both `workflowId` and `workflowRunId` links so a pre-automation review can be
+audited with the run ledger.
