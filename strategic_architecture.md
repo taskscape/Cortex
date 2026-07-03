@@ -829,8 +829,8 @@ type WorkflowRunEvent = {
 MVP note: this slice implements the workflow run ledger, schema validation,
 approval records, source evidence references, dry-run/shadow semantics, and
 workflow-scoped connector policy. It does not yet execute arbitrary multi-step
-workflow plans or call models inside workflow steps; those remain part of the
-later workflow compiler and automation execution hardening work.
+workflow plans or call models inside workflow steps; those remain automation
+execution hardening work after the compiler MVP.
 
 ### Technical Notes
 
@@ -885,14 +885,70 @@ exact recommendation, evidence, and proposed action metadata that was evaluated.
 
 MVP note: this slice keeps shadow mode deterministic and store-backed. It does
 not execute automation actions or generate model explanations for mismatches;
-those remain future workflow compiler and review-surface work.
+those remain future automation execution and review-surface work.
+
+## 7. Workflow Compiler MVP
+
+### Target
+
+Convert a selected chat, investigation, or repeated tool-use pattern into a
+typed workflow draft with inputs, evidence, allowed tools, approval gates,
+tests, versioning, and optional dry-run.
+
+### Tasklist
+
+- [x] Add deterministic workflow compiler primitives inside
+  `workflow-governance`.
+- [x] Register `WorkflowCompiler` service:
+  - [x] stable compilation ids.
+  - [x] `compile`.
+  - [x] `getCompilation`.
+  - [x] `queryCompilations`.
+- [x] Add `workflow_compilations` store with:
+  - [x] compiler version.
+  - [x] input hash.
+  - [x] generated definition.
+  - [x] validation results.
+  - [x] source ids.
+  - [x] proposed actions.
+  - [x] sample inputs.
+  - [x] published workflow id/version.
+  - [x] dry-run id.
+- [x] Add `workflow_action` compiler actions:
+  - [x] `compile`.
+  - [x] `get_compilation`.
+  - [x] `compilations`.
+- [x] Infer workflow draft fields from selected evidence:
+  - [x] workflow name and purpose.
+  - [x] typed input schema from explicit input hints and `{{placeholders}}`.
+  - [x] required source evidence from selected source ids.
+  - [x] allowed tools and connector instances from supplied tool calls.
+  - [x] risk level from requested tool capabilities.
+  - [x] approval gates for write/admin actions, stale sources, high risk, low confidence, and cost.
+  - [x] dry-run smoke test and success metrics.
+- [x] Publish compiled workflows through `WorkflowRegistry`.
+- [x] Run optional dry-run smoke tests through `WorkflowRunner`.
+- [x] Update connector-fabric action metadata for compiler actions.
+- [x] Add Node tests for compile, publish, dry-run, compilation lookup/listing,
+  and connector policy classification.
+- [ ] Add WebUI compile wizard for selecting chat ranges and reviewing diffs.
+- [ ] Add model-assisted inference for richer step, branch, and failure-handling suggestions.
+- [ ] Add workflow version diff UI.
+- [ ] Add background schedule integration.
+
+MVP note: this slice is deterministic and review-first. It does not call a model
+to invent hidden workflow behavior; callers provide selected transcript text,
+source ids, input hints, and tool calls, and the compiler produces a validated
+workflow definition plus an optional dry-run. Richer model-assisted inference,
+UI review, schedules, and editable diffs remain future work.
 
 ## Suggested Build Sequence
 
 Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
 Health Monitor primitives, Structured Data Reasoning MVP, Workflow Run Ledger,
-Automation Shadow Mode MVP, and Context Graph MVP are complete as the first
-committable slices. The next build-sequence item is Workflow Compiler MVP.
+Automation Shadow Mode MVP, Context Graph MVP, and Workflow Compiler MVP are
+complete as the first committable slices. The next build-sequence item is the
+Enterprise Expert Panel upgrade.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -913,7 +969,7 @@ committable slices. The next build-sequence item is Workflow Compiler MVP.
 7. Context Graph MVP. Complete.
    - Entity and relationship extraction from source records and workspace RAG,
      Neo4j projection, graph retrieval with source permission filtering.
-8. Workflow Compiler MVP.
+8. Workflow Compiler MVP. Complete.
    - Compile selected chat/investigation evidence into workflow definitions and
      tests.
 9. Enterprise Expert Panel upgrade.

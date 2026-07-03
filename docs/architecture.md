@@ -114,9 +114,10 @@ ordered, committable slices. Completed build-sequence items:
 | Workflow Run Ledger | Complete | `workflow-governance` registers `WorkflowRegistry`, `WorkflowRunner`, and `workflow_action`; workflow definitions, versions, eval cases, runs, run events, and approvals are store-backed; runs validate typed inputs, resolve evidence source ids and versions, record ordered events, separate proposed and executed actions, support dry-run and shadow modes, request approval gates, and restrict connector tool calls by active workflow allow-lists. |
 | Automation Shadow Mode MVP | Complete | `workflow-governance` now stores `workflow_shadow_comparisons`; shadow recommendations are hashed with inputs, evidence, and proposed actions, compared against human labels with deterministic accepted/rejected/mixed/unlabeled outcomes, and exposed through `compare_shadow_result` and `shadow_report` for per-workflow acceptance summaries. |
 | Context Graph MVP | Complete | `context-graph` registers `ContextGraph` and `context_graph_action`; entities, relationship assertions, extraction runs, and Neo4j projection operations are store-backed; workspace RAG enqueues deterministic source extraction after source version writes; graph retrieval expands source-backed facts within depth/relationship budgets and filters relationships from denied sources before results reach the model. |
+| Workflow Compiler MVP | Complete | `workflow-governance` now registers `WorkflowCompiler`; `workflow_action.compile` converts selected transcript text, input hints, source ids, and tool calls into a validated workflow definition, optional published version, persisted compilation record, and optional dry-run smoke test. |
 
 Remaining strategic architecture items still build on this foundation:
-workflow compiler and enterprise expert-panel review records.
+enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -252,7 +253,7 @@ The seeded local bindings cover the current Cortex data tools:
 | Local File Broker | `file_broker_action` | `health`, `list`, and `read` are read; `write` is write and redacts returned `content`. |
 | Local MCP Fabric | `mcp_action`, `mcp__*` | MCP server list is read; add/remove and delegated MCP tools are admin until per-server metadata exists. |
 | Local Postgres Read-Only | `structured_data_action` | Catalog and planning reads are read; semantic-model edits and approval are admin; execution is read-only and still requires a query approval token. |
-| Local Workflow Governance | `workflow_action` | Validation, inspection, run lists, and approval lists are read; drafts, run starts, dry-runs, and shadow labels are write; approve/reject is admin. |
+| Local Workflow Governance | `workflow_action` | Validation, inspection, run lists, approval lists, and compilation lists are read; compile, drafts, run starts, dry-runs, and shadow labels are write; approve/reject is admin. |
 | Local Context Graph | `context_graph_action` | List/search/retrieve/projection-log actions are read; entity upserts, relationship assertions, and source extraction are write with the `context-graph-write` approval policy. |
 
 The CLI inserts `connector-fabric` into each Cortex workspace before
@@ -308,9 +309,13 @@ The `workflow-governance` plugin registers:
 - `WorkflowRunner`: a run ledger and deterministic state-transition service for
   typed inputs, evidence resolution, proposed actions, approvals, shadow labels,
   and workflow-scoped tool policy.
-- `workflow_action`: a tool with `draft`, `validate`, `dry_run`, `start`,
-  `approve`, `reject`, `label_shadow_result`, `compare_shadow_result`,
-  `shadow_report`, `inspect_run`, `list_runs`, and `list_approvals` actions.
+- `WorkflowCompiler`: a deterministic compiler that turns selected transcript
+  text, source ids, input hints, and tool calls into workflow definitions,
+  persisted compilation records, and optional dry-run smoke tests.
+- `workflow_action`: a tool with `compile`, `get_compilation`,
+  `compilations`, `draft`, `validate`, `dry_run`, `start`, `approve`,
+  `reject`, `label_shadow_result`, `compare_shadow_result`, `shadow_report`,
+  `inspect_run`, `list_runs`, and `list_approvals` actions.
 
 Workflow definitions carry an input JSON Schema subset, source and connector
 allow-lists, allowed tools, required evidence, risk level, approval gates,
@@ -348,6 +353,34 @@ labels score `0`, ambiguous or conflicting labels score `0.5`, and unlabeled
 runs score `0`. `shadow_report` returns all comparisons plus aggregate counts
 and acceptance rates overall and by workflow id.
 
+### Workflow Compiler
+
+The workflow compiler is the promotion path from useful conversation to durable
+automation. The MVP is deterministic and review-first: callers provide selected
+transcript text, source ids, input hints, tool calls, and sample inputs; the
+compiler generates the workflow definition without inventing hidden behavior.
+
+`workflow_action.compile` can return a draft only, publish it through
+`WorkflowRegistry`, and optionally start a dry-run smoke test through
+`WorkflowRunner`. Each compile writes a `workflow_compilations` record with the
+compiler version, input hash, generated definition, validation errors, source
+ids, tool names, proposed actions, sample inputs, published workflow id/version,
+and dry-run id when present.
+
+The deterministic compiler infers:
+
+- workflow name and purpose from explicit fields or selected transcript text;
+- typed input schema from explicit `inputHints` and `{{placeholders}}`;
+- required evidence from selected source ids;
+- allowed tools and connector instances from supplied tool calls;
+- risk level from requested tool capabilities;
+- approval gates for write/admin actions, source freshness, high risk, low
+  confidence, and cost;
+- a dry-run smoke test plus default success metrics.
+
+Model-assisted inference, chat-range selection UI, editable workflow diffs, and
+background schedule integration remain future compiler work.
+
 ### Memory System
 
 Cortex memory is not a single bucket. It is several layers with different jobs:
@@ -363,7 +396,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Source health monitor | Store-backed health reports and stale/unhealthy source warnings. | `source_health_action`, `source_health_reports` |
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Structured data | Semantic table/metric catalog, query plans, approval tokens, and query-run provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action` |
-| Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, shadow labels, and shadow comparison records. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action` |
+| Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, shadow labels, shadow comparison records, and compiled workflow drafts. | `WorkflowRegistry`, `WorkflowRunner`, `WorkflowCompiler`, `workflow_action` |
 | Context graph | Source-backed entities, relationship assertions, extraction runs, and graph projection operations. | `ContextGraph`, `context_graph_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 

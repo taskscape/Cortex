@@ -17,6 +17,7 @@ declare module '@matatbread/matbot-plugin-api' {
   interface MatbotServices {
     readonly WorkflowRegistry?: WorkflowRegistry;
     readonly WorkflowRunner?: WorkflowRunner;
+    readonly WorkflowCompiler?: WorkflowCompiler;
   }
 }
 
@@ -27,6 +28,7 @@ export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected';
 export type WorkflowActionStatus = 'proposed' | 'approved' | 'rejected' | 'blocked' | 'executed';
 export type ConnectorCapability = 'read' | 'write' | 'admin';
 export type ShadowComparisonOutcome = 'accepted' | 'rejected' | 'mixed' | 'unlabeled';
+export type WorkflowCompilationStatus = 'drafted' | 'published' | 'dry_run_completed' | 'failed';
 
 export interface ValidationError {
   path: string;
@@ -257,6 +259,82 @@ export interface WorkflowShadowSummary {
   }>;
 }
 
+export interface WorkflowCompilerMessage {
+  role?: string;
+  text?: string;
+  content?: unknown;
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  sourceIds?: string[];
+  timestamp?: string;
+}
+
+export type WorkflowInputHint = {
+  name: string;
+  type?: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
+  description?: string;
+  required?: boolean;
+  sample?: unknown;
+};
+
+export type WorkflowCompilerToolCall = {
+  toolName: string;
+  input?: Record<string, unknown>;
+  capability?: ConnectorCapability;
+  connectorInstanceId?: string;
+  sourceIds?: string[];
+  reason?: string;
+  confidence?: number;
+  costEstimateUsd?: number;
+};
+
+export type WorkflowCompileInput = {
+  workspaceId: string;
+  name?: string;
+  purpose?: string;
+  transcript?: string;
+  messages?: WorkflowCompilerMessage[];
+  sourceIds?: string[];
+  toolCalls?: WorkflowCompilerToolCall[];
+  inputHints?: WorkflowInputHint[];
+  riskLevel?: WorkflowRiskLevel;
+  approvalGates?: ApprovalGate[];
+  successMetrics?: string[];
+  publish?: boolean;
+  dryRun?: boolean;
+  sampleInputs?: Record<string, unknown>;
+  labels?: string[];
+};
+
+export interface WorkflowCompilation {
+  id: string;
+  version: string;
+  workspaceId: string;
+  status: WorkflowCompilationStatus;
+  compilerVersion: string;
+  inputHash: string;
+  definition: WorkflowDefinitionInput;
+  validation: ValidationError[];
+  sourceIds: string[];
+  toolNames: string[];
+  proposedActions: ActionProposalInput[];
+  sampleInputs: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  workflowId?: string;
+  workflowVersion?: string;
+  dryRunId?: string;
+  warnings?: string[];
+}
+
+export interface WorkflowCompileResult {
+  compilation: WorkflowCompilation;
+  definition: WorkflowDefinitionInput;
+  validation: ValidationError[];
+  published?: { definition: WorkflowDefinition; version: WorkflowVersion };
+  dryRun?: WorkflowRun;
+}
+
 export type StartWorkflowInput = {
   workflowId?: string;
   workflowName?: string;
@@ -303,6 +381,13 @@ export interface WorkflowRunner {
   listRuns(query?: StoreQuery): Promise<WorkflowRun[]>;
   listApprovals(query?: StoreQuery): Promise<WorkflowApproval[]>;
   evaluateToolPolicy(toolName: string, input: unknown, principal?: Principal): Promise<WorkflowPolicyDecision>;
+}
+
+export interface WorkflowCompiler {
+  stableCompilationId(input: WorkflowCompileInput): string;
+  compile(input: WorkflowCompileInput): Promise<WorkflowCompileResult>;
+  getCompilation(id: string): Promise<WorkflowCompilation | null>;
+  queryCompilations(query?: StoreQuery): Promise<WorkflowCompilation[]>;
 }
 
 interface SourceRegistryLike {
@@ -375,7 +460,9 @@ const EVENT_STORE = 'workflow_run_events';
 const APPROVAL_STORE = 'workflow_approvals';
 const EVAL_CASE_STORE = 'workflow_eval_cases';
 const SHADOW_COMPARISON_STORE = 'workflow_shadow_comparisons';
+const COMPILATION_STORE = 'workflow_compilations';
 const RISK_ORDER: WorkflowRiskLevel[] = ['low', 'medium', 'high', 'critical'];
+const WORKFLOW_COMPILER_VERSION = 'deterministic-workflow-compiler-v1';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -457,6 +544,216 @@ function emptyShadowSummary(): WorkflowShadowSummary {
     acceptanceRate: 0,
     byWorkflow: [],
   };
+}
+
+function messageText(message: WorkflowCompilerMessage): string {
+  if (typeof message.text === 'string') return message.text;
+  if (typeof message.content === 'string') return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content.map(item => {
+      if (typeof item === 'string') return item;
+      if (isPlainRecord(item) && typeof item['text'] === 'string') return item['text'];
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  return '';
+}
+
+function compileText(input: WorkflowCompileInput): string {
+  return [
+    input.purpose ?? '',
+    input.transcript ?? '',
+    ...(input.messages ?? []).map(messageText),
+    ...(input.toolCalls ?? []).map(call => `${call.toolName} ${canonicalJson(call.input ?? {})}`),
+  ].filter(Boolean).join('\n');
+}
+
+function sentenceFragment(text: string): string {
+  const first = text.split(/\r?\n|[.!?]/).map(item => item.trim()).find(Boolean) ?? '';
+  return first.replace(/[`*_#:[\](){}]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function titleFromText(text: string): string {
+  const words = sentenceFragment(text).split(/\s+/).filter(Boolean).slice(0, 7);
+  const title = words.map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+  return title || 'Compiled Workflow';
+}
+
+function inferWorkflowName(input: WorkflowCompileInput): string {
+  if (input.name !== undefined && input.name.trim()) return input.name.trim();
+  return titleFromText(input.purpose ?? input.transcript ?? compileText(input));
+}
+
+function inferWorkflowPurpose(input: WorkflowCompileInput): string | undefined {
+  if (input.purpose !== undefined && input.purpose.trim()) return input.purpose.trim();
+  const fragment = sentenceFragment(input.transcript ?? compileText(input));
+  return fragment ? `Compiled from selected conversation: ${fragment}` : undefined;
+}
+
+function inputHintsFromText(text: string): WorkflowInputHint[] {
+  const placeholders = [...text.matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g)].map(match => match[1] ?? '');
+  return uniq(placeholders).map(name => ({ name, type: 'string' as const, required: true }));
+}
+
+function cleanInputName(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'input';
+}
+
+function normalizeInputHints(input: WorkflowCompileInput): WorkflowInputHint[] {
+  const explicit = input.inputHints ?? [];
+  const inferred = inputHintsFromText(compileText(input));
+  const byName = new Map<string, WorkflowInputHint>();
+  for (const hint of [...inferred, ...explicit]) {
+    const name = cleanInputName(hint.name);
+    const key = normalizeName(name);
+    byName.set(key, {
+      name,
+      type: hint.type ?? byName.get(key)?.type ?? 'string',
+      ...(hint.description ?? byName.get(key)?.description !== undefined ? { description: (hint.description ?? byName.get(key)?.description)! } : {}),
+      required: hint.required ?? byName.get(key)?.required ?? true,
+      ...(hint.sample ?? byName.get(key)?.sample !== undefined ? { sample: (hint.sample ?? byName.get(key)?.sample)! } : {}),
+    });
+  }
+  return [...byName.values()];
+}
+
+function schemaForInputHints(hints: readonly WorkflowInputHint[]): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  for (const hint of hints) {
+    properties[hint.name] = {
+      type: hint.type ?? 'string',
+      ...(hint.description !== undefined ? { description: hint.description } : {}),
+    };
+    if (hint.required !== false) required.push(hint.name);
+  }
+  return {
+    type: 'object',
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+  };
+}
+
+function defaultSampleForType(type: WorkflowInputHint['type']): unknown {
+  if (type === 'number') return 1;
+  if (type === 'integer') return 1;
+  if (type === 'boolean') return true;
+  if (type === 'array') return [];
+  if (type === 'object') return {};
+  return 'sample';
+}
+
+function sampleInputsForCompile(input: WorkflowCompileInput, hints: readonly WorkflowInputHint[]): Record<string, unknown> {
+  const sample: Record<string, unknown> = {};
+  for (const hint of hints) {
+    sample[hint.name] = hint.sample ?? defaultSampleForType(hint.type);
+  }
+  return { ...sample, ...(input.sampleInputs ?? {}) };
+}
+
+function compileSourceIds(input: WorkflowCompileInput): string[] {
+  return uniq([
+    ...(input.sourceIds ?? []),
+    ...(input.messages ?? []).flatMap(message => message.sourceIds ?? []),
+    ...(input.toolCalls ?? []).flatMap(call => call.sourceIds ?? []),
+  ]);
+}
+
+function compileToolCalls(input: WorkflowCompileInput): WorkflowCompilerToolCall[] {
+  const direct = input.toolCalls ?? [];
+  const messageCalls = (input.messages ?? [])
+    .filter(message => message.toolName !== undefined)
+    .map(message => ({
+      toolName: message.toolName!,
+      ...(message.toolInput !== undefined ? { input: message.toolInput } : {}),
+      ...(message.sourceIds !== undefined ? { sourceIds: message.sourceIds } : {}),
+    }));
+  return [...direct, ...messageCalls];
+}
+
+function compiledProposals(input: WorkflowCompileInput): ActionProposalInput[] {
+  return compileToolCalls(input).map(call => ({
+    toolName: call.toolName,
+    input: call.input ?? {},
+    capability: call.capability ?? inferCapability(call.input ?? {}),
+    sourceIds: uniq(call.sourceIds ?? []),
+    ...(call.connectorInstanceId !== undefined ? { connectorInstanceId: call.connectorInstanceId } : {}),
+    ...(call.reason !== undefined ? { reason: call.reason } : {}),
+    ...(call.confidence !== undefined ? { confidence: call.confidence } : {}),
+    ...(call.costEstimateUsd !== undefined ? { costEstimateUsd: call.costEstimateUsd } : {}),
+  }));
+}
+
+function inferCompilerRisk(input: WorkflowCompileInput, proposals: readonly ActionProposalInput[]): WorkflowRiskLevel {
+  if (input.riskLevel !== undefined) return input.riskLevel;
+  if (proposals.some(proposal => proposal.capability === 'admin')) return 'critical';
+  if (proposals.some(proposal => proposal.capability === 'write')) return 'high';
+  if (compileSourceIds(input).length > 0) return 'medium';
+  return 'low';
+}
+
+function defaultApprovalGates(riskLevel: WorkflowRiskLevel, proposals: readonly ActionProposalInput[], sourceIds: readonly string[]): ApprovalGate[] {
+  const gates: ApprovalGate[] = [];
+  if (proposals.some(proposal => proposal.capability !== 'read')) {
+    gates.push({ id: 'approve-action', type: 'action' });
+  }
+  if (sourceIds.length > 0) gates.push({ id: 'approve-stale-source', type: 'stale_source' });
+  if (riskAtLeast(riskLevel, 'high')) gates.push({ id: 'approve-risk', type: 'risk', requiredRiskLevel: 'high' });
+  if (proposals.some(proposal => proposal.confidence !== undefined && proposal.confidence < 0.8)) {
+    gates.push({ id: 'approve-low-confidence', type: 'low_confidence', threshold: 0.8 });
+  }
+  if (proposals.some(proposal => proposal.costEstimateUsd !== undefined && proposal.costEstimateUsd > 0)) {
+    gates.push({ id: 'approve-cost', type: 'cost', threshold: 0 });
+  }
+  return gates;
+}
+
+function compileWorkflowDefinition(input: WorkflowCompileInput): {
+  definition: WorkflowDefinitionInput;
+  sourceIds: string[];
+  proposals: ActionProposalInput[];
+  sampleInputs: Record<string, unknown>;
+  warnings: string[];
+} {
+  const text = compileText(input);
+  const hints = normalizeInputHints(input);
+  const sourceIds = compileSourceIds(input);
+  const proposals = compiledProposals(input);
+  const riskLevel = inferCompilerRisk(input, proposals);
+  const sampleInputs = sampleInputsForCompile(input, hints);
+  const toolNames = uniq(proposals.map(proposal => proposal.toolName));
+  const connectorIds = uniq(proposals.map(proposal => proposal.connectorInstanceId ?? '').filter(Boolean));
+  const purpose = inferWorkflowPurpose(input);
+  const warnings: string[] = [];
+  if (toolNames.length === 0) warnings.push('No tool calls were supplied; compiled workflow will only validate inputs and evidence.');
+  if (sourceIds.length === 0) warnings.push('No source ids were supplied; compiled workflow has no required evidence yet.');
+  if (hints.length === 0) warnings.push('No input hints or {{placeholders}} were found; compiled workflow accepts an empty input object.');
+  const definition: WorkflowDefinitionInput = {
+    workspaceId: input.workspaceId,
+    name: inferWorkflowName(input),
+    inputSchema: schemaForInputHints(hints),
+    allowedSourceIds: sourceIds,
+    allowedConnectorInstanceIds: connectorIds,
+    allowedTools: toolNames,
+    requiredEvidence: sourceIds.length > 0 ? [{ name: 'compiled-evidence', minCitations: sourceIds.length }] : [],
+    riskLevel,
+    approvalGates: input.approvalGates ?? defaultApprovalGates(riskLevel, proposals, sourceIds),
+    dryRunDefault: true,
+    tests: [{
+      name: 'compiled dry-run smoke test',
+      inputs: sampleInputs,
+      expected: {
+        mode: 'dry_run',
+        proposedActionCount: proposals.length,
+        requiredEvidenceCount: sourceIds.length,
+      },
+    }],
+    successMetrics: uniq(input.successMetrics ?? ['dry_run_success_rate', 'approval_acceptance_rate']),
+    ...(purpose !== undefined ? { description: purpose } : {}),
+    ...(input.labels !== undefined && input.labels.length > 0 ? { triggerSchema: { type: 'object', properties: { labels: { type: 'array' } } } } : {}),
+  };
+  if (text.trim().length === 0 && input.name === undefined) warnings.push('Compilation input did not include transcript text; used a generic workflow name.');
+  return { definition, sourceIds, proposals, sampleInputs, warnings };
 }
 
 function principalId(): string {
@@ -1297,6 +1594,116 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
   }
 }
 
+class StoreBackedWorkflowCompiler implements WorkflowCompiler {
+  private readonly registry: WorkflowRegistry;
+  private readonly runner: WorkflowRunner;
+  private readonly compilations: Store<WorkflowCompilation>;
+
+  constructor(registry: WorkflowRegistry, runner: WorkflowRunner, compilations: Store<WorkflowCompilation>) {
+    this.registry = registry;
+    this.runner = runner;
+    this.compilations = compilations;
+  }
+
+  stableCompilationId(input: WorkflowCompileInput): string {
+    return hashId('workflow-compilation', [
+      input.workspaceId,
+      normalizeName(inferWorkflowName(input)),
+      hashPayload({
+        purpose: input.purpose,
+        transcript: input.transcript,
+        messages: input.messages ?? [],
+        sourceIds: compileSourceIds(input),
+        toolCalls: compileToolCalls(input),
+        inputHints: input.inputHints ?? [],
+        sampleInputs: input.sampleInputs ?? {},
+      }),
+    ]);
+  }
+
+  async compile(input: WorkflowCompileInput): Promise<WorkflowCompileResult> {
+    const existing = await this.compilations.get(this.stableCompilationId(input));
+    const timestamp = nowIso();
+    const compiled = compileWorkflowDefinition(input);
+    let validation = this.registry.validateDefinition(compiled.definition);
+    let status: WorkflowCompilationStatus = 'drafted';
+    let published: { definition: WorkflowDefinition; version: WorkflowVersion; validation: ValidationError[] } | undefined;
+    let dryRun: WorkflowRun | undefined;
+    const warnings = [...compiled.warnings];
+
+    if (input.publish === true && validation.length === 0) {
+      published = await this.registry.upsertDefinition(compiled.definition);
+      validation = published.validation;
+      status = validation.length === 0 ? 'published' : 'failed';
+    } else if (input.publish !== true && input.dryRun === true) {
+      warnings.push('dryRun was requested without publish=true; no run was created.');
+    }
+
+    if (input.dryRun === true && published !== undefined && validation.length === 0) {
+      try {
+        dryRun = await this.runner.startRun({
+          workspaceId: input.workspaceId,
+          workflowId: published.definition.id,
+          mode: 'dry_run',
+          inputs: compiled.sampleInputs,
+          evidenceSourceIds: compiled.sourceIds,
+          proposedActions: compiled.proposals,
+          labels: input.labels ?? [],
+        });
+        status = dryRun.status === 'succeeded' ? 'dry_run_completed' : 'failed';
+        if (dryRun.error !== undefined) warnings.push(dryRun.error);
+      } catch (error) {
+        status = 'failed';
+        warnings.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const compilation: WorkflowCompilation = {
+      id: this.stableCompilationId(input),
+      version: randomUUID(),
+      workspaceId: input.workspaceId,
+      status,
+      compilerVersion: WORKFLOW_COMPILER_VERSION,
+      inputHash: hashPayload({
+        purpose: input.purpose,
+        transcript: input.transcript,
+        messages: input.messages ?? [],
+        sourceIds: compiled.sourceIds,
+        toolCalls: compileToolCalls(input),
+        inputHints: input.inputHints ?? [],
+        sampleInputs: compiled.sampleInputs,
+      }),
+      definition: compiled.definition,
+      validation,
+      sourceIds: compiled.sourceIds,
+      toolNames: uniq(compiled.proposals.map(proposal => proposal.toolName)),
+      proposedActions: compiled.proposals,
+      sampleInputs: compiled.sampleInputs,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      ...(published !== undefined ? { workflowId: published.definition.id, workflowVersion: published.definition.version } : {}),
+      ...(dryRun !== undefined ? { dryRunId: dryRun.id } : {}),
+      ...(warnings.length > 0 ? { warnings: uniq(warnings) } : {}),
+    };
+    await this.compilations.set(compilation.id, compilation);
+    return {
+      compilation,
+      definition: compiled.definition,
+      validation,
+      ...(published !== undefined ? { published } : {}),
+      ...(dryRun !== undefined ? { dryRun } : {}),
+    };
+  }
+
+  getCompilation(id: string): Promise<WorkflowCompilation | null> {
+    return this.compilations.get(id);
+  }
+
+  queryCompilations(query?: StoreQuery): Promise<WorkflowCompilation[]> {
+    return queryAll(this.compilations, query);
+  }
+}
+
 function inferCapability(input: unknown): ConnectorCapability {
   if (!isPlainRecord(input)) return 'read';
   const action = String(input['action'] ?? '').toLowerCase();
@@ -1319,11 +1726,26 @@ function extractConnectorInstanceId(input: unknown): string | undefined {
 
 interface WorkflowActionInput {
   action: string;
+  compile?: WorkflowCompileInput;
+  compilationId?: string;
   definition?: WorkflowDefinitionInput;
   workflowId?: string;
   workflowName?: string;
   workflowVersion?: string;
   workspaceId?: string;
+  name?: string;
+  purpose?: string;
+  transcript?: string;
+  messages?: WorkflowCompilerMessage[];
+  sourceIds?: string[];
+  toolCalls?: WorkflowCompilerToolCall[];
+  inputHints?: WorkflowInputHint[];
+  riskLevel?: WorkflowRiskLevel;
+  approvalGates?: ApprovalGate[];
+  successMetrics?: string[];
+  publish?: boolean;
+  dryRun?: boolean;
+  sampleInputs?: Record<string, unknown>;
   mode?: WorkflowRunMode;
   inputs?: Record<string, unknown>;
   evidenceSourceIds?: string[];
@@ -1337,22 +1759,37 @@ interface WorkflowActionInput {
   query?: StoreQuery;
 }
 
-function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRunner): Tool {
+function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRunner, compiler: WorkflowCompiler): Tool {
   return {
     name: 'workflow_action',
     description:
-      'Draft and validate governed workflow definitions, create dry-run/shadow/approval-gated workflow runs, inspect the run ledger, and approve or reject pending workflow actions.\n\n' +
-      'Actions: draft, validate, dry_run, start, approve, reject, label_shadow_result, compare_shadow_result, shadow_report, inspect_run, list_runs, list_approvals.',
+      'Compile, draft, and validate governed workflow definitions, create dry-run/shadow/approval-gated workflow runs, inspect the run ledger, and approve or reject pending workflow actions.\n\n' +
+      'Actions: compile, get_compilation, compilations, draft, validate, dry_run, start, approve, reject, label_shadow_result, compare_shadow_result, shadow_report, inspect_run, list_runs, list_approvals.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'compare_shadow_result', 'shadow_report', 'inspect_run', 'list_runs', 'list_approvals'] },
+        action: { type: 'string', enum: ['compile', 'get_compilation', 'compilations', 'draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'compare_shadow_result', 'shadow_report', 'inspect_run', 'list_runs', 'list_approvals'] },
+        compile: { type: 'object' },
+        compilationId: { type: 'string' },
         definition: { type: 'object' },
         workflowId: { type: 'string' },
         workflowName: { type: 'string' },
         workflowVersion: { type: 'string' },
         workspaceId: { type: 'string' },
+        name: { type: 'string' },
+        purpose: { type: 'string' },
+        transcript: { type: 'string' },
+        messages: { type: 'array', items: { type: 'object' } },
+        sourceIds: { type: 'array', items: { type: 'string' } },
+        toolCalls: { type: 'array', items: { type: 'object' } },
+        inputHints: { type: 'array', items: { type: 'object' } },
+        riskLevel: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
+        approvalGates: { type: 'array', items: { type: 'object' } },
+        successMetrics: { type: 'array', items: { type: 'string' } },
+        publish: { type: 'boolean' },
+        dryRun: { type: 'boolean' },
+        sampleInputs: { type: 'object' },
         mode: { type: 'string', enum: ['dry_run', 'shadow', 'approval_gated', 'execute'] },
         inputs: { type: 'object' },
         evidenceSourceIds: { type: 'array', items: { type: 'string' } },
@@ -1371,6 +1808,16 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
         const parsed = input && typeof input === 'object' ? input as WorkflowActionInput : { action: '' };
         try {
           switch (parsed.action) {
+            case 'compile':
+              yield { type: 'result', value: await compiler.compile(workflowCompileInputFromAction(parsed)) };
+              return;
+            case 'get_compilation':
+              if (parsed.compilationId === undefined) { yield { type: 'error', message: 'workflow_action get_compilation requires "compilationId".' }; return; }
+              yield { type: 'result', value: { compilation: await compiler.getCompilation(parsed.compilationId) } };
+              return;
+            case 'compilations':
+              yield { type: 'result', value: { compilations: await compiler.queryCompilations(parsed.query) } };
+              return;
             case 'draft':
               if (parsed.definition === undefined) { yield { type: 'error', message: 'workflow_action draft requires "definition".' }; return; }
               yield { type: 'result', value: await registry.upsertDefinition(parsed.definition) };
@@ -1441,6 +1888,28 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
   };
 }
 
+function workflowCompileInputFromAction(parsed: WorkflowActionInput): WorkflowCompileInput {
+  if (parsed.compile !== undefined) return parsed.compile;
+  if (parsed.workspaceId === undefined) throw new Error('workflow_action compile requires "workspaceId" or nested "compile.workspaceId".');
+  return {
+    workspaceId: parsed.workspaceId,
+    ...(parsed.name !== undefined ? { name: parsed.name } : {}),
+    ...(parsed.purpose !== undefined ? { purpose: parsed.purpose } : {}),
+    ...(parsed.transcript !== undefined ? { transcript: parsed.transcript } : {}),
+    ...(parsed.messages !== undefined ? { messages: parsed.messages } : {}),
+    ...(parsed.sourceIds !== undefined ? { sourceIds: parsed.sourceIds } : {}),
+    ...(parsed.toolCalls !== undefined ? { toolCalls: parsed.toolCalls } : {}),
+    ...(parsed.inputHints !== undefined ? { inputHints: parsed.inputHints } : {}),
+    ...(parsed.riskLevel !== undefined ? { riskLevel: parsed.riskLevel } : {}),
+    ...(parsed.approvalGates !== undefined ? { approvalGates: parsed.approvalGates } : {}),
+    ...(parsed.successMetrics !== undefined ? { successMetrics: parsed.successMetrics } : {}),
+    ...(parsed.publish !== undefined ? { publish: parsed.publish } : {}),
+    ...(parsed.dryRun !== undefined ? { dryRun: parsed.dryRun } : {}),
+    ...(parsed.sampleInputs !== undefined ? { sampleInputs: parsed.sampleInputs } : {}),
+    ...(parsed.labels !== undefined ? { labels: parsed.labels } : {}),
+  };
+}
+
 function startInput(parsed: WorkflowActionInput, mode?: WorkflowRunMode): StartWorkflowInput {
   if (parsed.workspaceId === undefined) throw new Error('workflow_action start requires "workspaceId".');
   return {
@@ -1508,17 +1977,27 @@ export function createWorkflowRunner(services: MatbotMachine, registry: Workflow
   );
 }
 
+export function createWorkflowCompiler(services: MatbotMachine, registry: WorkflowRegistry, runner: WorkflowRunner): WorkflowCompiler {
+  return new StoreBackedWorkflowCompiler(
+    registry,
+    runner,
+    services.createStore<WorkflowCompilation>(COMPILATION_STORE),
+  );
+}
+
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {
-    description: 'Registers WorkflowRegistry, WorkflowRunner, workflow_action, and workflow-scoped connector policy hooks.',
+    description: 'Registers WorkflowRegistry, WorkflowRunner, WorkflowCompiler, workflow_action, and workflow-scoped connector policy hooks.',
   },
   async setup(services: MatbotMachine) {
     const registry = createWorkflowRegistry(services);
     const runner = createWorkflowRunner(services, registry);
+    const compiler = createWorkflowCompiler(services, registry, runner);
     await services.register('WorkflowRegistry', registry);
     await services.register('WorkflowRunner', runner);
-    services.tools.register(createWorkflowActionTool(registry, runner));
+    await services.register('WorkflowCompiler', compiler);
+    services.tools.register(createWorkflowActionTool(registry, runner, compiler));
     registerWorkflowHooks(runner, services);
   },
 };

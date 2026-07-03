@@ -137,6 +137,7 @@ async function main() {
   assert.ok(workflowTool, "workflow_action should be registered");
   assert.ok(services.WorkflowRegistry, "WorkflowRegistry should be registered");
   assert.ok(services.WorkflowRunner, "WorkflowRunner should be registered");
+  assert.ok(services.WorkflowCompiler, "WorkflowCompiler should be registered");
 
   const invalidDefinition = await collectTool(workflowTool, {
     action: "validate",
@@ -172,6 +173,59 @@ async function main() {
     contentHash: "abc123",
     provenance: { activityId: "test-source" },
   });
+
+  const compiled = await collectTool(workflowTool, {
+    action: "compile",
+    workspaceId: "default",
+    name: "Compiled Ticket Followup",
+    purpose: "Gather ticket evidence and draft a follow-up for {{ticketId}} owned by {{customerName}}.",
+    transcript: "The analyst searched workspace notes, read the ticket source, then drafted a follow-up file for review.",
+    sourceIds: [source.id],
+    inputHints: [
+      { name: "ticketId", type: "string", required: true, sample: "T-123" },
+      { name: "customerName", type: "string", required: true, sample: "Acme" },
+    ],
+    toolCalls: [{
+      toolName: "file_broker_action",
+      input: { action: "write", path: "outbox/{{ticketId}}-followup.txt", content: "Draft for {{customerName}}" },
+      capability: "write",
+      connectorInstanceId: "connector-instance:file-broker:local",
+      sourceIds: [source.id],
+      reason: "Draft compiled follow-up artifact.",
+      confidence: 0.76,
+      costEstimateUsd: 0.01,
+    }],
+    publish: true,
+    dryRun: true,
+  });
+  assert.equal(compiled.compilation.status, "dry_run_completed");
+  assert.equal(compiled.validation.length, 0);
+  assert.equal(compiled.published.definition.name, "Compiled Ticket Followup");
+  assert.equal(compiled.published.definition.allowedTools.includes("file_broker_action"), true);
+  assert.equal(compiled.published.definition.allowedConnectorInstanceIds.includes("connector-instance:file-broker:local"), true);
+  assert.deepEqual(compiled.published.definition.allowedSourceIds, [source.id]);
+  assert.deepEqual(compiled.published.definition.inputSchema.required.sort(), ["customerName", "ticketId"]);
+  assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "action"));
+  assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "risk"));
+  assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "low_confidence"));
+  assert.ok(compiled.published.definition.approvalGates.some(gate => gate.type === "cost"));
+  assert.equal(compiled.dryRun.mode, "dry_run");
+  assert.equal(compiled.dryRun.status, "succeeded");
+  assert.equal(compiled.dryRun.proposedActions.length, 1);
+  assert.equal(compiled.dryRun.proposedActions[0].input.workflowRunId, compiled.dryRun.id);
+  assert.equal(compiled.compilation.dryRunId, compiled.dryRun.id);
+
+  const compiledInspection = await collectTool(workflowTool, { action: "inspect_run", runId: compiled.dryRun.id });
+  assert.ok(compiledInspection.events.some(event => event.eventType === "dry_run_completed"));
+
+  const compilationLookup = await collectTool(workflowTool, {
+    action: "get_compilation",
+    compilationId: compiled.compilation.id,
+  });
+  assert.equal(compilationLookup.compilation.workflowId, compiled.published.definition.id);
+
+  const compilations = await collectTool(workflowTool, { action: "compilations" });
+  assert.ok(compilations.compilations.some(item => item.id === compiled.compilation.id));
 
   const draft = await collectTool(workflowTool, {
     action: "draft",
