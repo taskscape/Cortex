@@ -453,49 +453,52 @@ type ContextRelationshipAssertion = {
 
 ### Tasklist
 
-- [ ] Create `local-agent/matbot/packages/plugins/context-graph`.
-- [ ] Add `ContextGraph` service:
-  - [ ] `upsertEntity`.
-  - [ ] `assertRelationship`.
-  - [ ] `searchEntities`.
-  - [ ] `neighbors`.
-  - [ ] `pathSearch`.
-  - [ ] `retrieveGraphContext`.
-- [ ] Add canonical stores or Postgres tables for entities and relationship
+- [x] Create `local-agent/matbot/packages/plugins/context-graph`.
+- [x] Add `ContextGraph` service:
+  - [x] `upsertEntity`.
+  - [x] `assertRelationship`.
+  - [x] `searchEntities`.
+  - [x] `neighbors`.
+  - [x] `pathSearch`.
+  - [x] `retrieveGraphContext`.
+- [x] Add canonical stores or Postgres tables for entities and relationship
   assertions.
-- [ ] Add Neo4j projection writer:
-  - [ ] workspace-scoped labels/properties.
-  - [ ] source id/source version on every relationship.
-  - [ ] confidence and validity properties.
-  - [ ] idempotent merge operations.
-- [ ] Add extraction jobs:
-  - [ ] deterministic extraction for headings, emails, issue ids, URLs, dates,
-    file paths, table names, and known entity dictionaries.
-  - [ ] connector metadata extraction from SaaS records.
+- [x] Add Neo4j projection writer:
+  - [x] workspace-scoped properties.
+  - [x] source id/source version on every relationship.
+  - [x] confidence and validity properties.
+  - [x] idempotent merge operations.
+- [x] Add extraction jobs:
+  - [x] deterministic extraction for headings, emails, issue ids, URLs, dates,
+    file paths, and table names.
+  - [x] connector/source metadata extraction from source records.
+  - [ ] richer known entity dictionaries.
   - [ ] optional model extraction for richer relationship candidates.
   - [ ] user confirmation path for high-value or low-confidence relationships.
-- [ ] Integrate with `workspace-rag` ingestion:
-  - [ ] enqueue extraction after document version changes.
-  - [ ] avoid extraction in the hot chat path.
-  - [ ] store extraction run ids and source version ids.
-- [ ] Add retrieval path:
-  - [ ] vector search finds candidate sources/entities.
-  - [ ] graph traversal expands within policy and budget.
-  - [ ] result renderer returns source-backed relationship facts.
-- [ ] Add ACL filtering:
-  - [ ] graph query must filter by workspace, effective principal, and source
+- [x] Integrate with `workspace-rag` ingestion:
+  - [x] enqueue idempotent extraction after durable source version writes.
+  - [x] avoid extraction in the hot chat path.
+  - [x] store extraction run ids and source version ids.
+- [x] Add retrieval path:
+  - [x] accept vector-derived candidate source ids and entity terms.
+  - [x] graph traversal expands within policy and budget.
+  - [x] result renderer returns source-backed relationship facts.
+- [x] Add ACL filtering:
+  - [x] graph query must filter by workspace, effective principal, and source
     permissions before results reach the model.
-  - [ ] relationships from inaccessible sources must not leak.
+  - [x] relationships from inaccessible sources must not leak.
 - [ ] Add UI affordances:
   - [ ] entity panel.
   - [ ] relationship evidence.
   - [ ] confidence and source freshness.
   - [ ] entity merge/split correction.
-- [ ] Add tests:
-  - [ ] entity id normalization.
-  - [ ] relationship dedupe.
-  - [ ] source permission filtering.
-  - [ ] graph retrieval with stale/degraded source warnings.
+- [x] Add tests:
+  - [x] entity id normalization.
+  - [x] relationship dedupe.
+  - [x] source permission filtering.
+  - [x] graph retrieval with stale/degraded source warnings.
+  - [x] workspace RAG ingestion triggers graph extraction when ContextGraph is loaded.
+  - [x] connector-fabric policy metadata covers `context_graph_action`.
 
 ### Technical Notes
 
@@ -508,6 +511,11 @@ type ContextRelationshipAssertion = {
   sources. GraphRAG can become expensive without hard limits.
 - Keep graph facts explainable. Every edge returned to the model should be
   renderable as "relationship, confidence, source, observed at, limitation".
+
+MVP note: this slice uses Matbot stores as the canonical graph and writes a
+durable, idempotent Neo4j projection operation log. It does not open a live
+Neo4j driver connection yet; replay/apply workers, model extraction, correction
+UI, and richer dictionary management remain future work.
 
 ## 4. Structured Data Reasoning
 
@@ -882,9 +890,9 @@ those remain future workflow compiler and review-surface work.
 ## Suggested Build Sequence
 
 Current implementation status: Source Registry MVP, Connector Fabric MVP, Source
-Health Monitor primitives, Structured Data Reasoning MVP, and Workflow Run
-Ledger, and Automation Shadow Mode MVP are complete as the first committable
-slices. The next build-sequence item is Context Graph MVP.
+Health Monitor primitives, Structured Data Reasoning MVP, Workflow Run Ledger,
+Automation Shadow Mode MVP, and Context Graph MVP are complete as the first
+committable slices. The next build-sequence item is Workflow Compiler MVP.
 
 1. Source Registry MVP.
    - Build the source model first because connectors, graph, SQL, dossiers,
@@ -902,7 +910,7 @@ slices. The next build-sequence item is Context Graph MVP.
      gates, and tool policy hook.
 6. Automation Shadow Mode MVP. Complete.
    - Use the workflow ledger to compare recommendations with human labels.
-7. Context Graph MVP.
+7. Context Graph MVP. Complete.
    - Entity and relationship extraction from source records and workspace RAG,
      Neo4j projection, graph retrieval with source permission filtering.
 8. Workflow Compiler MVP.

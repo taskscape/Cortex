@@ -92,7 +92,7 @@ There are three common plugin categories in this repository:
 | Category | Examples | Pattern |
 | --- | --- | --- |
 | Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
-| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `connector-fabric`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, connector policy/audit, and policy-aware host-file access. |
+| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `connector-fabric`, `context-graph`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, connector policy/audit, source-backed graph facts, and policy-aware host-file access. |
 | Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
 
 Bundled plugins may exist in the tree without being active. They become active
@@ -113,9 +113,10 @@ ordered, committable slices. Completed build-sequence items:
 | Structured Data Reasoning MVP | Complete | `structured-data` registers `DataCatalog`, `SqlPlanner`, and `structured_data_action`; semantic table, column, metric, and query-run records are store-backed; deterministic planning emits Postgres SELECT SQL from approved semantic inputs only; validation rejects writes, cross joins, unknown columns, and missing row caps; execution requires an approval token, runs in a read-only transaction with statement timeout, and creates query-result source records. |
 | Workflow Run Ledger | Complete | `workflow-governance` registers `WorkflowRegistry`, `WorkflowRunner`, and `workflow_action`; workflow definitions, versions, eval cases, runs, run events, and approvals are store-backed; runs validate typed inputs, resolve evidence source ids and versions, record ordered events, separate proposed and executed actions, support dry-run and shadow modes, request approval gates, and restrict connector tool calls by active workflow allow-lists. |
 | Automation Shadow Mode MVP | Complete | `workflow-governance` now stores `workflow_shadow_comparisons`; shadow recommendations are hashed with inputs, evidence, and proposed actions, compared against human labels with deterministic accepted/rejected/mixed/unlabeled outcomes, and exposed through `compare_shadow_result` and `shadow_report` for per-workflow acceptance summaries. |
+| Context Graph MVP | Complete | `context-graph` registers `ContextGraph` and `context_graph_action`; entities, relationship assertions, extraction runs, and Neo4j projection operations are store-backed; workspace RAG enqueues deterministic source extraction after source version writes; graph retrieval expands source-backed facts within depth/relationship budgets and filters relationships from denied sources before results reach the model. |
 
 Remaining strategic architecture items still build on this foundation:
-context graph, workflow compiler, and enterprise expert-panel review records.
+workflow compiler and enterprise expert-panel review records.
 
 ### Source Registry
 
@@ -175,6 +176,52 @@ retrieved source is stale, expired, degraded, or down, the injected context now
 contains explicit warning lines, and the durable `workspace-rag` marker contains
 the same structured `sourceWarnings` array for future UI source panels.
 
+### Context Graph
+
+The context graph is Cortex's source-backed entity and relationship layer above
+vector retrieval. It keeps extracted graph facts explainable: every relationship
+assertion carries the source id, optional source version id, confidence,
+extraction method, and optional evidence span.
+
+The `context-graph` plugin registers:
+
+- `ContextGraph`: a store-backed service for `upsertEntity`,
+  `assertRelationship`, `searchEntities`, `neighbors`, `pathSearch`,
+  `retrieveGraphContext`, extraction-run queries, and projection-operation
+  queries.
+- `context_graph_action`: a model/UI-facing tool with `list`,
+  `upsert_entity`, `assert_relationship`, `extract_source`,
+  `search_entities`, `neighbors`, `path_search`, `retrieve`, and
+  `projection_log` actions.
+
+The MVP uses four canonical stores:
+
+- `context_graph_entities`;
+- `context_graph_relationship_assertions`;
+- `context_graph_extraction_runs`;
+- `context_graph_projection_ops`.
+
+Workspace RAG is the first producer. After it writes a durable source version
+for markdown or derived knowledge content, it calls `ContextGraph.ingestSource`
+with the source id, source version id, and extracted text. That work happens in
+the ingestion path, not in the hot per-turn chat retrieval hook. Deterministic
+extraction currently recognizes markdown headings, emails, issue ids, issue
+numbers, URLs, file paths, dates, and `schema.table` names, plus source metadata
+such as title, URI, connector type, document type, and known limitations.
+
+Graph retrieval accepts seed terms, seed entity ids, and vector-derived source
+ids. It searches candidate entities, expands neighbors within configured depth
+and relationship budgets, resolves citations through `SourceRegistry`, and
+returns source-backed facts with source health/freshness warnings when present.
+Relationships from denied sources are filtered before facts are returned, so an
+inaccessible source cannot leak through graph traversal.
+
+Neo4j integration is represented as a durable projection operation log for now.
+Each entity or relationship write enqueues an idempotent Cypher merge operation
+with workspace id, source id, source version id, confidence, extraction method,
+and validity properties. A future projection worker can replay this log against
+Neo4j without changing the canonical assertion model.
+
 ### Connector Fabric
 
 The connector fabric is Cortex's policy and audit layer around tools that read
@@ -206,6 +253,7 @@ The seeded local bindings cover the current Cortex data tools:
 | Local MCP Fabric | `mcp_action`, `mcp__*` | MCP server list is read; add/remove and delegated MCP tools are admin until per-server metadata exists. |
 | Local Postgres Read-Only | `structured_data_action` | Catalog and planning reads are read; semantic-model edits and approval are admin; execution is read-only and still requires a query approval token. |
 | Local Workflow Governance | `workflow_action` | Validation, inspection, run lists, and approval lists are read; drafts, run starts, dry-runs, and shadow labels are write; approve/reject is admin. |
+| Local Context Graph | `context_graph_action` | List/search/retrieve/projection-log actions are read; entity upserts, relationship assertions, and source extraction are write with the `context-graph-write` approval policy. |
 
 The CLI inserts `connector-fabric` into each Cortex workspace before
 `workspace-rag`, preserving existing local behavior through wildcard bootstrap
@@ -316,6 +364,7 @@ Cortex memory is not a single bucket. It is several layers with different jobs:
 | Connector fabric | Connector identity, grants, health, sync cursors, and tool-call audit. | `ConnectorRegistry`, `connector_action` |
 | Structured data | Semantic table/metric catalog, query plans, approval tokens, and query-run provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action` |
 | Workflow governance | Workflow definitions, immutable versions, event-sourced run ledgers, approvals, evidence references, shadow labels, and shadow comparison records. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action` |
+| Context graph | Source-backed entities, relationship assertions, extraction runs, and graph projection operations. | `ContextGraph`, `context_graph_action` |
 | Dream-time runs | Memory consolidation audit records. | `dream_time`, `dream_runs_action` |
 
 The "remember my name" flow is the simplest way to understand this:
@@ -544,6 +593,7 @@ problems:
 | File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` service, `file_broker_action` tool |
 | Workspace RAG | One Cortex workspace | Grounding every conversation in selected markdown folders. | `workspace-rag` |
 | Source registry | One Cortex workspace | Stable source ids, versions, freshness, health, citations, and retrieval provenance. | `source-registry` |
+| Context graph | One Cortex workspace | Source-backed entity relationships and multi-hop graph retrieval with ACL filtering. | `context-graph` |
 | Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
 | Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
 | Expert knowledge roots | One expert definition | Isolated domain expertise. | `expert-panel` |

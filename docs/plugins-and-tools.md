@@ -14,6 +14,7 @@ The active default plugin list is in `local-agent\matbot\matbot.yaml`.
 | `./packages/plugins/connector-fabric` | Connector records, grants, health, tool bindings, and audit events for connector-backed tools. | `ConnectorRegistry`, `connector_action`, connector policy/audit hooks. |
 | `./packages/plugins/structured-data` | Governed structured data catalog, semantic SQL planning, read-only Postgres execution, and query result provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action`. |
 | `./packages/plugins/workflow-governance` | Governed workflow definitions, event-sourced run ledger, approval gates, shadow labels/comparisons, and workflow-scoped connector policy. | `WorkflowRegistry`, `WorkflowRunner`, `workflow_action`, workflow policy/audit hooks. |
+| `./packages/plugins/context-graph` | Source-backed entity graph, deterministic extraction, relationship assertions, graph retrieval, and Neo4j projection operation logs. | `ContextGraph`, `context_graph_action`. |
 | `./packages/plugins/workspace-rag` | Workspace-scoped markdown RAG. | `workspace_rag`, automatic per-turn RAG context. |
 | `./packages/plugins/skills` | Persistent markdown skills/playbooks. | `skill_action`, skill editor UI. |
 | `./packages/plugins/triggers` | Data-driven automatic tool triggers. | Trigger management and automatic `remember_fact` firing. |

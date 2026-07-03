@@ -32,6 +32,7 @@ plugins:
   - ./packages/plugins/connector-fabric
   - ./packages/plugins/structured-data
   - ./packages/plugins/workflow-governance
+  - ./packages/plugins/context-graph
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers

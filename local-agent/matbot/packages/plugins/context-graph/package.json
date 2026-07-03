@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-context-graph",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "Source-backed context graph entities, relationship assertions, deterministic extraction, and graph retrieval.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

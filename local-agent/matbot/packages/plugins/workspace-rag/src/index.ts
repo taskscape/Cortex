@@ -192,6 +192,15 @@ interface SourceRegistryLike {
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitationLike>;
 }
 
+interface ContextGraphLike {
+  ingestSource(input: {
+    sourceId: string;
+    sourceVersionId?: string;
+    text?: string;
+    extractionMethod?: 'deterministic' | 'connector_metadata' | 'model_extracted' | 'user_confirmed';
+  }): Promise<unknown>;
+}
+
 interface SearchHit {
   workspaceId: string;
   contextName: string;
@@ -666,10 +675,12 @@ class WorkspaceRagManager {
   private disposed = false;
   private readonly activeConfigPath: string;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
+  private readonly contextGraph: ContextGraphLike | undefined;
 
-  constructor(activeConfigPath: string, sourceRegistry?: SourceRegistryLike) {
+  constructor(activeConfigPath: string, sourceRegistry?: SourceRegistryLike, contextGraph?: ContextGraphLike) {
     this.activeConfigPath = activeConfigPath;
     this.sourceRegistry = sourceRegistry;
+    this.contextGraph = contextGraph;
   }
 
   async start(): Promise<void> {
@@ -1068,7 +1079,7 @@ class WorkspaceRagManager {
         }
         const hash = sha256(content);
         const fileStat = await stat(file).catch(() => null);
-        await this.registerFileSource(workspace, context, normalized, fileStat?.mtime.toISOString() ?? nowIso(), hash);
+        await this.registerFileSource(workspace, context, normalized, fileStat?.mtime.toISOString() ?? nowIso(), hash, content);
         const existing = byContextPath.get(contextPathKey);
         if (existing?.hash === hash && documentMatchesVectorizer(existing, this.vectorizer.info)) continue;
         const chunks = chunkMarkdown(content);
@@ -1183,6 +1194,7 @@ class WorkspaceRagManager {
     normalizedPath: string,
     updatedAt: string,
     contentHash: string,
+    content: string,
   ): Promise<void> {
     if (this.sourceRegistry === undefined) return;
     const externalId = this.fileSourceExternalId(context.id, normalizedPath);
@@ -1206,7 +1218,7 @@ class WorkspaceRagManager {
         'Search hits are chunk-level excerpts, not full document reads.',
       ],
     });
-    await this.sourceRegistry.upsertVersion({
+    const version = await this.sourceRegistry.upsertVersion({
       sourceId: source.id,
       contentHash,
       observedAt: updatedAt,
@@ -1220,6 +1232,7 @@ class WorkspaceRagManager {
       checkedAt: nowIso(),
       message: 'Workspace RAG read and indexed this markdown source.',
     });
+    await this.extractContextGraphSource(workspace, source.id, version.id, content, 'deterministic');
   }
 
   private async registerKnowledgeSource(
@@ -1247,7 +1260,7 @@ class WorkspaceRagManager {
       lastSuccessfulReadAt: nowIso(),
       knownLimitations: ['Knowledge entries are indexed into workspace RAG as derived artifacts.'],
     });
-    await this.sourceRegistry.upsertVersion({
+    const version = await this.sourceRegistry.upsertVersion({
       sourceId: source.id,
       contentHash,
       observedAt: nowIso(),
@@ -1255,6 +1268,32 @@ class WorkspaceRagManager {
         activityId: `workspace-rag:${workspace.id}:${context.id}:knowledge-index`,
       },
     });
+    await this.extractContextGraphSource(
+      workspace,
+      source.id,
+      version.id,
+      `${entry.summary}\n${entry.entities.join('\n')}\n${entry.content}`,
+      'deterministic',
+    );
+  }
+
+  private async extractContextGraphSource(
+    workspace: WorkspaceRef,
+    sourceId: string,
+    sourceVersionId: string,
+    text: string,
+    extractionMethod: 'deterministic' | 'connector_metadata' | 'model_extracted' | 'user_confirmed',
+  ): Promise<void> {
+    if (this.contextGraph === undefined) return;
+    try {
+      await this.contextGraph.ingestSource({ sourceId, sourceVersionId, text, extractionMethod });
+    } catch (error) {
+      await this.log(workspace, 'context_graph_extract_error', {
+        sourceId,
+        sourceVersionId,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private async registerFileReadFailure(
@@ -1679,7 +1718,8 @@ export const plugin: MatbotPluginSpec = {
     if (!services.configPath) throw new Error('workspace-rag requires services.configPath.');
 
     const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
-    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry);
+    const contextGraph = services.get('ContextGraph' as never) as ContextGraphLike | undefined;
+    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry, contextGraph);
     activeManager = manager;
     await manager.start();
     await services.register('WorkspaceRagManager' as never, manager as never);

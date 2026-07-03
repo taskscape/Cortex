@@ -998,6 +998,9 @@ async function main(): Promise<void> {
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workflow-governance', {
       before: './packages/plugins/workspace-rag',
     });
+    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/context-graph', {
+      before: './packages/plugins/workspace-rag',
+    });
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workspace-rag');
     configPath = await workspaceManager.selectConfigPath();
     process.chdir(path.dirname(configPath));

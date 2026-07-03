@@ -1056,6 +1056,15 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       capabilities: ['read' as const, 'write' as const, 'admin' as const],
       description: 'Governed workflow definitions, run ledger, approval queue, and workflow policy checks.',
     },
+    {
+      id: 'connector-definition:context-graph',
+      type: 'context-graph',
+      displayName: 'Context Graph',
+      protocol: 'native' as const,
+      sourceTypes: ['context_entity', 'context_relationship', 'graph_projection'],
+      capabilities: ['read' as const, 'write' as const, 'admin' as const],
+      description: 'Source-backed business entity graph, relationship assertions, deterministic extraction, and Neo4j projection operations.',
+    },
   ];
 
   for (const definition of definitions) await registry.upsertDefinition(definition);
@@ -1067,6 +1076,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
     { id: 'connector-instance:mcp:local', definitionId: 'connector-definition:mcp', type: 'mcp', workspaceId: 'local', displayName: 'Local MCP Fabric', scopes: ['mcp:read', 'mcp:admin'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:postgres-readonly:local', definitionId: 'connector-definition:postgres-readonly', type: 'postgres-readonly', workspaceId: 'local', displayName: 'Local Postgres Read-Only', scopes: ['postgres:read'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:workflow-governance:local', definitionId: 'connector-definition:workflow-governance', type: 'workflow-governance', workspaceId: 'local', displayName: 'Local Workflow Governance', scopes: ['workflow:read', 'workflow:write', 'workflow:admin'], readEnabled: true, writeEnabled: true },
+    { id: 'connector-instance:context-graph:local', definitionId: 'connector-definition:context-graph', type: 'context-graph', workspaceId: 'local', displayName: 'Local Context Graph', scopes: ['context-graph:read', 'context-graph:write', 'context-graph:admin'], readEnabled: true, writeEnabled: true },
   ];
 
   for (const instance of instances) {
@@ -1215,6 +1225,29 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       sensitiveFields: ['inputs', 'proposedActions', 'approvalToken'],
       description: 'Governed workflow definition, run ledger, dry-run, shadow labeling/comparison, and approvals.',
     },
+    {
+      connectorInstanceId: 'connector-instance:context-graph:local',
+      toolName: 'context_graph_action',
+      capability: 'read',
+      sourceTypes: ['context_entity', 'context_relationship', 'graph_projection'],
+      sensitivity: 'confidential',
+      requiredScopes: ['context-graph:read'],
+      inputActionField: 'action',
+      actionCapabilities: {
+        list: 'read',
+        search_entities: 'read',
+        neighbors: 'read',
+        path_search: 'read',
+        retrieve: 'read',
+        projection_log: 'read',
+        upsert_entity: 'write',
+        assert_relationship: 'write',
+        extract_source: 'write',
+      },
+      approvalPolicyId: 'context-graph-write',
+      sensitiveFields: ['identifiers', 'evidenceSpan', 'parameters', 'text'],
+      description: 'Search, retrieve, extract, and maintain source-backed context graph assertions.',
+    },
   ];
 
   for (const binding of bindings) await registry.upsertToolBinding(binding);
@@ -1264,6 +1297,14 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       allowedTools: ['workflow_action'],
       approvalRules: ['workflow-governance-admin'],
       sensitiveFields: ['inputs', 'proposedActions', 'approvalToken'],
+    },
+    {
+      connectorInstanceId: 'connector-instance:context-graph:local',
+      principalId: '*',
+      scopes: ['*'],
+      allowedTools: ['context_graph_action'],
+      approvalRules: ['context-graph-write'],
+      sensitiveFields: ['identifiers', 'evidenceSpan', 'parameters', 'text'],
     },
   ];
 

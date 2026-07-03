@@ -131,6 +131,7 @@ async function main() {
   assert.ok(definitions.some(definition => definition.id === "connector-definition:workspace-rag"));
   assert.ok(definitions.some(definition => definition.id === "connector-definition:mcp"));
   assert.ok(definitions.some(definition => definition.id === "connector-definition:workflow-governance"));
+  assert.ok(definitions.some(definition => definition.id === "connector-definition:context-graph"));
 
   const workspaceRead = await registry.evaluateToolCall({
     toolName: "workspace_rag",
@@ -215,6 +216,23 @@ async function main() {
   });
   assert.equal(workflowApprove.allowed, true);
   assert.equal(workflowApprove.capability, "admin");
+
+  const contextRetrieve = await registry.evaluateToolCall({
+    toolName: "context_graph_action",
+    input: { action: "retrieve", workspaceId: "default", terms: ["ticket"] },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(contextRetrieve.allowed, true);
+  assert.equal(contextRetrieve.capability, "read");
+
+  const contextExtract = await registry.evaluateToolCall({
+    toolName: "context_graph_action",
+    input: { action: "extract_source", sourceId: "source:123", text: "OPS-123" },
+    principal: { id: "alice", type: "user" },
+  });
+  assert.equal(contextExtract.allowed, true);
+  assert.equal(contextExtract.capability, "write");
+  assert.equal(contextExtract.approvalPolicyId, "context-graph-write");
 
   await registry.upsertGrant({
     connectorInstanceId: "connector-instance:workspace-rag:local",

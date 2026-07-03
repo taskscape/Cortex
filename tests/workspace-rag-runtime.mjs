@@ -7,6 +7,7 @@ process.env.CORTEX_RAG_DISABLE_CUDA = "1";
 process.env.CORTEX_RAG_STORAGE = "json";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
 const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
+const { plugin: contextGraphPlugin } = await import("../local-agent/matbot/packages/plugins/context-graph/src/index.ts");
 
 class MemoryStore {
   constructor() {
@@ -116,11 +117,14 @@ async function main() {
     };
 
     await sourceRegistryPlugin.setup(services);
+    await contextGraphPlugin.setup(services);
     await plugin.setup(services);
     const registeredTool = tools.get("workspace_rag");
     const sourceTool = tools.get("source_action");
+    const contextGraphTool = tools.get("context_graph_action");
     assert.equal(registeredTool?.name, "workspace_rag");
     assert.equal(sourceTool?.name, "source_action");
+    assert.equal(contextGraphTool?.name, "context_graph_action");
     assert.equal(screenHook?.on, "screen");
 
     const toolCtx = { signal: new AbortController().signal };
@@ -160,6 +164,14 @@ async function main() {
     assert.equal(retrievalSource.connectorType, "workspace-rag");
     assert.equal(retrievalSource.sourceKind, "document");
     assert.equal(retrievalSource.healthState, "healthy");
+
+    const graphListEvents = [];
+    for await (const event of contextGraphTool.executor.execute({ action: "list" }, toolCtx)) {
+      graphListEvents.push(event);
+    }
+    const graphListResult = graphListEvents.find(event => event.type === "result")?.value;
+    assert.ok(graphListResult.extractionRuns.some(run => run.sourceId === retrievalSource.id && run.status === "succeeded"));
+    assert.ok(graphListResult.relationships.some(relationship => relationship.sourceId === retrievalSource.id && relationship.sourceVersionId !== undefined));
 
     const ingestionLog = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "ingestion.log"), "utf8");
     assert.match(ingestionLog, /"event":"file_sanitized"/);

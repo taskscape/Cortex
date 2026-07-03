@@ -181,6 +181,7 @@ plugins:
   - ./packages/plugins/connector-fabric
   - ./packages/plugins/structured-data
   - ./packages/plugins/workflow-governance
+  - ./packages/plugins/context-graph
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills
   - ./packages/plugins/triggers
@@ -214,6 +215,8 @@ plans can create source records and run through connector policy.
 `workflow-governance` loads after source, connector, and structured-data services
 so workflow runs can resolve evidence, inherit connector policy metadata, and
 restrict connector-backed tool calls by workflow allow-lists.
+`context-graph` loads before `workspace-rag` so markdown ingestion can enqueue
+source-backed entity and relationship extraction after source version writes.
 `frontend/web` loads last so the WebUI sees the complete tool and plugin catalog.
 
 ## Providers
@@ -351,8 +354,8 @@ Matbot process with `CORTEX_WORKSPACE_ID`.
 The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
 conversation. It is installed by default in `matbot.yaml`, and the CLI ensures
 `source-registry`, `connector-fabric`, `structured-data`,
-`workflow-governance`, and `workspace-rag` are present in every workspace config
-when Matbot starts.
+`workflow-governance`, `context-graph`, and `workspace-rag` are present in every
+workspace config when Matbot starts.
 
 RAG configuration lives next to the active workspace config:
 
@@ -386,6 +389,7 @@ The ingestion manager:
 - scans the active workspace first, then scans inactive workspaces from `cortex-workspaces.json` serially in the background;
 - indexes markdown files under configured paths;
 - chunks markdown, hashes document content, and stores chunk text, metadata, and vectors in Postgres/pgvector;
+- writes source records and versions, then invokes `ContextGraph.ingestSource` when the context graph plugin is loaded;
 - re-indexes changed files when the markdown hash changes;
 - removes deleted markdown files from the index;
 - writes changed documents incrementally, so ingestion does not serialize one giant JSON file at the end;
