@@ -25,6 +25,42 @@ const runningTurns = new Map();
 let workspaceSeq = 1;
 let rememberedFactSeq = 1;
 const rememberedFacts = new Map();
+let queryRunSeq = 1;
+let workflowRunSeq = 1;
+let expertReviewSeq = 1;
+const queryRuns = new Map();
+const workflowRuns = new Map();
+const workflowApprovals = new Map();
+const expertReviews = new Map();
+
+const architectureSource = {
+  id: "source:playwright-architecture-brief",
+  version: "source-record-version-1",
+  workspaceId: "default",
+  connectorType: "workspace-rag",
+  connectorInstanceId: "connector-instance:workspace-rag:local",
+  externalId: "default:docs/architecture.md",
+  uri: "C:/Projects/Cortex/docs/architecture.md",
+  title: "architecture.md",
+  sourceKind: "document",
+  sensitivity: "internal",
+  permissionState: "allowed",
+  trustLevel: "high",
+  citationPolicy: "cite_path",
+  healthState: "degraded",
+  stalenessState: "stale",
+  lastObservedAt: now(),
+  lastSuccessfulReadAt: "2026-01-01T00:00:00.000Z",
+  knownLimitations: ["Harness source intentionally reports stale/degraded state."]
+};
+const architectureSourceVersion = {
+  id: "source-version:playwright-architecture-brief-v1",
+  version: "source-version-record-1",
+  sourceId: architectureSource.id,
+  contentHash: "playwright-architecture-hash",
+  observedAt: "2026-01-01T00:00:00.000Z",
+  provenance: { activityId: "playwright:source-registry" }
+};
 
 const files = new Map([
   ["brief.md", Buffer.from("# Brief\nInitial workspace file.", "utf8")]
@@ -153,6 +189,44 @@ const loadedPlugins = [
     description: "Workspace-scoped markdown RAG ingestion.",
     types: ["tools", "knowledge", "hooks"],
     tools: [{ name: "workspace_rag", description: "Configure workspace markdown RAG." }]
+  },
+  {
+    name: "@matatbread/matbot-source-registry",
+    specifier: "./packages/plugins/source-registry",
+    description: "Source identity, freshness, health, citations, and provenance.",
+    types: ["tools", "service:SourceRegistry"],
+    tools: [
+      { name: "source_action", description: "Inspect source records, citations, and source events." },
+      { name: "source_health_action", description: "Generate source health reports and warnings." }
+    ]
+  },
+  {
+    name: "@matatbread/matbot-connector-fabric",
+    specifier: "./packages/plugins/connector-fabric",
+    description: "Connector identity, grants, health, sync cursors, and audit.",
+    types: ["tools", "service:ConnectorRegistry", "hooks"],
+    tools: [{ name: "connector_action", description: "Inspect connectors, grants, health, sync cursors, and audit." }]
+  },
+  {
+    name: "@matatbread/matbot-structured-data",
+    specifier: "./packages/plugins/structured-data",
+    description: "Governed semantic SQL planning and approved read-only execution.",
+    types: ["tools", "service:DataCatalog", "service:SqlPlanner"],
+    tools: [{ name: "structured_data_action", description: "Plan, approve, and execute governed SQL queries." }]
+  },
+  {
+    name: "@matatbread/matbot-workflow-governance",
+    specifier: "./packages/plugins/workflow-governance",
+    description: "Workflow definitions, run ledger, approval gates, shadow comparisons, and compiler.",
+    types: ["tools", "service:WorkflowRegistry", "service:WorkflowRunner", "service:WorkflowCompiler", "hooks"],
+    tools: [{ name: "workflow_action", description: "Compile, run, inspect, approve, and compare governed workflows." }]
+  },
+  {
+    name: "@matatbread/matbot-context-graph",
+    specifier: "./packages/plugins/context-graph",
+    description: "Source-backed entity graph, relationship assertions, and graph retrieval.",
+    types: ["tools", "service:ContextGraph"],
+    tools: [{ name: "context_graph_action", description: "Search, retrieve, and maintain source-backed graph facts." }]
   },
   {
     name: "@matatbread/matbot-skills",
@@ -515,6 +589,543 @@ function expertPanelUsage(result) {
     if (typeof usage.outputTokens === "number") outputTokens += usage.outputTokens;
   }
   return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
+}
+
+function sourceCitation(sourceId = architectureSource.id, versionId = architectureSourceVersion.id) {
+  return {
+    sourceId,
+    versionId,
+    text: `${architectureSource.title} (${architectureSource.uri}) observed at ${architectureSourceVersion.observedAt}`
+  };
+}
+
+function queryResultSource(run) {
+  return {
+    id: run.resultSourceId,
+    version: "query-result-source-version",
+    workspaceId: run.workspaceId,
+    connectorType: "structured-data",
+    connectorInstanceId: "connector-instance:postgres-readonly:local",
+    externalId: `query-result:${run.id}`,
+    uri: `structured-data://query-runs/${run.id}`,
+    title: `Query result ${run.id}`,
+    sourceKind: "query_result",
+    sensitivity: "internal",
+    permissionState: "allowed",
+    trustLevel: "medium",
+    citationPolicy: "cite_query",
+    healthState: "healthy",
+    stalenessState: "fresh",
+    lastObservedAt: run.executedAt ?? run.updatedAt,
+    lastSuccessfulReadAt: run.executedAt ?? run.updatedAt,
+    knownLimitations: [`SQL hash: ${run.sqlHash}`]
+  };
+}
+
+function sourceActionResult(input) {
+  const executedRuns = [...queryRuns.values()].filter(run => run.resultSourceId);
+  const sources = [
+    architectureSource,
+    ...executedRuns.map(queryResultSource)
+  ];
+  if (input.action === "list") return { sources };
+  if (input.action === "get") return sources.find(source => source.id === input.id) ?? null;
+  if (input.action === "stale") return { sources: [architectureSource] };
+  if (input.action === "citation") return sourceCitation(input.sourceId, input.versionId);
+  if (input.action === "health") {
+    return {
+      events: [{
+        id: "source-health:playwright",
+        version: "source-health-version",
+        sourceId: input.sourceId ?? architectureSource.id,
+        state: "degraded",
+        checkedAt: now(),
+        message: "Harness source reports stale/degraded evidence."
+      }]
+    };
+  }
+  if (input.action === "events") {
+    return {
+      access: [{
+        id: "source-access:playwright",
+        version: "source-access-version",
+        sourceId: input.sourceId ?? architectureSource.id,
+        action: "retrieve",
+        allowed: true,
+        timestamp: now(),
+        message: "Harness retrieval access event."
+      }],
+      health: sourceActionResult({ action: "health", sourceId: input.sourceId }).events
+    };
+  }
+  return { error: `Unknown source_action "${input.action}".` };
+}
+
+function sourceHealthReport() {
+  return {
+    id: "source-health-report:playwright",
+    version: "source-health-report-version",
+    generatedAt: now(),
+    totalSources: 1,
+    healthySources: 0,
+    staleSources: 1,
+    unhealthySources: 1,
+    warningCount: 2,
+    criticalCount: 0,
+    workspaceId: "default",
+    findings: [
+      {
+        sourceId: architectureSource.id,
+        sourceVersionId: architectureSourceVersion.id,
+        severity: "warning",
+        issueType: "stale",
+        message: "architecture.md is stale."
+      },
+      {
+        sourceId: architectureSource.id,
+        sourceVersionId: architectureSourceVersion.id,
+        severity: "warning",
+        issueType: "degraded",
+        message: "architecture.md is degraded."
+      }
+    ],
+    connectorHealth: [{
+      connectorInstanceId: "connector-instance:workspace-rag:local",
+      displayName: "Local Workspace RAG",
+      type: "workspace-rag",
+      workspaceId: "default",
+      healthState: "degraded",
+      checkedAt: now(),
+      message: "Harness connector health warning."
+    }]
+  };
+}
+
+function sourceHealthActionResult(input) {
+  const report = sourceHealthReport();
+  if (input.action === "report") return report;
+  if (input.action === "warnings") {
+    return {
+      reportId: report.id,
+      generatedAt: report.generatedAt,
+      warningCount: report.warningCount,
+      criticalCount: report.criticalCount,
+      findings: report.findings,
+      connectorHealth: report.connectorHealth
+    };
+  }
+  if (input.action === "connectors") return { connectors: report.connectorHealth };
+  if (input.action === "reports") return { reports: [report] };
+  return { error: `Unknown source_health_action "${input.action}".` };
+}
+
+function connectorDefinitions() {
+  return [
+    { id: "connector-definition:source-registry", type: "source-registry", displayName: "Source Registry", protocol: "native", capabilities: ["read"] },
+    { id: "connector-definition:workspace-rag", type: "workspace-rag", displayName: "Workspace RAG", protocol: "native", capabilities: ["read", "write", "admin"] },
+    { id: "connector-definition:postgres-readonly", type: "postgres-readonly", displayName: "Postgres Read-Only", protocol: "postgres", capabilities: ["read"] },
+    { id: "connector-definition:workflow-governance", type: "workflow-governance", displayName: "Workflow Governance", protocol: "native", capabilities: ["read", "write", "admin"] },
+    { id: "connector-definition:context-graph", type: "context-graph", displayName: "Context Graph", protocol: "native", capabilities: ["read", "write", "admin"] }
+  ];
+}
+
+function connectorInstances() {
+  return [
+    { id: "connector-instance:source-registry:local", definitionId: "connector-definition:source-registry", type: "source-registry", workspaceId: "default", displayName: "Local Source Registry", healthState: "healthy" },
+    { id: "connector-instance:workspace-rag:local", definitionId: "connector-definition:workspace-rag", type: "workspace-rag", workspaceId: "default", displayName: "Local Workspace RAG", healthState: "degraded" },
+    { id: "connector-instance:postgres-readonly:local", definitionId: "connector-definition:postgres-readonly", type: "postgres-readonly", workspaceId: "default", displayName: "Local Postgres Read-Only", healthState: "healthy" },
+    { id: "connector-instance:workflow-governance:local", definitionId: "connector-definition:workflow-governance", type: "workflow-governance", workspaceId: "default", displayName: "Local Workflow Governance", healthState: "healthy" },
+    { id: "connector-instance:context-graph:local", definitionId: "connector-definition:context-graph", type: "context-graph", workspaceId: "default", displayName: "Local Context Graph", healthState: "healthy" }
+  ];
+}
+
+function connectorBindings() {
+  return [
+    { id: "binding:source-action", connectorInstanceId: "connector-instance:source-registry:local", toolName: "source_action", capability: "read", sourceTypes: ["source_record"] },
+    { id: "binding:source-health-action", connectorInstanceId: "connector-instance:source-registry:local", toolName: "source_health_action", capability: "read", sourceTypes: ["source_health_report"] },
+    { id: "binding:structured-data", connectorInstanceId: "connector-instance:postgres-readonly:local", toolName: "structured_data_action", capability: "read", approvalPolicyId: "structured-data-admin", sourceTypes: ["table", "query_result"] },
+    { id: "binding:workflow", connectorInstanceId: "connector-instance:workflow-governance:local", toolName: "workflow_action", capability: "read", approvalPolicyId: "workflow-governance-admin", sourceTypes: ["workflow_definition", "workflow_run", "workflow_approval"] },
+    { id: "binding:context-graph", connectorInstanceId: "connector-instance:context-graph:local", toolName: "context_graph_action", capability: "read", approvalPolicyId: "context-graph-write", sourceTypes: ["context_entity", "context_relationship"] }
+  ];
+}
+
+function connectorActionResult(input) {
+  if (input.action === "list") return { definitions: connectorDefinitions(), instances: connectorInstances() };
+  if (input.action === "list_tools") return { bindings: connectorBindings() };
+  if (input.action === "health") {
+    return {
+      events: [{
+        id: "connector-health:playwright",
+        version: "connector-health-version",
+        connectorInstanceId: input.connectorInstanceId ?? "connector-instance:workspace-rag:local",
+        state: "healthy",
+        checkedAt: now(),
+        message: "Harness connector health check passed."
+      }]
+    };
+  }
+  if (input.action === "test_health") {
+    return {
+      id: "connector-health:test",
+      version: "connector-health-version",
+      connectorInstanceId: input.connectorInstanceId,
+      state: "healthy",
+      checkedAt: now(),
+      message: "All exact connector tool bindings are registered.",
+      details: { missingTools: [], checkedBy: "connector_action" }
+    };
+  }
+  if (input.action === "list_audit") {
+    return {
+      events: [{
+        id: "connector-audit:playwright",
+        version: "connector-audit-version",
+        connectorInstanceId: "connector-instance:postgres-readonly:local",
+        toolName: "structured_data_action",
+        capability: "read",
+        principalId: "system",
+        inputHash: "audit-input-hash",
+        resultStatus: "ok",
+        timestamp: now(),
+        redactedInput: { action: "execute_query", approvalToken: "[redacted]" },
+        sourceIds: [architectureSource.id]
+      }]
+    };
+  }
+  return { error: `Unknown connector_action "${input.action}".` };
+}
+
+function structuredCatalog() {
+  const connection = {
+    id: "data-connection:playwright",
+    version: "data-connection-version",
+    workspaceId: "default",
+    displayName: "Harness Warehouse",
+    dialect: "postgres",
+    readOnly: true,
+    connectorInstanceId: "connector-instance:postgres-readonly:local",
+    rowLimitDefault: 50,
+    timeoutMsDefault: 2500,
+    defaultSchema: "public"
+  };
+  const table = {
+    id: "data-table:orders",
+    version: "data-table-version",
+    workspaceId: "default",
+    connectionId: connection.id,
+    schemaName: "public",
+    tableName: "orders",
+    displayName: "Orders",
+    primaryKey: ["id"],
+    allowed: true,
+    sourceId: architectureSource.id
+  };
+  const columns = [
+    { id: "data-column:orders:id", tableId: table.id, name: "id", dataType: "string", role: "identifier", nullable: false },
+    { id: "data-column:orders:order_date", tableId: table.id, name: "order_date", dataType: "date", role: "dimension", nullable: false },
+    { id: "data-column:orders:status", tableId: table.id, name: "status", dataType: "string", role: "dimension", nullable: false },
+    { id: "data-column:orders:amount", tableId: table.id, name: "amount", dataType: "number", role: "measure", nullable: false }
+  ];
+  const metric = {
+    id: "metric:total_revenue",
+    version: "metric-version",
+    workspaceId: "default",
+    name: "total_revenue",
+    businessName: "Total Revenue",
+    baseTableId: table.id,
+    expression: "amount",
+    aggregation: "sum",
+    allowedDimensions: ["data-column:orders:order_date"],
+    allowedFilters: ["data-column:orders:status"],
+    sourceId: architectureSource.id
+  };
+  return { connections: [connection], tables: [table], columns, metrics: [metric], runs: [...queryRuns.values()] };
+}
+
+function structuredDataActionResult(input) {
+  if (input.action === "catalog") return structuredCatalog();
+  if (input.action === "register_connection") return structuredCatalog().connections[0];
+  if (input.action === "upsert_table") return structuredCatalog().tables[0];
+  if (input.action === "upsert_column") return structuredCatalog().columns[0];
+  if (input.action === "upsert_metric") return structuredCatalog().metrics[0];
+  if (input.action === "validate_sql") {
+    const sql = String(input.sql ?? "");
+    const readOnly = /^\s*select\b/i.test(sql);
+    const hasExplicitLimit = /\blimit\s+\d+\b/i.test(sql);
+    const reasons = [];
+    if (!readOnly) reasons.push("Only SELECT statements are allowed.");
+    if (!hasExplicitLimit) reasons.push("A row-limited query must include an explicit LIMIT.");
+    return { valid: reasons.length === 0, readOnly, hasExplicitLimit, reasons, sqlHash: "sql-hash:playwright" };
+  }
+  if (input.action === "plan_query") {
+    const catalog = structuredCatalog();
+    const id = `query-run:playwright-${queryRunSeq++}`;
+    const timestamp = now();
+    const run = {
+      id,
+      version: "query-run-version",
+      workspaceId: "default",
+      dataConnectionId: catalog.connections[0].id,
+      principalId: "system",
+      status: "planned",
+      sql: 'SELECT "order_date" AS "order_date", sum("amount") AS "total_revenue" FROM "public"."orders" WHERE "status" = $1 GROUP BY "order_date" LIMIT 50',
+      sqlHash: "sql-hash:playwright",
+      semanticInputs: ["metric:total_revenue", "data-column:orders:order_date", "data-column:orders:status"],
+      parameters: ["paid"],
+      sourceIds: [architectureSource.id],
+      rowLimit: 50,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    queryRuns.set(id, run);
+    return {
+      queryRun: run,
+      metric: catalog.metrics[0],
+      table: catalog.tables[0],
+      dimensions: [catalog.columns[1]],
+      filters: [{ columnId: "data-column:orders:status", op: "eq", value: "paid" }],
+      validation: { valid: true, readOnly: true, hasExplicitLimit: true, reasons: [], sqlHash: run.sqlHash },
+      rowCapWarning: "Requested limit 200 exceeds row cap 50; using 50."
+    };
+  }
+  if (input.action === "approve_query") {
+    const run = queryRuns.get(input.queryRunId);
+    if (!run) return { error: `Unknown query run "${input.queryRunId}".` };
+    const approved = { ...run, status: "approved", approvalTokenHash: "approval-token-hash", updatedAt: now() };
+    queryRuns.set(run.id, approved);
+    return { queryRun: approved, approvalToken: `approval-token:${run.id}` };
+  }
+  if (input.action === "execute_query") {
+    const run = queryRuns.get(input.queryRunId);
+    if (!run) return { error: `Unknown query run "${input.queryRunId}".` };
+    if (input.approvalToken !== `approval-token:${run.id}`) return { error: "Invalid approval token for query execution." };
+    const executedAt = now();
+    const succeeded = {
+      ...run,
+      status: "succeeded",
+      rowCount: 1,
+      executedAt,
+      updatedAt: executedAt,
+      resultSourceId: `source:query-result:${run.id}`
+    };
+    queryRuns.set(run.id, succeeded);
+    return {
+      run: succeeded,
+      rows: [{ order_date: "2026-07-03", total_revenue: 1234 }],
+      fields: ["order_date", "total_revenue"],
+      citation: {
+        sourceId: succeeded.resultSourceId,
+        text: `Query ${run.id} executed at ${executedAt}. Source tables/metrics: ${run.sourceIds.join(", ")}`
+      }
+    };
+  }
+  if (input.action === "runs") return { runs: [...queryRuns.values()] };
+  return { error: `Unknown structured_data_action "${input.action}".` };
+}
+
+function workflowActionResult(input) {
+  if (input.action === "compile") {
+    const runId = `workflow-run:compiled-${workflowRunSeq++}`;
+    const dryRun = {
+      id: runId,
+      workflowId: "workflow:compiled-followup",
+      workflowVersion: "workflow-version:compiled-followup",
+      workspaceId: "default",
+      mode: "dry_run",
+      status: "succeeded",
+      inputs: { ticketId: "T-123" },
+      evidenceSourceIds: [architectureSource.id],
+      evidenceSourceVersions: [{ sourceId: architectureSource.id, sourceVersionId: architectureSourceVersion.id }],
+      proposedActions: [{ id: "action:compiled-write", toolName: "file_broker_action", status: "proposed", requiresApproval: true, sourceIds: [architectureSource.id], input: { workflowRunId: runId } }],
+      executedActions: [],
+      labels: [],
+      createdAt: now(),
+      updatedAt: now()
+    };
+    workflowRuns.set(runId, dryRun);
+    return {
+      compilation: {
+        id: "workflow-compilation:playwright",
+        status: "dry_run_completed",
+        compilerVersion: "deterministic-workflow-compiler-v1",
+        workflowId: "workflow:compiled-followup",
+        dryRunId: runId
+      },
+      validation: [],
+      published: {
+        definition: {
+          id: "workflow:compiled-followup",
+          version: "workflow-version:compiled-followup",
+          workspaceId: "default",
+          name: "Compiled Followup",
+          riskLevel: "high",
+          approvalGates: [
+            { id: "approve-action", type: "action" },
+            { id: "structured-expert-review", type: "expert_review", requiredRiskLevel: "high" }
+          ],
+          allowedSourceIds: [architectureSource.id],
+          allowedTools: ["file_broker_action"]
+        }
+      },
+      dryRun
+    };
+  }
+  if (input.action === "start" || input.action === "dry_run") {
+    const runId = `workflow-run:playwright-${workflowRunSeq++}`;
+    const mode = input.mode ?? (input.action === "dry_run" ? "dry_run" : "approval_gated");
+    const run = {
+      id: runId,
+      workflowId: input.workflowId ?? "workflow:compiled-followup",
+      workflowVersion: "workflow-version:compiled-followup",
+      workspaceId: input.workspaceId ?? "default",
+      mode,
+      status: mode === "dry_run" ? "succeeded" : "waiting_for_approval",
+      inputs: input.inputs ?? {},
+      evidenceSourceIds: input.evidenceSourceIds ?? [architectureSource.id],
+      evidenceSourceVersions: [{ sourceId: architectureSource.id, sourceVersionId: architectureSourceVersion.id }],
+      proposedActions: [{ id: "action:playwright-write", toolName: "file_broker_action", status: "proposed", requiresApproval: true, sourceIds: [architectureSource.id] }],
+      executedActions: [],
+      labels: [],
+      createdAt: now(),
+      updatedAt: now()
+    };
+    workflowRuns.set(runId, run);
+    if (run.status === "waiting_for_approval") {
+      workflowApprovals.set(runId, [
+        { id: "approval:action", runId, gateId: "approve-action", status: "pending", reason: "Write/admin tool requires approval." },
+        { id: "approval:expert-review", runId, gateId: "structured-expert-review", status: "pending", reason: "High-risk workflow requires structured expert review." }
+      ]);
+    }
+    return run;
+  }
+  if (input.action === "list_approvals") return { approvals: [...workflowApprovals.values()].flat() };
+  if (input.action === "inspect_run") {
+    const run = workflowRuns.get(input.runId) ?? null;
+    return {
+      run,
+      events: run ? [
+        { id: "event:created", runId: run.id, sequence: 1, eventType: "run_created", timestamp: run.createdAt },
+        { id: "event:approval", runId: run.id, sequence: 2, eventType: "approval_requested", timestamp: run.updatedAt }
+      ] : [],
+      approvals: workflowApprovals.get(input.runId) ?? []
+    };
+  }
+  if (input.action === "compare_shadow_result") {
+    return {
+      comparison: {
+        id: `shadow-comparison:${input.runId}`,
+        runId: input.runId,
+        outcome: "accepted",
+        score: 1,
+        labels: input.labels ?? ["accepted"],
+        sourceIds: [architectureSource.id],
+        recommendationHash: "shadow-recommendation-hash"
+      }
+    };
+  }
+  if (input.action === "shadow_report") return { summary: { total: 1, accepted: 1, rejected: 0, mixed: 0, unlabeled: 0, acceptanceRate: 1 }, comparisons: [] };
+  if (input.action === "list_runs") return { runs: [...workflowRuns.values()] };
+  return { error: `Unknown workflow_action "${input.action}".` };
+}
+
+function contextGraphActionResult(input) {
+  const entity = {
+    id: "context-entity:acme",
+    version: "context-entity-version",
+    workspaceId: "default",
+    type: "organization",
+    canonicalName: "Acme Corp",
+    aliases: ["Acme"],
+    identifiers: {},
+    sensitivity: "internal",
+    createdAt: now(),
+    updatedAt: now()
+  };
+  const relationship = {
+    id: "context-relationship:acme-ticket",
+    version: "context-relationship-version",
+    workspaceId: "default",
+    subjectEntityId: entity.id,
+    predicate: "mentioned_in",
+    objectEntityId: "context-entity:ticket-123",
+    sourceId: architectureSource.id,
+    sourceVersionId: architectureSourceVersion.id,
+    confidence: 0.9,
+    extractionMethod: "deterministic",
+    evidenceSpan: "Acme ticket follow-up",
+    createdAt: now(),
+    updatedAt: now()
+  };
+  if (input.action === "retrieve" || input.action === "neighbors" || input.action === "path_search") {
+    return {
+      entities: [entity],
+      facts: [{
+        relationship,
+        subject: entity,
+        object: { ...entity, id: "context-entity:ticket-123", canonicalName: "Ticket 123", type: "artifact" },
+        sourceId: architectureSource.id,
+        sourceVersionId: architectureSourceVersion.id,
+        citation: sourceCitation()
+      }],
+      warnings: []
+    };
+  }
+  if (input.action === "projection_log") {
+    return { operations: [{ id: "projection:acme", operationType: "merge_relationship", workspaceId: "default", sourceId: architectureSource.id }] };
+  }
+  if (input.action === "list") return { entities: [entity], relationships: [relationship] };
+  if (input.action === "upsert_entity") return input.entity ?? entity;
+  if (input.action === "assert_relationship") return input.relationship ?? relationship;
+  return { error: `Unknown context_graph_action "${input.action}".` };
+}
+
+function expertPanelReviewResult(input) {
+  const panel = expertPanelResult(input);
+  if (panel.error) return panel;
+  const id = `expert-review:playwright-${expertReviewSeq++}`;
+  const experts = panel.result.experts.map(opinion => ({
+    ...opinion,
+    recommendation: "approve_with_changes",
+    confidence: 0.81,
+    evidenceIds: opinion.citations.map(citation => citation.id),
+    risks: [`${opinion.title}: stale source may affect the decision.`],
+    blockers: [],
+    mitigations: [`${opinion.title}: refresh source before automation.`],
+    approvalChecklist: [`${opinion.title}: evidence reviewed`, `${opinion.title}: automation rollback path confirmed`]
+  }));
+  const review = {
+    id,
+    version: "expert-review-version",
+    createdAt: now(),
+    updatedAt: now(),
+    question: input.question,
+    mode: input.mode ?? "review",
+    reviewMode: input.reviewMode ?? "pre_automation_review",
+    targetType: input.targetType ?? "workflow",
+    status: "under_review",
+    expertIds: experts.map(expert => expert.expertId),
+    experts,
+    sourceIds: [architectureSource.id],
+    consensus: ["Experts returned mixed implementation cautions."],
+    disagreements: [],
+    blockers: [],
+    mitigations: experts.flatMap(expert => expert.mitigations),
+    approvalChecklist: experts.flatMap(expert => expert.approvalChecklist),
+    riskRegister: experts.map((expert, index) => ({
+      id: `risk:${index}`,
+      severity: "medium",
+      description: expert.risks[0],
+      ownerExpertId: expert.expertId,
+      mitigation: expert.mitigations[0]
+    })),
+    synthesis: panel.result.synthesis,
+    targetId: input.targetId,
+    workflowId: input.workflowId,
+    workflowRunId: input.workflowRunId,
+    dossierId: input.dossierId
+  };
+  expertReviews.set(id, review);
+  return { result: { review, panel: panel.result } };
 }
 
 const server = createServer(async (req, res) => {
@@ -1013,6 +1624,30 @@ async function handleTool(res, name, rawInput) {
       });
     }
   }
+  if (name === "source_action") {
+    const result = sourceActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "source_health_action") {
+    const result = sourceHealthActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "connector_action") {
+    const result = connectorActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "structured_data_action") {
+    const result = structuredDataActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "workflow_action") {
+    const result = workflowActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "context_graph_action") {
+    const result = contextGraphActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
   if (name === "remembered_facts_action") {
     if (input.action === "list") return json(res, 200, { facts: [...rememberedFacts.values()] });
     if (input.action === "query") return json(res, 200, queryRememberedFacts(input.query ?? {}));
@@ -1121,6 +1756,13 @@ async function handleTool(res, name, rawInput) {
   }
   if (name === "expert_panel") {
     if (input.action === "list") return json(res, 200, { experts: expertConfigs });
+    if (input.action === "get_review") return json(res, 200, { review: expertReviews.get(input.reviewId) ?? null });
+    if (input.action === "list_reviews") return json(res, 200, { reviews: [...expertReviews.values()] });
+    if (input.action === "review") {
+      const review = expertPanelReviewResult(input);
+      if (review.error) return json(res, 400, { error: review.error });
+      return json(res, 200, review.result);
+    }
     const panel = expertPanelResult(input);
     if (panel.error) return json(res, 400, { error: panel.error });
     return json(res, 200, panel.result);

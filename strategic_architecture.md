@@ -334,27 +334,28 @@ type SourceVersion = {
 
 ### Tasklist
 
-- [ ] Create `local-agent/matbot/packages/plugins/source-registry`.
-- [ ] Define `SourceRegistry` service with methods:
-  - [ ] `upsertSource`.
-  - [ ] `upsertVersion`.
-  - [ ] `recordHealth`.
-  - [ ] `recordAccess`.
-  - [ ] `resolveCitation`.
-  - [ ] `querySources`.
-- [ ] Add stores: `sources`, `source_versions`, `source_health_events`,
-  `source_access_events`, `source_limitations`.
-- [ ] Add `source_action` tool with actions: `list`, `get`, `health`,
+- [x] Create `local-agent/matbot/packages/plugins/source-registry`.
+- [x] Define `SourceRegistry` service with methods:
+  - [x] `upsertSource`.
+  - [x] `upsertVersion`.
+  - [x] `recordHealth`.
+  - [x] `recordAccess`.
+  - [x] `resolveCitation`.
+  - [x] `querySources`.
+- [x] Add stores: `sources`, `source_versions`, `source_health_events`,
+  `source_access_events`, and `source_health_reports`; source limitations are
+  stored as `knownLimitations` on source records.
+- [x] Add `source_action` tool with actions: `list`, `get`, `health`,
   `stale`, `citation`, `events`.
-- [ ] Define stable source ids:
-  - [ ] `workspaceId + connectorType + connectorInstanceId + externalId`.
-  - [ ] Use hashes for local paths but keep the normalized path as metadata.
-- [ ] Modify `workspace-rag` ingestion to call `SourceRegistry`:
-  - [ ] one `SourceRecord` per markdown file.
-  - [ ] one `SourceVersion` per content hash.
-  - [ ] health event when file read fails or path disappears.
-  - [ ] citation policy as path citation by default.
-- [ ] Modify `WorkspaceRagKnowledgeIndex` results to include source ids in
+- [x] Define stable source ids:
+  - [x] `workspaceId + connectorType + connectorInstanceId + externalId`.
+  - [x] Use hashes for local paths but keep the normalized path as metadata.
+- [x] Modify `workspace-rag` ingestion to call `SourceRegistry`:
+  - [x] one `SourceRecord` per markdown file.
+  - [x] one `SourceVersion` per content hash.
+  - [x] health event when file read fails or path disappears.
+  - [x] citation policy as path citation by default.
+- [x] Modify `WorkspaceRagKnowledgeIndex` results to include source ids in
   `KnowledgeEntry.source`.
 - [x] Add source warning markers in `workspace-rag` screen hook when retrieved
   context is stale or source health is degraded.
@@ -369,11 +370,11 @@ type SourceVersion = {
   - [ ] sensitivity.
   - [ ] citation link/path.
   - [ ] known limitations.
-- [ ] Add tests:
-  - [ ] source id stability.
+- [x] Add tests:
+  - [x] source id stability.
   - [x] stale-source detection.
-  - [ ] citation resolution.
-  - [ ] workspace RAG integration.
+  - [x] citation resolution.
+  - [x] workspace RAG integration.
 
 ### Technical Notes
 

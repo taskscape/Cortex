@@ -73,6 +73,16 @@ test("loads the shell, providers, conversations, files, plugins, and skills", as
   await expect(page.locator("#plugin-list")).toContainText("file_broker_action");
   await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-workspace-rag");
   await expect(page.locator("#plugin-list")).toContainText("workspace_rag");
+  await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-source-registry");
+  await expect(page.locator("#plugin-list")).toContainText("source_health_action");
+  await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-connector-fabric");
+  await expect(page.locator("#plugin-list")).toContainText("connector_action");
+  await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-structured-data");
+  await expect(page.locator("#plugin-list")).toContainText("structured_data_action");
+  await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-workflow-governance");
+  await expect(page.locator("#plugin-list")).toContainText("workflow_action");
+  await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-context-graph");
+  await expect(page.locator("#plugin-list")).toContainText("context_graph_action");
   await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-storage-google-drive");
   await expect(page.locator(".plugin-incompatible")).toContainText("google-drive");
   await expect(page.locator("#workspace-toggle-btn")).toBeInViewport();
@@ -93,6 +103,132 @@ test("default file broker tool reads host files through the WebUI transport", as
   expect(result.ok).toBe(true);
   expect(result.content).toContain("Broker harness host read");
   expect(result.content).toContain("C:\\Projects\\Cortex\\readme.md");
+});
+
+test("architecture source and connector health tools work through the WebUI transport", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop architecture direct tool coverage");
+  await page.goto("/");
+
+  const result = await page.evaluate(async () => {
+    const sourceList = await window.matbotTransport.callTool("source_action", { action: "list" });
+    const sourceId = sourceList.sources[0].id;
+    const citation = await window.matbotTransport.callTool("source_action", { action: "citation", sourceId });
+    const sourceEvents = await window.matbotTransport.callTool("source_action", { action: "events", sourceId });
+    const healthReport = await window.matbotTransport.callTool("source_health_action", { action: "report", workspaceId: "default" });
+    const connectorList = await window.matbotTransport.callTool("connector_action", { action: "list" });
+    const connectorHealth = await window.matbotTransport.callTool("connector_action", {
+      action: "test_health",
+      connectorInstanceId: "connector-instance:workspace-rag:local"
+    });
+    const connectorAudit = await window.matbotTransport.callTool("connector_action", { action: "list_audit" });
+    return { sourceList, citation, sourceEvents, healthReport, connectorList, connectorHealth, connectorAudit };
+  });
+
+  expect(result.sourceList.sources[0].id).toBe("source:playwright-architecture-brief");
+  expect(result.citation.text).toContain("architecture.md");
+  expect(result.sourceEvents.access[0].action).toBe("retrieve");
+  expect(result.healthReport.findings.map(finding => finding.issueType).sort()).toEqual(["degraded", "stale"]);
+  expect(result.healthReport.connectorHealth[0].healthState).toBe("degraded");
+  expect(result.connectorList.definitions.some(definition => definition.id === "connector-definition:workflow-governance")).toBe(true);
+  expect(result.connectorList.instances.some(instance => instance.id === "connector-instance:postgres-readonly:local")).toBe(true);
+  expect(result.connectorHealth.state).toBe("healthy");
+  expect(result.connectorAudit.events[0].redactedInput.approvalToken).toBe("[redacted]");
+});
+
+test("governed architecture tools preserve records through the WebUI transport", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop governed architecture direct tool coverage");
+  await page.goto("/");
+
+  const result = await page.evaluate(async () => {
+    const plan = await window.matbotTransport.callTool("structured_data_action", {
+      action: "plan_query",
+      plan: {
+        workspaceId: "default",
+        metricName: "total_revenue",
+        dimensions: ["data-column:orders:order_date"],
+        filters: [{ columnId: "data-column:orders:status", op: "eq", value: "paid" }],
+        limit: 200
+      }
+    });
+    const approval = await window.matbotTransport.callTool("structured_data_action", {
+      action: "approve_query",
+      queryRunId: plan.queryRun.id
+    });
+    const executed = await window.matbotTransport.callTool("structured_data_action", {
+      action: "execute_query",
+      queryRunId: plan.queryRun.id,
+      approvalToken: approval.approvalToken
+    });
+    const sourcesAfterExecution = await window.matbotTransport.callTool("source_action", { action: "list" });
+
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile",
+      workspaceId: "default",
+      name: "Compiled Followup",
+      sourceIds: ["source:playwright-architecture-brief"],
+      publish: true,
+      dryRun: true
+    });
+    const started = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      mode: "approval_gated",
+      inputs: { ticketId: "T-123" },
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    const approvals = await window.matbotTransport.callTool("workflow_action", { action: "list_approvals" });
+    const inspected = await window.matbotTransport.callTool("workflow_action", { action: "inspect_run", runId: started.id });
+
+    const graph = await window.matbotTransport.callTool("context_graph_action", {
+      action: "retrieve",
+      workspaceId: "default",
+      sourceIds: ["source:playwright-architecture-brief"],
+      terms: ["Acme"]
+    });
+
+    const review = await window.matbotTransport.callTool("expert_panel", {
+      action: "review",
+      question: "Should this high-risk workflow be approved?",
+      experts: ["finance", "engineering"],
+      mode: "review",
+      reviewMode: "pre_automation_review",
+      targetType: "workflow",
+      targetId: compiled.published.definition.id,
+      workflowId: compiled.published.definition.id,
+      workflowRunId: started.id,
+      synthesize: true
+    });
+    const reviewLookup = await window.matbotTransport.callTool("expert_panel", {
+      action: "get_review",
+      reviewId: review.review.id
+    });
+    const reviewList = await window.matbotTransport.callTool("expert_panel", { action: "list_reviews" });
+
+    return { plan, approval, executed, sourcesAfterExecution, compiled, started, approvals, inspected, graph, review, reviewLookup, reviewList };
+  });
+
+  expect(result.plan.validation.valid).toBe(true);
+  expect(result.plan.rowCapWarning).toContain("row cap 50");
+  expect(result.approval.queryRun.status).toBe("approved");
+  expect(result.executed.run.status).toBe("succeeded");
+  expect(result.executed.citation.text).toContain("Source tables/metrics");
+  expect(result.sourcesAfterExecution.sources.some(source => source.sourceKind === "query_result")).toBe(true);
+
+  expect(result.compiled.compilation.status).toBe("dry_run_completed");
+  expect(result.compiled.published.definition.approvalGates.some(gate => gate.type === "expert_review")).toBe(true);
+  expect(result.started.status).toBe("waiting_for_approval");
+  expect(result.approvals.approvals.some(approval => approval.gateId === "structured-expert-review")).toBe(true);
+  expect(result.inspected.events.map(event => event.sequence)).toEqual([1, 2]);
+
+  expect(result.graph.facts[0].sourceId).toBe("source:playwright-architecture-brief");
+  expect(result.graph.facts[0].citation.text).toContain("architecture.md");
+
+  expect(result.review.review.workflowRunId).toBe(result.started.id);
+  expect(result.review.review.riskRegister.length).toBeGreaterThan(0);
+  expect(result.review.review.approvalChecklist.some(item => item.includes("automation rollback path confirmed"))).toBe(true);
+  expect(result.reviewLookup.review.id).toBe(result.review.review.id);
+  expect(result.reviewList.reviews.some(review => review.id === result.review.review.id)).toBe(true);
 });
 
 test("activates and deactivates compatible local plugins through the plugins panel", async ({ page, isMobile }) => {
@@ -177,6 +313,8 @@ test("workspace selector lists, creates, renames, and switches workspaces", asyn
   await openPlugins(page);
   await expect(page.locator("#plugin-list")).toContainText("@matatbread/matbot-workspace-rag");
   await expect(page.locator("#plugin-list")).toContainText("workspace_rag");
+
+  await page.evaluate(async () => window.matbotTransport.switchWorkspace("default"));
 });
 
 test("workspace RAG configuration panel saves paths and shows indexing progress", async ({ page, isMobile }) => {
