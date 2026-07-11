@@ -197,7 +197,7 @@ explicit `plugins:` entry.
 | `--provider <name>` | Provider key from `matbot.yaml` (default: first in file) |
 | `--session create` | New persistent session; saved to the store |
 | `--session <id>` | Resume an existing session |
-| `--ephemeral` | Force ephemeral even when `--session` is given |
+| `--ephemeral` | Keep sessions, memory, settings, and plugin document stores in memory only |
 | `--system <text>` | System prompt injected at session start |
 | `--config <path>` | Config file path (default: `./matbot.yaml`; `-` reads YAML from stdin) |
 | `--prompt-file <path>` | Read the prompt from a file; runs a single turn and exits |

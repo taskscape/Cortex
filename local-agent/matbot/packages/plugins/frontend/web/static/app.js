@@ -206,6 +206,49 @@ const memoryBrowserDreamSkillInput = document.getElementById('memory-browser-dre
 const memoryBrowserIgnoreUntilInput = document.getElementById('memory-browser-ignore-until');
 const memoryBrowserDeleteBtn = document.getElementById('memory-browser-delete');
 const memoryBrowserSaveBtn = document.getElementById('memory-browser-save');
+const architectureScreenEl = document.getElementById('architecture-screen');
+const architectureTitleEl = document.getElementById('architecture-title');
+const architectureNavBtns = Array.from(document.querySelectorAll('.architecture-nav-btn'));
+const architectureTabBtns = Array.from(document.querySelectorAll('.architecture-tab'));
+const architecturePanelEls = Array.from(document.querySelectorAll('.architecture-panel'));
+const architectureSourceStatusEl = document.getElementById('architecture-source-status');
+const architectureSourceRefreshBtn = document.getElementById('architecture-source-refresh');
+const architectureSourceListEl = document.getElementById('architecture-source-list');
+const architectureSourceDetailEl = document.getElementById('architecture-source-detail');
+const architectureSqlForm = document.getElementById('architecture-sql-form');
+const architectureSqlMetricEl = document.getElementById('architecture-sql-metric');
+const architectureSqlDimensionEl = document.getElementById('architecture-sql-dimension');
+const architectureSqlFilterColumnEl = document.getElementById('architecture-sql-filter-column');
+const architectureSqlFilterValueEl = document.getElementById('architecture-sql-filter-value');
+const architectureSqlLimitEl = document.getElementById('architecture-sql-limit');
+const architectureSqlApproveBtn = document.getElementById('architecture-sql-approve-btn');
+const architectureSqlExecuteBtn = document.getElementById('architecture-sql-execute-btn');
+const architectureSqlStatusEl = document.getElementById('architecture-sql-status');
+const architectureSqlPreviewEl = document.getElementById('architecture-sql-preview');
+const architectureSqlResultsEl = document.getElementById('architecture-sql-results');
+const architectureWorkflowStatusEl = document.getElementById('architecture-workflow-status');
+const architectureWorkflowRefreshBtn = document.getElementById('architecture-workflow-refresh');
+const architectureApprovalListEl = document.getElementById('architecture-approval-list');
+const architectureApprovalDetailEl = document.getElementById('architecture-approval-detail');
+const architectureGraphForm = document.getElementById('architecture-graph-form');
+const architectureGraphRefreshBtn = document.getElementById('architecture-graph-refresh');
+const architectureGraphSearchEl = document.getElementById('architecture-graph-search');
+const architectureGraphSourceEl = document.getElementById('architecture-graph-source');
+const architectureGraphStatusEl = document.getElementById('architecture-graph-status');
+const architectureGraphListEl = document.getElementById('architecture-graph-list');
+const architectureGraphDetailEl = document.getElementById('architecture-graph-detail');
+const architectureReviewForm = document.getElementById('architecture-review-form');
+const architectureReviewQuestionEl = document.getElementById('architecture-review-question');
+const architectureReviewTargetTypeEl = document.getElementById('architecture-review-target-type');
+const architectureReviewTargetIdEl = document.getElementById('architecture-review-target-id');
+const architectureReviewWorkflowIdEl = document.getElementById('architecture-review-workflow-id');
+const architectureReviewRunIdEl = document.getElementById('architecture-review-run-id');
+const architectureReviewExpertsEl = document.getElementById('architecture-review-experts');
+const architectureReviewRefreshBtn = document.getElementById('architecture-review-refresh');
+const architectureReviewCreateBtn = document.getElementById('architecture-review-create-btn');
+const architectureReviewStatusEl = document.getElementById('architecture-review-status');
+const architectureReviewListEl = document.getElementById('architecture-review-list');
+const architectureReviewDetailEl = document.getElementById('architecture-review-detail');
 let expertPanelExperts = [];
 let expertPanelBusy = false;
 let workspaceState = { active: 'default', workspaces: [] };
@@ -218,6 +261,12 @@ let workspaceSwitching = false;
 const WORKSPACE_RESTART_TIMEOUT_MS = 120000;
 const WORKSPACE_RESTART_STATUS_INTERVAL_MS = 5000;
 let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
+let architectureView = 'sources';
+let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, healthReport: null, loaded: false };
+let architectureSqlState = { plan: null, approvalToken: '', executed: null };
+let architectureWorkflowState = { approvals: [], selected: null, inspected: null, loaded: false };
+let architectureGraphState = { entities: [], relationships: [], retrieve: null, selected: null, loaded: false };
+let architectureReviewState = { reviews: [], selected: null, loaded: false };
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
 if (burgerBtn)      burgerBtn.onclick      = () => document.body.classList.toggle('sidebar-open');
@@ -683,6 +732,991 @@ if (memoryBrowserOverlay) {
   });
 }
 
+// ── Architecture panels ─────────────────────────────────────────────────────
+
+const ARCHITECTURE_PANEL_TITLES = {
+  sources: 'Sources',
+  sql: 'SQL Preview',
+  workflows: 'Approval Queue',
+  graph: 'Graph Entities',
+  reviews: 'Expert Reviews',
+};
+
+function architectureString(value, fallback = '-') {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (Array.isArray(value)) return value.length ? value.map(item => architectureString(item, '')).filter(Boolean).join(', ') : fallback;
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); }
+    catch { return fallback; }
+  }
+  return String(value);
+}
+
+function architectureDate(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function architectureBadgeClass(value) {
+  const text = String(value || '').toLowerCase();
+  // Check negative states first: values such as "unhealthy" contain the
+  // positive word "healthy" and would otherwise be rendered as successful.
+  if (['failed', 'rejected', 'critical', 'blocked', 'unhealthy', 'denied', 'error'].some(term => text.includes(term))) return 'bad';
+  if (['pending', 'planned', 'waiting', 'degraded', 'stale', 'warning', 'review', 'changes'].some(term => text.includes(term))) return 'warn';
+  if (['healthy', 'fresh', 'allowed', 'approved', 'succeeded', 'complete', 'accepted'].some(term => text.includes(term))) return 'good';
+  return '';
+}
+
+function architectureClear(el) {
+  if (el) el.replaceChildren();
+}
+
+function architectureStatus(el, text, isError = false) {
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('error', Boolean(isError));
+}
+
+function architectureEmpty(text) {
+  const div = document.createElement('div');
+  div.className = 'architecture-empty';
+  div.textContent = text;
+  return div;
+}
+
+function architectureBadge(text, className = architectureBadgeClass(text)) {
+  const span = document.createElement('span');
+  span.className = 'architecture-badge' + (className ? ' ' + className : '');
+  span.textContent = architectureString(text, 'unknown');
+  return span;
+}
+
+function architectureMuted(text) {
+  const div = document.createElement('div');
+  div.className = 'architecture-muted';
+  div.textContent = architectureString(text, '');
+  return div;
+}
+
+function architectureHeading(level, text) {
+  const tag = level === 4 ? 'h4' : 'h3';
+  const heading = document.createElement(tag);
+  heading.textContent = text;
+  return heading;
+}
+
+function architectureKeyValues(entries) {
+  const dl = document.createElement('dl');
+  dl.className = 'architecture-kv';
+  for (const [label, value] of entries) {
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    if (value instanceof Node) dd.appendChild(value);
+    else dd.textContent = architectureString(value);
+    dl.append(dt, dd);
+  }
+  return dl;
+}
+
+function architectureInlineBadges(values) {
+  const wrap = document.createElement('div');
+  wrap.className = 'architecture-inline-list';
+  for (const value of values.filter(value => value !== undefined && value !== null && value !== '')) {
+    wrap.appendChild(architectureBadge(value));
+  }
+  if (!wrap.childElementCount) wrap.appendChild(architectureMuted('-'));
+  return wrap;
+}
+
+function architectureItemButton({ title, meta, badge, active, onClick }) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'architecture-item';
+  btn.classList.toggle('active', Boolean(active));
+  const titleRow = document.createElement('div');
+  titleRow.className = 'architecture-item-title';
+  const titleEl = document.createElement('span');
+  titleEl.textContent = architectureString(title, '(untitled)');
+  titleRow.appendChild(titleEl);
+  if (badge !== undefined && badge !== null && badge !== '') titleRow.appendChild(architectureBadge(badge));
+  btn.appendChild(titleRow);
+  if (meta) {
+    const metaEl = document.createElement('div');
+    metaEl.className = 'architecture-item-meta';
+    metaEl.textContent = meta;
+    btn.appendChild(metaEl);
+  }
+  btn.onclick = onClick;
+  return btn;
+}
+
+function architectureCard(title, lines = [], badge) {
+  const card = document.createElement('div');
+  card.className = 'architecture-card';
+  const header = document.createElement('div');
+  header.className = 'architecture-item-title';
+  const heading = document.createElement('h3');
+  heading.textContent = architectureString(title, '(untitled)');
+  header.appendChild(heading);
+  if (badge !== undefined && badge !== null && badge !== '') header.appendChild(architectureBadge(badge));
+  card.appendChild(header);
+  for (const line of lines) {
+    const p = document.createElement('p');
+    p.textContent = architectureString(line, '');
+    card.appendChild(p);
+  }
+  return card;
+}
+
+function architectureTable(rows, fields) {
+  const table = document.createElement('table');
+  table.className = 'architecture-table';
+  const thead = document.createElement('thead');
+  const trHead = document.createElement('tr');
+  for (const field of fields) {
+    const th = document.createElement('th');
+    th.textContent = field;
+    trHead.appendChild(th);
+  }
+  thead.appendChild(trHead);
+  const tbody = document.createElement('tbody');
+  for (const row of rows) {
+    const tr = document.createElement('tr');
+    for (const field of fields) {
+      const td = document.createElement('td');
+      td.textContent = architectureString(row?.[field], '');
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.append(thead, tbody);
+  return table;
+}
+
+function architectureJsonBlock(value) {
+  const pre = document.createElement('pre');
+  pre.className = 'architecture-code';
+  pre.textContent = JSON.stringify(value ?? null, null, 2);
+  return pre;
+}
+
+function setArchitectureOpen(open, view = architectureView, options = {}) {
+  if (!architectureScreenEl) return;
+  if (open && !options.skipWorkspace) setWorkspaceSettingsOpen(false);
+  if (open) closeMemoryBrowser();
+  architectureScreenEl.classList.toggle('open', Boolean(open));
+  document.body.classList.toggle('architecture-open', Boolean(open));
+  if (!open) return;
+  activateArchitecturePanel(view);
+  closeSidebar();
+  loadArchitecturePanel(view).catch(err => {
+    const statusEl = architectureStatusElement(view);
+    architectureStatus(statusEl, String(err?.message || err), true);
+  });
+}
+
+function architectureStatusElement(view) {
+  if (view === 'sources') return architectureSourceStatusEl;
+  if (view === 'sql') return architectureSqlStatusEl;
+  if (view === 'workflows') return architectureWorkflowStatusEl;
+  if (view === 'graph') return architectureGraphStatusEl;
+  if (view === 'reviews') return architectureReviewStatusEl;
+  return null;
+}
+
+function activateArchitecturePanel(view) {
+  architectureView = ARCHITECTURE_PANEL_TITLES[view] ? view : 'sources';
+  if (architectureTitleEl) architectureTitleEl.textContent = ARCHITECTURE_PANEL_TITLES[architectureView];
+  for (const btn of architectureNavBtns) {
+    const active = btn.dataset.architectureView === architectureView;
+    btn.classList.toggle('active', active);
+    if (active) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
+  }
+  for (const btn of architectureTabBtns) {
+    const active = btn.dataset.architectureTab === architectureView;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    btn.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of architecturePanelEls) {
+    const active = panel.dataset.architecturePanel === architectureView;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  }
+}
+
+async function loadArchitecturePanel(view, force = false) {
+  if (view === 'sources' && (force || !architectureSourcesState.loaded)) return loadArchitectureSources();
+  if (view === 'workflows' && (force || !architectureWorkflowState.loaded)) return loadArchitectureWorkflowApprovals();
+  if (view === 'graph' && (force || !architectureGraphState.loaded)) return loadArchitectureGraph();
+  if (view === 'reviews' && (force || !architectureReviewState.loaded)) return loadArchitectureReviews();
+  if (view === 'sql') renderArchitectureSqlResults();
+  return undefined;
+}
+
+function sourceHealthFindings(sourceId) {
+  const findings = Array.isArray(architectureSourcesState.healthReport?.findings)
+    ? architectureSourcesState.healthReport.findings
+    : [];
+  return findings.filter(finding => finding.sourceId === sourceId);
+}
+
+function renderArchitectureSourceList() {
+  architectureClear(architectureSourceListEl);
+  const sources = architectureSourcesState.sources;
+  if (!architectureSourceListEl) return;
+  if (!sources.length) {
+    architectureSourceListEl.appendChild(architectureEmpty('No sources'));
+    return;
+  }
+  for (const source of sources) {
+    const status = source.healthState || source.stalenessState || source.sourceKind;
+    architectureSourceListEl.appendChild(architectureItemButton({
+      title: source.title || source.id,
+      meta: [source.sourceKind, source.uri].filter(Boolean).join(' | '),
+      badge: status,
+      active: architectureSourcesState.selected?.id === source.id,
+      onClick: () => selectArchitectureSource(source.id),
+    }));
+  }
+}
+
+function renderArchitectureSourceDetail() {
+  architectureClear(architectureSourceDetailEl);
+  if (!architectureSourceDetailEl) return;
+  const source = architectureSourcesState.selected;
+  if (!source) {
+    architectureSourceDetailEl.appendChild(architectureEmpty('Select a source'));
+    return;
+  }
+
+  architectureSourceDetailEl.append(
+    architectureHeading(3, source.title || source.id),
+    architectureKeyValues([
+      ['ID', source.id],
+      ['URI', source.uri],
+      ['Kind', source.sourceKind],
+      ['Sensitivity', source.sensitivity],
+      ['Permission', source.permissionState],
+      ['Trust', source.trustLevel],
+      ['Health', source.healthState],
+      ['Freshness', source.stalenessState],
+      ['Connector', source.connectorInstanceId],
+      ['Observed', architectureDate(source.lastObservedAt)],
+      ['Last read', architectureDate(source.lastSuccessfulReadAt)],
+    ])
+  );
+
+  const limitations = Array.isArray(source.knownLimitations) ? source.knownLimitations : [];
+  if (limitations.length) {
+    architectureSourceDetailEl.append(architectureHeading(4, 'Limitations'), architectureInlineBadges(limitations));
+  }
+
+  const citation = architectureSourcesState.citation;
+  architectureSourceDetailEl.append(architectureHeading(4, 'Citation'));
+  architectureSourceDetailEl.appendChild(architectureMuted(citation?.text || citation?.sourceId || 'No citation available'));
+
+  const findings = sourceHealthFindings(source.id);
+  architectureSourceDetailEl.append(architectureHeading(4, 'Health Findings'));
+  if (findings.length) {
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const finding of findings) {
+      grid.appendChild(architectureCard(finding.issueType || finding.id, [finding.message, finding.sourceVersionId], finding.severity));
+    }
+    architectureSourceDetailEl.appendChild(grid);
+  } else {
+    architectureSourceDetailEl.appendChild(architectureEmpty('No findings'));
+  }
+
+  const events = architectureSourcesState.events || {};
+  const access = Array.isArray(events.access) ? events.access : [];
+  const health = Array.isArray(events.health) ? events.health : [];
+  architectureSourceDetailEl.append(architectureHeading(4, 'Events'));
+  if (access.length || health.length) {
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const event of [...access, ...health].slice(0, 8)) {
+      grid.appendChild(architectureCard(event.action || event.state || event.eventType || event.id, [event.message, architectureDate(event.timestamp || event.checkedAt)], event.allowed === false ? 'denied' : event.state));
+    }
+    architectureSourceDetailEl.appendChild(grid);
+  } else {
+    architectureSourceDetailEl.appendChild(architectureEmpty('No events'));
+  }
+}
+
+async function selectArchitectureSource(sourceId) {
+  const source = architectureSourcesState.sources.find(item => item.id === sourceId);
+  if (!source) return;
+  architectureSourcesState.selected = source;
+  renderArchitectureSourceList();
+  renderArchitectureSourceDetail();
+  architectureStatus(architectureSourceStatusEl, 'Loading source details...');
+  try {
+    const [citationResult, eventsResult] = await Promise.allSettled([
+      callTool('source_action', { action: 'citation', sourceId: source.id }),
+      callTool('source_action', { action: 'events', sourceId: source.id }),
+    ]);
+    if (architectureSourcesState.selected?.id !== source.id) return;
+    architectureSourcesState.citation = citationResult.status === 'fulfilled' ? citationResult.value : null;
+    architectureSourcesState.events = eventsResult.status === 'fulfilled' ? eventsResult.value : null;
+    renderArchitectureSourceDetail();
+    architectureStatus(architectureSourceStatusEl, `${architectureSourcesState.sources.length} source(s)`);
+  } catch (err) {
+    architectureStatus(architectureSourceStatusEl, String(err?.message || err), true);
+  }
+}
+
+async function loadArchitectureSources() {
+  if (architectureSourceRefreshBtn) architectureSourceRefreshBtn.disabled = true;
+  architectureStatus(architectureSourceStatusEl, 'Loading sources...');
+  try {
+    const [sourceResult, healthResult] = await Promise.allSettled([
+      callTool('source_action', { action: 'list' }),
+      callTool('source_health_action', { action: 'report', workspaceId: activeWorkspaceId() }),
+    ]);
+    if (sourceResult.status !== 'fulfilled') throw sourceResult.reason;
+    architectureSourcesState.sources = Array.isArray(sourceResult.value?.sources) ? sourceResult.value.sources : [];
+    architectureSourcesState.healthReport = healthResult.status === 'fulfilled' ? healthResult.value : null;
+    architectureSourcesState.loaded = true;
+    const previousId = architectureSourcesState.selected?.id;
+    const next = architectureSourcesState.sources.find(source => source.id === previousId) || architectureSourcesState.sources[0] || null;
+    architectureSourcesState.selected = next;
+    architectureSourcesState.citation = null;
+    architectureSourcesState.events = null;
+    renderArchitectureSourceList();
+    renderArchitectureSourceDetail();
+    if (next) await selectArchitectureSource(next.id);
+    else architectureStatus(architectureSourceStatusEl, 'No sources');
+  } catch (err) {
+    architectureStatus(architectureSourceStatusEl, String(err?.message || err), true);
+    architectureSourcesState.loaded = true;
+    renderArchitectureSourceList();
+    renderArchitectureSourceDetail();
+  } finally {
+    if (architectureSourceRefreshBtn) architectureSourceRefreshBtn.disabled = false;
+  }
+}
+
+function architectureSqlPlanInput() {
+  const metricName = architectureSqlMetricEl?.value.trim() || 'total_revenue';
+  const dimensions = (architectureSqlDimensionEl?.value || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  const filterColumn = architectureSqlFilterColumnEl?.value.trim() || '';
+  const filterValue = architectureSqlFilterValueEl?.value.trim() || '';
+  const filters = filterColumn ? [{ columnId: filterColumn, op: 'eq', value: filterValue }] : [];
+  const limit = Math.max(1, Number(architectureSqlLimitEl?.value || 50));
+  return { workspaceId: activeWorkspaceId(), metricName, dimensions, filters, limit };
+}
+
+function renderArchitectureSqlResults() {
+  if (architectureSqlPreviewEl) {
+    architectureSqlPreviewEl.textContent = architectureSqlState.plan?.queryRun?.sql || '';
+  }
+  if (architectureSqlApproveBtn) architectureSqlApproveBtn.disabled = !architectureSqlState.plan?.queryRun?.id || Boolean(architectureSqlState.approvalToken);
+  if (architectureSqlExecuteBtn) architectureSqlExecuteBtn.disabled = !architectureSqlState.plan?.queryRun?.id || !architectureSqlState.approvalToken || Boolean(architectureSqlState.executed);
+  architectureClear(architectureSqlResultsEl);
+  if (!architectureSqlResultsEl) return;
+
+  const plan = architectureSqlState.plan;
+  if (!plan) {
+    architectureSqlResultsEl.appendChild(architectureEmpty('No query plan'));
+    return;
+  }
+  const run = architectureSqlState.executed?.run || plan.queryRun;
+  architectureSqlResultsEl.append(
+    architectureHeading(3, 'Query Run'),
+    architectureKeyValues([
+      ['Run', run?.id],
+      ['Status', run?.status],
+      ['Metric', plan.metric?.businessName || plan.metric?.name],
+      ['Table', plan.table?.displayName || plan.table?.tableName],
+      ['Row limit', run?.rowLimit],
+      ['SQL hash', run?.sqlHash],
+      ['Sources', run?.sourceIds],
+      ['Warning', plan.rowCapWarning],
+    ])
+  );
+
+  if (Array.isArray(plan.validation?.reasons) && plan.validation.reasons.length) {
+    architectureSqlResultsEl.append(architectureHeading(4, 'Validation'), architectureInlineBadges(plan.validation.reasons));
+  }
+
+  const executed = architectureSqlState.executed;
+  if (!executed) return;
+  const rows = Array.isArray(executed.rows) ? executed.rows : [];
+  const fields = Array.isArray(executed.fields) && executed.fields.length
+    ? executed.fields
+    : Array.from(new Set(rows.flatMap(row => Object.keys(row || {}))));
+  architectureSqlResultsEl.append(architectureHeading(4, 'Rows'));
+  architectureSqlResultsEl.appendChild(rows.length && fields.length ? architectureTable(rows, fields) : architectureEmpty('No rows'));
+  if (executed.citation) {
+    architectureSqlResultsEl.append(architectureHeading(4, 'Result Citation'), architectureMuted(executed.citation.text || executed.citation.sourceId));
+  }
+}
+
+async function planArchitectureSql(event) {
+  event?.preventDefault();
+  architectureStatus(architectureSqlStatusEl, 'Planning query...');
+  architectureSqlState = { plan: null, approvalToken: '', executed: null };
+  renderArchitectureSqlResults();
+  try {
+    const plan = await callTool('structured_data_action', { action: 'plan_query', plan: architectureSqlPlanInput() });
+    architectureSqlState.plan = plan;
+    renderArchitectureSqlResults();
+    architectureStatus(architectureSqlStatusEl, plan.rowCapWarning || 'Query planned.');
+  } catch (err) {
+    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
+  }
+}
+
+async function approveArchitectureSql() {
+  const runId = architectureSqlState.plan?.queryRun?.id;
+  if (!runId) return;
+  architectureStatus(architectureSqlStatusEl, 'Approving query...');
+  if (architectureSqlApproveBtn) architectureSqlApproveBtn.disabled = true;
+  try {
+    const result = await callTool('structured_data_action', { action: 'approve_query', queryRunId: runId });
+    architectureSqlState.approvalToken = result?.approvalToken || '';
+    if (result?.queryRun && architectureSqlState.plan) architectureSqlState.plan.queryRun = result.queryRun;
+    renderArchitectureSqlResults();
+    architectureStatus(architectureSqlStatusEl, 'Query approved.');
+  } catch (err) {
+    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
+  } finally {
+    // A failed request must remain retryable. Rendering derives the enabled
+    // state from the durable plan/token instead of leaving the busy flag stuck.
+    renderArchitectureSqlResults();
+  }
+}
+
+async function executeArchitectureSql() {
+  const runId = architectureSqlState.plan?.queryRun?.id;
+  if (!runId || !architectureSqlState.approvalToken) return;
+  architectureStatus(architectureSqlStatusEl, 'Executing query...');
+  if (architectureSqlExecuteBtn) architectureSqlExecuteBtn.disabled = true;
+  try {
+    const result = await callTool('structured_data_action', {
+      action: 'execute_query',
+      queryRunId: runId,
+      approvalToken: architectureSqlState.approvalToken,
+    });
+    architectureSqlState.executed = result;
+    renderArchitectureSqlResults();
+    architectureSourcesState.loaded = false;
+    architectureStatus(architectureSqlStatusEl, `Executed ${Array.isArray(result?.rows) ? result.rows.length : 0} row(s).`);
+  } catch (err) {
+    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
+  } finally {
+    renderArchitectureSqlResults();
+  }
+}
+
+function renderArchitectureApprovalList() {
+  architectureClear(architectureApprovalListEl);
+  if (!architectureApprovalListEl) return;
+  const approvals = architectureWorkflowState.approvals;
+  if (!approvals.length) {
+    architectureApprovalListEl.appendChild(architectureEmpty('No approvals'));
+    return;
+  }
+  for (const approval of approvals) {
+    const item = architectureItemButton({
+      title: approval.gateId || approval.id,
+      meta: [approval.runId, approval.reason].filter(Boolean).join(' | '),
+      badge: approval.status,
+      active: architectureWorkflowState.selected?.id === approval.id && architectureWorkflowState.selected?.runId === approval.runId,
+      onClick: () => selectArchitectureApproval(approval.id, approval.runId),
+    });
+    if (approval.id) item.dataset.approvalId = approval.id;
+    if (approval.runId) item.dataset.runId = approval.runId;
+    architectureApprovalListEl.appendChild(item);
+  }
+}
+
+function renderArchitectureApprovalDetail() {
+  architectureClear(architectureApprovalDetailEl);
+  if (!architectureApprovalDetailEl) return;
+  const approval = architectureWorkflowState.selected;
+  if (!approval) {
+    architectureApprovalDetailEl.appendChild(architectureEmpty('Select an approval'));
+    return;
+  }
+  const inspected = architectureWorkflowState.inspected || {};
+  const run = inspected.run || null;
+  architectureApprovalDetailEl.append(
+    architectureHeading(3, approval.gateId || approval.id),
+    architectureKeyValues([
+      ['Approval', approval.id],
+      ['Status', approval.status],
+      ['Run', approval.runId],
+      ['Reason', approval.reason],
+      ['Decided', architectureDate(approval.decidedAt)],
+    ])
+  );
+  if (approval.status === 'pending') {
+    const actions = document.createElement('div');
+    actions.className = 'architecture-card-actions';
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Approve';
+    approve.onclick = () => decideArchitectureApproval('approve', approval);
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'danger';
+    reject.textContent = 'Reject';
+    reject.onclick = () => decideArchitectureApproval('reject', approval);
+    actions.append(approve, reject);
+    architectureApprovalDetailEl.appendChild(actions);
+  }
+  if (run) {
+    architectureApprovalDetailEl.append(
+      architectureHeading(4, 'Run'),
+      architectureKeyValues([
+        ['Workflow', run.workflowId],
+        ['Mode', run.mode],
+        ['Status', run.status],
+        ['Sources', run.evidenceSourceIds],
+        ['Created', architectureDate(run.createdAt)],
+        ['Updated', architectureDate(run.updatedAt)],
+      ])
+    );
+  }
+  const proposed = Array.isArray(run?.proposedActions) ? run.proposedActions : [];
+  if (proposed.length) {
+    architectureApprovalDetailEl.appendChild(architectureHeading(4, 'Proposed Actions'));
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const action of proposed) {
+      grid.appendChild(architectureCard(action.toolName || action.id, [action.id, `Sources: ${architectureString(action.sourceIds)}`], action.status));
+    }
+    architectureApprovalDetailEl.appendChild(grid);
+  }
+  const events = Array.isArray(inspected.events) ? inspected.events : [];
+  if (events.length) {
+    architectureApprovalDetailEl.appendChild(architectureHeading(4, 'Ledger'));
+    architectureApprovalDetailEl.appendChild(architectureTable(events, ['sequence', 'eventType', 'timestamp']));
+  }
+}
+
+async function selectArchitectureApproval(approvalId, runId) {
+  const approval = architectureWorkflowState.approvals.find(item =>
+    item.id === approvalId && (runId === undefined || item.runId === runId)
+  );
+  if (!approval) return;
+  architectureWorkflowState.selected = approval;
+  architectureWorkflowState.inspected = null;
+  renderArchitectureApprovalList();
+  renderArchitectureApprovalDetail();
+  if (!approval.runId) return;
+  architectureStatus(architectureWorkflowStatusEl, 'Loading run...');
+  try {
+    const inspected = await callTool('workflow_action', { action: 'inspect_run', runId: approval.runId });
+    if (architectureWorkflowState.selected?.id !== approval.id || architectureWorkflowState.selected?.runId !== approval.runId) return;
+    architectureWorkflowState.inspected = inspected;
+    renderArchitectureApprovalDetail();
+    architectureStatus(architectureWorkflowStatusEl, `${architectureWorkflowState.approvals.length} approval(s)`);
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  }
+}
+
+async function loadArchitectureWorkflowApprovals() {
+  if (architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = true;
+  architectureStatus(architectureWorkflowStatusEl, 'Loading approvals...');
+  try {
+    const result = await callTool('workflow_action', { action: 'list_approvals' });
+    architectureWorkflowState.approvals = Array.isArray(result?.approvals) ? result.approvals : [];
+    architectureWorkflowState.loaded = true;
+    const previousId = architectureWorkflowState.selected?.id;
+    const previousRunId = architectureWorkflowState.selected?.runId;
+    const next = architectureWorkflowState.approvals.find(approval =>
+      approval.id === previousId && approval.runId === previousRunId
+    ) || architectureWorkflowState.approvals[0] || null;
+    architectureWorkflowState.selected = next;
+    architectureWorkflowState.inspected = null;
+    renderArchitectureApprovalList();
+    renderArchitectureApprovalDetail();
+    if (next) await selectArchitectureApproval(next.id, next.runId);
+    else architectureStatus(architectureWorkflowStatusEl, 'No approvals');
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+    architectureWorkflowState.loaded = true;
+  } finally {
+    if (architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = false;
+  }
+}
+
+async function decideArchitectureApproval(action, approval) {
+  if (!approval?.runId) return;
+  architectureStatus(architectureWorkflowStatusEl, action === 'approve' ? 'Approving...' : 'Rejecting...');
+  try {
+    await callTool('workflow_action', {
+      action,
+      runId: approval.runId,
+      approvalId: approval.id,
+      reason: action === 'approve' ? 'Approved in architecture UI.' : 'Rejected in architecture UI.',
+    });
+    await loadArchitectureWorkflowApprovals();
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  }
+}
+
+function architectureGraphEntities() {
+  const byId = new Map();
+  for (const entity of architectureGraphState.entities) {
+    if (entity?.id) byId.set(entity.id, entity);
+  }
+  const retrieve = architectureGraphState.retrieve || {};
+  for (const entity of Array.isArray(retrieve.entities) ? retrieve.entities : []) {
+    if (entity?.id) byId.set(entity.id, entity);
+  }
+  for (const fact of Array.isArray(retrieve.facts) ? retrieve.facts : []) {
+    if (fact?.subject?.id) byId.set(fact.subject.id, fact.subject);
+    if (fact?.object?.id) byId.set(fact.object.id, fact.object);
+  }
+  return [...byId.values()];
+}
+
+function architectureGraphRelationships() {
+  const relationships = [...architectureGraphState.relationships];
+  const facts = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts : [];
+  for (const fact of facts) {
+    if (fact?.relationship) relationships.push(fact.relationship);
+  }
+  return relationships;
+}
+
+function renderArchitectureGraphList() {
+  architectureClear(architectureGraphListEl);
+  if (!architectureGraphListEl) return;
+  const entities = architectureGraphEntities();
+  if (!entities.length) {
+    architectureGraphListEl.appendChild(architectureEmpty('No entities'));
+    return;
+  }
+  for (const entity of entities) {
+    architectureGraphListEl.appendChild(architectureItemButton({
+      title: entity.canonicalName || entity.id,
+      meta: [entity.id, Array.isArray(entity.aliases) ? entity.aliases.join(', ') : ''].filter(Boolean).join(' | '),
+      badge: entity.type,
+      active: architectureGraphState.selected?.id === entity.id,
+      onClick: () => selectArchitectureGraphEntity(entity.id),
+    }));
+  }
+}
+
+function renderArchitectureGraphDetail() {
+  architectureClear(architectureGraphDetailEl);
+  if (!architectureGraphDetailEl) return;
+  const entity = architectureGraphState.selected;
+  if (!entity) {
+    architectureGraphDetailEl.appendChild(architectureEmpty('Select an entity'));
+    return;
+  }
+  architectureGraphDetailEl.append(
+    architectureHeading(3, entity.canonicalName || entity.id),
+    architectureKeyValues([
+      ['ID', entity.id],
+      ['Type', entity.type],
+      ['Aliases', entity.aliases],
+      ['Sensitivity', entity.sensitivity],
+      ['Updated', architectureDate(entity.updatedAt)],
+    ])
+  );
+
+  const relationships = architectureGraphRelationships().filter(rel =>
+    rel.subjectEntityId === entity.id || rel.objectEntityId === entity.id
+  );
+  architectureGraphDetailEl.appendChild(architectureHeading(4, 'Relationships'));
+  if (relationships.length) {
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const rel of relationships) {
+      grid.appendChild(architectureCard(rel.predicate || rel.id, [
+        `${rel.subjectEntityId} -> ${rel.objectEntityId}`,
+        `Source: ${architectureString(rel.sourceId)}`,
+        rel.evidenceSpan,
+      ], rel.confidence !== undefined ? `confidence ${rel.confidence}` : rel.extractionMethod));
+    }
+    architectureGraphDetailEl.appendChild(grid);
+  } else {
+    architectureGraphDetailEl.appendChild(architectureEmpty('No relationships'));
+  }
+
+  const facts = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts : [];
+  const entityFacts = facts.filter(fact => fact?.subject?.id === entity.id || fact?.object?.id === entity.id);
+  if (entityFacts.length) {
+    architectureGraphDetailEl.appendChild(architectureHeading(4, 'Evidence'));
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const fact of entityFacts) {
+      grid.appendChild(architectureCard(fact.relationship?.predicate || fact.sourceId, [
+        `${architectureString(fact.subject?.canonicalName || fact.subject?.id)} -> ${architectureString(fact.object?.canonicalName || fact.object?.id)}`,
+        fact.citation?.text,
+        `Version: ${architectureString(fact.sourceVersionId)}`,
+      ], fact.sourceId));
+    }
+    architectureGraphDetailEl.appendChild(grid);
+  }
+}
+
+function selectArchitectureGraphEntity(entityId) {
+  const entity = architectureGraphEntities().find(item => item.id === entityId);
+  if (!entity) return;
+  architectureGraphState.selected = entity;
+  renderArchitectureGraphList();
+  renderArchitectureGraphDetail();
+}
+
+async function loadArchitectureGraph() {
+  if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
+  architectureStatus(architectureGraphStatusEl, 'Loading graph...');
+  try {
+    const result = await callTool('context_graph_action', { action: 'list' });
+    architectureGraphState.entities = Array.isArray(result?.entities) ? result.entities : [];
+    architectureGraphState.relationships = Array.isArray(result?.relationships) ? result.relationships : [];
+    architectureGraphState.loaded = true;
+    const previousId = architectureGraphState.selected?.id;
+    const next = architectureGraphEntities().find(entity => entity.id === previousId) || architectureGraphEntities()[0] || null;
+    architectureGraphState.selected = next;
+    renderArchitectureGraphList();
+    renderArchitectureGraphDetail();
+    architectureStatus(architectureGraphStatusEl, `${architectureGraphState.entities.length} entity record(s)`);
+  } catch (err) {
+    architectureStatus(architectureGraphStatusEl, String(err?.message || err), true);
+    architectureGraphState.loaded = true;
+  } finally {
+    if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = false;
+  }
+}
+
+async function retrieveArchitectureGraph(event) {
+  event?.preventDefault();
+  architectureStatus(architectureGraphStatusEl, 'Retrieving graph context...');
+  const terms = (architectureGraphSearchEl?.value || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  const sourceIds = (architectureGraphSourceEl?.value || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  try {
+    architectureGraphState.retrieve = await callTool('context_graph_action', {
+      action: 'retrieve',
+      workspaceId: activeWorkspaceId(),
+      terms,
+      ...(sourceIds.length ? { sourceIds } : {}),
+      maxRelationships: 25,
+    });
+    const next = architectureGraphEntities()[0] || null;
+    if (next) architectureGraphState.selected = next;
+    renderArchitectureGraphList();
+    renderArchitectureGraphDetail();
+    const factCount = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts.length : 0;
+    architectureStatus(architectureGraphStatusEl, `Retrieved ${factCount} fact(s).`);
+  } catch (err) {
+    architectureStatus(architectureGraphStatusEl, String(err?.message || err), true);
+  }
+}
+
+function renderArchitectureReviewList() {
+  architectureClear(architectureReviewListEl);
+  if (!architectureReviewListEl) return;
+  const reviews = architectureReviewState.reviews;
+  if (!reviews.length) {
+    architectureReviewListEl.appendChild(architectureEmpty('No reviews'));
+    return;
+  }
+  for (const review of reviews) {
+    architectureReviewListEl.appendChild(architectureItemButton({
+      title: review.question || review.id,
+      meta: [review.targetType, review.targetId, review.workflowRunId].filter(Boolean).join(' | '),
+      badge: review.status,
+      active: architectureReviewState.selected?.id === review.id,
+      onClick: () => selectArchitectureReview(review.id),
+    }));
+  }
+}
+
+function renderArchitectureReviewDetail() {
+  architectureClear(architectureReviewDetailEl);
+  if (!architectureReviewDetailEl) return;
+  const review = architectureReviewState.selected;
+  if (!review) {
+    architectureReviewDetailEl.appendChild(architectureEmpty('Select a review'));
+    return;
+  }
+  architectureReviewDetailEl.append(
+    architectureHeading(3, review.question || review.id),
+    architectureKeyValues([
+      ['Review', review.id],
+      ['Status', review.status],
+      ['Mode', review.reviewMode || review.mode],
+      ['Target', [review.targetType, review.targetId].filter(Boolean).join(': ')],
+      ['Workflow', review.workflowId],
+      ['Run', review.workflowRunId],
+      ['Sources', review.sourceIds],
+      ['Created', architectureDate(review.createdAt)],
+    ])
+  );
+  if (review.synthesis) {
+    architectureReviewDetailEl.append(architectureHeading(4, 'Synthesis'), architectureMuted(review.synthesis));
+  }
+  const experts = Array.isArray(review.experts) ? review.experts : [];
+  architectureReviewDetailEl.appendChild(architectureHeading(4, 'Expert Cards'));
+  if (experts.length) {
+    const grid = document.createElement('div');
+    grid.className = 'architecture-card-grid';
+    for (const expert of experts) {
+      grid.appendChild(architectureCard(expert.title || expert.expertId, [
+        expert.answer,
+        `Risks: ${architectureString(expert.risks)}`,
+        `Mitigations: ${architectureString(expert.mitigations)}`,
+        `Checklist: ${architectureString(expert.approvalChecklist)}`,
+      ], expert.recommendation || expert.confidence));
+    }
+    architectureReviewDetailEl.appendChild(grid);
+  } else {
+    architectureReviewDetailEl.appendChild(architectureEmpty('No expert cards'));
+  }
+  const risks = Array.isArray(review.riskRegister) ? review.riskRegister : [];
+  if (risks.length) {
+    architectureReviewDetailEl.append(architectureHeading(4, 'Risk Register'), architectureTable(risks, ['severity', 'description', 'ownerExpertId', 'mitigation']));
+  }
+}
+
+async function selectArchitectureReview(reviewId) {
+  const review = architectureReviewState.reviews.find(item => item.id === reviewId);
+  if (!review) return;
+  architectureReviewState.selected = review;
+  renderArchitectureReviewList();
+  renderArchitectureReviewDetail();
+  architectureStatus(architectureReviewStatusEl, 'Loading review...');
+  try {
+    const result = await callTool('expert_panel', { action: 'get_review', reviewId });
+    if (architectureReviewState.selected?.id !== review.id) return;
+    if (result?.review) {
+      architectureReviewState.selected = result.review;
+      const idx = architectureReviewState.reviews.findIndex(item => item.id === result.review.id);
+      if (idx >= 0) architectureReviewState.reviews[idx] = result.review;
+    }
+    renderArchitectureReviewList();
+    renderArchitectureReviewDetail();
+    architectureStatus(architectureReviewStatusEl, `${architectureReviewState.reviews.length} review(s)`);
+  } catch (err) {
+    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
+  }
+}
+
+async function loadArchitectureReviews() {
+  if (architectureReviewRefreshBtn) architectureReviewRefreshBtn.disabled = true;
+  architectureStatus(architectureReviewStatusEl, 'Loading reviews...');
+  try {
+    const result = await callTool('expert_panel', { action: 'list_reviews' });
+    architectureReviewState.reviews = Array.isArray(result?.reviews) ? result.reviews : [];
+    architectureReviewState.loaded = true;
+    const previousId = architectureReviewState.selected?.id;
+    const next = architectureReviewState.reviews.find(review => review.id === previousId) || architectureReviewState.reviews[0] || null;
+    architectureReviewState.selected = next;
+    renderArchitectureReviewList();
+    renderArchitectureReviewDetail();
+    if (next) await selectArchitectureReview(next.id);
+    else architectureStatus(architectureReviewStatusEl, 'No reviews');
+  } catch (err) {
+    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
+    architectureReviewState.loaded = true;
+  } finally {
+    if (architectureReviewRefreshBtn) architectureReviewRefreshBtn.disabled = false;
+  }
+}
+
+async function createArchitectureReview(event) {
+  event?.preventDefault();
+  const question = architectureReviewQuestionEl?.value.trim() || '';
+  if (!question) {
+    architectureStatus(architectureReviewStatusEl, 'Question is required.', true);
+    return;
+  }
+  const experts = (architectureReviewExpertsEl?.value || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  const targetId = architectureReviewTargetIdEl?.value.trim() || undefined;
+  const workflowId = architectureReviewWorkflowIdEl?.value.trim() || undefined;
+  const workflowRunId = architectureReviewRunIdEl?.value.trim() || undefined;
+  architectureStatus(architectureReviewStatusEl, 'Creating review...');
+  if (architectureReviewCreateBtn) architectureReviewCreateBtn.disabled = true;
+  try {
+    const result = await callTool('expert_panel', {
+      action: 'review',
+      question,
+      mode: 'review',
+      reviewMode: 'pre_automation_review',
+      targetType: architectureReviewTargetTypeEl?.value || 'workflow',
+      ...(targetId ? { targetId } : {}),
+      ...(workflowId ? { workflowId } : {}),
+      ...(workflowRunId ? { workflowRunId } : {}),
+      ...(experts.length ? { experts } : {}),
+      synthesize: true,
+    });
+    const review = result?.review;
+    if (review?.id) {
+      const existing = architectureReviewState.reviews.findIndex(item => item.id === review.id);
+      if (existing >= 0) architectureReviewState.reviews[existing] = review;
+      else architectureReviewState.reviews.unshift(review);
+      architectureReviewState.selected = review;
+      architectureReviewState.loaded = true;
+      renderArchitectureReviewList();
+      renderArchitectureReviewDetail();
+    } else {
+      await loadArchitectureReviews();
+    }
+    architectureStatus(architectureReviewStatusEl, 'Review created.');
+  } catch (err) {
+    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
+  } finally {
+    if (architectureReviewCreateBtn) architectureReviewCreateBtn.disabled = false;
+  }
+}
+
+if (architectureScreenEl) {
+  for (const btn of architectureNavBtns) {
+    btn.addEventListener('click', () => setArchitectureOpen(true, btn.dataset.architectureView || 'sources'));
+  }
+  for (const btn of architectureTabBtns) {
+    btn.addEventListener('click', () => setArchitectureOpen(true, btn.dataset.architectureTab || 'sources'));
+    btn.addEventListener('keydown', event => {
+      const current = architectureTabBtns.indexOf(btn);
+      let next = current;
+      if (event.key === 'ArrowRight') next = (current + 1) % architectureTabBtns.length;
+      else if (event.key === 'ArrowLeft') next = (current - 1 + architectureTabBtns.length) % architectureTabBtns.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = architectureTabBtns.length - 1;
+      else return;
+      event.preventDefault();
+      architectureTabBtns[next].focus();
+      architectureTabBtns[next].click();
+    });
+  }
+  architectureSourceRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('sources', true));
+  architectureSqlForm?.addEventListener('submit', planArchitectureSql);
+  architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
+  architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);
+  architectureWorkflowRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('workflows', true));
+  architectureGraphRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('graph', true));
+  architectureGraphForm?.addEventListener('submit', retrieveArchitectureGraph);
+  architectureReviewRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('reviews', true));
+  architectureReviewForm?.addEventListener('submit', createArchitectureReview);
+}
+
 // ── Cortex workspaces ───────────────────────────────────────────────────────
 
 function setWorkspaceStatus(text, isError = false) {
@@ -770,6 +1804,7 @@ function setWorkspaceSettingsOpen(open) {
   document.body.classList.toggle('workspace-settings-open', open);
   workspaceConfigBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (open) {
+    setArchitectureOpen(false, architectureView, { skipWorkspace: true });
     setWorkspacePopoverOpen(false);
     closeSidebar();
     loadWorkspaceRagConfig();
@@ -784,6 +1819,7 @@ function confirmWorkspaceDelete(workspace) {
     return Promise.resolve(false);
   }
   workspaceDeleteMessageEl.textContent = `Delete "${workspace.name}" and its local workspace files?`;
+  const restoreFocus = document.activeElement;
   workspaceDeleteDialogEl.classList.add('open');
   workspaceDeleteDialogEl.setAttribute('aria-hidden', 'false');
   workspaceDeleteConfirmBtn.focus();
@@ -796,11 +1832,13 @@ function confirmWorkspaceDelete(workspace) {
       workspaceDeleteConfirmBtn.removeEventListener('click', onConfirm);
       workspaceDeleteDialogEl.removeEventListener('click', onBackdrop);
       document.removeEventListener('keydown', onKeyDown);
+      if (!confirmed && restoreFocus instanceof HTMLElement && restoreFocus.isConnected) restoreFocus.focus();
       resolve(confirmed);
     };
-    const onCancel = () => finish(false);
-    const onConfirm = () => finish(true);
+    const onCancel = (event) => { event.stopPropagation(); finish(false); };
+    const onConfirm = (event) => { event.stopPropagation(); finish(true); };
     const onBackdrop = (event) => {
+      event.stopPropagation();
       if (event.target === workspaceDeleteDialogEl) finish(false);
     };
     const onKeyDown = (event) => {
@@ -1302,12 +2340,13 @@ async function runExpertPanelFromUi() {
   inputEl.style.height = 'auto';
 
   try {
+    if (newSessionPromise && !(await newSessionPromise)) return;
     if (!currentSessionId) {
       const { id } = await apiNewSession();
       currentSessionId = id;
       location.hash = id;
     }
-    if (streamSessionId !== currentSessionId) connectSessionStream(currentSessionId);
+    await connectSessionStream(currentSessionId);
 
     const input = { question, mode, synthesize, maxCitationsPerExpert: 5, provider: providerSel.value };
     if (experts.length) input.experts = experts;
@@ -2643,6 +3682,7 @@ function renderSession(session, startIdx, scrollTarget) {
 
 async function openSession(id, scrollTarget) {
   closeSidebar();
+  setArchitectureOpen(false);
   currentSessionId = id;
   unreadSessions.delete(id);
   sessionListEl.querySelector('[data-sid="' + id + '"]')?.classList.remove('unread');
@@ -2661,22 +3701,44 @@ async function openSession(id, scrollTarget) {
   inputEl.focus();
 }
 
-// Shared: create a new session and navigate to it (used by click + hash).
-async function handleNewSession() {
+// Shared: create a new session and navigate to it (used by click + hash). DOM event
+// dispatch does not wait for an async listener, so retain the transition promise:
+// a message typed immediately after clicking New must not be posted to the previous
+// session while createSession() is still in flight.
+let newSessionPromise = null;
+
+function handleNewSession() {
+  if (newSessionPromise) return newSessionPromise;
+
   closeSidebar();
-  try {
-    const { id } = await apiNewSession();
-    currentSessionId = id;
-    location.hash = id;
-    showEmpty();
-    setBusyState(false); // a brand-new session is idle; clear any Stop carried over from the last view
-    if (chatHeaderEl) chatTitleEl.textContent = '';
-    const sessions = await apiListSessions();
-    renderSessions(sessions);
-    inputEl.focus();
-  } catch (e) {
-    alert('New session failed: ' + e.message);
-  }
+  setArchitectureOpen(false);
+  const pending = (async () => {
+    try {
+      const { id } = await apiNewSession();
+      currentSessionId = id;
+      // Bind the session stream as soon as the session exists. Waiting until the
+      // first submit races the submit POST against SSE establishment and can lose
+      // the complete response on a fast backend.
+      void connectSessionStream(id);
+      location.hash = id;
+      showEmpty();
+      setBusyState(false); // a brand-new session is idle; clear any Stop carried over from the last view
+      if (chatHeaderEl) chatTitleEl.textContent = '';
+      const sessions = await apiListSessions();
+      renderSessions(sessions);
+      inputEl.focus();
+      return id;
+    } catch (e) {
+      alert('New session failed: ' + e.message);
+      return null;
+    }
+  })();
+
+  newSessionPromise = pending;
+  void pending.then(() => {
+    if (newSessionPromise === pending) newSessionPromise = null;
+  });
+  return pending;
 }
 
 // Left-click creates a new session in the current tab.
@@ -2706,6 +3768,7 @@ async function submitFormResponse(sessionId, values) {
 
 let streamSessionId = null;       // session the persistent stream is bound to
 let streamAc        = null;       // AbortController for the current stream
+let streamReady     = Promise.resolve(); // settles after the transport confirms subscription
 const turnQueues    = new Map();  // traceId -> { items, wake, done, started }
 
 // Concat policy (the runner merges submissions queued behind a running turn into one turn, answered
@@ -2780,7 +3843,8 @@ async function* turnEvents(traceId) {
   }
 }
 
-async function connectSessionStream(sid) {
+function connectSessionStream(sid) {
+  if (streamSessionId === sid && streamAc && !streamAc.signal.aborted) return streamReady;
   if (streamAc) streamAc.abort();
   streamAc = new AbortController();
   streamSessionId = sid;
@@ -2788,16 +3852,36 @@ async function connectSessionStream(sid) {
   activeBatchHead = null;
   foldedTraces.clear();
   const ac = streamAc;
+  let markReady = () => {};
+  streamReady = new Promise(resolve => {
+    let settled = false;
+    markReady = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+  });
   // The transport owns the wire (reconnect, parsing); we just demux each turn event. Switching
   // sessions aborts ac (above), which ends the prior stream.
-  try {
-    for await (const ev of T.sessionEvents(sid, ac.signal)) {
-      if (ac.signal.aborted || sid !== currentSessionId) break;
-      pushTurnEvent(ev);
+  void (async () => {
+    try {
+      for await (const ev of T.sessionEvents(sid, ac.signal)) {
+        if (ev.type === 'stream-ready') {
+          markReady();
+          continue;
+        }
+        if (ac.signal.aborted || sid !== currentSessionId) break;
+        pushTurnEvent(ev);
+      }
+    } catch {
+      /* aborted or stream torn down */
+    } finally {
+      // Avoid trapping a caller forever if a custom transport closes without
+      // implementing the handshake. First-party transports settle earlier.
+      markReady();
     }
-  } catch {
-    /* aborted or stream torn down */
-  }
+  })();
+  return streamReady;
 }
 
 // Read the input box and submit it. The single entry point for *typed* messages; canned/programmatic
@@ -2826,13 +3910,14 @@ async function sendMessage(concat = true) {
 async function submit(content, concat = false) {
   const provider = providerSel.value;
   if (!content || !provider) return;
+  if (newSessionPromise && !(await newSessionPromise)) return;
   if (!currentSessionId) {
     const { id } = await apiNewSession();
     currentSessionId = id;
   }
   // Ensure the persistent event stream is bound to this session before we enqueue, so the turn's
   // events have a consumer (covers the just-created session and the "New session" button path).
-  if (streamSessionId !== currentSessionId) connectSessionStream(currentSessionId);
+  await connectSessionStream(currentSessionId);
   await postSubmit(currentSessionId, content, concat);
 }
 

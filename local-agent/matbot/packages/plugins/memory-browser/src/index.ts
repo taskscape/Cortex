@@ -112,7 +112,7 @@ async function serveStatic(res: ServerResponse, path: string, contentType: strin
   res.end(body);
 }
 
-function createMemoryBrowserServer(store: Store<RememberedFact>, principal: Principal) {
+export function createMemoryBrowserServer(store: Store<RememberedFact>, principal: Principal) {
   return createServer(async (req, res) => {
     const method = req.method ?? 'GET';
     const requestUrl = new URL(req.url ?? '/', BASE_URL);

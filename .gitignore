@@ -11,3 +11,7 @@ test-results/
 playwright-report/
 local-agent/matbot/.vscode
 test-results
+
+# Cortex workspace-local registry and per-workspace settings
+local-agent/matbot/cortex-workspaces.json
+local-agent/matbot/workspaces/*/cortex-rag.json

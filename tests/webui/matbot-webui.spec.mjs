@@ -1,5 +1,19 @@
 import { expect, test } from "@playwright/test";
 
+const uncaughtPageErrors = new WeakMap();
+
+test.beforeEach(async ({ page, request }) => {
+  const reset = await request.post("/__test/reset-memory");
+  expect(reset.ok(), "test harness memory reset").toBeTruthy();
+  const errors = [];
+  uncaughtPageErrors.set(page, errors);
+  page.on("pageerror", error => errors.push(error.message));
+});
+
+test.afterEach(async ({ page }) => {
+  expect(uncaughtPageErrors.get(page) ?? [], "uncaught browser errors").toEqual([]);
+});
+
 async function openPlugins(page) {
   await page.locator('[data-section="plugins"] .sidebar-heading').click();
 }
@@ -14,6 +28,15 @@ async function openExperts(page) {
 
 async function openMemorySection(page) {
   await page.locator('[data-section="memory"] .sidebar-heading').click();
+}
+
+async function openArchitecturePanel(page, view) {
+  const section = page.locator('[data-section="architecture"]');
+  const classes = await section.getAttribute("class");
+  if (classes?.includes("collapsed")) {
+    await section.locator(".sidebar-heading").click();
+  }
+  await page.locator(`.architecture-nav-btn[data-architecture-view="${view}"]`).click();
 }
 
 async function inputMetaTypography(locator) {
@@ -44,6 +67,21 @@ test("model label and expert selector use the same input meta typography", async
 
   await page.locator("#expert-enabled").check();
   expect(await inputMetaTypography(expertToggle)).toEqual(modelTypography);
+});
+
+test("persists provider and font preferences across reloads", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop preference controls coverage");
+  await page.goto("/");
+
+  await page.locator("#provider-select").selectOption("Local");
+  const initialSize = await page.locator("body").evaluate(el => parseFloat(getComputedStyle(el).fontSize));
+  await page.locator("#fs-up").click();
+  const increasedSize = await page.locator("body").evaluate(el => parseFloat(getComputedStyle(el).fontSize));
+  expect(increasedSize).toBeGreaterThan(initialSize);
+
+  await page.reload();
+  await expect(page.locator("#provider-select")).toHaveValue("Local");
+  await expect.poll(() => page.locator("body").evaluate(el => parseFloat(getComputedStyle(el).fontSize))).toBe(increasedSize);
 });
 
 test("loads the shell, providers, conversations, files, plugins, and skills", async ({ page, isMobile }) => {
@@ -231,6 +269,115 @@ test("governed architecture tools preserve records through the WebUI transport",
   expect(result.reviewList.reviews.some(review => review.id === result.review.review.id)).toBe(true);
 });
 
+test("architecture product panels expose sources, SQL approval, workflow approvals, graph evidence, and review cards", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop architecture panel coverage");
+  await page.goto("/");
+
+  const workflowRunId = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile",
+      workspaceId: "default",
+      name: "Compiled Followup",
+      sourceIds: ["source:playwright-architecture-brief"],
+      publish: true,
+      dryRun: true
+    });
+    const started = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      mode: "approval_gated",
+      inputs: { ticketId: "T-123" },
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    return started.id;
+  });
+
+  await openArchitecturePanel(page, "sources");
+  await expect(page.locator("#architecture-screen")).toBeVisible();
+  await expect(page.locator("#architecture-title")).toContainText("Sources");
+  await expect(page.locator("#architecture-source-list")).toContainText("architecture.md");
+  await expect(page.locator("#architecture-source-detail")).toContainText("Citation");
+  await expect(page.locator("#architecture-source-detail")).toContainText("stale");
+  await expect(page.locator("#architecture-source-list .architecture-badge", { hasText: "unhealthy" })).toHaveClass(/bad/);
+
+  const sourcesTab = page.getByRole("tab", { name: "Sources" });
+  await expect(sourcesTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "Sources" })).toBeVisible();
+  await sourcesTab.press("ArrowRight");
+  await expect(page.getByRole("tab", { name: "SQL Preview" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "SQL Preview" })).toBeVisible();
+
+  await page.locator("#architecture-sql-plan-btn").click();
+  await expect(page.locator("#architecture-sql-preview")).toContainText("SELECT");
+  await expect(page.locator("#architecture-sql-results")).toContainText("row cap 50");
+  await expect(page.locator("#architecture-sql-approve-btn")).toBeEnabled();
+  await page.locator("#architecture-sql-approve-btn").click();
+  await expect(page.locator("#architecture-sql-execute-btn")).toBeEnabled();
+  await page.locator("#architecture-sql-execute-btn").click();
+  await expect(page.locator("#architecture-sql-results")).toContainText("total_revenue");
+  await expect(page.locator("#architecture-sql-results")).toContainText("Source tables/metrics");
+
+  await page.locator('.architecture-tab[data-architecture-tab="workflows"]').click();
+  await expect(page.locator("#architecture-approval-list")).toContainText("structured-expert-review");
+  await page.locator(`#architecture-approval-list .architecture-item[data-run-id="${workflowRunId}"][data-approval-id="approval:expert-review"]`).click();
+  await expect(page.locator("#architecture-approval-detail")).toContainText(workflowRunId);
+  await expect(page.locator("#architecture-approval-detail")).toContainText("Proposed Actions");
+  await page.locator("#architecture-approval-detail").getByRole("button", { name: "Approve" }).click();
+  await expect(page.locator("#architecture-approval-detail")).toContainText("approved");
+
+  await page.locator('.architecture-tab[data-architecture-tab="graph"]').click();
+  await expect(page.locator("#architecture-graph-list")).toContainText("Acme Corp");
+  await page.locator("#architecture-graph-retrieve").click();
+  await expect(page.locator("#architecture-graph-detail")).toContainText("Ticket 123");
+  await expect(page.locator("#architecture-graph-detail")).toContainText("architecture.md");
+
+  await page.locator('.architecture-tab[data-architecture-tab="reviews"]').click();
+  await page.locator("#architecture-review-run-id").fill(workflowRunId);
+  await page.locator("#architecture-review-create-btn").click();
+  await expect(page.locator("#architecture-review-list")).toContainText("Should this high-risk workflow be approved?");
+  await expect(page.locator("#architecture-review-detail")).toContainText("Finance Expert");
+  await expect(page.locator("#architecture-review-detail")).toContainText("automation rollback path confirmed");
+  await expect(page.locator("#architecture-review-detail")).toContainText("Risk Register");
+});
+
+test("architecture SQL actions recover from transient approval and execution failures", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop architecture recovery coverage");
+  let failApproval = true;
+  let failExecution = true;
+  await page.route("**/tools/structured_data_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "approve_query" && failApproval) {
+      failApproval = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "temporary approval failure" }) });
+      return;
+    }
+    if (input.action === "execute_query" && failExecution) {
+      failExecution = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "temporary execution failure" }) });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await openArchitecturePanel(page, "sql");
+  await page.locator("#architecture-sql-plan-btn").click();
+  await expect(page.locator("#architecture-sql-approve-btn")).toBeEnabled();
+
+  await page.locator("#architecture-sql-approve-btn").click();
+  await expect(page.locator("#architecture-sql-status")).toContainText("temporary approval failure");
+  await expect(page.locator("#architecture-sql-approve-btn")).toBeEnabled();
+  await page.locator("#architecture-sql-approve-btn").click();
+  await expect(page.locator("#architecture-sql-execute-btn")).toBeEnabled();
+
+  await page.locator("#architecture-sql-execute-btn").click();
+  await expect(page.locator("#architecture-sql-status")).toContainText("temporary execution failure");
+  await expect(page.locator("#architecture-sql-execute-btn")).toBeEnabled();
+  await page.locator("#architecture-sql-execute-btn").click();
+  await expect(page.locator("#architecture-sql-results")).toContainText("total_revenue");
+});
+
 test("activates and deactivates compatible local plugins through the plugins panel", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop plugin activation coverage");
   await page.goto("/");
@@ -298,6 +445,20 @@ test("workspace selector lists, creates, renames, and switches workspaces", asyn
   });
   await page.locator("#workspace-new-btn").click();
   await expect(page.locator("#workspace-list")).toContainText("Research");
+
+  page.once("dialog", dialog => dialog.accept("Disposable"));
+  await page.locator("#workspace-new-btn").click();
+  const disposable = page.locator('.workspace-row[data-workspace-id="workspace-2"]');
+  await expect(disposable).toContainText("Disposable");
+
+  await disposable.getByRole("button", { name: "Delete Disposable" }).click();
+  await expect(page.locator("#workspace-delete-dialog")).toHaveClass(/open/);
+  await page.locator("#workspace-delete-cancel").click();
+  await expect(disposable).toBeVisible();
+
+  await disposable.getByRole("button", { name: "Delete Disposable" }).click();
+  await page.locator("#workspace-delete-confirm").click();
+  await expect(disposable).toHaveCount(0);
 
   page.once("dialog", async dialog => {
     expect(dialog.message()).toContain("Rename workspace");
@@ -383,6 +544,70 @@ test("remembered facts persist across conversations and are used in later answer
   await expect(page.locator(".message.assistant").last()).toContainText("Maciej Zagozda");
 });
 
+test("an immediate message after New waits for the new session", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop session transition coverage");
+  await page.goto("/");
+  await page.locator("#new-btn").click();
+  await expect(page.locator(".empty-state")).toContainText("Start a conversation");
+  const previousSessionId = await page.evaluate(() => location.hash.slice(1));
+
+  await page.route("**/sessions", async route => {
+    if (route.request().method() === "POST") {
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+    await route.continue();
+  });
+
+  await page.locator("#new-btn").click();
+  await page.locator("#input").fill("Immediate new-session message");
+  await page.keyboard.press("Shift+Enter");
+  await expect(page.locator(".message.assistant").last()).toContainText("Immediate new-session message");
+
+  const newSessionId = await page.evaluate(() => location.hash.slice(1));
+  expect(newSessionId).not.toBe(previousSessionId);
+  const [previousSession, newSession] = await page.evaluate(async sessionIds => Promise.all(
+    sessionIds.map(sessionId => window.matbotTransport.callTool("session_action", { action: "get", sessionId }))
+  ), [previousSessionId, newSessionId]);
+  expect(previousSession.messages.some(message => message.content?.[0]?.text === "Immediate new-session message")).toBeFalsy();
+  expect(newSession.messages.some(message => message.content?.[0]?.text === "Immediate new-session message")).toBeTruthy();
+});
+
+test("remembered facts are isolated between Cortex workspaces", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop cross-workspace memory coverage");
+  await page.goto("/");
+  await page.evaluate(async () => window.matbotTransport.switchWorkspace("default"));
+  await page.reload();
+
+  await page.locator("#new-btn").click();
+  await page.locator("#input").fill("Memorize this: Alpha workspace memory token.");
+  await page.keyboard.press("Shift+Enter");
+  await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
+
+  const secondWorkspace = await page.evaluate(async () => window.matbotTransport.createWorkspace("Memory Isolation"));
+  await page.evaluate(async id => window.matbotTransport.switchWorkspace(id), secondWorkspace.id);
+  await page.reload();
+  const secondWorkspaceFacts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", {
+    action: "query",
+    query: {}
+  }));
+  expect(secondWorkspaceFacts.items).toEqual([]);
+
+  await page.locator("#new-btn").click();
+  await page.locator("#input").fill("Memorize this: Beta workspace memory token.");
+  await page.keyboard.press("Shift+Enter");
+  await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
+
+  await page.evaluate(async () => window.matbotTransport.switchWorkspace("default"));
+  await page.reload();
+  const defaultFacts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", {
+    action: "query",
+    query: {}
+  }));
+  expect(defaultFacts.items.map(item => item.fact)).toContain("Alpha workspace memory token.");
+  expect(defaultFacts.items.map(item => item.fact)).not.toContain("Beta workspace memory token.");
+  await page.evaluate(async id => window.matbotTransport.deleteWorkspace(id), secondWorkspace.id);
+});
+
 test("memory sidebar affordance opens the in-page memory browser", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory browser coverage");
   await page.goto("/");
@@ -433,11 +658,15 @@ test("in-page memory browser can create, edit, search, and delete memories", asy
   await page.locator("#memory-browser-search").fill("Copper, revised");
   await page.locator("#memory-browser-search").press("Enter");
   await expect(page.locator("#memory-browser-list")).toContainText("Copper, revised");
+  await page.locator("#memory-browser-filter").selectOption("processed");
+  await expect(page.locator("#memory-browser-list")).toContainText("Copper, revised");
 
   page.once("dialog", dialog => dialog.accept());
   await page.locator("#memory-browser-delete").click();
   await expect(page.locator("#memory-browser-panel-status")).toContainText("Deleted");
   await expect(page.locator("#memory-browser-list")).not.toContainText("Copper, revised");
+  await page.locator("#memory-browser-close").click();
+  await expect(page.locator("#memory-browser-overlay")).not.toHaveClass(/open/);
 });
 
 test("direct cognition tool calls can receive session and provider context", async ({ page, isMobile }) => {
@@ -686,6 +915,28 @@ test("opens skill editor, shows metadata and trigger controls, and saves", async
 
   await page.locator("#skill-editor-save").click();
   await expect(page.locator("#skill-editor-overlay")).not.toHaveClass(/open/);
+});
+
+test("skill deletion supports cancellation and confirmation", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop skill deletion coverage");
+  await page.goto("/");
+  await page.evaluate(async () => window.matbotTransport.callTool("skill_action", {
+    action: "save",
+    name: "Disposable Playwright Skill",
+    content: "# Disposable"
+  }));
+  await openSkills(page);
+
+  const skill = page.locator(".skill-entry", { hasText: "Disposable Playwright Skill" });
+  await expect(skill).toBeVisible();
+  await skill.hover();
+  page.once("dialog", dialog => dialog.dismiss());
+  await skill.getByTitle("Delete skill").click();
+  await expect(skill).toBeVisible();
+
+  page.once("dialog", dialog => dialog.accept());
+  await skill.getByTitle("Delete skill").click();
+  await expect(skill).toHaveCount(0);
 });
 
 test("renames, hides, and marks sessions via sidebar controls", async ({ page, isMobile }) => {

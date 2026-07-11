@@ -24,7 +24,7 @@ const pendingPrompts = new Map();
 const runningTurns = new Map();
 let workspaceSeq = 1;
 let rememberedFactSeq = 1;
-const rememberedFacts = new Map();
+const rememberedFactsByWorkspace = new Map();
 let queryRunSeq = 1;
 let workflowRunSeq = 1;
 let expertReviewSeq = 1;
@@ -47,7 +47,7 @@ const architectureSource = {
   permissionState: "allowed",
   trustLevel: "high",
   citationPolicy: "cite_path",
-  healthState: "degraded",
+  healthState: "unhealthy",
   stalenessState: "stale",
   lastObservedAt: now(),
   lastSuccessfulReadAt: "2026-01-01T00:00:00.000Z",
@@ -76,6 +76,23 @@ const workspaces = [
     active: true
   }
 ];
+
+function activeHarnessWorkspaceId() {
+  return workspaces.find(workspace => workspace.active)?.id ?? "default";
+}
+
+function rememberedFactsForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  let store = rememberedFactsByWorkspace.get(workspaceId);
+  if (!store) {
+    store = new Map();
+    rememberedFactsByWorkspace.set(workspaceId, store);
+  }
+  return store;
+}
+
+function sessionWorkspaceId(sessionId) {
+  return sessions.get(sessionId)?.workspaceId ?? activeHarnessWorkspaceId();
+}
 let workspaceRagConfig = {
   activeContextId: "default",
   contexts: [
@@ -133,6 +150,7 @@ sessions.set("s0", {
   version: "v1",
   status: "active",
   title: "Conversation s0",
+  workspaceId: "default",
   messages: [],
   contexts: [],
   createdAt: now(),
@@ -410,8 +428,8 @@ function matchesRememberedFactFilter(record, filter) {
   }
 }
 
-function queryRememberedFacts(query = {}) {
-  let items = [...rememberedFacts.values()];
+function queryRememberedFacts(query = {}, store = rememberedFactsForWorkspace()) {
+  let items = [...store.values()];
   if (query.where) items = items.filter(item => matchesRememberedFactFilter(item, query.where));
   if (Array.isArray(query.sort)) {
     items = [...items].sort((a, b) => {
@@ -999,6 +1017,32 @@ function workflowActionResult(input) {
     return run;
   }
   if (input.action === "list_approvals") return { approvals: [...workflowApprovals.values()].flat() };
+  if (input.action === "approve" || input.action === "reject") {
+    const approvals = workflowApprovals.get(input.runId) ?? [];
+    if (!approvals.length) return { error: `Unknown workflow run "${input.runId}".` };
+    const targetIds = input.approvalId ? new Set([input.approvalId]) : new Set(approvals.map(approval => approval.id));
+    const status = input.action === "approve" ? "approved" : "rejected";
+    const decidedAt = now();
+    const updatedApprovals = approvals.map(approval =>
+      targetIds.has(approval.id) ? { ...approval, status, decidedAt, reason: input.reason ?? approval.reason } : approval
+    );
+    workflowApprovals.set(input.runId, updatedApprovals);
+    const run = workflowRuns.get(input.runId);
+    if (run) {
+      const hasPending = updatedApprovals.some(approval => approval.status === "pending");
+      const hasRejected = updatedApprovals.some(approval => approval.status === "rejected");
+      const updatedRun = {
+        ...run,
+        status: hasPending ? "waiting_for_approval" : (hasRejected ? "failed" : "succeeded"),
+        updatedAt: decidedAt
+      };
+      workflowRuns.set(input.runId, updatedRun);
+    }
+    return {
+      run: workflowRuns.get(input.runId) ?? null,
+      approvals: updatedApprovals.filter(approval => targetIds.has(approval.id))
+    };
+  }
   if (input.action === "inspect_run") {
     const run = workflowRuns.get(input.runId) ?? null;
     return {
@@ -1176,6 +1220,11 @@ async function handle(req, res) {
   if (method === "OPTIONS") return void res.writeHead(204).end();
 
   if (method === "GET" && url.pathname === "/health") return json(res, 200, { status: "ok" });
+  if (method === "POST" && url.pathname === "/__test/reset-memory") {
+    rememberedFactsByWorkspace.clear();
+    rememberedFactSeq = 1;
+    return json(res, 200, { ok: true });
+  }
   if (method === "GET" && url.pathname === "/") return file(res, "text/html; charset=utf-8", "index.html");
   if (method === "GET" && url.pathname === "/app.js") return file(res, "application/javascript; charset=utf-8", "app.js");
   if (method === "GET" && url.pathname === "/http-transport.js") return file(res, "application/javascript; charset=utf-8", "http-transport.js");
@@ -1225,6 +1274,26 @@ async function handle(req, res) {
     return json(res, 200, { active: id, restarting: true });
   }
 
+  const workspaceDeleteCheck = /^\/workspaces\/([^/]+)\/delete-check$/.exec(url.pathname);
+  if (method === "GET" && workspaceDeleteCheck) {
+    const id = decodeURIComponent(workspaceDeleteCheck[1]);
+    const workspace = workspaces.find(item => item.id === id);
+    if (!workspace) return json(res, 404, { error: "Workspace not found" });
+    if (workspace.active) return json(res, 409, { error: "Cannot delete the active workspace" });
+    return json(res, 200, { ok: true, workspaceId: id });
+  }
+
+  const workspaceDelete = /^\/workspaces\/([^/]+)$/.exec(url.pathname);
+  if (method === "DELETE" && workspaceDelete) {
+    const id = decodeURIComponent(workspaceDelete[1]);
+    const index = workspaces.findIndex(item => item.id === id);
+    if (index < 0) return json(res, 404, { error: "Workspace not found" });
+    if (workspaces[index].active) return json(res, 409, { error: "Cannot delete the active workspace" });
+    rememberedFactsByWorkspace.delete(id);
+    workspaces.splice(index, 1);
+    return json(res, 200, { ok: true, deleted: id });
+  }
+
   const sessionEvents = /^\/events\/sessions\/([^/]+)$/.exec(url.pathname);
   if (method === "GET" && sessionEvents) return openSessionStream(req, res, decodeURIComponent(sessionEvents[1]));
 
@@ -1235,6 +1304,7 @@ async function handle(req, res) {
       version: "v1",
       status: "active",
       title: `Conversation ${id}`,
+      workspaceId: activeHarnessWorkspaceId(),
       messages: [],
       contexts: [],
       createdAt: now(),
@@ -1363,6 +1433,7 @@ async function handle(req, res) {
 async function handleMemoryBrowser(req, res) {
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", memoryBrowserUrl);
+  const rememberedFacts = rememberedFactsForWorkspace();
   if (method === "GET" && url.pathname === "/") return memoryBrowserFile(res, "text/html; charset=utf-8", "index.html");
   if (method === "GET" && url.pathname === "/app.js") return memoryBrowserFile(res, "application/javascript; charset=utf-8", "app.js");
   if (method === "GET" && url.pathname === "/style.css") return memoryBrowserFile(res, "text/css; charset=utf-8", "style.css");
@@ -1461,6 +1532,9 @@ async function handleTool(res, name, rawInput) {
   const invocation = unwrapToolInvocation(rawInput);
   const input = invocation.input ?? {};
   const context = invocation.context;
+  const rememberedFacts = rememberedFactsForWorkspace(
+    context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId()
+  );
 
   if (name === "provider") {
     return json(res, 200, { providers: [{ name: "openai" }, { name: "Local" }, { name: "panel-test" }] });
@@ -1650,7 +1724,7 @@ async function handleTool(res, name, rawInput) {
   }
   if (name === "remembered_facts_action") {
     if (input.action === "list") return json(res, 200, { facts: [...rememberedFacts.values()] });
-    if (input.action === "query") return json(res, 200, queryRememberedFacts(input.query ?? {}));
+    if (input.action === "query") return json(res, 200, queryRememberedFacts(input.query ?? {}, rememberedFacts));
     if (input.action === "get") return json(res, 200, rememberedFacts.get(input.id) ?? null);
     if (input.action === "set") {
       const id = input.id ? String(input.id) : `fact-${rememberedFactSeq++}`;
@@ -1815,6 +1889,7 @@ async function handleTool(res, name, rawInput) {
 
 async function runTurn(sessionId, traceId, body) {
   const session = sessions.get(sessionId);
+  const rememberedFacts = rememberedFactsForWorkspace(session?.workspaceId ?? activeHarnessWorkspaceId());
   const content = typeof body.content === "string" ? body.content : JSON.stringify(body.content);
   const userMessage = {
     id: `m-${traceId}-u`,

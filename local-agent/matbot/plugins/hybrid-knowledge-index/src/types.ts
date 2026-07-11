@@ -19,6 +19,7 @@ export interface KnowledgeIndex {
 }
 
 export interface MatbotServices {
+  configPath?: string;
   register(name: "KnowledgeIndex", service: KnowledgeIndex): Promise<void> | void;
 }
 

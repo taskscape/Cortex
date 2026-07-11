@@ -12,6 +12,11 @@ import { evaluateAccess } from "../local-agent/file-broker/dist/policy.js";
 import { writeTextFile } from "../local-agent/file-broker/dist/file-writer.js";
 import { createFileBrokerTool, FileBrokerClient } from "../local-agent/matbot/plugins/file-broker/dist/index.js";
 import { mergeRankAndDeduplicate } from "../local-agent/matbot/plugins/hybrid-knowledge-index/dist/ranking.js";
+import { Mem0Client } from "../local-agent/matbot/plugins/hybrid-knowledge-index/dist/mem0-client.js";
+import {
+  workspaceIdFromConfigPath,
+  workspaceScopedMem0UserId
+} from "../local-agent/matbot/plugins/hybrid-knowledge-index/dist/index.js";
 
 test("file index stores searchable text with path metadata", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-index-"));
@@ -116,6 +121,52 @@ test("hybrid ranking deduplicates entries", () => {
 
   assert.equal(ranked.length, 2);
   assert.equal(ranked[0].content, "same");
+});
+
+test("Mem0 identities are isolated for every Cortex workspace", () => {
+  const root = path.join(os.tmpdir(), "cortex", "local-agent", "matbot");
+  const rootConfig = path.join(root, "matbot.yaml");
+  const alphaConfig = path.join(root, "workspaces", "alpha", "matbot.yaml");
+  const betaConfig = path.join(root, "workspaces", "beta", "matbot.yaml");
+
+  assert.equal(workspaceIdFromConfigPath(rootConfig), "default");
+  assert.equal(workspaceIdFromConfigPath(alphaConfig), "alpha");
+  assert.equal(workspaceScopedMem0UserId("local-agent", "default"), "local-agent:workspace:default");
+  assert.equal(workspaceScopedMem0UserId("local-agent", "alpha"), "local-agent:workspace:alpha");
+  assert.notEqual(
+    workspaceScopedMem0UserId("local-agent", workspaceIdFromConfigPath(alphaConfig)),
+    workspaceScopedMem0UserId("local-agent", workspaceIdFromConfigPath(betaConfig))
+  );
+});
+
+test("Mem0 add and search requests carry the workspace-scoped identity", async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(request.url?.includes("search") ? JSON.stringify({ results: [] }) : JSON.stringify({}));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  assert.ok(address);
+
+  try {
+    const client = new Mem0Client({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      userId: "local-agent:workspace:alpha",
+      workspaceId: "alpha"
+    });
+    await client.add(knowledgeEntry({ id: "memory-alpha", content: "alpha only", sourceType: "test", sourceUuid: "alpha", confidence: 1 }));
+    await client.search("alpha");
+    assert.equal(requests[0].user_id, "local-agent:workspace:alpha");
+    assert.equal(requests[0].metadata.workspaceId, "alpha");
+    assert.equal(requests[1].user_id, "local-agent:workspace:alpha");
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 function knowledgeEntry({ id, content, sourceType, sourceUuid, confidence }) {

@@ -96,6 +96,9 @@
       try {
         const res = await fetch('/events/sessions/' + sid, { signal });
         if (!res.ok || !res.body) break;
+        // Internal lifecycle event: lets app.js wait until the SSE subscription
+        // exists before it sends a turn that may complete immediately.
+        yield { type: 'stream-ready' };
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';

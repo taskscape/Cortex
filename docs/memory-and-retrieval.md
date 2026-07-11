@@ -162,6 +162,17 @@ Omit `expected` only when you intentionally want an unconditional delete.
 In this repository, `hybrid-knowledge-index` registers an implementation that
 queries Mem0 and file-index, ranks results, and deduplicates them.
 
+Mem0 memory is strictly workspace-scoped. Every workspace, including default,
+uses `<MEM0_USER_ID>:workspace:<workspace-id>`. Legacy records stored under the
+old unscoped id are left intact but are no longer queried, preventing historical
+cross-workspace entries from polluting current recall. Local cognition stores such as
+`remembered_facts` and `dream_runs` are also physically separated under the
+active workspace's own `.data` directory.
+
+Ephemeral CLI runs use in-memory stores for every document namespace, including
+remembered facts, dream runs, settings, skills, triggers, and store-tool data.
+They cannot write to a workspace's persistent memory backend.
+
 Skills also mirror saved skill content into the active `KnowledgeIndex`.
 `KnowledgeIndex` is not the same as `remembered_facts`: facts are stored raw in
 `remembered_facts`; skills and indexed entries are searched through

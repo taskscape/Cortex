@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 import { loadConfig, loadConfigFromText, loadDotEnv } from './config.js';
 import { installPlugin }                    from './install.js';
-import { executeQuery }                     from '@matatbread/matbot-storage-base';
 import { loadPluginsWithDescriptions, readPluginMeta, type PluginLoadRequest } from './plugin-description.js';
 import { nodePluginResolver }               from './plugin-resolver.js';
 import type { Principal, ProviderAdapter,
               ProviderConfig, Session,
-              Store, StoreQuery, QueryResult, CASResult,
+              Store,
               MessageContent, FileStore } from '@matatbread/matbot-core';
 import { appendMessage, createMessage,
          createSession,
@@ -26,7 +25,6 @@ import type { MatbotMachine, MatbotServices, PluginSettings, Vault, SessionRunne
 import { systemPrincipal }                 from '@matatbread/matbot-security';
 import { createAlsPrincipalCarrier }       from './principal-als.js';
 import { EnvFileVault }                     from './env-vault.js';
-import { FilesystemStore }                 from '@matatbread/matbot-storage-filesystem';
 import { FilesystemFileStore }             from '@matatbread/matbot-files-node';
 import { createBuiltinTools, createProviderTool, classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
 import { LookupKnowledgeIndex }               from '@matatbread/matbot-knowledge';
@@ -38,6 +36,7 @@ import { fileURLToPath, pathToFileURL }     from 'node:url';
 import process                             from 'node:process';
 import path                                from 'node:path';
 import { spawn, type ChildProcess }        from 'node:child_process';
+import { createWorkspaceStore, MemoryStore, workspaceDataDirectory } from './storage-isolation.js';
 
 // Prefix all console output with ISO timestamp + PID so parent and spawned
 // background processes are distinguishable in shared terminal output.
@@ -207,39 +206,6 @@ async function resolveCredentialsInteractive(
 
 // Reused as the no-op signal fallback; never aborted.
 const NEVER_ABORT_SIGNAL = new AbortController().signal;
-
-// ── Ephemeral in-memory store ──────────────────────────────────────────────────
-
-class MemoryStore<T extends { id: string; version: string }> implements Store<T> {
-  private readonly items = new Map<string, T>();
-
-  async get(id: string): Promise<T | null> {
-    return this.items.get(id) ?? null;
-  }
-
-  async set(id: string, value: T): Promise<void> {
-    this.items.set(id, value);
-  }
-
-  async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
-    const current = this.items.get(id) ?? null;
-    if (current === null || current.version !== expected) return { ok: false, current };
-    this.items.set(id, next);
-    return { ok: true, doc: next };
-  }
-
-  async delete(id: string, expectedVersion?: string): Promise<boolean> {
-    if (expectedVersion !== undefined) {
-      const current = this.items.get(id);
-      if (current === undefined || current.version !== expectedVersion) return false;
-    }
-    return this.items.delete(id);
-  }
-
-  async query(q: StoreQuery): Promise<QueryResult<T>> {
-    return executeQuery([...this.items.values()], q);
-  }
-}
 
 // ── Arg parsing ────────────────────────────────────────────────────────────────
 
@@ -655,7 +621,7 @@ Options:
   --system      <text>      System prompt injected at session start
   --config      <path>      Config file path (default: ./matbot.yaml)
   --prompt-file <path>      Read prompt from file; run single turn and exit
-  --ephemeral               Force ephemeral even when --session is given
+  --ephemeral               Keep sessions, memory, settings, and plugin stores in memory only
   --principal   <id|json>   Boot identity: an id (type "user") or JSON {"id","type"}.
                             Overrides MATBOT_PRINCIPAL and config principal:.
   --help                    Show this help
@@ -1060,7 +1026,7 @@ async function main(): Promise<void> {
 
   // ── Stores (created early so plugins like frontend-web can use them) ──────────
 
-  const dotData  = path.join(path.dirname(configPath), '.data');
+  const dotData  = workspaceDataDirectory(configPath);
   const dataDir  = path.join(dotData, 'sessions');
   const workDir  = path.join(dotData, 'bash-cwd');
   const filesDir = path.join(dotData, 'files');
@@ -1100,7 +1066,7 @@ async function main(): Promise<void> {
   // The config entry of the plugin whose storageBackend the pre-scan opened, if any. Recorded against
   // its plugin name once the loader has resolved names, so its unload reverts storage like a register().
   let storageBootSpec: string | undefined;
-  for (const { spec, importSpec } of allSpecifiers) {
+  for (const { spec, importSpec } of isEphemeral ? [] : allSpecifiers) {
     try {
       const mod  = await import(/* @vite-ignore */ importSpec) as Record<string, unknown>;
       const plug = (mod['plugin'] ?? (mod['default'] as Record<string, unknown> | undefined)?.['plugin']) as MatbotPlugin | undefined;
@@ -1128,9 +1094,13 @@ async function main(): Promise<void> {
   // One proxy per namespace, including 'sessions'. Keyed by namespace string.
   const storeProxies = new Map<string, [AnyStore, SwapFn<AnyStore>]>();
 
-  const makeStoreForNamespace = (namespace: string): AnyStore =>
-    activeStorageBackend?.createStore(namespace) ??
-    new FilesystemStore(namespace === 'sessions' ? dataDir : path.join(dotData, namespace));
+  const makeStoreForNamespace = (namespace: string): AnyStore => createWorkspaceStore({
+    ephemeral: isEphemeral,
+    namespace,
+    dotData,
+    sessionsDir: dataDir,
+    ...(activeStorageBackend === undefined ? {} : { backend: activeStorageBackend }),
+  });
 
   const createStore = <T extends { id: string; version: string }>(namespace: string): Store<T> => {
     let entry = storeProxies.get(namespace);
@@ -1230,7 +1200,10 @@ async function main(): Promise<void> {
       // StorageBackend is the system of record: stage it and let the quiescent edge apply it (idle →
       // now; mid-turn → at turn end) — its mount notification is marked dirty there, after the swap
       // lands. The other swap-keys repoint immediately, then mark dirty so the edge multicasts the mount.
-      if (key === 'StorageBackend')      stageSwap(value as StorageBackend);
+      if (key === 'StorageBackend') {
+        if (isEphemeral) await (value as StorageBackend).close?.();
+        else stageSwap(value as StorageBackend);
+      }
       else if (key === 'KnowledgeIndex') swapKnowledge(value as KnowledgeIndex);
       else if (key === 'Vault')          activeVault = value as Vault;
       else serviceRegistry.set(key as string, value);
@@ -1240,7 +1213,9 @@ async function main(): Promise<void> {
     // dangling on the unloaded plugin's impl; everything else is a plain registry delete. Marking dirty
     // lets the edge deliver a committed unload (or, if re-registered before the edge, a single remount).
     unregister(key: string) {
-      if (key === 'StorageBackend')      stageSwap(bootBackend);
+      if (key === 'StorageBackend') {
+        if (!isEphemeral) stageSwap(bootBackend);
+      }
       else if (key === 'KnowledgeIndex') knowledgeImpl = bootKnowledge;
       else if (key === 'Vault')          activeVault = bootVault;
       else serviceRegistry.delete(key);

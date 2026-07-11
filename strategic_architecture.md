@@ -365,11 +365,11 @@ type SourceVersion = {
   - [ ] investigation timelines.
   - [x] source health reports.
 - [ ] Add UI source panels:
-  - [ ] source freshness.
+  - [x] source freshness.
   - [ ] owner.
-  - [ ] sensitivity.
-  - [ ] citation link/path.
-  - [ ] known limitations.
+  - [x] sensitivity.
+  - [x] citation link/path.
+  - [x] known limitations.
 - [x] Add tests:
   - [x] source id stability.
   - [x] stale-source detection.
@@ -489,9 +489,10 @@ type ContextRelationshipAssertion = {
     permissions before results reach the model.
   - [x] relationships from inaccessible sources must not leak.
 - [ ] Add UI affordances:
-  - [ ] entity panel.
-  - [ ] relationship evidence.
-  - [ ] confidence and source freshness.
+  - [x] entity panel.
+  - [x] relationship evidence.
+  - [x] confidence.
+  - [ ] source freshness in graph detail.
   - [ ] entity merge/split correction.
 - [x] Add tests:
   - [x] entity id normalization.
@@ -631,7 +632,8 @@ type QueryRun = {
   - [x] attach query timeout.
 - [ ] Add preview and approval flow:
   - [x] `plan_query` returns semantic inputs and SQL.
-  - [ ] UI shows SQL, source freshness, row cap, cost warning, and approval.
+  - [x] UI shows SQL, source ids, row cap warning, and approval.
+  - [ ] UI shows source freshness and cost warning.
   - [x] `execute_query` requires approval token for risky queries.
 - [ ] Add query result source records:
   - [x] create `query_result` source record.
@@ -645,13 +647,13 @@ type QueryRun = {
   - [x] unknown table/column rejection.
   - [x] row cap enforcement.
   - [ ] citation contains query timestamp and source ids.
-  - [ ] Playwright preview/approval path.
+  - [x] Playwright preview/approval path.
 
 MVP note: this slice uses a deterministic TypeScript SQL scanner and semantic
 planner instead of adding SQLGlot or a new SQL parser dependency. Live Postgres
 execution is implemented behind read-only transactions, statement timeout, row
 caps, connector policy, and approval tokens. Live database introspection,
-foreign-key/join planning, UI approval screens, and anomaly/trend analysis
+foreign-key/join planning, cost/freshness display in the SQL UI, and anomaly/trend analysis
 remain future hardening tasks.
 
 ### Technical Notes
@@ -816,7 +818,7 @@ type WorkflowRunEvent = {
 - [ ] Add WebUI surfaces:
   - [ ] workflow library.
   - [ ] run ledger.
-  - [ ] approval queue.
+  - [x] approval queue.
   - [ ] shadow-mode comparison.
   - [ ] eval/test results.
 - [ ] Add test coverage:
@@ -825,7 +827,7 @@ type WorkflowRunEvent = {
   - [x] blocked tool outside allowed list.
   - [x] dry-run cannot execute write tools.
   - [x] run event ordering.
-  - [ ] Playwright approval queue.
+  - [x] Playwright approval queue.
 
 MVP note: this slice implements the workflow run ledger, schema validation,
 approval records, source evidence references, dry-run/shadow semantics, and
@@ -993,14 +995,15 @@ structured review artifacts.
   - [x] compiled high-risk workflows include a structured expert-review gate.
 - [x] Add Node tests for structured reviews, review lookup/listing, business
   expert configuration, and workflow expert-review gates.
-- [ ] Add WebUI expert review cards for durable review records.
+- [x] Add WebUI expert review cards for durable review records.
 - [ ] Add manual review-status editing and reviewer assignment UI.
 - [ ] Add source-registry citation resolution in expert review records.
 
 MVP note: this slice keeps structured review extraction deterministic over the
-expert answers and citations already produced by the panel. It does not yet add
-review-card UI, reviewer assignment, or direct source-registry citation
-resolution; those remain future review-surface work.
+expert answers and citations already produced by the panel. It now includes
+WebUI review cards for durable review records, but reviewer assignment, manual
+status editing, and direct source-registry citation resolution remain future
+review-surface work.
 
 ## Suggested Build Sequence
 
@@ -1097,6 +1100,8 @@ type CortexAuditEvent = {
   - connector health display;
   - SQL preview and approval;
   - workflow approval queue;
+  - graph entity panels;
+  - expert review cards;
   - shadow-mode labeling.
 - No tests should require live provider tokens by default. Use fake Matbot
   harness patterns already present in the WebUI test suite.

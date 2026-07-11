@@ -14,9 +14,17 @@ Current UI capabilities include:
 - plugin catalog display;
 - skill editor;
 - workspace selector in the bottom-left corner;
-- workspace creation, rename, and switch;
+- workspace creation, rename, confirmed deletion, and switch;
 - full-page workspace settings editor for RAG context name and markdown folders;
 - RAG ingestion progress, including current file;
+- architecture source panels with freshness, sensitivity, citations, health
+  findings, and limitations;
+- governed SQL preview with row-cap warnings, approval, execution results, and
+  query-result citations;
+- workflow approval queue with run inspection and approve/reject actions;
+- context graph entity panels with relationship evidence and confidence;
+- durable expert review cards with recommendations, checklists, and risk
+  registers;
 - expert panel controls integrated into the main composer;
 - mobile sidebar behavior.
 

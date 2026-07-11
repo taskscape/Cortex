@@ -7,8 +7,9 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "node --test tests/*.test.mjs",
+    "test:cli": "corepack pnpm -C local-agent/matbot --filter @matatbread/matbot-cli run test",
     "test:webui": "playwright test",
-    "test:all": "npm test && npm run test:webui",
+    "test:all": "npm test && npm run test:cli && npm run test:webui",
     "verify:openai": "node tests/verify-openai-key.mjs"
   },
   "workspaces": [

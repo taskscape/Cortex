@@ -49,7 +49,7 @@ Additional runtime environment variables:
 | `FILE_INDEX_BASE_URL` | `http://localhost:8877` | URL used by the hybrid KnowledgeIndex plugin. |
 | `FILE_BROKER_BASE_URL` | `http://localhost:8878` | URL used by local file tools. |
 | `MEM0_BASE_URL` | `http://localhost:8888` | URL used by Mem0 retrieval. |
-| `MEM0_USER_ID` | `local-agent` | User id used by hybrid Mem0 retrieval. |
+| `MEM0_USER_ID` | `local-agent` | Base user id used by hybrid Mem0 retrieval. Every workspace uses `<id>:workspace:<workspace-id>` for strict memory isolation. Legacy unscoped records are not queried. |
 | `CORTEX_RAG_POSTGRES_URL` | unset | Optional full Postgres connection string for workspace RAG storage. Overrides the individual `CORTEX_RAG_POSTGRES_*` values. |
 | `CORTEX_RAG_POSTGRES_HOST` | `localhost` | Postgres host used by workspace RAG. Set by the launch scripts from Docker environment values when possible. |
 | `CORTEX_RAG_POSTGRES_PORT` | `5432` | Postgres port used by workspace RAG. |

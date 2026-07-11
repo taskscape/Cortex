@@ -391,6 +391,10 @@ function makeInProcessTransport(services) {
       return;
     }
 
+    // Match the HTTP transport's subscription handshake. The hub listener and
+    // runner view are both live before this event is yielded.
+    yield { type: 'stream-ready' };
+
     const feed = (async () => {
       try {
         for await (const ev of view.events) {

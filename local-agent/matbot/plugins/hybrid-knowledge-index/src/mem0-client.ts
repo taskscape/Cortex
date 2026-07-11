@@ -5,6 +5,7 @@ export interface Mem0ClientOptions {
   baseUrl: string;
   apiKey?: string;
   userId?: string;
+  workspaceId?: string;
 }
 
 export class Mem0Client {
@@ -23,6 +24,7 @@ export class Mem0Client {
         source: entry.source,
         contentHash: entry.contentHash,
         confidence: entry.confidence,
+        workspaceId: this.options.workspaceId ?? "default",
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt
       }

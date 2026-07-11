@@ -116,6 +116,7 @@ ordered, committable slices. Completed build-sequence items:
 | Context Graph MVP | Complete | `context-graph` registers `ContextGraph` and `context_graph_action`; entities, relationship assertions, extraction runs, and Neo4j projection operations are store-backed; workspace RAG enqueues deterministic source extraction after source version writes; graph retrieval expands source-backed facts within depth/relationship budgets and filters relationships from denied sources before results reach the model. |
 | Workflow Compiler MVP | Complete | `workflow-governance` now registers `WorkflowCompiler`; `workflow_action.compile` converts selected transcript text, input hints, source ids, and tool calls into a validated workflow definition, optional published version, persisted compilation record, and optional dry-run smoke test. |
 | Enterprise Expert Panel Upgrade | Complete | `expert-panel` now supports durable structured review records through `expert_panel.review`, `get_review`, and `list_reviews`; reviews link to workflows, workflow runs, dossiers, alerts, investigations, or chats and include structured expert recommendations, confidence, evidence ids, risks, blockers, mitigations, approval checklists, risk registers, consensus, disagreements, and synthesis. |
+| Architecture WebUI Panels | In progress | The WebUI exposes dedicated source, governed SQL preview, workflow approval queue, context graph entity, and expert review-card panels. Remaining product hardening includes source ownership display, source freshness directly inside graph detail, SQL cost warnings, workflow library/run-ledger/shadow comparison views, and manual expert-review assignment/status editing. |
 
 All current build-sequence items in `strategic_architecture.md` are complete.
 
@@ -175,7 +176,8 @@ can be correlated with connector outage or degradation.
 Workspace RAG consumes the same source health fields during retrieval. When a
 retrieved source is stale, expired, degraded, or down, the injected context now
 contains explicit warning lines, and the durable `workspace-rag` marker contains
-the same structured `sourceWarnings` array for future UI source panels.
+the same structured `sourceWarnings` array consumed by the WebUI architecture
+source panels.
 
 ### Context Graph
 
@@ -630,7 +632,7 @@ problems:
 | Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
 | Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
 | Expert knowledge roots | One expert definition | Isolated domain expertise. | `expert-panel` |
-| Mem0 | Shared Mem0 service, queried by user id | External memory service integration. | `hybrid-knowledge-index` |
+| Mem0 | Shared service with workspace-scoped user ids | External memory service integration without cross-workspace recall. | `hybrid-knowledge-index` |
 
 The high-level rule is:
 
