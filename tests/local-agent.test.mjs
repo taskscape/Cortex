@@ -6,9 +6,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { indexRoot } from "../local-agent/file-index/dist/indexer.js";
-import { emptyStore } from "../local-agent/file-index/dist/store.js";
+import { emptyStore, loadStore, saveStore } from "../local-agent/file-index/dist/store.js";
 import { searchChunks } from "../local-agent/file-index/dist/search.js";
 import { evaluateAccess } from "../local-agent/file-broker/dist/policy.js";
+import { ReloadingConfig } from "../local-agent/file-broker/dist/config-cache.js";
 import { writeTextFile } from "../local-agent/file-broker/dist/file-writer.js";
 import { createFileBrokerTool, FileBrokerClient } from "../local-agent/matbot/plugins/file-broker/dist/index.js";
 import { mergeRankAndDeduplicate } from "../local-agent/matbot/plugins/hybrid-knowledge-index/dist/ranking.js";
@@ -23,16 +24,30 @@ test("file index stores searchable text with path metadata", async () => {
   await writeFile(path.join(root, "notes.md"), "Matbot should retrieve durable memory from Mem0.", "utf8");
 
   try {
-    const store = await indexRoot({
+    const options = {
       root,
       excludedPatterns: [],
       maxFileBytes: 100_000
-    }, emptyStore());
+    };
+    const store = await indexRoot(options, emptyStore());
 
     const results = searchChunks(store.chunks, "durable memory", 5);
     assert.equal(results.length, 1);
     assert.match(results[0].snippet, /durable memory/i);
     assert.equal(results[0].relativePath, "notes.md");
+
+    const unchanged = await indexRoot(options, store);
+    assert.strictEqual(unchanged.chunks[0], store.chunks[0], "unchanged files reuse their indexed chunks");
+
+    await writeFile(path.join(root, "notes.md"), "Matbot should retrieve current project context from the resident index.", "utf8");
+    const changed = await indexRoot(options, unchanged);
+    assert.equal(searchChunks(changed.chunks, "project context", 1).length, 1);
+    assert.equal(searchChunks(changed.chunks, "durable memory", 1).length, 0);
+
+    const storePath = path.join(root, "index.json");
+    await saveStore(storePath, changed);
+    await saveStore(storePath, changed);
+    assert.equal((await loadStore(storePath)).chunks.length, changed.chunks.length);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -53,6 +68,27 @@ test("file broker blocks writes outside configured roots and allows project writ
   assert.equal(evaluateAccess("C:\\Windows\\system.ini", "write", workspaces, policy).allowed, false);
   assert.equal(evaluateAccess("C:\\Projects\\Bot\\README.md", "write", workspaces, policy).allowed, true);
   assert.equal(evaluateAccess("C:\\Projects\\Bot\\.env", "write", workspaces, policy).highRisk, true);
+});
+
+test("file broker config cache reuses unchanged values and reloads changed files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "file-broker-config-"));
+  const configPath = path.join(root, "config.json");
+  let loads = 0;
+  await writeFile(configPath, JSON.stringify({ version: 1 }), "utf8");
+  const cache = new ReloadingConfig(configPath, async file => {
+    loads++;
+    return JSON.parse(await readFile(file, "utf8"));
+  });
+  try {
+    const first = await cache.get();
+    assert.strictEqual(await cache.get(), first);
+    assert.equal(loads, 1);
+    await writeFile(configPath, JSON.stringify({ version: 200 }), "utf8");
+    assert.equal((await cache.get()).version, 200);
+    assert.equal(loads, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("file broker Matbot tool reads host files through the broker service", async () => {

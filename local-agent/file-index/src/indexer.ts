@@ -10,6 +10,7 @@ export interface IndexOptions {
   root: string;
   excludedPatterns: string[];
   maxFileBytes: number;
+  signal?: AbortSignal;
 }
 
 export interface IndexSummary {
@@ -22,9 +23,17 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
   const root = path.resolve(options.root);
   const nextChunks: IndexedChunk[] = [];
   const skipped: IndexStore["skipped"] = [];
-  let fileCount = 0;
+  const rootCanonical = normalizeWindowsPath(root).canonicalPath;
+  const existingByPath = new Map<string, IndexedChunk[]>();
+  for (const chunk of existing.chunks) {
+    if (!isWithinRoot(chunk.canonicalPath, rootCanonical)) continue;
+    const chunks = existingByPath.get(chunk.canonicalPath) ?? [];
+    chunks.push(chunk);
+    existingByPath.set(chunk.canonicalPath, chunks);
+  }
 
   for await (const filePath of walk(root)) {
+    options.signal?.throwIfAborted();
     const relative = path.relative(root, filePath);
 
     if (isExcluded(relative, options.excludedPatterns)) {
@@ -48,6 +57,18 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
       continue;
     }
 
+    const normalized = normalizeWindowsPath(filePath, root);
+    const previous = existingByPath.get(normalized.canonicalPath);
+    if (
+      previous !== undefined &&
+      previous.length > 0 &&
+      previous[0]!.size === stats.size &&
+      previous[0]!.modifiedTime === stats.mtime.toISOString()
+    ) {
+      nextChunks.push(...previous);
+      continue;
+    }
+
     const content = await extractText(filePath, options.maxFileBytes);
 
     if (looksLikeSecret(content)) {
@@ -56,9 +77,7 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
     }
 
     const hash = crypto.createHash("sha256").update(content).digest("hex");
-    const normalized = normalizeWindowsPath(filePath, root);
     const chunks = chunkText(content);
-    fileCount += 1;
 
     nextChunks.push(
       ...chunks.map((chunk, chunkIndex) => ({
@@ -77,9 +96,8 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
     );
   }
 
-  const rootCanonical = normalizeWindowsPath(root).canonicalPath;
   const outsideRoot = existing.chunks.filter(chunk => {
-    return !chunk.canonicalPath.startsWith(rootCanonical);
+    return !isWithinRoot(chunk.canonicalPath, rootCanonical);
   });
 
   return {
@@ -88,6 +106,10 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
     chunks: [...outsideRoot, ...nextChunks],
     skipped
   };
+}
+
+function isWithinRoot(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}\\`);
 }
 
 export function summarize(store: IndexStore): IndexSummary {

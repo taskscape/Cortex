@@ -15,45 +15,89 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 const MAX_FILE_BYTES = 1_000_000;
+const MANIFEST_TTL_MS = 5_000;
+const FILE_READ_CONCURRENCY = 8;
+
+interface ExpertFileMetadata {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+interface CachedExpertFile extends ExpertFileMetadata {
+  contextContent: string;
+  haystack: string;
+}
 
 export class FileExpertKnowledge {
   private readonly expert: ExpertConfig;
+  private readonly cache = new Map<string, CachedExpertFile>();
+  private manifest: ExpertFileMetadata[] = [];
+  private manifestExpiresAt = 0;
 
   constructor(expert: ExpertConfig) {
     this.expert = expert;
   }
 
   async search(query: string, limit: number, signal: AbortSignal): Promise<ExpertSource[]> {
-    const files = await listTextFiles(this.expert.roots, signal);
+    const files = await this.listFiles(signal);
     const terms = tokenize(query);
-    const sources: ExpertSource[] = [];
-
-    for (const file of files) {
+    const sources = await mapWithConcurrency(files, FILE_READ_CONCURRENCY, async file => {
       signal.throwIfAborted();
-      const content = await readFile(file, "utf8");
-      const score = scoreContent(content, file, terms);
+      const cached = await this.readCached(file, signal).catch(error => {
+        signal.throwIfAborted();
+        return undefined;
+      });
+      if (cached === undefined) return undefined;
+      const score = scoreContent(cached.haystack, terms);
       if (score <= 0 && terms.length > 0) {
-        continue;
+        return undefined;
       }
 
-      sources.push({
-        id: stableId(`${this.expert.id}:${file}`),
+      return {
+        id: stableId(`${this.expert.id}:${file.path}`),
         expertId: this.expert.id,
-        path: file,
-        title: path.basename(file),
-        content: trimForContext(content),
+        path: file.path,
+        title: path.basename(file.path),
+        content: cached.contextContent,
         score
-      });
-    }
+      } satisfies ExpertSource;
+    });
 
     return sources
+      .filter((source): source is ExpertSource => source !== undefined)
       .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
       .slice(0, limit);
   }
+
+  private async listFiles(signal: AbortSignal): Promise<ExpertFileMetadata[]> {
+    if (Date.now() < this.manifestExpiresAt) return this.manifest;
+    const files = await listTextFiles(this.expert.roots, signal);
+    const livePaths = new Set(files.map(file => file.path));
+    for (const cachedPath of this.cache.keys()) {
+      if (!livePaths.has(cachedPath)) this.cache.delete(cachedPath);
+    }
+    this.manifest = files;
+    this.manifestExpiresAt = Date.now() + MANIFEST_TTL_MS;
+    return files;
+  }
+
+  private async readCached(file: ExpertFileMetadata, signal: AbortSignal): Promise<CachedExpertFile> {
+    const cached = this.cache.get(file.path);
+    if (cached?.size === file.size && cached.mtimeMs === file.mtimeMs) return cached;
+    const content = await readFile(file.path, { encoding: "utf8", signal });
+    const next: CachedExpertFile = {
+      ...file,
+      contextContent: trimForContext(content),
+      haystack: `${file.path}\n${content}`.toLowerCase(),
+    };
+    this.cache.set(file.path, next);
+    return next;
+  }
 }
 
-async function listTextFiles(roots: string[], signal: AbortSignal): Promise<string[]> {
-  const files: string[] = [];
+async function listTextFiles(roots: string[], signal: AbortSignal): Promise<ExpertFileMetadata[]> {
+  const files: ExpertFileMetadata[] = [];
 
   for (const root of roots) {
     await walk(root, files, signal);
@@ -62,7 +106,7 @@ async function listTextFiles(roots: string[], signal: AbortSignal): Promise<stri
   return files;
 }
 
-async function walk(target: string, files: string[], signal: AbortSignal): Promise<void> {
+async function walk(target: string, files: ExpertFileMetadata[], signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
 
   let info;
@@ -74,7 +118,7 @@ async function walk(target: string, files: string[], signal: AbortSignal): Promi
 
   if (info.isFile()) {
     if (isTextFile(target) && info.size <= MAX_FILE_BYTES) {
-      files.push(target);
+      files.push({ path: target, size: info.size, mtimeMs: info.mtimeMs });
     }
     return;
   }
@@ -104,12 +148,11 @@ function tokenize(text: string): string[] {
   return [...seen];
 }
 
-function scoreContent(content: string, file: string, terms: string[]): number {
+function scoreContent(haystack: string, terms: string[]): number {
   if (terms.length === 0) {
     return 1;
   }
 
-  const haystack = `${file}\n${content}`.toLowerCase();
   let score = 0;
 
   for (const term of terms) {
@@ -119,6 +162,22 @@ function scoreContent(content: string, file: string, terms: string[]): number {
   }
 
   return score;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index]!);
+    }
+  }));
+  return results;
 }
 
 function trimForContext(content: string): string {

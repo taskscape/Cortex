@@ -15,16 +15,27 @@ export interface SearchResult {
 
 export function searchChunks(chunks: IndexedChunk[], query: string, limit: number): SearchResult[] {
   const terms = tokenize(query);
+  const wanted = Math.max(0, Math.floor(limit));
 
-  if (terms.length === 0) {
+  if (terms.length === 0 || wanted === 0) {
     return [];
   }
 
-  return chunks
-    .map(chunk => scoreChunk(chunk, terms))
-    .filter((result): result is SearchResult => result !== undefined)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  const top: SearchResult[] = [];
+  for (const chunk of chunks) {
+    const result = scoreChunk(chunk, terms);
+    if (result === undefined) continue;
+    if (top.length === wanted && result.score <= top[top.length - 1]!.score) continue;
+    insertByDescendingScore(top, result);
+    if (top.length > wanted) top.pop();
+  }
+  return top;
+}
+
+function insertByDescendingScore(results: SearchResult[], result: SearchResult): void {
+  let index = results.length;
+  while (index > 0 && results[index - 1]!.score < result.score) index--;
+  results.splice(index, 0, result);
 }
 
 function scoreChunk(chunk: IndexedChunk, terms: string[]): SearchResult | undefined {

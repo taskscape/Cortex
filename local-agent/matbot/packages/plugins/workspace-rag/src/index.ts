@@ -32,6 +32,7 @@ const CPU_VECTOR_BACKEND = 'hash-cpu';
 const CPU_VECTOR_MODEL = 'token-hash-v1';
 const STORED_VECTOR_DECIMAL_PLACES = 6;
 const STORED_VECTOR_SCALE = 10 ** STORED_VECTOR_DECIMAL_PLACES;
+const SCAN_FILE_CONCURRENCY = 4;
 
 type Accelerator = 'nvidia' | 'cpu';
 type VectorizerBackend = 'hash-cpu' | 'cuda-http';
@@ -100,6 +101,7 @@ interface IndexedDocument {
   hash: string;
   vectorizer?: VectorizerMetadata;
   updatedAt: string;
+  fileSize?: number;
   chunks: VectorChunk[];
 }
 
@@ -1055,67 +1057,85 @@ class WorkspaceRagManager {
         ...storageStatus,
       });
 
-      for (const { context, file } of allFiles) {
-        const normalized = normalizePathForId(file);
-        const contextPathKey = `${context.id}:${normalized}`;
-        seen.add(contextPathKey);
-        processed++;
-        this.updateProgress(workspace.id, processed, allFiles.length, file);
-        if (processed === 1 || processed === allFiles.length || processed % 100 === 0) {
-          await this.log(workspace, 'scan_progress', {
-            processedFiles: processed,
-            totalFiles: allFiles.length,
-            percent: allFiles.length === 0 ? 100 : Math.round((processed / allFiles.length) * 100),
-            currentFile: file,
-          });
+      for (let start = 0; start < allFiles.length; start += SCAN_FILE_CONCURRENCY) {
+        const batch = allFiles.slice(start, start + SCAN_FILE_CONCURRENCY);
+        const results = await Promise.all(batch.map(async ({ context, file }): Promise<IndexedDocument | undefined> => {
+          const normalized = normalizePathForId(file);
+          const contextPathKey = `${context.id}:${normalized}`;
+          seen.add(contextPathKey);
+          processed++;
+          this.updateProgress(workspace.id, processed, allFiles.length, file);
+          if (processed === 1 || processed === allFiles.length || processed % 100 === 0) {
+            await this.log(workspace, 'scan_progress', {
+              processedFiles: processed,
+              totalFiles: allFiles.length,
+              percent: allFiles.length === 0 ? 100 : Math.round((processed / allFiles.length) * 100),
+              currentFile: file,
+            });
+          }
+          const fileStat = await stat(file).catch(() => null);
+          if (fileStat === null) {
+            const error = new Error('File disappeared before it could be indexed.');
+            await this.registerFileReadFailure(workspace, context, normalized, error);
+            await this.log(workspace, 'file_read_error', { file, error: error.message });
+            return undefined;
+          }
+          const existing = byContextPath.get(contextPathKey);
+          const updatedAt = fileStat.mtime.toISOString();
+          if (
+            existing?.fileSize === fileStat.size &&
+            existing.updatedAt === updatedAt &&
+            documentMatchesVectorizer(existing, this.vectorizer.info)
+          ) {
+            await this.registerFileSource(workspace, context, normalized, updatedAt, existing.hash);
+            return undefined;
+          }
+          let content: string;
+          try { content = await readFile(file, 'utf8'); } catch (error) {
+            await this.registerFileReadFailure(workspace, context, normalized, error);
+            await this.log(workspace, 'file_read_error', { file, error: errorMessage(error) });
+            return undefined;
+          }
+          const nulCharsRemoved = countNulChars(content);
+          if (nulCharsRemoved > 0) {
+            content = stripNulChars(content);
+            await this.log(workspace, 'file_sanitized', {
+              file,
+              nulCharsRemoved,
+              reason: 'postgres_text_columns_do_not_accept_nul',
+            });
+          }
+          const hash = sha256(content);
+          await this.registerFileSource(workspace, context, normalized, updatedAt, hash, content);
+          const chunks = chunkMarkdown(content);
+          const vectors = await this.embedTexts(
+            chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
+          );
+          const docId = stableId(contextPathKey);
+          return {
+            id: docId,
+            contextId: context.id,
+            path: normalized,
+            hash,
+            vectorizer: vectorizerMetadata(this.vectorizer.info),
+            updatedAt,
+            fileSize: fileStat.size,
+            chunks: chunks.map((text, index) => ({
+              id: `${docId}:${index}`,
+              text,
+              vector: compactStoredVector(vectors[index] ?? []),
+            })),
+          };
+        }));
+        for (const doc of results) {
+          if (doc === undefined) continue;
+          pendingDocuments.push(doc);
+          pendingChunks += doc.chunks.length;
+          changedDocuments++;
+          changedChunks += doc.chunks.length;
         }
-        let content: string;
-        try { content = await readFile(file, 'utf8'); } catch (error) {
-          await this.registerFileReadFailure(workspace, context, normalized, error);
-          await this.log(workspace, 'file_read_error', {
-            file,
-            error: errorMessage(error),
-          });
-          continue;
-        }
-        const nulCharsRemoved = countNulChars(content);
-        if (nulCharsRemoved > 0) {
-          content = stripNulChars(content);
-          await this.log(workspace, 'file_sanitized', {
-            file,
-            nulCharsRemoved,
-            reason: 'postgres_text_columns_do_not_accept_nul',
-          });
-        }
-        const hash = sha256(content);
-        const fileStat = await stat(file).catch(() => null);
-        await this.registerFileSource(workspace, context, normalized, fileStat?.mtime.toISOString() ?? nowIso(), hash, content);
-        const existing = byContextPath.get(contextPathKey);
-        if (existing?.hash === hash && documentMatchesVectorizer(existing, this.vectorizer.info)) continue;
-        const chunks = chunkMarkdown(content);
-        const vectors = await this.embedTexts(
-          chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
-        );
-        const docId = stableId(contextPathKey);
-        const doc: IndexedDocument = {
-          id: docId,
-          contextId: context.id,
-          path: normalized,
-          hash,
-          vectorizer: vectorizerMetadata(this.vectorizer.info),
-          updatedAt: fileStat?.mtime.toISOString() ?? nowIso(),
-          chunks: chunks.map((text, index) => ({
-            id: `${docId}:${index}`,
-            text,
-            vector: compactStoredVector(vectors[index] ?? []),
-          })),
-        };
-        pendingDocuments.push(doc);
-        pendingChunks += doc.chunks.length;
-        changedDocuments++;
-        changedChunks += doc.chunks.length;
         if (pendingDocuments.length >= 32 || pendingChunks >= 1024) {
-          await flushPendingDocuments('batch', file);
+          await flushPendingDocuments('batch', batch.at(-1)?.file);
         }
       }
       await flushPendingDocuments('final');
@@ -1204,7 +1224,7 @@ class WorkspaceRagManager {
     normalizedPath: string,
     updatedAt: string,
     contentHash: string,
-    content: string,
+    content?: string,
   ): Promise<void> {
     if (this.sourceRegistry === undefined) return;
     const externalId = this.fileSourceExternalId(context.id, normalizedPath);
@@ -1228,6 +1248,15 @@ class WorkspaceRagManager {
         'Search hits are chunk-level excerpts, not full document reads.',
       ],
     });
+    if (content === undefined) {
+      await this.sourceRegistry.recordHealth({
+        sourceId: source.id,
+        state: 'healthy',
+        checkedAt: nowIso(),
+        message: 'Workspace RAG confirmed this markdown source is unchanged.',
+      });
+      return;
+    }
     const version = await this.sourceRegistry.upsertVersion({
       sourceId: source.id,
       contentHash,

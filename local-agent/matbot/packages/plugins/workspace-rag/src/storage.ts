@@ -11,6 +11,7 @@ const DEFAULT_POSTGRES_DB = 'mem0';
 const DEFAULT_POSTGRES_USER = 'mem0';
 const DEFAULT_POSTGRES_SCHEMA = 'workspace_rag';
 const POSTGRES_UPSERT_BATCH_SIZE = 1024;
+const POSTGRES_CHUNK_INSERT_BATCH_SIZE = 128;
 const POSTGRES_SEARCH_LIMIT = 200;
 
 export type RagStorageKind = 'json' | 'postgres-pgvector';
@@ -49,6 +50,7 @@ export interface IndexedDocument {
   hash: string;
   vectorizer?: VectorizerMetadata;
   updatedAt: string;
+  fileSize?: number;
   chunks: VectorChunk[];
 }
 
@@ -64,6 +66,7 @@ export interface StoredDocumentInfo {
   hash: string;
   vectorizer?: VectorizerMetadata;
   updatedAt: string;
+  fileSize?: number;
   sourceType: 'file' | 'knowledge';
 }
 
@@ -221,6 +224,7 @@ class JsonRagStorage implements RagStorage {
       path: doc.path,
       hash: doc.hash,
       updatedAt: doc.updatedAt,
+      ...(doc.fileSize !== undefined ? { fileSize: doc.fileSize } : {}),
       sourceType: sourceTypeForDocument(doc),
       ...(doc.contextId ? { contextId: doc.contextId } : {}),
       ...(doc.vectorizer ? { vectorizer: doc.vectorizer } : {}),
@@ -325,6 +329,7 @@ interface DocumentRow {
   vectorizer_model: string;
   vectorizer_dimensions: number;
   updated_at: string;
+  file_size: string | null;
   source_type: 'file' | 'knowledge';
 }
 
@@ -380,7 +385,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
   async listDocumentInfo(workspace: WorkspaceRefLike): Promise<StoredDocumentInfo[]> {
     const result = await this.pool.query<DocumentRow>(`
       SELECT id, context_id, path, hash, vectorizer_backend, vectorizer_model,
-             vectorizer_dimensions, updated_at, source_type
+             vectorizer_dimensions, updated_at, file_size, source_type
       FROM ${this.documentsTableSql}
       WHERE workspace_id = $1
     `, [postgresText(workspace.id)]);
@@ -389,6 +394,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
       path: row.path,
       hash: row.hash,
       updatedAt: row.updated_at,
+      ...(row.file_size !== null ? { fileSize: Number(row.file_size) } : {}),
       sourceType: row.source_type,
       ...(row.context_id !== null ? { contextId: row.context_id } : {}),
       vectorizer: {
@@ -519,10 +525,12 @@ class PostgresPgvectorRagStorage implements RagStorage {
         vectorizer_model TEXT NOT NULL,
         vectorizer_dimensions INTEGER NOT NULL,
         updated_at TEXT NOT NULL,
+        file_size BIGINT,
         source_type TEXT NOT NULL,
         PRIMARY KEY (workspace_id, id)
       )
     `);
+    await this.pool.query(`ALTER TABLE ${this.documentsTableSql} ADD COLUMN IF NOT EXISTS file_size BIGINT`);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS ${this.chunksTableSql} (
         id TEXT NOT NULL,
@@ -573,32 +581,8 @@ class PostgresPgvectorRagStorage implements RagStorage {
           documentIds,
         ]);
       }
-
-      for (const doc of documents) {
-        try {
-          await client.query(`
-            INSERT INTO ${this.documentsTableSql} (
-              id, workspace_id, context_id, path, hash, vectorizer_backend, vectorizer_model,
-              vectorizer_dimensions, updated_at, source_type
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT (workspace_id, id) DO UPDATE SET
-              context_id = EXCLUDED.context_id,
-              path = EXCLUDED.path,
-              hash = EXCLUDED.hash,
-              vectorizer_backend = EXCLUDED.vectorizer_backend,
-              vectorizer_model = EXCLUDED.vectorizer_model,
-              vectorizer_dimensions = EXCLUDED.vectorizer_dimensions,
-              updated_at = EXCLUDED.updated_at,
-              source_type = EXCLUDED.source_type
-          `, documentValues(workspace, doc, this.vectorizer));
-        } catch (error) {
-          throw new Error(
-            `Postgres pgvector document insert failed for workspace="${workspace.id}", document="${doc.id}", path="${doc.path}". ` +
-            `Original error: ${errorMessage(error)}`,
-          );
-        }
-        await this.insertChunks(client, workspace, doc);
-      }
+      await this.insertDocuments(client, workspace, documents);
+      await this.insertChunks(client, workspace, documents);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -608,18 +592,47 @@ class PostgresPgvectorRagStorage implements RagStorage {
     }
   }
 
-  private async insertChunks(client: PoolClient, workspace: WorkspaceRefLike, doc: IndexedDocument): Promise<void> {
-    const metadata = doc.vectorizer ?? this.vectorizer;
-    const sourceType = sourceTypeForDocument(doc);
-    for (let index = 0; index < doc.chunks.length; index++) {
-      const chunk = doc.chunks[index]!;
-      try {
-        await client.query(`
-          INSERT INTO ${this.chunksTableSql} (
-            id, document_id, workspace_id, context_id, path, chunk_index, text, embedding,
-            vectorizer_backend, vectorizer_model, vectorizer_dimensions, source_type
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12)
-        `, [
+  private async insertDocuments(client: PoolClient, workspace: WorkspaceRefLike, documents: IndexedDocument[]): Promise<void> {
+    const values: unknown[] = [];
+    const rows = documents.map(doc => {
+      const offset = values.length;
+      values.push(...documentValues(workspace, doc, this.vectorizer));
+      return `(${Array.from({ length: 11 }, (_, index) => `$${offset + index + 1}`).join(', ')})`;
+    });
+    try {
+      await client.query(`
+        INSERT INTO ${this.documentsTableSql} (
+          id, workspace_id, context_id, path, hash, vectorizer_backend, vectorizer_model,
+          vectorizer_dimensions, updated_at, file_size, source_type
+        ) VALUES ${rows.join(', ')}
+        ON CONFLICT (workspace_id, id) DO UPDATE SET
+          context_id = EXCLUDED.context_id,
+          path = EXCLUDED.path,
+          hash = EXCLUDED.hash,
+          vectorizer_backend = EXCLUDED.vectorizer_backend,
+          vectorizer_model = EXCLUDED.vectorizer_model,
+          vectorizer_dimensions = EXCLUDED.vectorizer_dimensions,
+          updated_at = EXCLUDED.updated_at,
+          file_size = EXCLUDED.file_size,
+          source_type = EXCLUDED.source_type
+      `, values);
+    } catch (error) {
+      throw new Error(
+        `Postgres pgvector document batch insert failed for workspace="${workspace.id}", documents=${documents.length}. ` +
+        `Original error: ${errorMessage(error)}`,
+      );
+    }
+  }
+
+  private async insertChunks(client: PoolClient, workspace: WorkspaceRefLike, documents: IndexedDocument[]): Promise<void> {
+    const chunks = documents.flatMap(doc => doc.chunks.map((chunk, index) => ({ doc, chunk, index })));
+    for (let start = 0; start < chunks.length; start += POSTGRES_CHUNK_INSERT_BATCH_SIZE) {
+      const batch = chunks.slice(start, start + POSTGRES_CHUNK_INSERT_BATCH_SIZE);
+      const values: unknown[] = [];
+      const rows = batch.map(({ doc, chunk, index }) => {
+        const metadata = doc.vectorizer ?? this.vectorizer;
+        const offset = values.length;
+        values.push(
           postgresText(chunk.id),
           postgresText(doc.id),
           postgresText(workspace.id),
@@ -631,12 +644,21 @@ class PostgresPgvectorRagStorage implements RagStorage {
           postgresText(metadata.backend),
           postgresText(metadata.model),
           metadata.dimensions,
-          postgresText(sourceType),
-        ]);
+          postgresText(sourceTypeForDocument(doc)),
+        );
+        return `(${Array.from({ length: 12 }, (_, parameter) => `$${offset + parameter + 1}`).join(', ')})`;
+      });
+      try {
+        await client.query(`
+          INSERT INTO ${this.chunksTableSql} (
+            id, document_id, workspace_id, context_id, path, chunk_index, text, embedding,
+            vectorizer_backend, vectorizer_model, vectorizer_dimensions, source_type
+          ) VALUES ${rows.map((row, rowIndex) => row.replace(`$${rowIndex * 12 + 8}`, `$${rowIndex * 12 + 8}::vector`)).join(', ')}
+        `, values);
       } catch (error) {
         throw new Error(
-          `Postgres pgvector chunk insert failed for workspace="${workspace.id}", document="${doc.id}", ` +
-          `path="${doc.path}", chunkIndex=${index}, chunkId="${chunk.id}". Original error: ${errorMessage(error)}`,
+          `Postgres pgvector chunk batch insert failed for workspace="${workspace.id}", ` +
+          `chunks=${batch.length}, offset=${start}. Original error: ${errorMessage(error)}`,
         );
       }
     }
@@ -720,6 +742,7 @@ function documentValues(workspace: WorkspaceRefLike, doc: IndexedDocument, fallb
     postgresText(metadata.model),
     metadata.dimensions,
     postgresText(doc.updatedAt),
+    doc.fileSize ?? null,
     postgresText(sourceTypeForDocument(doc)),
   ];
 }

@@ -1,5 +1,7 @@
 import http from "node:http";
 import path from "node:path";
+import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
+import { ReloadingConfig } from "./config-cache.js";
 import { listDirectory, readTextFile } from "./file-reader.js";
 import { writeTextFile } from "./file-writer.js";
 import { evaluateAccess, loadSecurityPolicy, loadWorkspaceConfig } from "./policy.js";
@@ -7,12 +9,14 @@ import { evaluateAccess, loadSecurityPolicy, loadWorkspaceConfig } from "./polic
 const port = Number(process.env.FILE_BROKER_PORT ?? 8878);
 const workspaceConfigPath = path.resolve(process.env.WORKSPACES_CONFIG ?? "local-agent/config/workspaces.json");
 const securityPolicyPath = path.resolve(process.env.SECURITY_POLICY_CONFIG ?? "local-agent/config/security-policy.json");
+const workspacesConfig = new ReloadingConfig(workspaceConfigPath, loadWorkspaceConfig);
+const securityPolicy = new ReloadingConfig(securityPolicyPath, loadSecurityPolicy);
 
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    const workspaces = await loadWorkspaceConfig(workspaceConfigPath);
-    const policy = await loadSecurityPolicy(securityPolicyPath);
+    const signal = requestAbortSignal(request);
+    const [workspaces, policy] = await Promise.all([workspacesConfig.get(), securityPolicy.get()]);
 
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, { ok: true, roots: workspaces.roots.length, maxReadBytes: policy.maxReadBytes });
@@ -20,6 +24,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/list") {
+      signal.throwIfAborted();
       const target = requiredQuery(url, "path");
       const decision = evaluateAccess(target, "list", workspaces, policy);
       if (!decision.allowed) {
@@ -32,6 +37,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/read") {
+      signal.throwIfAborted();
       const target = requiredQuery(url, "path");
       const decision = evaluateAccess(target, "read", workspaces, policy);
       if (!decision.allowed) {
@@ -44,7 +50,8 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/write") {
-      const body = await readJson<{ path: string; content: string; approved?: boolean }>(request);
+      const body = await readJsonBody<{ path: string; content: string; approved?: boolean }>(request, { validate: isWriteRequest });
+      signal.throwIfAborted();
       const decision = evaluateAccess(body.path, "write", workspaces, policy);
       if (!decision.allowed) {
         sendJson(response, 403, decision);
@@ -63,7 +70,7 @@ const server = http.createServer(async (request, response) => {
 
     sendJson(response, 404, { error: "Not found." });
   } catch (error) {
-    sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    sendJsonError(response, error);
   }
 });
 
@@ -80,16 +87,8 @@ function requiredQuery(url: URL, name: string): string {
   return value;
 }
 
-async function readJson<T>(request: http.IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as T;
-}
-
-function sendJson(response: http.ServerResponse, status: number, payload: unknown): void {
-  response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify(payload));
+function isWriteRequest(value: unknown): value is { path: string; content: string; approved?: boolean } {
+  return isJsonObject(value) && typeof value.path === "string" && value.path.length > 0 &&
+    typeof value.content === "string" &&
+    (value.approved === undefined || typeof value.approved === "boolean");
 }

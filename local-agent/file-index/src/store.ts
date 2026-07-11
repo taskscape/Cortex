@@ -46,9 +46,16 @@ export async function loadStore(storePath: string): Promise<IndexStore> {
 
 export async function saveStore(storePath: string, store: IndexStore): Promise<void> {
   await fs.mkdir(path.dirname(storePath), { recursive: true });
-  await fs.writeFile(
-    storePath,
-    JSON.stringify({ ...store, updatedAt: new Date().toISOString() }, null, 2),
-    "utf8"
-  );
+  const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(
+      temporaryPath,
+      `${JSON.stringify({ ...store, updatedAt: new Date().toISOString() })}\n`,
+      "utf8"
+    );
+    await fs.rename(temporaryPath, storePath);
+  } catch (error) {
+    await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }

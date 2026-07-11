@@ -1,5 +1,6 @@
 import http from "node:http";
 import path from "node:path";
+import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
 import { indexRoot, summarize } from "./indexer.js";
 import { searchChunks } from "./search.js";
 import { loadStore, saveStore } from "./store.js";
@@ -13,18 +14,22 @@ interface WorkspaceConfig {
   excludedPatterns: string[];
 }
 
+let storeSnapshot = loadStore(storePath);
+let indexQueue: Promise<void> = Promise.resolve();
+
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+    const signal = requestAbortSignal(request);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      const store = await loadStore(storePath);
+      const store = await storeSnapshot;
       sendJson(response, 200, { ok: true, storePath, ...summarize(store) });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/index") {
-      const body = await readJson<{ root?: string }>(request);
+      const body = await readJsonBody<{ root?: string }>(request, { validate: isIndexRequest });
       const config = await readWorkspaceConfig();
       const root = body.root ?? config.roots[0]?.path;
 
@@ -33,20 +38,19 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      const current = await loadStore(storePath);
-      const next = await indexRoot({
-        root,
-        excludedPatterns: config.excludedPatterns,
-        maxFileBytes: Number(process.env.FILE_INDEX_MAX_FILE_BYTES ?? 1_000_000)
-      }, current);
-      await saveStore(storePath, next);
+      const next = await enqueueIndex(async current => indexRoot({
+          root,
+          excludedPatterns: config.excludedPatterns,
+          maxFileBytes: Number(process.env.FILE_INDEX_MAX_FILE_BYTES ?? 1_000_000),
+          signal
+        }, current));
       sendJson(response, 200, { ok: true, root, ...summarize(next) });
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/search") {
-      const body = await readJson<{ query: string; limit?: number }>(request);
-      const store = await loadStore(storePath);
+      const body = await readJsonBody<{ query: string; limit?: number }>(request, { validate: isSearchRequest });
+      const store = await storeSnapshot;
       const results = searchChunks(store.chunks, body.query, Math.min(body.limit ?? 10, 50));
       sendJson(response, 200, { ok: true, results });
       return;
@@ -54,9 +58,30 @@ const server = http.createServer(async (request, response) => {
 
     sendJson(response, 404, { error: "Not found." });
   } catch (error) {
-    sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    sendJsonError(response, error);
   }
 });
+
+async function enqueueIndex(build: (current: Awaited<typeof storeSnapshot>) => Promise<Awaited<typeof storeSnapshot>>): Promise<Awaited<typeof storeSnapshot>> {
+  let resolveResult!: (value: Awaited<typeof storeSnapshot>) => void;
+  let rejectResult!: (error: unknown) => void;
+  const result = new Promise<Awaited<typeof storeSnapshot>>((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  indexQueue = indexQueue.then(async () => {
+    try {
+      const next = await build(await storeSnapshot);
+      await saveStore(storePath, next);
+      storeSnapshot = Promise.resolve(next);
+      resolveResult(next);
+    } catch (error) {
+      rejectResult(error);
+    }
+  });
+  await indexQueue;
+  return result;
+}
 
 server.listen(port, () => {
   console.log(`file-index listening on http://localhost:${port}`);
@@ -67,16 +92,11 @@ async function readWorkspaceConfig(): Promise<WorkspaceConfig> {
   return JSON.parse(raw) as WorkspaceConfig;
 }
 
-async function readJson<T>(request: http.IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as T;
+function isIndexRequest(value: unknown): value is { root?: string } {
+  return isJsonObject(value) && (value.root === undefined || typeof value.root === "string");
 }
 
-function sendJson(response: http.ServerResponse, status: number, payload: unknown): void {
-  response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify(payload));
+function isSearchRequest(value: unknown): value is { query: string; limit?: number } {
+  return isJsonObject(value) && typeof value.query === "string" && value.query.trim().length > 0 &&
+    (value.limit === undefined || (typeof value.limit === "number" && Number.isFinite(value.limit)));
 }

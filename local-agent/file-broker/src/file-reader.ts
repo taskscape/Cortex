@@ -25,18 +25,26 @@ export async function readTextFile(filePath: string, maxBytes: number): Promise<
 
 export async function listDirectory(directoryPath: string): Promise<Array<{ name: string; path: string; type: string; size?: number }>> {
   const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const rows = [];
-
-  for (const entry of entries) {
+  return mapWithConcurrency(entries, 16, async entry => {
     const fullPath = path.join(directoryPath, entry.name);
-    const stats = await fs.stat(fullPath);
-    rows.push({
+    const size = entry.isFile() ? (await fs.stat(fullPath)).size : undefined;
+    return {
       name: entry.name,
       path: fullPath,
       type: entry.isDirectory() ? "directory" : "file",
-      size: entry.isFile() ? stats.size : undefined
-    });
-  }
+      size
+    };
+  });
+}
 
-  return rows;
+async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index]!);
+    }
+  }));
+  return results;
 }
