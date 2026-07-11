@@ -271,6 +271,16 @@ test("governed architecture tools preserve records through the WebUI transport",
 
 test("architecture product panels expose sources, SQL approval, workflow approvals, graph evidence, and review cards", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop architecture panel coverage");
+  const architectureListRequests = [];
+  page.on("request", request => {
+    if (!request.url().includes("/tools/")) return;
+    const input = request.postDataJSON();
+    if (input?.action !== "list") return;
+    const tool = request.url().split("/").at(-1);
+    if (tool === "source_action" || tool === "context_graph_action") {
+      architectureListRequests.push({ tool, input });
+    }
+  });
   await page.goto("/");
 
   const workflowRunId = await page.evaluate(async () => {
@@ -319,6 +329,7 @@ test("architecture product panels expose sources, SQL approval, workflow approva
   await expect(page.locator("#architecture-sql-results")).toContainText("Source tables/metrics");
 
   await page.locator('.architecture-tab[data-architecture-tab="workflows"]').click();
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="approvals"]').click();
   await expect(page.locator("#architecture-approval-list")).toContainText("structured-expert-review");
   await page.locator(`#architecture-approval-list .architecture-item[data-run-id="${workflowRunId}"][data-approval-id="approval:expert-review"]`).click();
   await expect(page.locator("#architecture-approval-detail")).toContainText(workflowRunId);
@@ -339,14 +350,31 @@ test("architecture product panels expose sources, SQL approval, workflow approva
   await expect(page.locator("#architecture-review-detail")).toContainText("Finance Expert");
   await expect(page.locator("#architecture-review-detail")).toContainText("automation rollback path confirmed");
   await expect(page.locator("#architecture-review-detail")).toContainText("Risk Register");
+
+  expect(architectureListRequests).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      tool: "source_action",
+      input: expect.objectContaining({ query: { where: { op: "eq", field: "workspaceId", value: "default" } } })
+    }),
+    expect.objectContaining({
+      tool: "context_graph_action",
+      input: expect.objectContaining({ query: { where: { op: "eq", field: "workspaceId", value: "default" } } })
+    })
+  ]));
 });
 
 test("architecture SQL actions recover from transient approval and execution failures", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop architecture recovery coverage");
+  let failPlanning = true;
   let failApproval = true;
   let failExecution = true;
   await page.route("**/tools/structured_data_action", async route => {
     const input = route.request().postDataJSON();
+    if (input.action === "plan_query" && failPlanning) {
+      failPlanning = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "temporary planning failure" }) });
+      return;
+    }
     if (input.action === "approve_query" && failApproval) {
       failApproval = false;
       await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "temporary approval failure" }) });
@@ -363,6 +391,9 @@ test("architecture SQL actions recover from transient approval and execution fai
   await page.goto("/");
   await openArchitecturePanel(page, "sql");
   await page.locator("#architecture-sql-plan-btn").click();
+  await expect(page.locator("#architecture-sql-status")).toContainText("temporary planning failure");
+  await expect(page.locator("#architecture-sql-plan-btn")).toBeEnabled();
+  await page.locator("#architecture-sql-plan-btn").click();
   await expect(page.locator("#architecture-sql-approve-btn")).toBeEnabled();
 
   await page.locator("#architecture-sql-approve-btn").click();
@@ -376,6 +407,296 @@ test("architecture SQL actions recover from transient approval and execution fai
   await expect(page.locator("#architecture-sql-execute-btn")).toBeEnabled();
   await page.locator("#architecture-sql-execute-btn").click();
   await expect(page.locator("#architecture-sql-results")).toContainText("total_revenue");
+});
+
+test("architecture graph retrieval selects the returned entity instead of stale list state", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop graph result selection coverage");
+  await page.route("**/tools/context_graph_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action !== "retrieve") return route.fallback();
+    const entity = {
+      id: "context-entity:retrieved-customer",
+      version: "retrieved-version",
+      workspaceId: "default",
+      type: "organization",
+      canonicalName: "Retrieved Customer",
+      aliases: ["RC"],
+      sensitivity: "internal",
+      updatedAt: new Date().toISOString()
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ entities: [entity], facts: [], warnings: [] })
+    });
+  });
+
+  await page.goto("/");
+  await openArchitecturePanel(page, "graph");
+  await page.locator("#architecture-graph-search").fill("Retrieved Customer");
+  await page.locator("#architecture-graph-retrieve").click();
+
+  await expect(page.locator("#architecture-graph-status")).toContainText("Retrieved 0 fact(s)");
+  await expect(page.locator("#architecture-graph-detail").getByRole("heading", { name: "Retrieved Customer" })).toBeVisible();
+  await expect(page.locator("#architecture-graph-list .architecture-item.active")).toContainText("Retrieved Customer");
+
+  await page.locator("#architecture-graph-refresh").click();
+  await expect(page.locator("#architecture-graph-list")).not.toContainText("Retrieved Customer");
+  await expect(page.locator("#architecture-graph-detail").getByRole("heading", { name: "Acme Corp" })).toBeVisible();
+});
+
+test("workflow rejection is idempotent under a rapid double click", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow decision coverage");
+  let rejectRequests = 0;
+  await page.route("**/tools/workflow_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "reject") {
+      rejectRequests += 1;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  const runId = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile",
+      workspaceId: "default",
+      name: "Reject Once",
+      sourceIds: ["source:playwright-architecture-brief"],
+      publish: true,
+      dryRun: true
+    });
+    const started = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      mode: "approval_gated",
+      inputs: {},
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    return started.id;
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="approvals"]').click();
+  await page.locator(`#architecture-approval-list .architecture-item[data-run-id="${runId}"]`).first().click();
+  await expect(page.locator("#architecture-approval-detail").getByRole("button", { name: "Reject" })).toBeEnabled();
+  await page.locator("#architecture-approval-detail").evaluate(detail => {
+    const button = [...detail.querySelectorAll("button")].find(candidate => candidate.textContent === "Reject");
+    button.click();
+    button.click();
+  });
+
+  await expect(page.locator("#architecture-approval-detail")).toContainText("rejected");
+  expect(rejectRequests).toBe(1);
+});
+
+test("workflow operations center summarizes library, runs, approvals, and shadow outcomes", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow operations coverage");
+  await page.goto("/");
+
+  const seeded = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile",
+      workspaceId: "default",
+      name: "Invoice Risk Review",
+      purpose: "Review invoices against governed evidence.",
+      sourceIds: ["source:playwright-architecture-brief"],
+      toolCalls: [{ toolName: "file_broker_action", capability: "write", sourceIds: ["source:playwright-architecture-brief"] }],
+      riskLevel: "high",
+      successMetrics: ["invoice reviewed"],
+      publish: true,
+      dryRun: true
+    });
+    const approvalRun = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      workflowVersion: compiled.published.definition.version,
+      mode: "approval_gated",
+      inputs: { invoiceId: "INV-42" },
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    const shadowRun = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      workflowVersion: compiled.published.definition.version,
+      mode: "shadow",
+      inputs: { invoiceId: "INV-43" },
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    await window.matbotTransport.callTool("workflow_action", {
+      action: "compare_shadow_result",
+      runId: shadowRun.id,
+      labels: ["accepted"],
+      note: "Human reviewer agreed."
+    });
+    return { compilationId: compiled.compilation.id, workflowId: compiled.published.definition.id, approvalRunId: approvalRun.id, shadowRunId: shadowRun.id };
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await expect(page.locator("#architecture-title")).toHaveText("Workflow Operations Center");
+  await expect(page.locator("#workflow-ops-workflow-count")).toHaveText("1");
+  await expect(page.locator("#workflow-ops-run-count")).toHaveText("3");
+  await expect(page.locator("#workflow-ops-pending-count")).toHaveText("2");
+  await expect(page.locator("#workflow-ops-acceptance-rate")).toHaveText("100%");
+  await expect(page.locator("#workflow-ops-attention")).toContainText("Pending approvals");
+  await expect(page.locator("#workflow-ops-recent-runs")).toContainText(seeded.workflowId);
+
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="library"]').click();
+  await page.locator(`#workflow-ops-library-list .architecture-item[data-compilation-id="${seeded.compilationId}"]`).click();
+  await expect(page.locator("#workflow-ops-library-detail")).toContainText("Invoice Risk Review");
+  await expect(page.locator("#workflow-ops-library-detail")).toContainText("invoice reviewed");
+  await expect(page.locator("#workflow-ops-library-detail").getByRole("button", { name: "Start approval-gated run" })).toBeEnabled();
+
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="runs"]').click();
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${seeded.approvalRunId}"]`).click();
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("Typed inputs");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("INV-42");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("Run Ledger");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("approval_requested");
+
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="approvals"]').click();
+  await expect(page.locator(`#architecture-approval-list .architecture-item[data-run-id="${seeded.approvalRunId}"]`)).toHaveCount(2);
+
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="shadow"]').click();
+  await page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${seeded.shadowRunId}"]`).click();
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("accepted");
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("shadow-recommendation-hash");
+});
+
+test("workflow compiler publishes a library entry and starts an approval-gated run", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow compiler coverage");
+  await page.goto("/");
+  await openArchitecturePanel(page, "workflows");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="library"]').click();
+
+  await page.locator("#workflow-ops-compile-name").fill("Customer Escalation Review");
+  await page.locator("#workflow-ops-compile-transcript").fill("Review {{customerId}} and propose a governed escalation.");
+  await page.locator("#workflow-ops-compile-risk").selectOption("high");
+  await page.locator("#workflow-ops-compile-sources").fill("source:playwright-architecture-brief");
+  await page.locator("#workflow-ops-compile-tool").fill("file_broker_action");
+  await page.locator("#workflow-ops-compile-form").getByRole("button", { name: "Compile workflow" }).click();
+
+  await expect(page.locator("#architecture-workflow-status")).toContainText("compiled, published, and smoke-tested");
+  const libraryItem = page.locator("#workflow-ops-library-list .architecture-item", { hasText: "Customer Escalation Review" });
+  await expect(libraryItem).toBeVisible();
+  await libraryItem.click();
+  await expect(page.locator("#workflow-ops-library-detail")).toContainText("structured-expert-review");
+  await expect(page.locator("#workflow-ops-workflow-count")).toHaveText("1");
+
+  await page.locator("#workflow-ops-library-search").fill("not-a-workflow");
+  await expect(page.locator("#workflow-ops-library-list")).toContainText("No compiled workflows");
+  await page.locator("#workflow-ops-library-search").fill("Customer Escalation");
+  await expect(libraryItem).toBeVisible();
+  await libraryItem.click();
+
+  await page.locator("#workflow-ops-library-detail").getByRole("button", { name: "Start approval-gated run" }).click();
+  await expect(page.locator('.workflow-ops-tab[data-workflow-ops-view="runs"]')).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("approval_gated");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("waiting_for_approval");
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("structured-expert-review");
+
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="approvals"]').click();
+  await expect(page.locator("#architecture-approval-list")).toContainText("Write/admin tool requires approval");
+});
+
+test("workflow shadow lab records a human outcome and refreshes readiness metrics", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow shadow coverage");
+  await page.goto("/");
+  const shadowRunId = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile",
+      workspaceId: "default",
+      name: "Shadow Candidate",
+      sourceIds: ["source:playwright-architecture-brief"],
+      publish: true,
+      dryRun: false
+    });
+    const run = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: compiled.published.definition.id,
+      mode: "shadow",
+      inputs: {},
+      evidenceSourceIds: ["source:playwright-architecture-brief"]
+    });
+    return run.id;
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await expect(page.locator("#workflow-ops-acceptance-rate")).toHaveText("0%");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="shadow"]').click();
+  await page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${shadowRunId}"]`).click();
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("unlabeled");
+  await page.locator("#workflow-ops-shadow-detail").getByRole("button", { name: "Accept" }).click();
+  await expect(page.locator("#architecture-workflow-status")).toContainText("recorded as accepted");
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("accepted");
+  await expect(page.locator("#workflow-ops-acceptance-rate")).toHaveText("100%");
+});
+
+test("workflow run inspector ignores stale responses after selecting another run", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow stale-selection coverage");
+  await page.goto("/");
+  const runIds = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile", workspaceId: "default", name: "Run Selection", publish: true, dryRun: false
+    });
+    const first = await window.matbotTransport.callTool("workflow_action", {
+      action: "dry_run", workspaceId: "default", workflowId: compiled.published.definition.id, inputs: { selected: "first" }
+    });
+    const second = await window.matbotTransport.callTool("workflow_action", {
+      action: "dry_run", workspaceId: "default", workflowId: compiled.published.definition.id, inputs: { selected: "second" }
+    });
+    return { first: first.id, second: second.id };
+  });
+  await page.route("**/tools/workflow_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "inspect_run" && input.runId === runIds.first) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    await route.fallback();
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="runs"]').click();
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${runIds.first}"]`).click();
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${runIds.second}"]`).click();
+  await expect(page.locator("#workflow-ops-run-detail").getByRole("heading", { name: runIds.second })).toBeVisible();
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText('"selected": "second"');
+  await page.waitForTimeout(300);
+  await expect(page.locator("#workflow-ops-run-detail").getByRole("heading", { name: runIds.second })).toBeVisible();
+  await expect(page.locator("#workflow-ops-run-detail")).not.toContainText('"selected": "first"');
+});
+
+test("workflow operations center keeps partial data usable and refreshes a failed service", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow recovery coverage");
+  await page.goto("/");
+  await page.evaluate(async () => {
+    await window.matbotTransport.callTool("workflow_action", {
+      action: "compile", workspaceId: "default", name: "Recovery Workflow", publish: true, dryRun: true
+    });
+  });
+  let failCompilations = true;
+  await page.route("**/tools/workflow_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "compilations" && failCompilations) {
+      failCompilations = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "temporary compilation service failure" }) });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await expect(page.locator("#architecture-workflow-status")).toContainText("Loaded with 1 unavailable workflow service");
+  await expect(page.locator("#workflow-ops-run-count")).toHaveText("1");
+  await page.locator("#architecture-workflow-refresh").click();
+  await expect(page.locator("#architecture-workflow-status")).toContainText("1 workflow(s)");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="library"]').click();
+  await expect(page.locator("#workflow-ops-library-list")).toContainText("Recovery Workflow");
 });
 
 test("activates and deactivates compatible local plugins through the plugins panel", async ({ page, isMobile }) => {
@@ -875,6 +1196,24 @@ test("uploads and deletes workspace files through the files panel", async ({ pag
   await uploaded.hover();
   await uploaded.locator(".file-action-btn").click();
   await expect(uploaded).toHaveCount(0);
+
+  const reservedName = "report #1?final%.txt";
+  await page.setInputFiles("#upload-input", {
+    name: reservedName,
+    mimeType: "text/plain",
+    buffer: Buffer.from("reserved filename opened", "utf8")
+  });
+  const reserved = page.locator(`.file-item[data-path="${reservedName}"]`);
+  await expect(reserved).toBeVisible();
+  const [opened] = await Promise.all([
+    page.waitForEvent("popup"),
+    reserved.click()
+  ]);
+  await expect(opened.locator("body")).toHaveText("reserved filename opened");
+  await opened.close();
+  await reserved.hover();
+  await reserved.locator(".file-action-btn").click();
+  await expect(reserved).toHaveCount(0);
 });
 
 test("opens skill editor, shows metadata and trigger controls, and saves", async ({ page, isMobile }) => {
@@ -986,4 +1325,44 @@ test("mobile layout exposes the sidebar through the burger button", async ({ pag
   await page.locator("#burger").click();
   await expect(page.locator("body")).toHaveClass(/sidebar-open/);
   await expect(page.locator("#session-list")).toContainText(/Conversation/);
+});
+
+test("mobile layout can navigate and operate architecture panels", async ({ page, isMobile }) => {
+  test.skip(!isMobile, "mobile architecture coverage");
+  await page.goto("/");
+  await page.locator("#burger").click();
+  await openArchitecturePanel(page, "sources");
+
+  await expect(page.locator("#architecture-screen")).toBeVisible();
+  await expect(page.locator("body")).not.toHaveClass(/sidebar-open/);
+  await expect(page.locator("#architecture-source-list")).toContainText("architecture.md");
+
+  await page.getByRole("tab", { name: "SQL Preview" }).click();
+  await page.locator("#architecture-sql-plan-btn").click();
+  await expect(page.locator("#architecture-sql-preview")).toContainText("SELECT");
+  await expect(page.locator("#architecture-sql-approve-btn")).toBeEnabled();
+});
+
+test("mobile layout exposes workflow operations summary and run ledger", async ({ page, isMobile }) => {
+  test.skip(!isMobile, "mobile workflow operations coverage");
+  await page.goto("/");
+  const runId = await page.evaluate(async () => {
+    const compiled = await window.matbotTransport.callTool("workflow_action", {
+      action: "compile", workspaceId: "default", name: "Mobile Workflow", publish: true, dryRun: false
+    });
+    const run = await window.matbotTransport.callTool("workflow_action", {
+      action: "dry_run", workspaceId: "default", workflowId: compiled.published.definition.id, inputs: { device: "mobile" }
+    });
+    return run.id;
+  });
+
+  await page.locator("#burger").click();
+  await openArchitecturePanel(page, "workflows");
+  await expect(page.locator("#architecture-title")).toHaveText("Workflow Operations Center");
+  await expect(page.locator("#workflow-ops-workflow-count")).toHaveText("1");
+  await expect(page.locator("#workflow-ops-run-count")).toHaveText("1");
+  await page.locator('.workflow-ops-tab[data-workflow-ops-view="runs"]').click();
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${runId}"]`).click();
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText('"device": "mobile"');
+  await expect(page.locator("#workflow-ops-run-detail")).toContainText("Run Ledger");
 });

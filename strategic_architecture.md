@@ -816,10 +816,11 @@ type WorkflowRunEvent = {
   - [x] high-risk workflows can require structured expert reviews.
   - [x] reviews are durable artifacts linked to the run.
 - [ ] Add WebUI surfaces:
-  - [ ] workflow library.
-  - [ ] run ledger.
+  - [x] workflow library backed by persisted compilation records.
+  - [x] run ledger with typed inputs, evidence, proposed/executed actions,
+    approvals, and ordered events.
   - [x] approval queue.
-  - [ ] shadow-mode comparison.
+  - [x] shadow-mode comparison and accepted/rejected/mixed labeling.
   - [ ] eval/test results.
 - [ ] Add test coverage:
   - [x] schema validation.
@@ -828,6 +829,8 @@ type WorkflowRunEvent = {
   - [x] dry-run cannot execute write tools.
   - [x] run event ordering.
   - [x] Playwright approval queue.
+  - [x] Playwright Workflow Operations Center library, compiler, run ledger,
+    shadow labeling, stale-selection, recovery, and mobile coverage.
 
 MVP note: this slice implements the workflow run ledger, schema validation,
 approval records, source evidence references, dry-run/shadow semantics, and
@@ -882,7 +885,8 @@ exact recommendation, evidence, and proposed action metadata that was evaluated.
 - [x] Keep shadow-mode write/admin tool calls blocked by workflow policy.
 - [x] Update connector-fabric action metadata for new workflow actions.
 - [x] Add Node tests for comparison records, shadow reports, and policy blocks.
-- [ ] Add WebUI shadow comparison view.
+- [x] Add WebUI shadow comparison view with human outcome labeling and summary
+  acceptance metrics.
 - [ ] Add richer customer-configurable label taxonomy.
 - [ ] Add drift reports across workflow versions.
 
@@ -934,7 +938,9 @@ tests, versioning, and optional dry-run.
 - [x] Update connector-fabric action metadata for compiler actions.
 - [x] Add Node tests for compile, publish, dry-run, compilation lookup/listing,
   and connector policy classification.
-- [ ] Add WebUI compile wizard for selecting chat ranges and reviewing diffs.
+- [x] Add WebUI compile wizard for name, purpose/transcript, sources, allowed
+  tool, risk, publication, and optional dry-run smoke test.
+- [ ] Add chat-range selection and editable workflow diffs to the compiler UI.
 - [ ] Add model-assisted inference for richer step, branch, and failure-handling suggestions.
 - [ ] Add workflow version diff UI.
 - [ ] Add background schedule integration.

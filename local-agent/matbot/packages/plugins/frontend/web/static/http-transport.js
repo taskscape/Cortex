@@ -189,7 +189,10 @@
   function skillEvents(signal)  { return globalEventStream('skill-changed',  signal); }
 
   function openFile(namespace, path) {
-    window.open('/files/' + namespace + '/' + path, '_blank');
+    // Encode the complete logical path as one segment. Reserved characters in
+    // user file names (notably #, ?, and %) must not be interpreted as URL
+    // fragment/query syntax before the server decodes the workspace path.
+    window.open('/files/' + encodeURIComponent(namespace) + '/' + encodeURIComponent(path), '_blank');
   }
 
   async function listWorkspaces() {

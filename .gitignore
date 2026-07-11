@@ -14,4 +14,6 @@ test-results
 
 # Cortex workspace-local registry and per-workspace settings
 local-agent/matbot/cortex-workspaces.json
-local-agent/matbot/workspaces/*/cortex-rag.json
+# Every workspace directory contains machine-local configuration, credentials,
+# memory, sessions, indexes, uploaded files, and other generated runtime state.
+local-agent/matbot/workspaces/

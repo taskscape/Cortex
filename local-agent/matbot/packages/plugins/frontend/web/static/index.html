@@ -858,6 +858,124 @@
       padding: 16px;
       text-align: center;
     }
+    .workflow-ops-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .workflow-ops-metric {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      background: linear-gradient(145deg, #ffffff, #f8fbff);
+      padding: 12px;
+    }
+    .workflow-ops-metric-label {
+      color: #667085;
+      font-size: 0.78em;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .workflow-ops-metric-value {
+      margin-top: 4px;
+      color: #111827;
+      font-size: 1.5em;
+      font-weight: 750;
+    }
+    .workflow-ops-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      border-bottom: 1px solid #e5e7eb;
+      padding-bottom: 8px;
+    }
+    .workflow-ops-tab {
+      min-height: 32px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: #475467;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 650;
+      padding: 6px 10px;
+    }
+    .workflow-ops-tab:hover,
+    .workflow-ops-tab.active {
+      border-color: #bfdbfe;
+      background: #eff6ff;
+      color: #1d4ed8;
+    }
+    .workflow-ops-view { display: none; }
+    .workflow-ops-view.active {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .workflow-ops-overview-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .workflow-ops-section {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+    }
+    .workflow-ops-section h3 {
+      margin: 0 0 8px;
+      color: #111827;
+      font-size: 1em;
+    }
+    .workflow-ops-section p {
+      margin: 5px 0;
+      color: #475467;
+      font-size: 0.88em;
+      line-height: 1.45;
+    }
+    .workflow-ops-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .workflow-ops-filters input,
+    .workflow-ops-filters select {
+      min-height: 34px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      background: #fff;
+      color: #111827;
+      font: inherit;
+      padding: 6px 9px;
+    }
+    .workflow-ops-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 12px;
+    }
+    .workflow-ops-actions button {
+      min-height: 32px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      background: #fff;
+      color: #374151;
+      cursor: pointer;
+      font: inherit;
+      padding: 6px 10px;
+    }
+    .workflow-ops-actions button.primary {
+      border-color: #2563eb;
+      background: #2563eb;
+      color: #fff;
+    }
+    .workflow-ops-actions button:disabled {
+      background: #d0d5dd;
+      border-color: #d0d5dd;
+      color: #667085;
+      cursor: not-allowed;
+    }
     @media (max-width: 820px) {
       #architecture-screen {
         padding: 18px 16px;
@@ -868,6 +986,16 @@
       }
       .architecture-grid,
       .architecture-form {
+        grid-template-columns: 1fr;
+      }
+      .workflow-ops-summary,
+      .workflow-ops-overview-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 520px) {
+      .workflow-ops-summary,
+      .workflow-ops-overview-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -4025,7 +4153,7 @@
       <div id="architecture-list" class="sidebar-list">
         <button class="architecture-nav-btn" data-architecture-view="sources" type="button">Sources</button>
         <button class="architecture-nav-btn" data-architecture-view="sql" type="button">SQL Preview</button>
-        <button class="architecture-nav-btn" data-architecture-view="workflows" type="button">Approvals</button>
+        <button class="architecture-nav-btn" data-architecture-view="workflows" type="button">Workflow Center</button>
         <button class="architecture-nav-btn" data-architecture-view="graph" type="button">Graph</button>
         <button class="architecture-nav-btn" data-architecture-view="reviews" type="button">Reviews</button>
       </div>
@@ -4213,7 +4341,7 @@
           <div class="architecture-tabs" role="tablist" aria-label="Architecture panels">
             <button id="architecture-tab-sources" class="architecture-tab active" data-architecture-tab="sources" type="button" role="tab" aria-selected="true" aria-controls="architecture-panel-sources">Sources</button>
             <button id="architecture-tab-sql" class="architecture-tab" data-architecture-tab="sql" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-sql" tabindex="-1">SQL Preview</button>
-            <button id="architecture-tab-workflows" class="architecture-tab" data-architecture-tab="workflows" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-workflows" tabindex="-1">Approvals</button>
+            <button id="architecture-tab-workflows" class="architecture-tab" data-architecture-tab="workflows" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-workflows" tabindex="-1">Workflows</button>
             <button id="architecture-tab-graph" class="architecture-tab" data-architecture-tab="graph" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-graph" tabindex="-1">Graph</button>
             <button id="architecture-tab-reviews" class="architecture-tab" data-architecture-tab="reviews" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-reviews" tabindex="-1">Reviews</button>
           </div>
@@ -4274,9 +4402,106 @@
               <button id="architecture-workflow-refresh" type="button">Refresh</button>
             </div>
           </div>
-          <div class="architecture-grid">
-            <div id="architecture-approval-list" class="architecture-list" aria-label="Approval queue"></div>
-            <div id="architecture-approval-detail" class="architecture-detail" aria-live="polite"></div>
+
+          <div class="workflow-ops-summary" aria-label="Workflow operations summary">
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Workflows</div><div id="workflow-ops-workflow-count" class="workflow-ops-metric-value">0</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Runs</div><div id="workflow-ops-run-count" class="workflow-ops-metric-value">0</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Pending approvals</div><div id="workflow-ops-pending-count" class="workflow-ops-metric-value">0</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Shadow acceptance</div><div id="workflow-ops-acceptance-rate" class="workflow-ops-metric-value">-</div></div>
+          </div>
+
+          <div class="workflow-ops-nav" role="tablist" aria-label="Workflow Operations Center">
+            <button id="workflow-ops-tab-overview" class="workflow-ops-tab active" data-workflow-ops-view="overview" type="button" role="tab" aria-selected="true" aria-controls="workflow-ops-view-overview">Overview</button>
+            <button id="workflow-ops-tab-library" class="workflow-ops-tab" data-workflow-ops-view="library" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-library" tabindex="-1">Library</button>
+            <button id="workflow-ops-tab-runs" class="workflow-ops-tab" data-workflow-ops-view="runs" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-runs" tabindex="-1">Run Ledger</button>
+            <button id="workflow-ops-tab-approvals" class="workflow-ops-tab" data-workflow-ops-view="approvals" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-approvals" tabindex="-1">Approvals</button>
+            <button id="workflow-ops-tab-shadow" class="workflow-ops-tab" data-workflow-ops-view="shadow" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-shadow" tabindex="-1">Shadow Lab</button>
+          </div>
+
+          <section id="workflow-ops-view-overview" class="workflow-ops-view active" data-workflow-ops-panel="overview" role="tabpanel" aria-labelledby="workflow-ops-tab-overview">
+            <div class="workflow-ops-overview-grid">
+              <div class="workflow-ops-section">
+                <h3>Release lifecycle</h3>
+                <p>Compile a repeated business task, validate it, run safely in dry-run or shadow mode, then move to approval-gated execution.</p>
+                <div class="architecture-inline-list"><span class="architecture-badge">Draft</span><span class="architecture-badge">Dry run</span><span class="architecture-badge warn">Shadow</span><span class="architecture-badge good">Approval gated</span></div>
+              </div>
+              <div class="workflow-ops-section">
+                <h3>Operational attention</h3>
+                <div id="workflow-ops-attention"></div>
+              </div>
+              <div class="workflow-ops-section">
+                <h3>Recent runs</h3>
+                <div id="workflow-ops-recent-runs"></div>
+              </div>
+              <div class="workflow-ops-section">
+                <h3>Shadow readiness</h3>
+                <div id="workflow-ops-shadow-readiness"></div>
+              </div>
+            </div>
+          </section>
+
+          <section id="workflow-ops-view-library" class="workflow-ops-view" data-workflow-ops-panel="library" role="tabpanel" aria-labelledby="workflow-ops-tab-library" hidden>
+            <form id="workflow-ops-compile-form" class="architecture-form">
+              <label>
+                Workflow name
+                <input id="workflow-ops-compile-name" type="text" value="Vendor Invoice Review" autocomplete="off" required>
+              </label>
+              <label>
+                Risk
+                <select id="workflow-ops-compile-risk"><option value="low">Low</option><option value="medium">Medium</option><option value="high" selected>High</option><option value="critical">Critical</option></select>
+              </label>
+              <label class="full">
+                Purpose or selected transcript
+                <textarea id="workflow-ops-compile-transcript" required>Review {{invoiceId}} against approved evidence and propose a governed follow-up.</textarea>
+              </label>
+              <label>
+                Evidence source IDs
+                <input id="workflow-ops-compile-sources" type="text" placeholder="source:contract, source:invoice" autocomplete="off">
+              </label>
+              <label>
+                Allowed tool
+                <input id="workflow-ops-compile-tool" type="text" placeholder="Optional tool name" autocomplete="off">
+              </label>
+              <label>
+                <span>Release options</span>
+                <span><input id="workflow-ops-compile-publish" type="checkbox" checked> Publish immutable version</span>
+              </label>
+              <label>
+                <span>Safety check</span>
+                <span><input id="workflow-ops-compile-dry-run" type="checkbox" checked> Run smoke-test</span>
+              </label>
+              <div class="architecture-form-actions"><button id="workflow-ops-compile-btn" class="primary" type="submit">Compile workflow</button></div>
+            </form>
+            <div class="workflow-ops-filters"><input id="workflow-ops-library-search" type="search" placeholder="Filter workflow library" autocomplete="off"></div>
+            <div class="architecture-grid">
+              <div id="workflow-ops-library-list" class="architecture-list" aria-label="Workflow library"></div>
+              <div id="workflow-ops-library-detail" class="architecture-detail" aria-live="polite"></div>
+            </div>
+          </section>
+
+          <section id="workflow-ops-view-runs" class="workflow-ops-view" data-workflow-ops-panel="runs" role="tabpanel" aria-labelledby="workflow-ops-tab-runs" hidden>
+            <div class="workflow-ops-filters">
+              <input id="workflow-ops-run-search" type="search" placeholder="Filter by workflow or run ID" autocomplete="off">
+              <select id="workflow-ops-run-status" aria-label="Run status"><option value="all">All statuses</option><option value="waiting_for_approval">Waiting for approval</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option></select>
+            </div>
+            <div class="architecture-grid">
+              <div id="workflow-ops-run-list" class="architecture-list" aria-label="Workflow run ledger"></div>
+              <div id="workflow-ops-run-detail" class="architecture-detail" aria-live="polite"></div>
+            </div>
+          </section>
+
+          <section id="workflow-ops-view-approvals" class="workflow-ops-view" data-workflow-ops-panel="approvals" role="tabpanel" aria-labelledby="workflow-ops-tab-approvals" hidden>
+            <div class="architecture-grid">
+              <div id="architecture-approval-list" class="architecture-list" aria-label="Approval queue"></div>
+              <div id="architecture-approval-detail" class="architecture-detail" aria-live="polite"></div>
+            </div>
+          </section>
+
+          <section id="workflow-ops-view-shadow" class="workflow-ops-view" data-workflow-ops-panel="shadow" role="tabpanel" aria-labelledby="workflow-ops-tab-shadow" hidden>
+            <div class="architecture-grid">
+              <div id="workflow-ops-shadow-list" class="architecture-list" aria-label="Shadow comparisons"></div>
+              <div id="workflow-ops-shadow-detail" class="architecture-detail" aria-live="polite"></div>
+            </div>
           </div>
         </section>
 

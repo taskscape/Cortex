@@ -27,10 +27,13 @@ let rememberedFactSeq = 1;
 const rememberedFactsByWorkspace = new Map();
 let queryRunSeq = 1;
 let workflowRunSeq = 1;
+let workflowCompilationSeq = 1;
 let expertReviewSeq = 1;
 const queryRuns = new Map();
+const workflowCompilations = new Map();
 const workflowRuns = new Map();
 const workflowApprovals = new Map();
+const workflowShadowComparisons = new Map();
 const expertReviews = new Map();
 
 const architectureSource = {
@@ -941,82 +944,162 @@ function structuredDataActionResult(input) {
   return { error: `Unknown structured_data_action "${input.action}".` };
 }
 
+function harnessQueryMatches(record, query) {
+  const where = query?.where;
+  if (!where || where.op !== "eq" || !where.field) return true;
+  return record?.[where.field] === where.value;
+}
+
+function harnessWorkflowSlug(value) {
+  return String(value || "compiled-followup").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "compiled-followup";
+}
+
 function workflowActionResult(input) {
   if (input.action === "compile") {
-    const runId = `workflow-run:compiled-${workflowRunSeq++}`;
-    const dryRun = {
-      id: runId,
-      workflowId: "workflow:compiled-followup",
-      workflowVersion: "workflow-version:compiled-followup",
-      workspaceId: "default",
-      mode: "dry_run",
-      status: "succeeded",
-      inputs: { ticketId: "T-123" },
-      evidenceSourceIds: [architectureSource.id],
-      evidenceSourceVersions: [{ sourceId: architectureSource.id, sourceVersionId: architectureSourceVersion.id }],
-      proposedActions: [{ id: "action:compiled-write", toolName: "file_broker_action", status: "proposed", requiresApproval: true, sourceIds: [architectureSource.id], input: { workflowRunId: runId } }],
-      executedActions: [],
-      labels: [],
-      createdAt: now(),
-      updatedAt: now()
+    const sequence = workflowCompilationSeq++;
+    const workspaceId = input.workspaceId ?? input.compile?.workspaceId ?? "default";
+    const name = input.name ?? input.compile?.name ?? "Compiled Followup";
+    const purpose = input.purpose ?? input.transcript ?? input.compile?.purpose ?? input.compile?.transcript ?? "Compiled governed workflow.";
+    const sourceIds = input.sourceIds ?? input.compile?.sourceIds ?? [architectureSource.id];
+    const toolCalls = input.toolCalls ?? input.compile?.toolCalls ?? [{ toolName: "file_broker_action", capability: "write", sourceIds }];
+    const toolNames = toolCalls.map(call => call.toolName).filter(Boolean);
+    const riskLevel = input.riskLevel ?? input.compile?.riskLevel ?? "high";
+    const workflowId = `workflow:${harnessWorkflowSlug(name)}-${sequence}`;
+    const workflowVersion = `workflow-version:${harnessWorkflowSlug(name)}-${sequence}`;
+    const compilationId = `workflow-compilation:playwright-${sequence}`;
+    const timestamp = now();
+    const approvalGates = input.approvalGates ?? input.compile?.approvalGates ?? [
+      { id: "approve-action", type: "action" },
+      ...(riskLevel === "high" || riskLevel === "critical"
+        ? [{ id: "structured-expert-review", type: "expert_review", requiredRiskLevel: "high" }]
+        : [])
+    ];
+    const proposedActions = toolCalls.map((call, index) => ({
+      id: `action:compiled-${sequence}-${index + 1}`,
+      toolName: call.toolName,
+      capability: call.capability ?? "read",
+      status: "proposed",
+      requiresApproval: call.capability === "write" || call.capability === "admin",
+      sourceIds: call.sourceIds ?? sourceIds,
+      reason: call.reason,
+      input: call.input ?? {}
+    }));
+    const definition = {
+      id: workflowId,
+      version: workflowVersion,
+      workspaceId,
+      name,
+      description: purpose,
+      riskLevel,
+      inputSchema: { type: "object", additionalProperties: true },
+      approvalGates,
+      allowedSourceIds: sourceIds,
+      allowedConnectorInstanceIds: toolCalls.map(call => call.connectorInstanceId).filter(Boolean),
+      allowedTools: toolNames,
+      requiredEvidence: sourceIds.length ? [{ name: "compiled-evidence", minCitations: sourceIds.length }] : [],
+      successMetrics: input.successMetrics ?? input.compile?.successMetrics ?? ["run completed"],
+      dryRunDefault: true,
+      tests: []
     };
-    workflowRuns.set(runId, dryRun);
-    return {
-      compilation: {
-        id: "workflow-compilation:playwright",
-        status: "dry_run_completed",
-        compilerVersion: "deterministic-workflow-compiler-v1",
-        workflowId: "workflow:compiled-followup",
-        dryRunId: runId
-      },
+    const publish = input.publish ?? input.compile?.publish ?? false;
+    const runDry = input.dryRun ?? input.compile?.dryRun ?? false;
+    let dryRun;
+    if (runDry) {
+      const runId = `workflow-run:compiled-${workflowRunSeq++}`;
+      dryRun = {
+        id: runId,
+        version: "run-version-1",
+        workflowId,
+        workflowVersion,
+        workspaceId,
+        principalId: "principal:playwright",
+        mode: "dry_run",
+        status: "succeeded",
+        inputs: input.sampleInputs ?? input.compile?.sampleInputs ?? {},
+        evidenceSourceIds: sourceIds,
+        evidenceSourceVersions: sourceIds.map(sourceId => ({ sourceId, sourceVersionId: architectureSourceVersion.id, healthState: "unhealthy", stalenessState: "stale" })),
+        proposedActions,
+        executedActions: [],
+        labels: [],
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      workflowRuns.set(runId, dryRun);
+    }
+    const compilation = {
+      id: compilationId,
+      version: "compilation-version-1",
+      workspaceId,
+      status: runDry ? "dry_run_completed" : (publish ? "published" : "draft"),
+      compilerVersion: "deterministic-workflow-compiler-v1",
+      inputHash: `input-hash-${sequence}`,
+      definition,
       validation: [],
-      published: {
-        definition: {
-          id: "workflow:compiled-followup",
-          version: "workflow-version:compiled-followup",
-          workspaceId: "default",
-          name: "Compiled Followup",
-          riskLevel: "high",
-          approvalGates: [
-            { id: "approve-action", type: "action" },
-            { id: "structured-expert-review", type: "expert_review", requiredRiskLevel: "high" }
-          ],
-          allowedSourceIds: [architectureSource.id],
-          allowedTools: ["file_broker_action"]
-        }
-      },
-      dryRun
+      sourceIds,
+      toolNames,
+      proposedActions,
+      sampleInputs: input.sampleInputs ?? input.compile?.sampleInputs ?? {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      ...(publish ? { workflowId, workflowVersion } : {}),
+      ...(dryRun ? { dryRunId: dryRun.id } : {}),
+      warnings: []
+    };
+    workflowCompilations.set(compilationId, compilation);
+    return {
+      compilation,
+      definition,
+      validation: [],
+      ...(publish ? { published: { definition, version: { id: workflowVersion, workflowId, version: workflowVersion } } } : {}),
+      ...(dryRun ? { dryRun } : {})
     };
   }
+  if (input.action === "compilations") {
+    return { compilations: [...workflowCompilations.values()].filter(item => harnessQueryMatches(item, input.query)) };
+  }
+  if (input.action === "get_compilation") return { compilation: workflowCompilations.get(input.compilationId) ?? null };
   if (input.action === "start" || input.action === "dry_run") {
     const runId = `workflow-run:playwright-${workflowRunSeq++}`;
     const mode = input.mode ?? (input.action === "dry_run" ? "dry_run" : "approval_gated");
+    const timestamp = now();
+    const sourceIds = input.evidenceSourceIds ?? [architectureSource.id];
     const run = {
       id: runId,
+      version: "run-version-1",
       workflowId: input.workflowId ?? "workflow:compiled-followup",
-      workflowVersion: "workflow-version:compiled-followup",
+      workflowVersion: input.workflowVersion ?? "workflow-version:compiled-followup",
       workspaceId: input.workspaceId ?? "default",
+      principalId: "principal:playwright",
       mode,
-      status: mode === "dry_run" ? "succeeded" : "waiting_for_approval",
+      status: mode === "dry_run" || mode === "shadow" ? "succeeded" : "waiting_for_approval",
       inputs: input.inputs ?? {},
-      evidenceSourceIds: input.evidenceSourceIds ?? [architectureSource.id],
-      evidenceSourceVersions: [{ sourceId: architectureSource.id, sourceVersionId: architectureSourceVersion.id }],
-      proposedActions: [{ id: "action:playwright-write", toolName: "file_broker_action", status: "proposed", requiresApproval: true, sourceIds: [architectureSource.id] }],
+      evidenceSourceIds: sourceIds,
+      evidenceSourceVersions: sourceIds.map(sourceId => ({ sourceId, sourceVersionId: architectureSourceVersion.id, healthState: "unhealthy", stalenessState: "stale" })),
+      proposedActions: input.proposedActions?.length ? input.proposedActions.map((action, index) => ({
+        id: action.id ?? `action:playwright-${index + 1}`,
+        toolName: action.toolName,
+        capability: action.capability ?? "write",
+        status: "proposed",
+        requiresApproval: action.requiresApproval ?? true,
+        sourceIds: action.sourceIds ?? sourceIds,
+        input: action.input ?? {},
+        reason: action.reason
+      })) : [{ id: "action:playwright-write", toolName: "file_broker_action", capability: "write", status: "proposed", requiresApproval: true, sourceIds, input: {} }],
       executedActions: [],
       labels: [],
-      createdAt: now(),
-      updatedAt: now()
+      createdAt: timestamp,
+      updatedAt: timestamp
     };
     workflowRuns.set(runId, run);
     if (run.status === "waiting_for_approval") {
       workflowApprovals.set(runId, [
-        { id: "approval:action", runId, gateId: "approve-action", status: "pending", reason: "Write/admin tool requires approval." },
-        { id: "approval:expert-review", runId, gateId: "structured-expert-review", status: "pending", reason: "High-risk workflow requires structured expert review." }
+        { id: "approval:action", version: "approval-version-1", runId, workflowId: run.workflowId, gateId: "approve-action", status: "pending", requestedAt: timestamp, updatedAt: timestamp, reason: "Write/admin tool requires approval." },
+        { id: "approval:expert-review", version: "approval-version-1", runId, workflowId: run.workflowId, gateId: "structured-expert-review", status: "pending", requestedAt: timestamp, updatedAt: timestamp, reason: "High-risk workflow requires structured expert review." }
       ]);
     }
     return run;
   }
-  if (input.action === "list_approvals") return { approvals: [...workflowApprovals.values()].flat() };
+  if (input.action === "list_approvals") return { approvals: [...workflowApprovals.values()].flat().filter(item => harnessQueryMatches(item, input.query)) };
   if (input.action === "approve" || input.action === "reject") {
     const approvals = workflowApprovals.get(input.runId) ?? [];
     if (!approvals.length) return { error: `Unknown workflow run "${input.runId}".` };
@@ -1024,51 +1107,74 @@ function workflowActionResult(input) {
     const status = input.action === "approve" ? "approved" : "rejected";
     const decidedAt = now();
     const updatedApprovals = approvals.map(approval =>
-      targetIds.has(approval.id) ? { ...approval, status, decidedAt, reason: input.reason ?? approval.reason } : approval
+      targetIds.has(approval.id) ? { ...approval, status, decidedAt, updatedAt: decidedAt, decidedByPrincipalId: "principal:playwright", reason: input.reason ?? approval.reason } : approval
     );
     workflowApprovals.set(input.runId, updatedApprovals);
     const run = workflowRuns.get(input.runId);
     if (run) {
       const hasPending = updatedApprovals.some(approval => approval.status === "pending");
       const hasRejected = updatedApprovals.some(approval => approval.status === "rejected");
-      const updatedRun = {
-        ...run,
-        status: hasPending ? "waiting_for_approval" : (hasRejected ? "failed" : "succeeded"),
-        updatedAt: decidedAt
-      };
-      workflowRuns.set(input.runId, updatedRun);
+      workflowRuns.set(input.runId, { ...run, status: hasPending ? "waiting_for_approval" : (hasRejected ? "failed" : "succeeded"), updatedAt: decidedAt });
     }
-    return {
-      run: workflowRuns.get(input.runId) ?? null,
-      approvals: updatedApprovals.filter(approval => targetIds.has(approval.id))
-    };
+    return { run: workflowRuns.get(input.runId) ?? null, approvals: updatedApprovals.filter(approval => targetIds.has(approval.id)) };
   }
   if (input.action === "inspect_run") {
     const run = workflowRuns.get(input.runId) ?? null;
+    const approvals = workflowApprovals.get(input.runId) ?? [];
     return {
       run,
       events: run ? [
-        { id: "event:created", runId: run.id, sequence: 1, eventType: "run_created", timestamp: run.createdAt },
-        { id: "event:approval", runId: run.id, sequence: 2, eventType: "approval_requested", timestamp: run.updatedAt }
+        { id: `event:${run.id}:created`, version: "event-version-1", runId: run.id, sequence: 1, eventType: "run_created", timestamp: run.createdAt, principalId: run.principalId, payload: { mode: run.mode } },
+        { id: `event:${run.id}:evidence`, version: "event-version-1", runId: run.id, sequence: 2, eventType: approvals.length ? "approval_requested" : "run_completed", timestamp: run.updatedAt, principalId: run.principalId, sourceIds: run.evidenceSourceIds, payload: { status: run.status } }
       ] : [],
-      approvals: workflowApprovals.get(input.runId) ?? []
+      approvals
     };
   }
-  if (input.action === "compare_shadow_result") {
-    return {
-      comparison: {
-        id: `shadow-comparison:${input.runId}`,
-        runId: input.runId,
-        outcome: "accepted",
-        score: 1,
-        labels: input.labels ?? ["accepted"],
-        sourceIds: [architectureSource.id],
-        recommendationHash: "shadow-recommendation-hash"
-      }
+  if (input.action === "compare_shadow_result" || input.action === "label_shadow_result") {
+    const run = workflowRuns.get(input.runId);
+    if (!run) return { error: `Unknown workflow run "${input.runId}".` };
+    const labels = input.labels ?? (input.label ? [input.label] : ["accepted"]);
+    const normalized = labels.map(label => String(label).toLowerCase());
+    const outcome = normalized.includes("mixed") ? "mixed" : normalized.some(label => label.includes("reject")) ? "rejected" : normalized.some(label => label.includes("accept")) ? "accepted" : "unlabeled";
+    const score = outcome === "accepted" ? 1 : outcome === "mixed" ? 0.5 : 0;
+    const timestamp = now();
+    const comparison = {
+      id: `shadow-comparison:${input.runId}`,
+      version: "shadow-comparison-version-1",
+      runId: input.runId,
+      workflowId: run.workflowId,
+      workflowVersion: run.workflowVersion,
+      workspaceId: run.workspaceId,
+      principalId: run.principalId,
+      outcome,
+      score,
+      humanLabels: labels,
+      proposedActionIds: run.proposedActions.map(action => action.id),
+      proposedToolNames: run.proposedActions.map(action => action.toolName),
+      sourceIds: run.evidenceSourceIds,
+      recommendationHash: `shadow-recommendation-hash:${run.id}`,
+      comparedAt: timestamp,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      note: input.note
     };
+    workflowShadowComparisons.set(run.id, comparison);
+    const updatedRun = { ...run, labels, updatedAt: timestamp };
+    workflowRuns.set(run.id, updatedRun);
+    return { run: updatedRun, comparison };
   }
-  if (input.action === "shadow_report") return { summary: { total: 1, accepted: 1, rejected: 0, mixed: 0, unlabeled: 0, acceptanceRate: 1 }, comparisons: [] };
-  if (input.action === "list_runs") return { runs: [...workflowRuns.values()] };
+  if (input.action === "shadow_report") {
+    const comparisons = [...workflowShadowComparisons.values()].filter(item => harnessQueryMatches(item, input.query));
+    const count = outcome => comparisons.filter(item => item.outcome === outcome).length;
+    const accepted = count("accepted");
+    const byWorkflow = [...new Set(comparisons.map(item => item.workflowId))].map(workflowId => {
+      const records = comparisons.filter(item => item.workflowId === workflowId);
+      const acceptedForWorkflow = records.filter(item => item.outcome === "accepted").length;
+      return { workflowId, total: records.length, accepted: acceptedForWorkflow, rejected: records.filter(item => item.outcome === "rejected").length, mixed: records.filter(item => item.outcome === "mixed").length, unlabeled: records.filter(item => item.outcome === "unlabeled").length, acceptanceRate: records.length ? acceptedForWorkflow / records.length : 0 };
+    });
+    return { summary: { total: comparisons.length, accepted, rejected: count("rejected"), mixed: count("mixed"), unlabeled: count("unlabeled"), acceptanceRate: comparisons.length ? accepted / comparisons.length : 0, byWorkflow }, comparisons };
+  }
+  if (input.action === "list_runs") return { runs: [...workflowRuns.values()].filter(item => harnessQueryMatches(item, input.query)) };
   return { error: `Unknown workflow_action "${input.action}".` };
 }
 
@@ -1223,6 +1329,14 @@ async function handle(req, res) {
   if (method === "POST" && url.pathname === "/__test/reset-memory") {
     rememberedFactsByWorkspace.clear();
     rememberedFactSeq = 1;
+    workflowCompilations.clear();
+    workflowRuns.clear();
+    workflowApprovals.clear();
+    workflowShadowComparisons.clear();
+    workflowRunSeq = 1;
+    workflowCompilationSeq = 1;
+    expertReviews.clear();
+    expertReviewSeq = 1;
     return json(res, 200, { ok: true });
   }
   if (method === "GET" && url.pathname === "/") return file(res, "text/html; charset=utf-8", "index.html");

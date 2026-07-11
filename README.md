@@ -38,11 +38,13 @@ then diverge independently.
 
 ## Documentation
 
-This README covers orientation and getting started. Detailed reference material
-lives under [`docs/`](docs):
+This README covers product and repository orientation. Start with the user guide
+for installation and feature walkthroughs, then use the reference documents for
+configuration, architecture, and development details.
 
 | Document | Contents |
 | --- | --- |
+| [Cortex User Guide](userguide.md) | Installation, WebUI tour, conversations, workspaces, files, RAG, memory, skills, experts, sources, SQL, workflows, graph, reviews, plugins, scheduling, safety, and troubleshooting. |
 | [Architecture And Core Systems](docs/architecture.md) | How requests move through the system; the plugin, memory, inner-voice, scheduling, workspace, RAG, and expert systems. |
 | [Commands](docs/commands.md) | Purpose of every PowerShell script, launcher/service startup paths, `run.ps1` switches, and npm scripts. |
 | [Configuration Reference](docs/configuration.md) | Configuration files, secrets/environment, Mem0 Docker, host file access, Matbot runtime, providers, workspaces, workspace RAG, and expert panel config. |
@@ -53,12 +55,11 @@ lives under [`docs/`](docs):
 | [Testing](docs/testing.md) | Node and Playwright test layers and coverage. |
 | [Troubleshooting](docs/troubleshooting.md) | Common failures and their fixes. |
 
-A good reading order for a new reader: this overview, then
-[Architecture And Core Systems](docs/architecture.md), the `Repository Map`,
-`Requirements`, and `Quick Start` below, and finally the
-[Configuration Reference](docs/configuration.md) and later documents as needed.
-The reference documents intentionally repeat some terms introduced here so each
-can be read on its own.
+A good reading order is this overview, the [Cortex User Guide](userguide.md),
+and then [Architecture And Core Systems](docs/architecture.md) or the
+[Configuration Reference](docs/configuration.md) when deeper operational or
+implementation detail is needed. The reference documents intentionally repeat
+some terms so each can be read on its own.
 
 ## Repository Map
 
@@ -104,72 +105,13 @@ Cross-cutting choices worth noting:
 - The local HTTP services deliberately use Node's built-in `http` module instead
   of a web framework to keep dependencies minimal.
 
-## Requirements
+## Using Cortex
 
-- Node.js 20 or newer provides `node` and `npm`; it is required for builds,
-  tests, file-index, file-broker, and Matbot.
-- `pnpm` is required by the Matbot monorepo. `run.ps1` installs `pnpm@9` when it
-  is missing unless `-SkipInstall` is used.
-- Docker Desktop with WSL2 is required for the Mem0 stack: Postgres, Neo4j, and
-  the Mem0 API.
-- The Mem0 API image used here is currently run as `linux/arm64` in Docker
-  Compose. On `amd64` Windows hosts, Docker Desktop runs it through QEMU
-  emulation.
-- The local Mem0 API image is patched with `Dockerfile.mem0-api` because the
-  upstream image lacks the `psycopg` driver needed by pgvector and needs a
-  persistent history directory. The first compose startup may take a few minutes
-  while this derived image is built; later starts reuse it.
-- An OpenAI-compatible model provider is required for real model turns. The
-  default hosted provider uses `OPENAI_API_KEY`; the configured `Local` provider
-  points at `http://100.122.2.99:11435/v1`.
+The [Cortex User Guide](userguide.md) is the main task-oriented manual. It owns
+the installation requirements, first-run commands, WebUI walkthroughs, feature
+instructions, safety guidance, and common troubleshooting steps that previously
+lived in this README or were spread across technical reference files.
 
-## Quick Start
-
-Prerequisites:
-
-- Windows PowerShell.
-- Node.js 20 or newer.
-- Docker Desktop if you want Mem0 memory services.
-- Network access to any configured hosted provider.
-
-Configure secrets once:
-
-```powershell
-.\scripts\setup-secrets.ps1 -OpenAiKey "<your-openai-key>"
-```
-
-This generates strong local passwords, stores them as User-scoped environment
-variables, and writes `local-agent\docker\mem0\.env`. Open a new terminal after
-running it so the new User-scoped environment variables are visible.
-
-Launch everything:
-
-```powershell
-.\scripts\run.ps1
-```
-
-The command installs and builds when needed, starts local services, checks health,
-starts or restarts the WebUI process, and opens the browser at:
-
-```text
-http://localhost:19778
-```
-
-Stop local services:
-
-```powershell
-.\scripts\stop-local-agent.ps1
-```
-
-For the full command reference, see [Commands](docs/commands.md).
-
-## Safety Defaults
-
-- Secrets are gitignored and should stay out of commits.
-- File-broker only writes inside configured read-write roots.
-- File-broker creates backups and diffs for overwrites.
-- Security policy blocks sensitive path fragments and marks high-risk extensions.
-- File-index skips likely secrets and excludes common generated directories.
-- Workspace RAG indexes markdown only and stores per-workspace data locally.
-- Expert knowledge roots are isolated by expert id.
-- Playwright tests use a fake Matbot harness and do not spend model tokens.
+Use [Commands](docs/commands.md) for the complete operational command reference
+and [Configuration Reference](docs/configuration.md) for provider, secret,
+workspace, RAG, file-access, and expert configuration.

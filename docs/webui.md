@@ -21,7 +21,10 @@ Current UI capabilities include:
   findings, and limitations;
 - governed SQL preview with row-cap warnings, approval, execution results, and
   query-result citations;
-- workflow approval queue with run inspection and approve/reject actions;
+- Workflow Operations Center with operational counts, a governed compilation
+  form, searchable workflow library, typed run inspection, event-ledger and
+  evidence views, approval actions, shadow comparisons, and human outcome
+  labeling;
 - context graph entity panels with relationship evidence and confidence;
 - durable expert review cards with recommendations, checklists, and risk
   registers;

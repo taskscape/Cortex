@@ -221,6 +221,7 @@ const architectureSqlDimensionEl = document.getElementById('architecture-sql-dim
 const architectureSqlFilterColumnEl = document.getElementById('architecture-sql-filter-column');
 const architectureSqlFilterValueEl = document.getElementById('architecture-sql-filter-value');
 const architectureSqlLimitEl = document.getElementById('architecture-sql-limit');
+const architectureSqlPlanBtn = document.getElementById('architecture-sql-plan-btn');
 const architectureSqlApproveBtn = document.getElementById('architecture-sql-approve-btn');
 const architectureSqlExecuteBtn = document.getElementById('architecture-sql-execute-btn');
 const architectureSqlStatusEl = document.getElementById('architecture-sql-status');
@@ -230,8 +231,36 @@ const architectureWorkflowStatusEl = document.getElementById('architecture-workf
 const architectureWorkflowRefreshBtn = document.getElementById('architecture-workflow-refresh');
 const architectureApprovalListEl = document.getElementById('architecture-approval-list');
 const architectureApprovalDetailEl = document.getElementById('architecture-approval-detail');
+const workflowOpsTabBtns = Array.from(document.querySelectorAll('.workflow-ops-tab'));
+const workflowOpsPanelEls = Array.from(document.querySelectorAll('.workflow-ops-view'));
+const workflowOpsWorkflowCountEl = document.getElementById('workflow-ops-workflow-count');
+const workflowOpsRunCountEl = document.getElementById('workflow-ops-run-count');
+const workflowOpsPendingCountEl = document.getElementById('workflow-ops-pending-count');
+const workflowOpsAcceptanceRateEl = document.getElementById('workflow-ops-acceptance-rate');
+const workflowOpsAttentionEl = document.getElementById('workflow-ops-attention');
+const workflowOpsRecentRunsEl = document.getElementById('workflow-ops-recent-runs');
+const workflowOpsShadowReadinessEl = document.getElementById('workflow-ops-shadow-readiness');
+const workflowOpsCompileForm = document.getElementById('workflow-ops-compile-form');
+const workflowOpsCompileNameEl = document.getElementById('workflow-ops-compile-name');
+const workflowOpsCompileRiskEl = document.getElementById('workflow-ops-compile-risk');
+const workflowOpsCompileTranscriptEl = document.getElementById('workflow-ops-compile-transcript');
+const workflowOpsCompileSourcesEl = document.getElementById('workflow-ops-compile-sources');
+const workflowOpsCompileToolEl = document.getElementById('workflow-ops-compile-tool');
+const workflowOpsCompilePublishEl = document.getElementById('workflow-ops-compile-publish');
+const workflowOpsCompileDryRunEl = document.getElementById('workflow-ops-compile-dry-run');
+const workflowOpsCompileBtn = document.getElementById('workflow-ops-compile-btn');
+const workflowOpsLibrarySearchEl = document.getElementById('workflow-ops-library-search');
+const workflowOpsLibraryListEl = document.getElementById('workflow-ops-library-list');
+const workflowOpsLibraryDetailEl = document.getElementById('workflow-ops-library-detail');
+const workflowOpsRunSearchEl = document.getElementById('workflow-ops-run-search');
+const workflowOpsRunStatusEl = document.getElementById('workflow-ops-run-status');
+const workflowOpsRunListEl = document.getElementById('workflow-ops-run-list');
+const workflowOpsRunDetailEl = document.getElementById('workflow-ops-run-detail');
+const workflowOpsShadowListEl = document.getElementById('workflow-ops-shadow-list');
+const workflowOpsShadowDetailEl = document.getElementById('workflow-ops-shadow-detail');
 const architectureGraphForm = document.getElementById('architecture-graph-form');
 const architectureGraphRefreshBtn = document.getElementById('architecture-graph-refresh');
+const architectureGraphRetrieveBtn = document.getElementById('architecture-graph-retrieve');
 const architectureGraphSearchEl = document.getElementById('architecture-graph-search');
 const architectureGraphSourceEl = document.getElementById('architecture-graph-source');
 const architectureGraphStatusEl = document.getElementById('architecture-graph-status');
@@ -264,8 +293,27 @@ let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded:
 let architectureView = 'sources';
 let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, healthReport: null, loaded: false };
 let architectureSqlState = { plan: null, approvalToken: '', executed: null };
-let architectureWorkflowState = { approvals: [], selected: null, inspected: null, loaded: false };
+let architectureSqlBusy = '';
+let architectureSqlPlanRequest = 0;
+let architectureWorkflowState = {
+  view: 'overview',
+  compilations: [],
+  runs: [],
+  approvals: [],
+  comparisons: [],
+  shadowSummary: null,
+  selectedCompilation: null,
+  selectedRun: null,
+  selectedShadowRun: null,
+  selected: null,
+  inspected: null,
+  loaded: false,
+};
+let architectureWorkflowDecision = '';
+let architectureWorkflowBusy = '';
+let architectureWorkflowLoadRequest = 0;
 let architectureGraphState = { entities: [], relationships: [], retrieve: null, selected: null, loaded: false };
+let architectureGraphRetrieveRequest = 0;
 let architectureReviewState = { reviews: [], selected: null, loaded: false };
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
@@ -737,7 +785,7 @@ if (memoryBrowserOverlay) {
 const ARCHITECTURE_PANEL_TITLES = {
   sources: 'Sources',
   sql: 'SQL Preview',
-  workflows: 'Approval Queue',
+  workflows: 'Workflow Operations Center',
   graph: 'Graph Entities',
   reviews: 'Expert Reviews',
 };
@@ -951,7 +999,7 @@ function activateArchitecturePanel(view) {
 async function loadArchitecturePanel(view, force = false) {
   if (view === 'sources' && (force || !architectureSourcesState.loaded)) return loadArchitectureSources();
   if (view === 'workflows' && (force || !architectureWorkflowState.loaded)) return loadArchitectureWorkflowApprovals();
-  if (view === 'graph' && (force || !architectureGraphState.loaded)) return loadArchitectureGraph();
+  if (view === 'graph' && (force || !architectureGraphState.loaded)) return loadArchitectureGraph(force);
   if (view === 'reviews' && (force || !architectureReviewState.loaded)) return loadArchitectureReviews();
   if (view === 'sql') renderArchitectureSqlResults();
   return undefined;
@@ -1075,7 +1123,10 @@ async function loadArchitectureSources() {
   architectureStatus(architectureSourceStatusEl, 'Loading sources...');
   try {
     const [sourceResult, healthResult] = await Promise.allSettled([
-      callTool('source_action', { action: 'list' }),
+      callTool('source_action', {
+        action: 'list',
+        query: { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } },
+      }),
       callTool('source_health_action', { action: 'report', workspaceId: activeWorkspaceId() }),
     ]);
     if (sourceResult.status !== 'fulfilled') throw sourceResult.reason;
@@ -1118,8 +1169,13 @@ function renderArchitectureSqlResults() {
   if (architectureSqlPreviewEl) {
     architectureSqlPreviewEl.textContent = architectureSqlState.plan?.queryRun?.sql || '';
   }
-  if (architectureSqlApproveBtn) architectureSqlApproveBtn.disabled = !architectureSqlState.plan?.queryRun?.id || Boolean(architectureSqlState.approvalToken);
-  if (architectureSqlExecuteBtn) architectureSqlExecuteBtn.disabled = !architectureSqlState.plan?.queryRun?.id || !architectureSqlState.approvalToken || Boolean(architectureSqlState.executed);
+  if (architectureSqlPlanBtn) architectureSqlPlanBtn.disabled = Boolean(architectureSqlBusy);
+  if (architectureSqlApproveBtn) {
+    architectureSqlApproveBtn.disabled = Boolean(architectureSqlBusy) || !architectureSqlState.plan?.queryRun?.id || Boolean(architectureSqlState.approvalToken);
+  }
+  if (architectureSqlExecuteBtn) {
+    architectureSqlExecuteBtn.disabled = Boolean(architectureSqlBusy) || !architectureSqlState.plan?.queryRun?.id || !architectureSqlState.approvalToken || Boolean(architectureSqlState.executed);
+  }
   architectureClear(architectureSqlResultsEl);
   if (!architectureSqlResultsEl) return;
 
@@ -1162,44 +1218,57 @@ function renderArchitectureSqlResults() {
 
 async function planArchitectureSql(event) {
   event?.preventDefault();
+  if (architectureSqlBusy) return;
+  const requestId = ++architectureSqlPlanRequest;
+  architectureSqlBusy = 'plan';
   architectureStatus(architectureSqlStatusEl, 'Planning query...');
   architectureSqlState = { plan: null, approvalToken: '', executed: null };
   renderArchitectureSqlResults();
   try {
     const plan = await callTool('structured_data_action', { action: 'plan_query', plan: architectureSqlPlanInput() });
+    if (requestId !== architectureSqlPlanRequest) return;
+    if (!plan?.queryRun?.id) throw new Error('Query planning returned no query run.');
     architectureSqlState.plan = plan;
     renderArchitectureSqlResults();
     architectureStatus(architectureSqlStatusEl, plan.rowCapWarning || 'Query planned.');
   } catch (err) {
+    if (requestId !== architectureSqlPlanRequest) return;
     architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
+  } finally {
+    if (requestId === architectureSqlPlanRequest) {
+      architectureSqlBusy = '';
+      renderArchitectureSqlResults();
+    }
   }
 }
 
 async function approveArchitectureSql() {
   const runId = architectureSqlState.plan?.queryRun?.id;
-  if (!runId) return;
+  if (!runId || architectureSqlBusy) return;
+  architectureSqlBusy = 'approve';
   architectureStatus(architectureSqlStatusEl, 'Approving query...');
-  if (architectureSqlApproveBtn) architectureSqlApproveBtn.disabled = true;
+  renderArchitectureSqlResults();
   try {
     const result = await callTool('structured_data_action', { action: 'approve_query', queryRunId: runId });
-    architectureSqlState.approvalToken = result?.approvalToken || '';
+    if (!result?.approvalToken) throw new Error('Query approval returned no approval token.');
+    architectureSqlState.approvalToken = result.approvalToken;
     if (result?.queryRun && architectureSqlState.plan) architectureSqlState.plan.queryRun = result.queryRun;
     renderArchitectureSqlResults();
     architectureStatus(architectureSqlStatusEl, 'Query approved.');
   } catch (err) {
     architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
   } finally {
-    // A failed request must remain retryable. Rendering derives the enabled
-    // state from the durable plan/token instead of leaving the busy flag stuck.
+    architectureSqlBusy = '';
     renderArchitectureSqlResults();
   }
 }
 
 async function executeArchitectureSql() {
   const runId = architectureSqlState.plan?.queryRun?.id;
-  if (!runId || !architectureSqlState.approvalToken) return;
+  if (!runId || !architectureSqlState.approvalToken || architectureSqlBusy) return;
+  architectureSqlBusy = 'execute';
   architectureStatus(architectureSqlStatusEl, 'Executing query...');
-  if (architectureSqlExecuteBtn) architectureSqlExecuteBtn.disabled = true;
+  renderArchitectureSqlResults();
   try {
     const result = await callTool('structured_data_action', {
       action: 'execute_query',
@@ -1213,8 +1282,515 @@ async function executeArchitectureSql() {
   } catch (err) {
     architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
   } finally {
+    architectureSqlBusy = '';
     renderArchitectureSqlResults();
   }
+}
+
+function workflowOpsWorkspaceQuery() {
+  return { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } };
+}
+
+function workflowOpsSplitValues(value) {
+  return String(value || '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function workflowOpsAcceptanceText(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '-';
+  return `${Math.round(numeric * 100)}%`;
+}
+
+function activateWorkflowOpsView(view) {
+  const allowed = new Set(['overview', 'library', 'runs', 'approvals', 'shadow']);
+  architectureWorkflowState.view = allowed.has(view) ? view : 'overview';
+  for (const btn of workflowOpsTabBtns) {
+    const active = btn.dataset.workflowOpsView === architectureWorkflowState.view;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    btn.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of workflowOpsPanelEls) {
+    const active = panel.dataset.workflowOpsPanel === architectureWorkflowState.view;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  }
+}
+
+function renderWorkflowOpsSummary() {
+  if (workflowOpsWorkflowCountEl) workflowOpsWorkflowCountEl.textContent = String(architectureWorkflowState.compilations.length);
+  if (workflowOpsRunCountEl) workflowOpsRunCountEl.textContent = String(architectureWorkflowState.runs.length);
+  const pending = architectureWorkflowState.approvals.filter(approval => approval.status === 'pending').length;
+  if (workflowOpsPendingCountEl) workflowOpsPendingCountEl.textContent = String(pending);
+  if (workflowOpsAcceptanceRateEl) workflowOpsAcceptanceRateEl.textContent = workflowOpsAcceptanceText(architectureWorkflowState.shadowSummary?.acceptanceRate);
+}
+
+function workflowOpsSortedRuns() {
+  return [...architectureWorkflowState.runs].sort((left, right) =>
+    String(right.updatedAt || right.createdAt || '').localeCompare(String(left.updatedAt || left.createdAt || ''))
+  );
+}
+
+function renderWorkflowOpsOverview() {
+  architectureClear(workflowOpsAttentionEl);
+  architectureClear(workflowOpsRecentRunsEl);
+  architectureClear(workflowOpsShadowReadinessEl);
+
+  const pending = architectureWorkflowState.approvals.filter(approval => approval.status === 'pending');
+  const failed = architectureWorkflowState.runs.filter(run => run.status === 'failed');
+  if (workflowOpsAttentionEl) {
+    if (!pending.length && !failed.length) workflowOpsAttentionEl.appendChild(architectureEmpty('No workflow operations need attention'));
+    else {
+      workflowOpsAttentionEl.appendChild(architectureKeyValues([
+        ['Pending approvals', pending.length],
+        ['Failed runs', failed.length],
+      ]));
+    }
+  }
+
+  if (workflowOpsRecentRunsEl) {
+    const recent = workflowOpsSortedRuns().slice(0, 4);
+    if (!recent.length) workflowOpsRecentRunsEl.appendChild(architectureEmpty('No workflow runs yet'));
+    else {
+      for (const run of recent) {
+        const item = architectureItemButton({
+          title: run.workflowId,
+          meta: `${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
+          badge: run.status,
+          onClick: () => {
+            activateWorkflowOpsView('runs');
+            selectWorkflowOpsRun(run.id);
+          },
+        });
+        item.dataset.runId = run.id;
+        workflowOpsRecentRunsEl.appendChild(item);
+      }
+    }
+  }
+
+  if (workflowOpsShadowReadinessEl) {
+    const summary = architectureWorkflowState.shadowSummary;
+    if (!summary?.total) workflowOpsShadowReadinessEl.appendChild(architectureEmpty('No labeled shadow runs'));
+    else {
+      workflowOpsShadowReadinessEl.appendChild(architectureKeyValues([
+        ['Compared runs', summary.total],
+        ['Accepted', summary.accepted],
+        ['Rejected', summary.rejected],
+        ['Mixed', summary.mixed],
+        ['Acceptance', workflowOpsAcceptanceText(summary.acceptanceRate)],
+      ]));
+    }
+  }
+}
+
+function workflowOpsFilteredCompilations() {
+  const term = String(workflowOpsLibrarySearchEl?.value || '').trim().toLowerCase();
+  if (!term) return architectureWorkflowState.compilations;
+  return architectureWorkflowState.compilations.filter(compilation => {
+    const definition = compilation.definition || {};
+    return [definition.name, definition.description, compilation.workflowId, compilation.id, compilation.status]
+      .some(value => String(value || '').toLowerCase().includes(term));
+  });
+}
+
+function renderWorkflowOpsLibraryList() {
+  architectureClear(workflowOpsLibraryListEl);
+  if (!workflowOpsLibraryListEl) return;
+  const compilations = workflowOpsFilteredCompilations();
+  if (!compilations.length) {
+    workflowOpsLibraryListEl.appendChild(architectureEmpty('No compiled workflows'));
+    return;
+  }
+  for (const compilation of compilations) {
+    const definition = compilation.definition || {};
+    const item = architectureItemButton({
+      title: definition.name || compilation.workflowId || compilation.id,
+      meta: [compilation.workflowVersion, definition.riskLevel, architectureDate(compilation.updatedAt || compilation.createdAt)].filter(Boolean).join(' | '),
+      badge: compilation.status,
+      active: architectureWorkflowState.selectedCompilation?.id === compilation.id,
+      onClick: () => selectWorkflowOpsCompilation(compilation.id),
+    });
+    item.dataset.compilationId = compilation.id;
+    if (compilation.workflowId) item.dataset.workflowId = compilation.workflowId;
+    workflowOpsLibraryListEl.appendChild(item);
+  }
+}
+
+function renderWorkflowOpsLibraryDetail() {
+  architectureClear(workflowOpsLibraryDetailEl);
+  if (!workflowOpsLibraryDetailEl) return;
+  const compilation = architectureWorkflowState.selectedCompilation;
+  if (!compilation) {
+    workflowOpsLibraryDetailEl.appendChild(architectureEmpty('Select a compiled workflow'));
+    return;
+  }
+  const definition = compilation.definition || {};
+  workflowOpsLibraryDetailEl.append(
+    architectureHeading(3, definition.name || compilation.workflowId || compilation.id),
+    architectureKeyValues([
+      ['Compilation', compilation.id],
+      ['Status', compilation.status],
+      ['Published workflow', compilation.workflowId],
+      ['Version', compilation.workflowVersion],
+      ['Risk', definition.riskLevel],
+      ['Compiler', compilation.compilerVersion],
+      ['Created', architectureDate(compilation.createdAt)],
+      ['Updated', architectureDate(compilation.updatedAt)],
+    ]),
+    architectureHeading(4, 'Purpose'),
+    architectureMuted(definition.description || 'No purpose recorded'),
+    architectureHeading(4, 'Evidence and permissions'),
+    architectureKeyValues([
+      ['Sources', compilation.sourceIds || definition.allowedSourceIds],
+      ['Tools', compilation.toolNames || definition.allowedTools],
+      ['Approval gates', (definition.approvalGates || []).map(gate => [gate.id, gate.type].filter(Boolean).join(': '))],
+      ['Success metrics', definition.successMetrics],
+    ])
+  );
+  const validation = Array.isArray(compilation.validation) ? compilation.validation : [];
+  const warnings = Array.isArray(compilation.warnings) ? compilation.warnings : [];
+  workflowOpsLibraryDetailEl.appendChild(architectureHeading(4, 'Release checks'));
+  workflowOpsLibraryDetailEl.appendChild(architectureInlineBadges([
+    validation.length ? `${validation.length} validation error(s)` : 'validated',
+    ...warnings,
+  ]));
+
+  if (compilation.workflowId) {
+    const actions = document.createElement('div');
+    actions.className = 'workflow-ops-actions';
+    for (const [mode, label, primary] of [
+      ['dry_run', 'Start dry run', false],
+      ['shadow', 'Start shadow run', false],
+      ['approval_gated', 'Start approval-gated run', true],
+    ]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.classList.toggle('primary', primary);
+      button.disabled = Boolean(architectureWorkflowBusy);
+      button.onclick = () => startWorkflowOpsRun(compilation, mode);
+      actions.appendChild(button);
+    }
+    workflowOpsLibraryDetailEl.appendChild(actions);
+  }
+}
+
+function selectWorkflowOpsCompilation(compilationId) {
+  const compilation = architectureWorkflowState.compilations.find(item => item.id === compilationId);
+  if (!compilation) return;
+  architectureWorkflowState.selectedCompilation = compilation;
+  renderWorkflowOpsLibraryList();
+  renderWorkflowOpsLibraryDetail();
+}
+
+async function compileWorkflowOperation(event) {
+  event?.preventDefault();
+  if (architectureWorkflowBusy) return;
+  const name = workflowOpsCompileNameEl?.value.trim() || '';
+  const transcript = workflowOpsCompileTranscriptEl?.value.trim() || '';
+  if (!name || !transcript) return;
+  const sourceIds = workflowOpsSplitValues(workflowOpsCompileSourcesEl?.value);
+  const toolName = workflowOpsCompileToolEl?.value.trim() || '';
+  architectureWorkflowBusy = 'compile';
+  if (workflowOpsCompileBtn) workflowOpsCompileBtn.disabled = true;
+  architectureStatus(architectureWorkflowStatusEl, 'Compiling governed workflow...');
+  try {
+    const result = await callTool('workflow_action', {
+      action: 'compile',
+      workspaceId: activeWorkspaceId(),
+      name,
+      purpose: transcript,
+      transcript,
+      sourceIds,
+      ...(toolName ? {
+        toolCalls: [{
+          toolName,
+          capability: 'write',
+          sourceIds,
+          reason: 'Compiled in Workflow Operations Center.',
+        }],
+      } : {}),
+      riskLevel: workflowOpsCompileRiskEl?.value || 'medium',
+      successMetrics: ['evidence cited', 'approval decision recorded', 'run completed'],
+      publish: Boolean(workflowOpsCompilePublishEl?.checked),
+      dryRun: Boolean(workflowOpsCompileDryRunEl?.checked),
+      sampleInputs: {},
+    });
+    await loadArchitectureWorkflowApprovals(true);
+    const compilationId = result?.compilation?.id;
+    if (compilationId) selectWorkflowOpsCompilation(compilationId);
+    activateWorkflowOpsView('library');
+    architectureStatus(architectureWorkflowStatusEl, result?.published ? 'Workflow compiled, published, and smoke-tested.' : 'Workflow draft compiled.');
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  } finally {
+    architectureWorkflowBusy = '';
+    if (workflowOpsCompileBtn) workflowOpsCompileBtn.disabled = false;
+    renderWorkflowOpsLibraryDetail();
+  }
+}
+
+async function startWorkflowOpsRun(compilation, mode) {
+  if (!compilation?.workflowId || architectureWorkflowBusy) return;
+  architectureWorkflowBusy = `start:${mode}`;
+  renderWorkflowOpsLibraryDetail();
+  architectureStatus(architectureWorkflowStatusEl, `Starting ${mode.replaceAll('_', ' ')}...`);
+  try {
+    const run = await callTool('workflow_action', {
+      action: mode === 'dry_run' ? 'dry_run' : 'start',
+      workspaceId: activeWorkspaceId(),
+      workflowId: compilation.workflowId,
+      ...(compilation.workflowVersion ? { workflowVersion: compilation.workflowVersion } : {}),
+      mode,
+      inputs: compilation.sampleInputs || {},
+      evidenceSourceIds: compilation.sourceIds || [],
+      proposedActions: compilation.proposedActions || [],
+    });
+    await loadArchitectureWorkflowApprovals(true);
+    activateWorkflowOpsView('runs');
+    if (run?.id) await selectWorkflowOpsRun(run.id);
+    architectureStatus(architectureWorkflowStatusEl, `${mode.replaceAll('_', ' ')} started.`);
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  } finally {
+    architectureWorkflowBusy = '';
+    renderWorkflowOpsLibraryDetail();
+  }
+}
+
+function workflowOpsFilteredRuns() {
+  const term = String(workflowOpsRunSearchEl?.value || '').trim().toLowerCase();
+  const status = workflowOpsRunStatusEl?.value || 'all';
+  return workflowOpsSortedRuns().filter(run => {
+    if (status !== 'all' && run.status !== status) return false;
+    if (!term) return true;
+    return [run.id, run.workflowId, run.workflowVersion, run.mode, run.status]
+      .some(value => String(value || '').toLowerCase().includes(term));
+  });
+}
+
+function renderWorkflowOpsRunList() {
+  architectureClear(workflowOpsRunListEl);
+  if (!workflowOpsRunListEl) return;
+  const runs = workflowOpsFilteredRuns();
+  if (!runs.length) {
+    workflowOpsRunListEl.appendChild(architectureEmpty('No matching workflow runs'));
+    return;
+  }
+  for (const run of runs) {
+    const item = architectureItemButton({
+      title: run.workflowId,
+      meta: [run.id, run.mode, architectureDate(run.updatedAt || run.createdAt)].filter(Boolean).join(' | '),
+      badge: run.status,
+      active: architectureWorkflowState.selectedRun?.id === run.id,
+      onClick: () => selectWorkflowOpsRun(run.id),
+    });
+    item.dataset.runId = run.id;
+    item.dataset.workflowId = run.workflowId;
+    workflowOpsRunListEl.appendChild(item);
+  }
+}
+
+function workflowOpsActionCards(actions, emptyText) {
+  const wrap = document.createElement('div');
+  if (!actions.length) {
+    wrap.appendChild(architectureEmpty(emptyText));
+    return wrap;
+  }
+  wrap.className = 'architecture-card-grid';
+  for (const action of actions) {
+    wrap.appendChild(architectureCard(action.toolName || action.id, [
+      action.id,
+      action.reason,
+      `Sources: ${architectureString(action.sourceIds)}`,
+    ].filter(Boolean), action.status));
+  }
+  return wrap;
+}
+
+function renderWorkflowOpsRunDetail() {
+  architectureClear(workflowOpsRunDetailEl);
+  if (!workflowOpsRunDetailEl) return;
+  const run = architectureWorkflowState.selectedRun;
+  if (!run) {
+    workflowOpsRunDetailEl.appendChild(architectureEmpty('Select a workflow run'));
+    return;
+  }
+  const inspected = architectureWorkflowState.inspected?.run?.id === run.id ? architectureWorkflowState.inspected : null;
+  const current = inspected?.run || run;
+  workflowOpsRunDetailEl.append(
+    architectureHeading(3, current.id),
+    architectureKeyValues([
+      ['Workflow', current.workflowId],
+      ['Version', current.workflowVersion],
+      ['Mode', current.mode],
+      ['Status', current.status],
+      ['Principal', current.principalId],
+      ['Created', architectureDate(current.createdAt)],
+      ['Updated', architectureDate(current.updatedAt)],
+      ['Error', current.error],
+    ]),
+    architectureHeading(4, 'Typed inputs'),
+    architectureJsonBlock(current.inputs || {}),
+    architectureHeading(4, 'Evidence'),
+    architectureKeyValues([
+      ['Source IDs', current.evidenceSourceIds],
+      ['Source versions', (current.evidenceSourceVersions || []).map(reference => reference.sourceVersionId || reference.sourceId)],
+    ]),
+    architectureHeading(4, 'Proposed Actions'),
+    workflowOpsActionCards(current.proposedActions || [], 'No proposed actions'),
+    architectureHeading(4, 'Executed Actions'),
+    workflowOpsActionCards(current.executedActions || [], 'No actions executed')
+  );
+  const approvals = Array.isArray(inspected?.approvals) ? inspected.approvals : [];
+  workflowOpsRunDetailEl.appendChild(architectureHeading(4, 'Approvals'));
+  if (approvals.length) workflowOpsRunDetailEl.appendChild(architectureTable(approvals, ['gateId', 'status', 'reason', 'decidedAt']));
+  else workflowOpsRunDetailEl.appendChild(architectureEmpty('No approval gates'));
+  const events = Array.isArray(inspected?.events) ? inspected.events : [];
+  workflowOpsRunDetailEl.appendChild(architectureHeading(4, 'Run Ledger'));
+  if (events.length) workflowOpsRunDetailEl.appendChild(architectureTable(events, ['sequence', 'eventType', 'timestamp', 'principalId']));
+  else workflowOpsRunDetailEl.appendChild(architectureEmpty('Loading run events...'));
+}
+
+async function selectWorkflowOpsRun(runId) {
+  const run = architectureWorkflowState.runs.find(item => item.id === runId);
+  if (!run) return;
+  architectureWorkflowState.selectedRun = run;
+  architectureWorkflowState.inspected = null;
+  renderWorkflowOpsRunList();
+  renderWorkflowOpsRunDetail();
+  architectureStatus(architectureWorkflowStatusEl, 'Loading run ledger...');
+  try {
+    const inspected = await callTool('workflow_action', { action: 'inspect_run', runId });
+    if (architectureWorkflowState.selectedRun?.id !== runId) return;
+    architectureWorkflowState.inspected = inspected;
+    if (inspected?.run) {
+      architectureWorkflowState.selectedRun = inspected.run;
+      const index = architectureWorkflowState.runs.findIndex(item => item.id === runId);
+      if (index >= 0) architectureWorkflowState.runs[index] = inspected.run;
+    }
+    renderWorkflowOpsRunList();
+    renderWorkflowOpsRunDetail();
+    architectureStatus(architectureWorkflowStatusEl, `${architectureWorkflowState.runs.length} run(s)`);
+  } catch (err) {
+    if (architectureWorkflowState.selectedRun?.id === runId) architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  }
+}
+
+function workflowOpsComparisonForRun(runId) {
+  return architectureWorkflowState.comparisons.find(comparison => comparison.runId === runId) || null;
+}
+
+function workflowOpsShadowRuns() {
+  return workflowOpsSortedRuns().filter(run => run.mode === 'shadow');
+}
+
+function renderWorkflowOpsShadowList() {
+  architectureClear(workflowOpsShadowListEl);
+  if (!workflowOpsShadowListEl) return;
+  const runs = workflowOpsShadowRuns();
+  if (!runs.length) {
+    workflowOpsShadowListEl.appendChild(architectureEmpty('No shadow runs'));
+    return;
+  }
+  for (const run of runs) {
+    const comparison = workflowOpsComparisonForRun(run.id);
+    const item = architectureItemButton({
+      title: run.workflowId,
+      meta: `${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
+      badge: comparison?.outcome || 'unlabeled',
+      active: architectureWorkflowState.selectedShadowRun?.id === run.id,
+      onClick: () => selectWorkflowOpsShadowRun(run.id),
+    });
+    item.dataset.runId = run.id;
+    workflowOpsShadowListEl.appendChild(item);
+  }
+}
+
+function renderWorkflowOpsShadowDetail() {
+  architectureClear(workflowOpsShadowDetailEl);
+  if (!workflowOpsShadowDetailEl) return;
+  const run = architectureWorkflowState.selectedShadowRun;
+  if (!run) {
+    workflowOpsShadowDetailEl.appendChild(architectureEmpty('Select a shadow run'));
+    return;
+  }
+  const comparison = workflowOpsComparisonForRun(run.id);
+  workflowOpsShadowDetailEl.append(
+    architectureHeading(3, run.id),
+    architectureKeyValues([
+      ['Workflow', run.workflowId],
+      ['Version', run.workflowVersion],
+      ['Run status', run.status],
+      ['Outcome', comparison?.outcome || 'unlabeled'],
+      ['Score', comparison?.score],
+      ['Recommendation hash', comparison?.recommendationHash],
+      ['Human labels', comparison?.humanLabels || comparison?.labels],
+      ['Evidence', comparison?.sourceIds || run.evidenceSourceIds],
+    ]),
+    architectureHeading(4, 'Proposed recommendation'),
+    workflowOpsActionCards(run.proposedActions || [], 'No proposed actions')
+  );
+  const actions = document.createElement('div');
+  actions.className = 'workflow-ops-actions';
+  for (const [label, text] of [['accepted', 'Accept'], ['rejected', 'Reject'], ['mixed', 'Mark mixed']]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.classList.toggle('primary', label === 'accepted');
+    button.disabled = Boolean(architectureWorkflowBusy);
+    button.onclick = () => labelWorkflowOpsShadow(run.id, label);
+    actions.appendChild(button);
+  }
+  workflowOpsShadowDetailEl.appendChild(actions);
+}
+
+function selectWorkflowOpsShadowRun(runId) {
+  const run = workflowOpsShadowRuns().find(item => item.id === runId);
+  if (!run) return;
+  architectureWorkflowState.selectedShadowRun = run;
+  renderWorkflowOpsShadowList();
+  renderWorkflowOpsShadowDetail();
+}
+
+async function labelWorkflowOpsShadow(runId, label) {
+  if (!runId || architectureWorkflowBusy) return;
+  architectureWorkflowBusy = `shadow:${runId}`;
+  renderWorkflowOpsShadowDetail();
+  architectureStatus(architectureWorkflowStatusEl, `Recording ${label} shadow outcome...`);
+  try {
+    await callTool('workflow_action', {
+      action: 'compare_shadow_result',
+      runId,
+      labels: [label],
+      note: 'Labeled in Workflow Operations Center.',
+    });
+    await loadArchitectureWorkflowApprovals(true);
+    selectWorkflowOpsShadowRun(runId);
+    activateWorkflowOpsView('shadow');
+    architectureStatus(architectureWorkflowStatusEl, `Shadow outcome recorded as ${label}.`);
+  } catch (err) {
+    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  } finally {
+    architectureWorkflowBusy = '';
+    renderWorkflowOpsShadowDetail();
+  }
+}
+
+function renderWorkflowOperationsCenter() {
+  renderWorkflowOpsSummary();
+  renderWorkflowOpsOverview();
+  renderWorkflowOpsLibraryList();
+  renderWorkflowOpsLibraryDetail();
+  renderWorkflowOpsRunList();
+  renderWorkflowOpsRunDetail();
+  renderArchitectureApprovalList();
+  renderArchitectureApprovalDetail();
+  renderWorkflowOpsShadowList();
+  renderWorkflowOpsShadowDetail();
 }
 
 function renderArchitectureApprovalList() {
@@ -1265,11 +1841,13 @@ function renderArchitectureApprovalDetail() {
     const approve = document.createElement('button');
     approve.type = 'button';
     approve.textContent = 'Approve';
+    approve.disabled = Boolean(architectureWorkflowDecision);
     approve.onclick = () => decideArchitectureApproval('approve', approval);
     const reject = document.createElement('button');
     reject.type = 'button';
     reject.className = 'danger';
     reject.textContent = 'Reject';
+    reject.disabled = Boolean(architectureWorkflowDecision);
     reject.onclick = () => decideArchitectureApproval('reject', approval);
     actions.append(approve, reject);
     architectureApprovalDetailEl.appendChild(actions);
@@ -1327,12 +1905,40 @@ async function selectArchitectureApproval(approvalId, runId) {
 }
 
 async function loadArchitectureWorkflowApprovals() {
+  const requestId = ++architectureWorkflowLoadRequest;
   if (architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = true;
-  architectureStatus(architectureWorkflowStatusEl, 'Loading approvals...');
+  architectureStatus(architectureWorkflowStatusEl, 'Loading workflow operations...');
   try {
-    const result = await callTool('workflow_action', { action: 'list_approvals' });
-    architectureWorkflowState.approvals = Array.isArray(result?.approvals) ? result.approvals : [];
+    const query = workflowOpsWorkspaceQuery();
+    const results = await Promise.allSettled([
+      callTool('workflow_action', { action: 'compilations', query }),
+      callTool('workflow_action', { action: 'list_runs', query }),
+      callTool('workflow_action', { action: 'list_approvals' }),
+      callTool('workflow_action', { action: 'shadow_report', query }),
+    ]);
+    if (requestId !== architectureWorkflowLoadRequest) return;
+    const [compilationsResult, runsResult, approvalsResult, shadowResult] = results;
+    if (compilationsResult.status === 'fulfilled') architectureWorkflowState.compilations = Array.isArray(compilationsResult.value?.compilations) ? compilationsResult.value.compilations : [];
+    if (runsResult.status === 'fulfilled') architectureWorkflowState.runs = Array.isArray(runsResult.value?.runs) ? runsResult.value.runs : [];
+    if (approvalsResult.status === 'fulfilled') architectureWorkflowState.approvals = Array.isArray(approvalsResult.value?.approvals) ? approvalsResult.value.approvals : [];
+    if (shadowResult.status === 'fulfilled') {
+      architectureWorkflowState.shadowSummary = shadowResult.value?.summary || null;
+      architectureWorkflowState.comparisons = Array.isArray(shadowResult.value?.comparisons) ? shadowResult.value.comparisons : [];
+    }
     architectureWorkflowState.loaded = true;
+
+    const previousCompilationId = architectureWorkflowState.selectedCompilation?.id;
+    architectureWorkflowState.selectedCompilation = architectureWorkflowState.compilations.find(item => item.id === previousCompilationId)
+      || architectureWorkflowState.compilations[0]
+      || null;
+    const previousSelectedRunId = architectureWorkflowState.selectedRun?.id;
+    architectureWorkflowState.selectedRun = architectureWorkflowState.runs.find(run => run.id === previousSelectedRunId)
+      || workflowOpsSortedRuns()[0]
+      || null;
+    const previousShadowRunId = architectureWorkflowState.selectedShadowRun?.id;
+    architectureWorkflowState.selectedShadowRun = workflowOpsShadowRuns().find(run => run.id === previousShadowRunId)
+      || workflowOpsShadowRuns()[0]
+      || null;
     const previousId = architectureWorkflowState.selected?.id;
     const previousRunId = architectureWorkflowState.selected?.runId;
     const next = architectureWorkflowState.approvals.find(approval =>
@@ -1340,21 +1946,32 @@ async function loadArchitectureWorkflowApprovals() {
     ) || architectureWorkflowState.approvals[0] || null;
     architectureWorkflowState.selected = next;
     architectureWorkflowState.inspected = null;
-    renderArchitectureApprovalList();
-    renderArchitectureApprovalDetail();
+    renderWorkflowOperationsCenter();
     if (next) await selectArchitectureApproval(next.id, next.runId);
-    else architectureStatus(architectureWorkflowStatusEl, 'No approvals');
+    else if (architectureWorkflowState.selectedRun) await selectWorkflowOpsRun(architectureWorkflowState.selectedRun.id);
+    if (requestId !== architectureWorkflowLoadRequest) return;
+    const failures = results.filter(result => result.status === 'rejected');
+    architectureStatus(
+      architectureWorkflowStatusEl,
+      failures.length
+        ? `Loaded with ${failures.length} unavailable workflow service(s). Refresh to retry.`
+        : `${architectureWorkflowState.compilations.length} workflow(s), ${architectureWorkflowState.runs.length} run(s), ${architectureWorkflowState.approvals.filter(approval => approval.status === 'pending').length} pending approval(s).`,
+      failures.length > 0
+    );
   } catch (err) {
+    if (requestId !== architectureWorkflowLoadRequest) return;
     architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
     architectureWorkflowState.loaded = true;
   } finally {
-    if (architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = false;
+    if (requestId === architectureWorkflowLoadRequest && architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = false;
   }
 }
 
 async function decideArchitectureApproval(action, approval) {
-  if (!approval?.runId) return;
+  if (!approval?.runId || architectureWorkflowDecision) return;
+  architectureWorkflowDecision = `${approval.runId}:${approval.id}`;
   architectureStatus(architectureWorkflowStatusEl, action === 'approve' ? 'Approving...' : 'Rejecting...');
+  renderArchitectureApprovalDetail();
   try {
     await callTool('workflow_action', {
       action,
@@ -1365,6 +1982,9 @@ async function decideArchitectureApproval(action, approval) {
     await loadArchitectureWorkflowApprovals();
   } catch (err) {
     architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
+  } finally {
+    architectureWorkflowDecision = '';
+    renderArchitectureApprovalDetail();
   }
 }
 
@@ -1475,13 +2095,18 @@ function selectArchitectureGraphEntity(entityId) {
   renderArchitectureGraphDetail();
 }
 
-async function loadArchitectureGraph() {
+async function loadArchitectureGraph(resetRetrieve = false) {
   if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
+  if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = true;
   architectureStatus(architectureGraphStatusEl, 'Loading graph...');
   try {
-    const result = await callTool('context_graph_action', { action: 'list' });
+    const result = await callTool('context_graph_action', {
+      action: 'list',
+      query: { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } },
+    });
     architectureGraphState.entities = Array.isArray(result?.entities) ? result.entities : [];
     architectureGraphState.relationships = Array.isArray(result?.relationships) ? result.relationships : [];
+    if (resetRetrieve) architectureGraphState.retrieve = null;
     architectureGraphState.loaded = true;
     const previousId = architectureGraphState.selected?.id;
     const next = architectureGraphEntities().find(entity => entity.id === previousId) || architectureGraphEntities()[0] || null;
@@ -1494,11 +2119,27 @@ async function loadArchitectureGraph() {
     architectureGraphState.loaded = true;
   } finally {
     if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = false;
+    if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = false;
   }
+}
+
+function firstRetrievedArchitectureGraphEntity(retrieve) {
+  const direct = Array.isArray(retrieve?.entities) ? retrieve.entities.find(entity => entity?.id) : null;
+  if (direct) return direct;
+  const facts = Array.isArray(retrieve?.facts) ? retrieve.facts : [];
+  for (const fact of facts) {
+    if (fact?.subject?.id) return fact.subject;
+    if (fact?.object?.id) return fact.object;
+  }
+  return null;
 }
 
 async function retrieveArchitectureGraph(event) {
   event?.preventDefault();
+  if (architectureGraphRetrieveBtn?.disabled) return;
+  const requestId = ++architectureGraphRetrieveRequest;
+  if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = true;
+  if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
   architectureStatus(architectureGraphStatusEl, 'Retrieving graph context...');
   const terms = (architectureGraphSearchEl?.value || '')
     .split(',')
@@ -1509,21 +2150,28 @@ async function retrieveArchitectureGraph(event) {
     .map(value => value.trim())
     .filter(Boolean);
   try {
-    architectureGraphState.retrieve = await callTool('context_graph_action', {
+    const retrieve = await callTool('context_graph_action', {
       action: 'retrieve',
       workspaceId: activeWorkspaceId(),
       terms,
       ...(sourceIds.length ? { sourceIds } : {}),
       maxRelationships: 25,
     });
-    const next = architectureGraphEntities()[0] || null;
-    if (next) architectureGraphState.selected = next;
+    if (requestId !== architectureGraphRetrieveRequest) return;
+    architectureGraphState.retrieve = retrieve;
+    architectureGraphState.selected = firstRetrievedArchitectureGraphEntity(retrieve) || architectureGraphEntities()[0] || null;
     renderArchitectureGraphList();
     renderArchitectureGraphDetail();
     const factCount = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts.length : 0;
     architectureStatus(architectureGraphStatusEl, `Retrieved ${factCount} fact(s).`);
   } catch (err) {
+    if (requestId !== architectureGraphRetrieveRequest) return;
     architectureStatus(architectureGraphStatusEl, String(err?.message || err), true);
+  } finally {
+    if (requestId === architectureGraphRetrieveRequest) {
+      if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = false;
+      if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = false;
+    }
   }
 }
 
@@ -1706,11 +2354,30 @@ if (architectureScreenEl) {
       architectureTabBtns[next].click();
     });
   }
+  for (const btn of workflowOpsTabBtns) {
+    btn.addEventListener('click', () => activateWorkflowOpsView(btn.dataset.workflowOpsView || 'overview'));
+    btn.addEventListener('keydown', event => {
+      const current = workflowOpsTabBtns.indexOf(btn);
+      let next = current;
+      if (event.key === 'ArrowRight') next = (current + 1) % workflowOpsTabBtns.length;
+      else if (event.key === 'ArrowLeft') next = (current - 1 + workflowOpsTabBtns.length) % workflowOpsTabBtns.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = workflowOpsTabBtns.length - 1;
+      else return;
+      event.preventDefault();
+      workflowOpsTabBtns[next].focus();
+      workflowOpsTabBtns[next].click();
+    });
+  }
   architectureSourceRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('sources', true));
   architectureSqlForm?.addEventListener('submit', planArchitectureSql);
   architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
   architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);
   architectureWorkflowRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('workflows', true));
+  workflowOpsCompileForm?.addEventListener('submit', compileWorkflowOperation);
+  workflowOpsLibrarySearchEl?.addEventListener('input', renderWorkflowOpsLibraryList);
+  workflowOpsRunSearchEl?.addEventListener('input', renderWorkflowOpsRunList);
+  workflowOpsRunStatusEl?.addEventListener('change', renderWorkflowOpsRunList);
   architectureGraphRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('graph', true));
   architectureGraphForm?.addEventListener('submit', retrieveArchitectureGraph);
   architectureReviewRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('reviews', true));
