@@ -389,7 +389,8 @@ async function main() {
     runId: started.id,
     reason: "Approved in test",
   });
-  assert.equal(approved.run.status, "succeeded");
+  assert.equal(approved.run.status, "running");
+  assert.equal(approved.run.completionState, "approved_pending_execution");
   assert.equal(approved.run.proposedActions[0].status, "approved");
 
   const allowedAfterApproval = await services.WorkflowRunner.evaluateToolPolicy(
@@ -400,6 +401,8 @@ async function main() {
 
   await services.WorkflowRunner.recordToolResult(started.id, "file_broker_action", { ok: true, sourceIds: [source.id] }, false, 12);
   const inspection = await collectTool(workflowTool, { action: "inspect_run", runId: started.id });
+  assert.equal(inspection.run.status, "succeeded");
+  assert.equal(inspection.run.completionState, "action_succeeded");
   assert.equal(inspection.run.executedActions.length, 1);
   assert.deepEqual(inspection.events.map(event => event.sequence), inspection.events.map((_, index) => index + 1));
   assert.ok(inspection.events.some(event => event.eventType === "tool_executed"));

@@ -89,6 +89,8 @@ export interface MatbotServices {
    *  reference held across a swap keeps resolving to the live backend. Always present (boot default). */
   readonly Vault: Vault;
   readonly KnowledgeIndex: KnowledgeIndex;
+  /** Optional durable trace/evaluation sink installed by an observability plugin. */
+  readonly Observability?: import('./types.js').ObservabilitySink | undefined;
 }
 
 /** The assembled machine: registry services wired to the fixed runtime — what `setup()` receives. */

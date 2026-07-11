@@ -815,14 +815,14 @@ type WorkflowRunEvent = {
 - [x] Integrate with expert panel:
   - [x] high-risk workflows can require structured expert reviews.
   - [x] reviews are durable artifacts linked to the run.
-- [ ] Add WebUI surfaces:
+- [x] Add WebUI surfaces:
   - [x] workflow library backed by persisted compilation records.
   - [x] run ledger with typed inputs, evidence, proposed/executed actions,
     approvals, and ordered events.
   - [x] approval queue.
   - [x] shadow-mode comparison and accepted/rejected/mixed labeling.
-  - [ ] eval/test results.
-- [ ] Add test coverage:
+  - [x] eval/test results.
+- [x] Add test coverage:
   - [x] schema validation.
   - [x] approval gate enforcement.
   - [x] blocked tool outside allowed list.
@@ -1044,6 +1044,14 @@ slices.
      tests.
 9. Enterprise Expert Panel upgrade. Complete.
    - Structured expert outputs linked to dossiers, workflows, and approvals.
+10. Evaluation, Observability, and ROI. Complete.
+   - End-to-end trace lineage across agents, models, tools, retrieval, policy,
+     evaluation, and workflows.
+   - Redacted inspection and side-effect-free replay; versioned regression
+     suites with deterministic and model-based scorers.
+   - Retrieval, citation, action, policy, cost, latency, workflow completion,
+     approval, escalation, time-saved, benefit, and ROI metrics.
+   - Sponsor-facing WebUI evidence and a CI-oriented evaluation command.
 
 ## Cross-Cutting Implementation Notes
 
@@ -1082,6 +1090,17 @@ type CortexAuditEvent = {
   redactedPayload?: Record<string, unknown>;
 };
 ```
+
+The `evaluation-observability` plugin now supplies this shared event path through
+the `Observability` service. The runner creates root trace lineage and emits
+agent/model/tool spans; retrieval, connector policy, workflow governance, and
+evaluation components append domain spans and events. Sensitive attributes are
+redacted before persistence, and sink failures never fail the production run.
+
+Trace replay is deliberately side-effect-free: it reconstructs the persisted
+event sequence and reports that writes were not executed. A regression suite may
+also target static fixtures, stored traces, or workflow dry runs. Live write
+re-execution requires a separately approved workflow and is not part of replay.
 
 ### Permissions
 

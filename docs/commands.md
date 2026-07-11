@@ -83,6 +83,7 @@ Useful Windows service switches:
 | `npm test` | Run the Node test suite in `tests\*.test.mjs`. |
 | `npm run test:webui` | Run Playwright WebUI tests. |
 | `npm run test:all` | Run Node tests and Playwright tests. |
+| `npm run eval:cortex -- <suite-id> [--candidate <version>] [--provider <provider>] [--url <base-url>] [--junit <path>]` | Run a persisted regression suite through the Cortex tool endpoint, print the gate result, optionally write JUnit XML, and return a failing process status when the gate fails. |
 | `npm run verify:openai` | Verify the current OpenAI API key with the configured test script. |
 
 First Playwright setup on a machine:

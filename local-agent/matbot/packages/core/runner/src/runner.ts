@@ -2,6 +2,7 @@ import type {
   Session, MessageContent,
   PipelineEvent, RunConfig, ProviderAdapter, ProviderConfig,
   Tool, ToolRegistry, ToolContext, Store, FileStore, SystemContextRegistry, Vault, PromptFn, FormField,
+  ObservabilityEvent, ObservabilitySink, ObservabilityStatus,
 } from './types.js';
 import type { MatbotPlugin } from './plugin.js';
 import { HookRegistry } from './hooks.js';
@@ -40,6 +41,7 @@ export interface RunSessionOpts {
    * re-run of the originating user turn. Empty/absent for an ordinary turn.
    */
   injectedEphemeral?: MessageContent[];
+  observability?: ObservabilitySink;
   loadPlugin:     (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
   unloadPlugin:   (specifier: string) => Promise<boolean>;
 }
@@ -62,6 +64,36 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     scrub(text: string) { return text; },
   };
   const traceId = config.traceId ?? crypto.randomUUID();
+  const rootTraceId = config.rootTraceId ?? traceId;
+  const sessionId = config.sessionId ?? opts.session.id;
+  const turnSpanId = crypto.randomUUID();
+  const turnStartedAt = Date.now();
+  let turnFinished = false;
+  const observe = async (event: Omit<ObservabilityEvent, 'traceId' | 'rootTraceId' | 'timestamp'> & { timestamp?: string }): Promise<void> => {
+    if (opts.observability === undefined) return;
+    try {
+      await opts.observability.record({
+        ...event,
+        traceId,
+        rootTraceId,
+        timestamp: event.timestamp ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      console.warn(`[runner] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const finishTurn = async (status: ObservabilityStatus, attributes?: Record<string, unknown>): Promise<void> => {
+    if (turnFinished) return;
+    turnFinished = true;
+    await observe({
+      phase: 'end', kind: 'agent', name: 'matbot.turn', spanId: turnSpanId, sessionId,
+      status, durationMs: Date.now() - turnStartedAt, ...(attributes !== undefined ? { attributes } : {}),
+    });
+  };
+  await observe({
+    phase: 'start', kind: 'agent', name: 'matbot.turn', spanId: turnSpanId, sessionId,
+    attributes: { provider: config.provider, persona: config.persona ?? null },
+  });
 
   // ── 1. screen — once per turn: shape/abort the incoming submission ──────────
 
@@ -72,6 +104,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     if (screen.markers.length > 0) yield { type: 'marker', content: screen.markers, traceId };
     await store.set(screen.session.id, screen.session);
     yield { type: 'aborted', reason: screen.abort, session: screen.session, traceId };
+    await finishTurn('error', { terminal: 'aborted', reason: screen.abort });
     return;
   }
   // Durable context a screen hook folded onto the user message (e.g. a fired `contextual` trigger),
@@ -124,6 +157,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     if (signal.aborted) {
       await store.set(session.id, session);
       yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
+      await finishTurn('error', { terminal: 'aborted', reason: String(signal.reason ?? 'user-abort') });
       return;
     }
 
@@ -146,14 +180,29 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       outgoing: [...systemMsg, ...history],
       session, config, signal,
     });
+    const providerSpanId = crypto.randomUUID();
+    const providerStartedAt = Date.now();
+    let firstTokenAt: number | undefined;
+    let providerInputTokens = 0;
+    let providerOutputTokens = 0;
+    let providerCostUsd = 0;
+    let providerCacheReadTokens = 0;
+    let providerCacheCreationTokens = 0;
+    await observe({
+      phase: 'start', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
+      parentSpanId: turnSpanId, sessionId,
+      attributes: { provider: config.provider, model: providerConfig.model, messageCount: outgoing.length, toolCount: tools.size },
+    });
     try {
       for await (const ev of provider.complete(outgoing, providerConfig, [...tools.values()], signal)) {
         switch (ev.type) {
           case 'text-delta':
+            firstTokenAt ??= Date.now();
             textAcc += ev.delta;
             yield { type: 'text-delta', delta: ev.delta, traceId };
             break;
           case 'thinking':
+            firstTokenAt ??= Date.now();
             yield { type: 'thinking', delta: ev.delta, traceId };
             break;
           case 'thinking-block':
@@ -172,6 +221,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
             pendingCalls.push({ id: ev.id, name: ev.name, input: ev.input });
             break;
           case 'usage':
+            providerInputTokens += ev.inputTokens;
+            providerOutputTokens += ev.outputTokens;
+            providerCostUsd += ev.costUsd ?? 0;
+            providerCacheReadTokens += ev.cacheReadTokens ?? 0;
+            providerCacheCreationTokens += ev.cacheCreationTokens ?? 0;
             yield { type: 'usage', inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, traceId,
               ...(ev.costUsd              !== undefined ? { costUsd:              ev.costUsd              } : {}),
               ...(ev.cacheReadTokens     !== undefined ? { cacheReadTokens:     ev.cacheReadTokens     } : {}),
@@ -181,7 +235,28 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
             break;
         }
       }
+      await observe({
+        phase: 'end', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
+        parentSpanId: turnSpanId, sessionId, status: 'ok', durationMs: Date.now() - providerStartedAt,
+        attributes: {
+          provider: config.provider,
+          model: providerConfig.model,
+          inputTokens: providerInputTokens,
+          outputTokens: providerOutputTokens,
+          cacheReadTokens: providerCacheReadTokens,
+          cacheCreationTokens: providerCacheCreationTokens,
+          costUsd: providerCostUsd,
+          timeToFirstTokenMs: firstTokenAt === undefined ? null : firstTokenAt - providerStartedAt,
+          outputCharacters: textAcc.length,
+          toolCallCount: pendingCalls.length,
+        },
+      });
     } catch (e: any) {
+      await observe({
+        phase: 'end', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
+        parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - providerStartedAt,
+        attributes: { provider: config.provider, error: String(e) },
+      });
       if (signal.aborted) {
         // Save whatever the LLM streamed before the abort hit.
         if (textAcc) assistantParts.push({ type: 'text', text: textAcc });
@@ -192,9 +267,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         }
         await store.set(session.id, session);
         yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
+        await finishTurn('error', { terminal: 'aborted', reason: String(signal.reason ?? 'user-abort') });
         return;
       }
       yield { type: 'error', error: String(e) + (('cause' in e && e.cause) ? ' ('+String(e.cause)+')' : '' ), traceId };
+      await finishTurn('error', { terminal: 'error', error: String(e) });
       return;
     }
 
@@ -229,6 +306,13 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     const toolMarkers: MessageContent[] = [];
 
     for (const tc of pendingCalls) {
+      const toolSpanId = crypto.randomUUID();
+      const toolStartedAt = Date.now();
+      await observe({
+        phase: 'start', kind: 'tool', name: tc.name, spanId: toolSpanId,
+        parentSpanId: turnSpanId, sessionId,
+        attributes: { callId: tc.id, input: tc.input },
+      });
       yield { type: 'tool:start', callId: tc.id, name: tc.name, input: tc.input, traceId };
 
       const tool = opts.toolRegistry !== undefined ? opts.toolRegistry.resolve(tc.name) : tools.get(tc.name);
@@ -236,6 +320,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         const err = { error: `Unknown tool: ${tc.name}` };
         toolResults.push({ type: 'tool-result', id: tc.id, result: err, isError: true });
         yield { type: 'tool:end', callId: tc.id, result: err, isError: true, traceId };
+        await observe({
+          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
+          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
+          attributes: { callId: tc.id, error: `Unknown tool: ${tc.name}` },
+        });
         continue;
       }
 
@@ -246,12 +335,35 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       });
       if (decision.abort) {
         yield { type: 'aborted', reason: decision.abort, session, traceId };
+        const policySpanId = crypto.randomUUID();
+        await observe({
+          phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
+          parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
+          attributes: { callId: tc.id, policyOutcome: 'aborted', reason: decision.abort },
+        });
+        await observe({
+          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
+          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
+          attributes: { callId: tc.id, isError: true, policyOutcome: 'aborted', error: decision.abort },
+        });
+        await finishTurn('error', { terminal: 'aborted', reason: decision.abort });
         return;
       }
       if (decision.rejectTool) {
         const err = { error: decision.rejectTool.message };
         toolResults.push({ type: 'tool-result', id: tc.id, result: err, isError: true });
         yield { type: 'tool:end', callId: tc.id, result: err, isError: true, traceId };
+        const policySpanId = crypto.randomUUID();
+        await observe({
+          phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
+          parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
+          attributes: { callId: tc.id, policyOutcome: 'denied', reason: decision.rejectTool.message },
+        });
+        await observe({
+          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
+          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
+          attributes: { callId: tc.id, result: err, isError: true, policyOutcome: 'denied' },
+        });
         continue;
       }
 
@@ -262,6 +374,9 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       const toolCtx: ToolContext = {
         callId: tc.id, session, signal, vault,
         provider:     config.provider,
+        traceId,
+        rootTraceId,
+        parentSpanId: toolSpanId,
         prompt:       promptFn,
         loadPlugin:   (specifier: string) => opts.loadPlugin(specifier, promptFn),
         unloadPlugin: opts.unloadPlugin,
@@ -301,6 +416,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
 
       toolResults.push({ type: 'tool-result', id: tc.id, result, isError });
       yield { type: 'tool:end', callId: tc.id, result, isError, traceId };
+      await observe({
+        phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
+        parentSpanId: turnSpanId, sessionId, status: isError ? 'error' : 'ok', durationMs: Date.now() - toolStartedAt,
+        attributes: { callId: tc.id, result, isError },
+      });
     }
 
     // Add tool results message, then loop for the next provider call.
@@ -321,4 +441,5 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   await store.set(session.id, session);
 
   yield { type: 'done', session, traceId };
+  await finishTurn('ok', { terminal: 'done', messageCount: session.messages.length });
 }

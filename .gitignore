@@ -12,8 +12,8 @@ playwright-report/
 local-agent/matbot/.vscode
 test-results
 
-# Cortex workspace-local registry and per-workspace settings
-local-agent/matbot/cortex-workspaces.json
-# Every workspace directory contains machine-local configuration, credentials,
-# memory, sessions, indexes, uploaded files, and other generated runtime state.
-local-agent/matbot/workspaces/
+# Cortex workspace-local registry and per-workspace settings. Keep these rules
+# root-anchored: the registry may already be tracked, but no new workspace state
+# or nested runtime artifact should ever enter version control.
+/local-agent/matbot/cortex-workspaces.json
+/local-agent/matbot/workspaces/**

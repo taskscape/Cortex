@@ -9,7 +9,7 @@ import type {
   ToolContext,
   ToolEvent,
 } from '@matatbread/matbot-plugin-api';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { access, appendFile, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -188,6 +188,8 @@ interface SourceRegistryLike {
     allowed: boolean;
     timestamp?: string;
     message?: string;
+    traceId?: string;
+    toolCallId?: string;
   }): Promise<unknown>;
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitationLike>;
 }
@@ -221,6 +223,14 @@ interface SourceWarning {
   issueType: 'stale' | 'expired' | 'degraded' | 'down';
   message: string;
   sourceId?: string;
+}
+
+interface RetrievalTraceContext {
+  traceId?: string;
+  rootTraceId?: string;
+  sessionId?: string;
+  parentSpanId?: string;
+  toolCallId?: string;
 }
 
 function nowIso(): string {
@@ -857,11 +867,11 @@ class WorkspaceRagManager {
     return configView(await this.readConfig(await this.currentWorkspace()));
   }
 
-  async searchCurrent(query: string, limit: number, signal: AbortSignal): Promise<SearchHit[]> {
-    return this.search(this.currentWorkspaceId(), query, limit, signal);
+  async searchCurrent(query: string, limit: number, signal: AbortSignal, trace?: RetrievalTraceContext): Promise<SearchHit[]> {
+    return this.search(this.currentWorkspaceId(), query, limit, signal, trace);
   }
 
-  async search(workspaceId: string, query: string, limit: number, signal: AbortSignal): Promise<SearchHit[]> {
+  async search(workspaceId: string, query: string, limit: number, signal: AbortSignal, trace?: RetrievalTraceContext): Promise<SearchHit[]> {
     if (signal.aborted) return [];
     const workspace = (await this.listWorkspaces()).find(item => item.id === workspaceId);
     if (!workspace || !query.trim()) return [];
@@ -869,7 +879,7 @@ class WorkspaceRagManager {
     const active = activeContext(config);
     const queryVector = (await this.embedTexts([query], signal))[0] ?? [];
     const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
-    return this.enrichSearchHits(workspace, active, hits);
+    return this.enrichSearchHits(workspace, active, hits, trace);
   }
 
   async indexKnowledgeEntry(workspaceId: string, entry: KnowledgeEntry): Promise<void> {
@@ -1362,6 +1372,7 @@ class WorkspaceRagManager {
     workspace: WorkspaceRef,
     context: RagContextConfig,
     hits: SearchHit[],
+    trace?: RetrievalTraceContext,
   ): Promise<SearchHit[]> {
     const sourceRegistry = this.sourceRegistry;
     if (sourceRegistry === undefined) return hits;
@@ -1377,6 +1388,8 @@ class WorkspaceRagManager {
         allowed: true,
         timestamp: nowIso(),
         message: 'Workspace RAG returned this source as retrieval context.',
+        ...(trace?.traceId !== undefined ? { traceId: trace.traceId } : {}),
+        ...(trace?.toolCallId !== undefined ? { toolCallId: trace.toolCallId } : {}),
       });
       const citation = await sourceRegistry.resolveCitation(sourceId).catch(() => undefined);
       return {
@@ -1564,7 +1577,39 @@ class WorkspaceRagManager {
 
 }
 
-function createWorkspaceRagTool(manager: WorkspaceRagManager): Tool {
+async function observeRetrieval(
+  services: MatbotMachine,
+  trace: RetrievalTraceContext,
+  query: string,
+  hits: SearchHit[],
+  startedAt: number,
+  spanId: string,
+): Promise<void> {
+  const observability = services.get('Observability');
+  if (observability === undefined || trace.traceId === undefined) return;
+  try {
+    await observability.record({
+      traceId: trace.traceId,
+      rootTraceId: trace.rootTraceId ?? trace.traceId,
+      spanId,
+      ...(trace.parentSpanId !== undefined ? { parentSpanId: trace.parentSpanId } : {}),
+      ...(trace.sessionId !== undefined ? { sessionId: trace.sessionId } : {}),
+      timestamp: nowIso(),
+      phase: 'end', kind: 'retriever', name: 'workspace_rag.search', status: 'ok',
+      durationMs: Date.now() - startedAt,
+      attributes: {
+        queryHash: sha256(query),
+        returnedCount: hits.length,
+        retrievedSourceIds: hits.map(hit => hit.sourceId).filter((value): value is string => value !== undefined),
+        hits: hits.map((hit, rank) => ({ rank: rank + 1, sourceId: hit.sourceId ?? null, sourceVersionId: hit.sourceVersionId ?? null, score: hit.score, path: hit.path, citation: hit.citation ?? null, health: hit.sourceHealthState ?? null, freshness: hit.sourceStalenessState ?? null })),
+      },
+    });
+  } catch (error) {
+    console.warn(`[workspace-rag] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMachine): Tool {
   return {
     name: 'workspace_rag',
     description:
@@ -1628,7 +1673,12 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager): Tool {
             const query = typeof value.query === 'string' ? value.query : '';
             if (!query.trim()) { yield { type: 'error', message: 'workspace_rag search requires "query".' }; return; }
             const limit = typeof value.limit === 'number' ? value.limit : 5;
-            yield { type: 'result', value: { hits: await manager.searchCurrent(query, limit, ctx.signal) } };
+            const trace = { ...(ctx.traceId !== undefined ? { traceId: ctx.traceId } : {}), ...(ctx.rootTraceId !== undefined ? { rootTraceId: ctx.rootTraceId } : {}), ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}), ...(ctx.session?.id !== undefined ? { sessionId: ctx.session.id } : {}), ...(ctx.callId !== undefined ? { toolCallId: ctx.callId } : {}) };
+            const startedAt = Date.now();
+            const spanId = randomUUID();
+            const hits = await manager.searchCurrent(query, limit, ctx.signal, trace);
+            await observeRetrieval(services, trace, query, hits, startedAt, spanId);
+            yield { type: 'result', value: { hits } };
             return;
           }
           yield { type: 'error', message: `Unknown workspace_rag action "${action}".` };
@@ -1723,7 +1773,7 @@ export const plugin: MatbotPluginSpec = {
     activeManager = manager;
     await manager.start();
     await services.register('WorkspaceRagManager' as never, manager as never);
-    services.tools.register(createWorkspaceRagTool(manager));
+    services.tools.register(createWorkspaceRagTool(manager, services));
     services.hooks.register({
       on: 'screen',
       priority: -10,
@@ -1734,7 +1784,11 @@ export const plugin: MatbotPluginSpec = {
         if (status.state === 'pending') return {
           markers: [{ type: 'marker', creator: 'workspace-rag', data: { state: 'pending', message: status.message } }],
         };
-        const hits = await manager.searchCurrent(query, MAX_CONTEXT_CHUNKS, ctx.signal);
+        const trace = { ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}), ...(ctx.config.rootTraceId !== undefined ? { rootTraceId: ctx.config.rootTraceId } : {}), sessionId: ctx.session.id };
+        const startedAt = Date.now();
+        const spanId = randomUUID();
+        const hits = await manager.searchCurrent(query, MAX_CONTEXT_CHUNKS, ctx.signal, trace);
+        await observeRetrieval(services, trace, query, hits, startedAt, spanId);
         const text = renderContext(hits);
         if (!text) return;
         const sourceWarnings = hits.flatMap(sourceWarningsForHit);

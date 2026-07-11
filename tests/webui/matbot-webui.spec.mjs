@@ -699,6 +699,38 @@ test("workflow operations center keeps partial data usable and refreshes a faile
   await expect(page.locator("#workflow-ops-library-list")).toContainText("Recovery Workflow");
 });
 
+test("evaluation observability and ROI panel traces replay regressions and sponsor evidence", async ({ page, isMobile }) => {
+  await page.goto("/");
+  if (isMobile) await page.locator("#burger").click();
+
+  await openArchitecturePanel(page, "evaluation");
+  await expect(page.locator("#architecture-title")).toHaveText("Evaluation, Observability & ROI");
+  await expect(page.locator("#evaluation-trace-count")).toHaveText("1");
+  await expect(page.locator("#evaluation-pass-rate")).toHaveText("100%");
+  await expect(page.locator("#evaluation-completion-rate")).toHaveText("75%");
+  await expect(page.locator("#evaluation-net-benefit")).toContainText("1,565");
+
+  const trace = page.locator('#evaluation-trace-list .architecture-item[data-trace-id="trace:playwright-governed"]');
+  await expect(trace).toBeVisible();
+  await trace.click();
+  await expect(page.locator("#evaluation-trace-detail")).toContainText("Span waterfall");
+  await expect(page.locator("#evaluation-trace-detail")).toContainText("workspace_rag.search");
+  await page.locator("#evaluation-trace-detail").getByRole("button", { name: "Replay trace safely" }).click();
+  await expect(page.locator("#architecture-evaluation-status")).toContainText("writes executed: no");
+
+  const suite = page.locator('#evaluation-suite-list .architecture-item[data-suite-id="suite:playwright-governed"]');
+  await expect(suite).toBeVisible();
+  await suite.click();
+  await expect(page.locator("#evaluation-suite-detail")).toContainText("Retrieval, citation, action, policy");
+  await page.locator("#evaluation-suite-detail").getByRole("button", { name: "Run regression suite" }).click();
+  await expect(page.locator("#architecture-evaluation-status")).toContainText("Evaluation passed");
+  await expect(page.locator("#evaluation-suite-detail")).toContainText("webui");
+
+  await expect(page.locator("#evaluation-roi-detail")).toContainText("Verified outcomes");
+  await expect(page.locator("#evaluation-roi-detail")).toContainText("workflow:invoice-review");
+  await expect(page.locator("#evaluation-roi-detail")).toContainText("Citation coverage");
+});
+
 test("activates and deactivates compatible local plugins through the plugins panel", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop plugin activation coverage");
   await page.goto("/");

@@ -59,6 +59,8 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
 | `CORTEX_STRUCTURED_POSTGRES_URL` | unset | Optional Postgres connection string used by the `structured-data` plugin for approved read-only semantic SQL execution. Use a database role with read-only privileges. |
+| `CORTEX_MODEL_PRICING_JSON` | unset | Optional JSON object keyed by model id with `inputPerMillionUsd`, `cachedInputPerMillionUsd`, and `outputPerMillionUsd`; used when a provider does not report model cost directly. |
+| `CORTEX_APPROVAL_SLA_HOURS` | `24` | Hours before a pending workflow approval is considered overdue in observability and governance metrics. |
 | `MATBOT_WEB_PORT` | `19778` | WebUI port. Set by `run.ps1 -WebPort`. |
 | `MATBOT_COMMAND` | unset | Optional command consumed by `start-local-agent.ps1` to launch Matbot. |
 | `MATBOT_PRINCIPAL` | unset | Boot identity override for Matbot. Accepts an id or JSON `{ "id", "type" }`. |
@@ -181,6 +183,7 @@ plugins:
   - ./packages/plugins/connector-fabric
   - ./packages/plugins/structured-data
   - ./packages/plugins/workflow-governance
+  - ./packages/plugins/evaluation-observability
   - ./packages/plugins/context-graph
   - ./packages/plugins/workspace-rag
   - ./packages/plugins/skills

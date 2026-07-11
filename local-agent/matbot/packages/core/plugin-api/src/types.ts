@@ -200,6 +200,43 @@ export interface RunConfig {
   persona?:   string;
   sessionId?: string;
   traceId?:   string;
+  /** Root human-submission trace for resubmission chains. Defaults to traceId. */
+  rootTraceId?: string;
+}
+
+export type ObservabilitySpanKind =
+  | 'agent'
+  | 'llm'
+  | 'tool'
+  | 'retriever'
+  | 'reranker'
+  | 'guardrail'
+  | 'workflow'
+  | 'evaluator'
+  | 'chain';
+
+export type ObservabilityEventPhase = 'start' | 'event' | 'end';
+export type ObservabilityStatus = 'unset' | 'ok' | 'error';
+
+/** Vendor-neutral event that an optional service can persist and export as OTLP. */
+export interface ObservabilityEvent {
+  traceId:        string;
+  rootTraceId:    string;
+  spanId:         string;
+  parentSpanId?:  string;
+  sessionId?:     string;
+  workflowRunId?: string;
+  timestamp:      string;
+  phase:          ObservabilityEventPhase;
+  kind:           ObservabilitySpanKind;
+  name:           string;
+  status?:        ObservabilityStatus;
+  durationMs?:    number;
+  attributes?:    Record<string, unknown>;
+}
+
+export interface ObservabilitySink {
+  record(event: ObservabilityEvent): void | Promise<void>;
 }
 
 /**
@@ -450,6 +487,10 @@ export interface ToolContext {
   /** The provider key driving the current turn (`RunConfig.provider`). A tool that spawns further
    *  work should default to this so the child inherits the same model rather than the config default. */
   provider?:   string;
+  /** Correlation context for durable workflow, retrieval, policy, and audit records. */
+  traceId?:     string;
+  rootTraceId?: string;
+  parentSpanId?: string;
   workdir?:    string;
   configPath?: string;
   files?:      FileStore;

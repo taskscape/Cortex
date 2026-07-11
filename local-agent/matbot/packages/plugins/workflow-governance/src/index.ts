@@ -11,6 +11,7 @@ import type {
   ToolContext,
   ToolEvent,
   ToolResultContext,
+  ObservabilityEvent,
 } from '@matatbread/matbot-plugin-api';
 
 declare module '@matatbread/matbot-plugin-api' {
@@ -23,12 +24,13 @@ declare module '@matatbread/matbot-plugin-api' {
 
 export type WorkflowRiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type WorkflowRunMode = 'dry_run' | 'shadow' | 'approval_gated' | 'execute';
-export type WorkflowRunStatus = 'created' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled';
-export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected';
+export type WorkflowRunStatus = 'created' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'escalated';
+export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected' | 'escalated';
 export type WorkflowActionStatus = 'proposed' | 'approved' | 'rejected' | 'blocked' | 'executed';
 export type ConnectorCapability = 'read' | 'write' | 'admin';
 export type ShadowComparisonOutcome = 'accepted' | 'rejected' | 'mixed' | 'unlabeled';
 export type WorkflowCompilationStatus = 'drafted' | 'published' | 'dry_run_completed' | 'failed';
+export type WorkflowCompletionState = 'planned' | 'awaiting_approval' | 'approved_pending_execution' | 'executing' | 'action_succeeded' | 'business_outcome_verified' | 'failed' | 'cancelled' | 'escalated';
 
 export interface ValidationError {
   path: string;
@@ -177,6 +179,7 @@ export interface WorkflowRun {
   principalId: string;
   mode: WorkflowRunMode;
   status: WorkflowRunStatus;
+  completionState: WorkflowCompletionState;
   inputs: Record<string, unknown>;
   evidenceSourceIds: string[];
   evidenceSourceVersions: EvidenceReference[];
@@ -188,6 +191,10 @@ export interface WorkflowRun {
   startedAt?: string;
   finishedAt?: string;
   error?: string;
+  traceId?: string;
+  rootTraceId?: string;
+  parentSpanId?: string;
+  outcomeId?: string;
 }
 
 export interface WorkflowRunEvent {
@@ -218,6 +225,9 @@ export interface WorkflowApproval {
   decidedByPrincipalId?: string;
   reason?: string;
   message?: string;
+  dueAt?: string;
+  escalatedAt?: string;
+  escalationReason?: string;
 }
 
 export interface WorkflowShadowComparison {
@@ -345,6 +355,9 @@ export type StartWorkflowInput = {
   evidenceSourceIds?: string[];
   proposedActions?: ActionProposalInput[];
   labels?: string[];
+  traceId?: string;
+  rootTraceId?: string;
+  parentSpanId?: string;
 };
 
 export type WorkflowPolicyDecision = {
@@ -372,6 +385,8 @@ export interface WorkflowRunner {
   startRun(input: StartWorkflowInput): Promise<WorkflowRun>;
   approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
   rejectRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
+  escalateRun(runId: string, reason: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
+  recordBusinessOutcome(runId: string, outcomeId: string, status: 'verified_completed' | 'estimated_completed' | 'failed' | 'cancelled' | 'escalated'): Promise<WorkflowRun>;
   labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun>;
   compareShadowRun(runId: string, labels?: string[], note?: string): Promise<{ run: WorkflowRun; comparison: WorkflowShadowComparison }>;
   shadowComparisons(query?: StoreQuery): Promise<WorkflowShadowComparison[]>;
@@ -431,6 +446,10 @@ interface ConnectorRegistryLike {
   }>;
 }
 
+interface ObservabilityLike {
+  record(event: ObservabilityEvent): void | Promise<void>;
+}
+
 export const WORKFLOW_DEFINITION_SCHEMA: Record<string, unknown> = {
   type: 'object',
   required: ['workspaceId', 'name'],
@@ -466,6 +485,12 @@ const WORKFLOW_COMPILER_VERSION = 'deterministic-workflow-compiler-v1';
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function approvalDueAt(requestedAt: string): string {
+  const configured = Number(process.env['CORTEX_APPROVAL_SLA_HOURS'] ?? 24);
+  const hours = Number.isFinite(configured) && configured > 0 ? configured : 24;
+  return new Date(Date.parse(requestedAt) + hours * 3_600_000).toISOString();
 }
 
 function hashId(prefix: string, parts: readonly string[]): string {
@@ -986,6 +1011,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
   private readonly shadowComparisonsStore: Store<WorkflowShadowComparison>;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
   private readonly connectorRegistry: ConnectorRegistryLike | undefined;
+  private readonly observability: () => ObservabilityLike | undefined;
 
   constructor(
     registry: WorkflowRegistry,
@@ -995,6 +1021,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     shadowComparisons: Store<WorkflowShadowComparison>,
     sourceRegistry: SourceRegistryLike | undefined,
     connectorRegistry: ConnectorRegistryLike | undefined,
+    observability: () => ObservabilityLike | undefined,
   ) {
     this.registry = registry;
     this.runs = runs;
@@ -1003,6 +1030,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     this.shadowComparisonsStore = shadowComparisons;
     this.sourceRegistry = sourceRegistry;
     this.connectorRegistry = connectorRegistry;
+    this.observability = observability;
   }
 
   async startRun(input: StartWorkflowInput): Promise<WorkflowRun> {
@@ -1018,6 +1046,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       principalId: principalId(),
       mode,
       status: 'created',
+      completionState: 'planned',
       inputs: input.inputs ?? {},
       evidenceSourceIds: uniq(input.evidenceSourceIds ?? []),
       evidenceSourceVersions: [],
@@ -1026,13 +1055,16 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       labels: uniq(input.labels ?? []),
       createdAt: timestamp,
       updatedAt: timestamp,
+      ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
+      ...(input.rootTraceId !== undefined ? { rootTraceId: input.rootTraceId } : {}),
+      ...(input.parentSpanId !== undefined ? { parentSpanId: input.parentSpanId } : {}),
     };
     await this.runs.set(run.id, run);
     await this.appendEvent(run, 'run_created', { mode, workflowId: definition.id, workflowVersion: definition.version });
 
     const inputErrors = validateSchemaValue(definition.inputSchema, run.inputs);
     if (inputErrors.length > 0) {
-      run = await this.updateRun({ ...run, status: 'failed', error: 'Workflow inputs failed schema validation.', finishedAt: nowIso(), updatedAt: nowIso() });
+      run = await this.updateRun({ ...run, status: 'failed', completionState: 'failed', error: 'Workflow inputs failed schema validation.', finishedAt: nowIso(), updatedAt: nowIso() });
       await this.appendEvent(run, 'input_validation_failed', { errors: inputErrors });
       return run;
     }
@@ -1050,6 +1082,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     run = await this.updateRun({
       ...run,
       status: 'running',
+      completionState: 'planned',
       startedAt: nowIso(),
       proposedActions,
       updatedAt: nowIso(),
@@ -1057,23 +1090,30 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     await this.appendEvent(run, 'actions_proposed', { proposedActions });
 
     if (mode === 'dry_run') {
-      run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
+      run = await this.updateRun({ ...run, status: 'succeeded', completionState: 'planned', finishedAt: nowIso(), updatedAt: nowIso() });
       await this.appendEvent(run, 'dry_run_completed', { proposedActionCount: proposedActions.length });
       return run;
     }
     if (mode === 'shadow') {
-      run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
+      run = await this.updateRun({ ...run, status: 'succeeded', completionState: 'planned', finishedAt: nowIso(), updatedAt: nowIso() });
       await this.appendEvent(run, 'shadow_recommendation_recorded', { proposedActionCount: proposedActions.length, labels: run.labels });
       return run;
     }
     const approvalRequests = await this.createApprovalRequests(definition, run, evidence.warnings);
     if (approvalRequests.length > 0 || (mode === 'approval_gated' && proposedActions.some(action => action.requiresApproval))) {
-      run = await this.updateRun({ ...run, status: 'waiting_for_approval', updatedAt: nowIso() });
+      run = await this.updateRun({ ...run, status: 'waiting_for_approval', completionState: 'awaiting_approval', updatedAt: nowIso() });
       await this.appendEvent(run, 'approval_requested', { approvals: approvalRequests });
       return run;
     }
-    run = await this.updateRun({ ...run, status: 'succeeded', finishedAt: nowIso(), updatedAt: nowIso() });
-    await this.appendEvent(run, 'run_succeeded', { reason: 'No approval gates were triggered.' });
+    const hasExecutableActions = proposedActions.some(action => action.status !== 'blocked' && action.status !== 'rejected');
+    run = await this.updateRun({
+      ...run,
+      status: hasExecutableActions ? 'running' : 'succeeded',
+      completionState: hasExecutableActions ? 'approved_pending_execution' : 'action_succeeded',
+      ...(hasExecutableActions ? {} : { finishedAt: nowIso() }),
+      updatedAt: nowIso(),
+    });
+    await this.appendEvent(run, hasExecutableActions ? 'actions_ready' : 'run_succeeded', { reason: 'No approval gates were triggered.' });
     return run;
   }
 
@@ -1102,17 +1142,20 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
         ? { ...action, status: 'approved' as const, requiresApproval: false }
         : action);
     const remaining = (await this.pendingApprovals(runId)).filter(item => !decided.some(done => done.id === item.id));
-    const nextStatus: WorkflowRunStatus = remaining.length === 0 ? 'succeeded' : 'waiting_for_approval';
+    const hasApprovedActions = proposedActions.some(action => action.status === 'approved');
+    const nextStatus: WorkflowRunStatus = remaining.length > 0 ? 'waiting_for_approval' : hasApprovedActions ? 'running' : 'succeeded';
+    const completionState: WorkflowCompletionState = remaining.length > 0 ? 'awaiting_approval' : hasApprovedActions ? 'approved_pending_execution' : 'action_succeeded';
     const updatedRun = await this.updateRun({
       ...run,
       version: randomUUID(),
       status: nextStatus,
+      completionState,
       proposedActions,
       ...(nextStatus === 'succeeded' ? { finishedAt: timestamp } : {}),
       updatedAt: timestamp,
     });
     await this.appendEvent(updatedRun, 'approval_approved', { approvalIds: decided.map(item => item.id), reason: reason ?? null });
-    if (nextStatus === 'succeeded') await this.appendEvent(updatedRun, 'run_succeeded', { reason: 'All pending approvals were approved.' });
+    if (remaining.length === 0) await this.appendEvent(updatedRun, hasApprovedActions ? 'approvals_completed' : 'run_succeeded', { reason: 'All pending approvals were approved.' });
     return { run: updatedRun, approvals: decided };
   }
 
@@ -1143,12 +1186,60 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     const updatedRun = await this.updateRun({
       ...run,
       status: 'cancelled',
+      completionState: 'cancelled',
       proposedActions,
       finishedAt: timestamp,
       updatedAt: timestamp,
     });
     await this.appendEvent(updatedRun, 'approval_rejected', { approvalIds: rejected.map(item => item.id), reason: reason ?? null });
     return { run: updatedRun, approvals: rejected };
+  }
+
+  async escalateRun(runId: string, reason: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
+    const run = await this.requireRun(runId);
+    const timestamp = nowIso();
+    const pending = await this.pendingApprovals(runId);
+    const escalated: WorkflowApproval[] = [];
+    for (const approval of pending) {
+      const updated: WorkflowApproval = {
+        ...approval,
+        version: randomUUID(),
+        status: 'escalated',
+        updatedAt: timestamp,
+        escalatedAt: timestamp,
+        escalationReason: reason,
+      };
+      await this.approvals.set(updated.id, updated);
+      escalated.push(updated);
+    }
+    const updatedRun = await this.updateRun({
+      ...run,
+      version: randomUUID(),
+      status: 'escalated',
+      completionState: 'escalated',
+      finishedAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await this.appendEvent(updatedRun, 'run_escalated', { reason, approvalIds: escalated.map(item => item.id) });
+    return { run: updatedRun, approvals: escalated };
+  }
+
+  async recordBusinessOutcome(runId: string, outcomeId: string, status: 'verified_completed' | 'estimated_completed' | 'failed' | 'cancelled' | 'escalated'): Promise<WorkflowRun> {
+    const run = await this.requireRun(runId);
+    const timestamp = nowIso();
+    const nextStatus: WorkflowRunStatus = status === 'failed' ? 'failed' : status === 'cancelled' ? 'cancelled' : status === 'escalated' ? 'escalated' : 'succeeded';
+    const completionState: WorkflowCompletionState = status === 'verified_completed' ? 'business_outcome_verified' : status === 'estimated_completed' ? 'action_succeeded' : status;
+    const updatedRun = await this.updateRun({
+      ...run,
+      version: randomUUID(),
+      status: nextStatus,
+      completionState,
+      outcomeId,
+      finishedAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await this.appendEvent(updatedRun, 'business_outcome_recorded', { outcomeId, status });
+    return updatedRun;
   }
 
   async labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun> {
@@ -1245,10 +1336,17 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       resultHash: hashPayload(result),
       ...(isError ? { error: canonicalJson(result).slice(0, 1000) } : {}),
     };
+    const proposedActions = run.proposedActions.map(action => action.id === proposal.id ? { ...action, status: 'executed' as const } : action);
+    const allExecutableFinished = proposedActions.every(action => action.status === 'executed' || action.status === 'blocked' || action.status === 'rejected');
+    const nextStatus: WorkflowRunStatus = isError ? 'failed' : allExecutableFinished ? 'succeeded' : 'running';
+    const completionState: WorkflowCompletionState = isError ? 'failed' : allExecutableFinished ? 'action_succeeded' : 'executing';
     const updatedRun = await this.updateRun({
       ...run,
+      status: nextStatus,
+      completionState,
       executedActions: [...run.executedActions, executed],
-      proposedActions: run.proposedActions.map(action => action.id === proposal.id ? { ...action, status: 'executed' as const } : action),
+      proposedActions,
+      ...((isError || allExecutableFinished) ? { finishedAt: executed.executedAt } : {}),
       updatedAt: executed.executedAt,
     });
     await this.appendEvent(updatedRun, isError ? 'tool_execution_failed' : 'tool_executed', {
@@ -1257,6 +1355,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       resultHash: executed.resultHash,
       ...(durationMs !== undefined ? { durationMs } : {}),
     }, proposal.sourceIds);
+    if (!isError && allExecutableFinished) await this.appendEvent(updatedRun, 'run_succeeded', { reason: 'All approved actions executed successfully.' });
   }
 
   async inspectRun(runId: string): Promise<{ run: WorkflowRun | null; events: WorkflowRunEvent[]; approvals: WorkflowApproval[] }> {
@@ -1494,6 +1593,7 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
         status: 'pending' as const,
         requestedAt: timestamp,
         updatedAt: timestamp,
+        dueAt: approvalDueAt(timestamp),
       }, 'gateId', input.gateId), 'proposalId', input.proposalId), 'principalId', input.principalId);
       const withMessage = withOptional(approval, 'message', input.message);
       await this.approvals.set(withMessage.id, withMessage);
@@ -1585,6 +1685,28 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
       ...(sourceIds !== undefined ? { sourceIds } : {}),
     };
     await this.events.set(event.id, event);
+    const observability = this.observability();
+    if (observability !== undefined) {
+      const terminal = new Set(['input_validation_failed', 'dry_run_completed', 'shadow_recommendation_recorded', 'run_succeeded', 'approval_rejected', 'run_escalated', 'business_outcome_recorded']);
+      const failed = eventType === 'input_validation_failed' || eventType === 'tool_execution_failed';
+      try {
+        await observability.record({
+          traceId: run.traceId ?? run.id,
+          rootTraceId: run.rootTraceId ?? run.traceId ?? run.id,
+          spanId: `workflow-run:${run.id}`,
+          ...(run.parentSpanId !== undefined ? { parentSpanId: run.parentSpanId } : {}),
+          workflowRunId: run.id,
+          timestamp: event.timestamp,
+          phase: eventType === 'run_created' ? 'start' : terminal.has(eventType) ? 'end' : 'event',
+          kind: 'workflow',
+          name: `workflow.${eventType}`,
+          status: failed ? 'error' : terminal.has(eventType) ? 'ok' : 'unset',
+          attributes: { ...payload, eventType, sequence: event.sequence, workspaceId: run.workspaceId, workflowId: run.workflowId, mode: run.mode, completionState: run.completionState, sourceIds: sourceIds ?? [] },
+        });
+      } catch (error) {
+        console.warn(`[workflow-governance] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     return event;
   }
 
@@ -1773,12 +1895,12 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
     name: 'workflow_action',
     description:
       'Compile, draft, and validate governed workflow definitions, create dry-run/shadow/approval-gated workflow runs, inspect the run ledger, and approve or reject pending workflow actions.\n\n' +
-      'Actions: compile, get_compilation, compilations, draft, validate, dry_run, start, approve, reject, label_shadow_result, compare_shadow_result, shadow_report, inspect_run, list_runs, list_approvals.',
+      'Actions: compile, get_compilation, compilations, draft, validate, dry_run, start, approve, reject, escalate, label_shadow_result, compare_shadow_result, shadow_report, inspect_run, list_runs, list_approvals.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['compile', 'get_compilation', 'compilations', 'draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'label_shadow_result', 'compare_shadow_result', 'shadow_report', 'inspect_run', 'list_runs', 'list_approvals'] },
+        action: { type: 'string', enum: ['compile', 'get_compilation', 'compilations', 'draft', 'validate', 'dry_run', 'start', 'approve', 'reject', 'escalate', 'label_shadow_result', 'compare_shadow_result', 'shadow_report', 'inspect_run', 'list_runs', 'list_approvals'] },
         compile: { type: 'object' },
         compilationId: { type: 'string' },
         definition: { type: 'object' },
@@ -1813,7 +1935,7 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
       },
     },
     executor: {
-      async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {
+      async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
         const parsed = input && typeof input === 'object' ? input as WorkflowActionInput : { action: '' };
         try {
           switch (parsed.action) {
@@ -1848,10 +1970,10 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
               }
               return;
             case 'dry_run':
-              yield { type: 'result', value: await runner.startRun(startInput(parsed, 'dry_run')) };
+              yield { type: 'result', value: await runner.startRun({ ...startInput(parsed, 'dry_run'), ...toolTraceInput(ctx) }) };
               return;
             case 'start':
-              yield { type: 'result', value: await runner.startRun(startInput(parsed, parsed.mode)) };
+              yield { type: 'result', value: await runner.startRun({ ...startInput(parsed, parsed.mode), ...toolTraceInput(ctx) }) };
               return;
             case 'approve':
               if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action approve requires "runId".' }; return; }
@@ -1860,6 +1982,10 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
             case 'reject':
               if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action reject requires "runId".' }; return; }
               yield { type: 'result', value: await runner.rejectRun(parsed.runId, parsed.approvalId, parsed.reason) };
+              return;
+            case 'escalate':
+              if (parsed.runId === undefined || parsed.reason === undefined) { yield { type: 'error', message: 'workflow_action escalate requires "runId" and "reason".' }; return; }
+              yield { type: 'result', value: await runner.escalateRun(parsed.runId, parsed.reason) };
               return;
             case 'label_shadow_result':
               if (parsed.runId === undefined) { yield { type: 'error', message: 'workflow_action label_shadow_result requires "runId".' }; return; }
@@ -1916,6 +2042,14 @@ function workflowCompileInputFromAction(parsed: WorkflowActionInput): WorkflowCo
     ...(parsed.dryRun !== undefined ? { dryRun: parsed.dryRun } : {}),
     ...(parsed.sampleInputs !== undefined ? { sampleInputs: parsed.sampleInputs } : {}),
     ...(parsed.labels !== undefined ? { labels: parsed.labels } : {}),
+  };
+}
+
+function toolTraceInput(ctx: ToolContext): Pick<StartWorkflowInput, 'traceId' | 'rootTraceId' | 'parentSpanId'> {
+  return {
+    ...(ctx.traceId !== undefined ? { traceId: ctx.traceId } : {}),
+    ...(ctx.rootTraceId !== undefined ? { rootTraceId: ctx.rootTraceId } : {}),
+    ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
   };
 }
 
@@ -1983,6 +2117,7 @@ export function createWorkflowRunner(services: MatbotMachine, registry: Workflow
     services.createStore<WorkflowShadowComparison>(SHADOW_COMPARISON_STORE),
     sourceRegistry,
     connectorRegistry,
+    () => services.get('Observability') as ObservabilityLike | undefined,
   );
 }
 

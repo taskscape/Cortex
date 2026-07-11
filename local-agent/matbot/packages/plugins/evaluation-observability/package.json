@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-evaluation-observability",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "End-to-end traces, replay, evaluation suites, governance metrics, and ROI evidence.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

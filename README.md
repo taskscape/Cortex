@@ -48,7 +48,7 @@ configuration, architecture, and development details.
 | [Architecture And Core Systems](docs/architecture.md) | How requests move through the system; the plugin, memory, inner-voice, scheduling, workspace, RAG, and expert systems. |
 | [Commands](docs/commands.md) | Purpose of every PowerShell script, launcher/service startup paths, `run.ps1` switches, and npm scripts. |
 | [Configuration Reference](docs/configuration.md) | Configuration files, secrets/environment, Mem0 Docker, host file access, Matbot runtime, providers, workspaces, workspace RAG, and expert panel config. |
-| [Plugins And Tools](docs/plugins-and-tools.md) | Active and bundled plugins, adding plugins at runtime, and the `powershell`, `file_broker_action`, `workspace_action`, `skill_action`, `contextual_search`, `expert_panel`, and cognition tools. |
+| [Plugins And Tools](docs/plugins-and-tools.md) | Active and bundled plugins, adding plugins at runtime, and governed retrieval, workflow, evaluation, ROI, host-file, expert-panel, and cognition tools. |
 | [Memory And Retrieval](docs/memory-and-retrieval.md) | The "remember my name" flow, `remembered_facts`, `KnowledgeIndex`, workspace RAG, `contextual_search`, and `memory-policy.json`. |
 | [Expert Panel WebUI User Manual](docs/expert-panel.md) | Using the expert panel from the WebUI, modes, synthesis, citations, and troubleshooting. |
 | [WebUI](docs/webui.md) | WebUI capabilities and behavior. |
@@ -93,6 +93,7 @@ the significant languages, runtimes, and libraries used by each module.
 | `workspace-rag` plugin | TypeScript, Node.js | Markdown chunking and SHA-256 content hashing; Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback; CPU hash vectorizer fallback; optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds. |
 | Retrieval plugins (`hybrid-knowledge-index`, `persist-ki-bge`, `rumsfeld`) | TypeScript | `KnowledgeIndex` implementations querying Mem0 and file-index; optional BGE reranking in `persist-ki-bge`; `contextual_search` tool. |
 | `expert-panel` plugin | TypeScript, Node.js | Tool-based multi-expert orchestration over the Matbot single-turn API; per-expert file retrieval and optional synthesis. |
+| `evaluation-observability` plugin | TypeScript, Node.js | Store-backed end-to-end spans, redacted trace replay, deterministic and model-scored regression suites, operational metrics, cost accounting, and verified ROI evidence. |
 | `tests` | JavaScript (`.mjs`), TypeScript | Node built-in test runner (`node --test`); Playwright for WebUI tests with a fake Matbot harness. |
 | Root workspace | JSON, TypeScript | npm workspaces; TypeScript 5.x build (`tsc`); `@playwright/test`; shared `@types/node`. |
 

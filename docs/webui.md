@@ -28,6 +28,9 @@ Current UI capabilities include:
 - context graph entity panels with relationship evidence and confidence;
 - durable expert review cards with recommendations, checklists, and risk
   registers;
+- Evaluation & ROI with trace search and waterfall inspection, safe replay,
+  regression-suite runs, score details, operating metrics, workflow completion,
+  approval/escalation measures, and verified sponsor ROI evidence;
 - expert panel controls integrated into the main composer;
 - mobile sidebar behavior.
 

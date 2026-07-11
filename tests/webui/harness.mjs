@@ -35,6 +35,30 @@ const workflowRuns = new Map();
 const workflowApprovals = new Map();
 const workflowShadowComparisons = new Map();
 const expertReviews = new Map();
+const evaluationTraces = new Map();
+const evaluationSuites = new Map();
+const evaluationRuns = new Map();
+
+function seedEvaluationData() {
+  evaluationTraces.clear();
+  evaluationSuites.clear();
+  evaluationRuns.clear();
+  evaluationTraces.set("trace:playwright-governed", {
+    id: "trace:playwright-governed", version: "trace-version-1", traceId: "trace:playwright-governed", rootTraceId: "trace:playwright-governed",
+    workspaceId: "default", sessionId: "session:playwright", status: "ok", startedAt: "2026-07-10T08:00:00.000Z", endedAt: "2026-07-10T08:00:01.250Z", updatedAt: "2026-07-10T08:00:01.250Z",
+    durationMs: 1250, spanCount: 5, eventCount: 10, inputTokens: 850, outputTokens: 120, costUsd: 0.032, workflowRunIds: ["run:playwright-governed"]
+  });
+  evaluationSuites.set("suite:playwright-governed", {
+    id: "suite:playwright-governed", version: "suite-version-1", workspaceId: "default", name: "Governed deployment regression", description: "Retrieval, citation, action, policy, and workflow completion release gates.",
+    caseIds: ["case:retrieval", "case:policy"], scorerIds: ["scorer:retrieval", "scorer:policy"], passThreshold: 1, createdAt: now(), updatedAt: now()
+  });
+  evaluationRuns.set("eval-run:playwright", {
+    id: "eval-run:playwright", version: "eval-run-version-1", suiteId: "suite:playwright-governed", suiteVersion: "suite-version-1", workspaceId: "default", candidate: "baseline",
+    status: "completed", passed: true, score: 0.94, passRate: 1, caseCount: 2, startedAt: "2026-07-10T09:00:00.000Z", updatedAt: "2026-07-10T09:00:02.000Z", finishedAt: "2026-07-10T09:00:02.000Z", traceId: "trace:evaluator-playwright"
+  });
+}
+
+seedEvaluationData();
 
 const architectureSource = {
   id: "source:playwright-architecture-brief",
@@ -241,6 +265,13 @@ const loadedPlugins = [
     description: "Workflow definitions, run ledger, approval gates, shadow comparisons, and compiler.",
     types: ["tools", "service:WorkflowRegistry", "service:WorkflowRunner", "service:WorkflowCompiler", "hooks"],
     tools: [{ name: "workflow_action", description: "Compile, run, inspect, approve, and compare governed workflows." }]
+  },
+  {
+    name: "@matatbread/matbot-evaluation-observability",
+    specifier: "./packages/plugins/evaluation-observability",
+    description: "End-to-end traces, replay, regression suites, governance metrics, and ROI evidence.",
+    types: ["tools", "service:Observability"],
+    tools: [{ name: "evaluation_action", description: "Inspect traces, run evaluations, and report ROI." }]
   },
   {
     name: "@matatbread/matbot-context-graph",
@@ -1178,6 +1209,60 @@ function workflowActionResult(input) {
   return { error: `Unknown workflow_action "${input.action}".` };
 }
 
+function evaluationActionResult(input) {
+  const traces = [...evaluationTraces.values()].filter(item => harnessQueryMatches(item, input.query));
+  const suites = [...evaluationSuites.values()].filter(item => harnessQueryMatches(item, input.query));
+  const runs = [...evaluationRuns.values()].filter(item => harnessQueryMatches(item, input.query));
+  if (input.action === "traces") return { traces };
+  if (input.action === "inspect_trace") {
+    const trace = evaluationTraces.get(input.traceId) ?? null;
+    if (!trace) return { error: `Unknown trace "${input.traceId}".` };
+    return {
+      trace,
+      spans: [
+        { id: "span:agent", spanId: "span:agent", traceId: trace.traceId, kind: "agent", name: "matbot.turn", status: "ok", startedAt: trace.startedAt, durationMs: 1250, attributes: {} },
+        { id: "span:llm", spanId: "span:llm", traceId: trace.traceId, parentSpanId: "span:agent", kind: "llm", name: "gen_ai.chat", status: "ok", startedAt: trace.startedAt, durationMs: 640, attributes: { inputTokens: 850, outputTokens: 120, costUsd: 0.032 } },
+        { id: "span:retrieval", spanId: "span:retrieval", traceId: trace.traceId, parentSpanId: "span:agent", kind: "retriever", name: "workspace_rag.search", status: "ok", startedAt: trace.startedAt, durationMs: 90, attributes: { retrievedSourceIds: [architectureSource.id] } },
+        { id: "span:policy", spanId: "span:policy", traceId: trace.traceId, parentSpanId: "span:agent", kind: "guardrail", name: "connector.policy", status: "ok", startedAt: trace.startedAt, durationMs: 2, attributes: { policyOutcome: "allowed" } },
+        { id: "span:tool", spanId: "span:tool", traceId: trace.traceId, parentSpanId: "span:agent", kind: "tool", name: "workflow_action", status: "ok", startedAt: trace.startedAt, durationMs: 130, attributes: {} }
+      ],
+      events: [],
+      scores: []
+    };
+  }
+  if (input.action === "replay") {
+    if (!evaluationTraces.has(input.traceId)) return { error: `Unknown trace "${input.traceId}".` };
+    return { mode: "playback", writesExecuted: false, trace: evaluationTraces.get(input.traceId), timeline: [{ phase: "start" }, { phase: "end" }] };
+  }
+  if (input.action === "suites") return { suites };
+  if (input.action === "evaluation_runs") return { runs };
+  if (input.action === "run_suite") {
+    const suite = evaluationSuites.get(input.suiteId);
+    if (!suite) return { error: `Unknown evaluation suite "${input.suiteId}".` };
+    const id = `eval-run:webui-${evaluationRuns.size + 1}`;
+    const run = { id, version: `${id}:v1`, suiteId: suite.id, suiteVersion: suite.version, workspaceId: suite.workspaceId, candidate: input.candidate ?? "webui", status: "completed", passed: true, score: 0.97, passRate: 1, caseCount: suite.caseIds.length, startedAt: now(), updatedAt: now(), finishedAt: now(), traceId: `trace:${id}` };
+    evaluationRuns.set(id, run);
+    return { run, results: suite.scorerIds.map((scorerId, index) => ({ id: `${id}:score:${index}`, scorerId, passed: true, score: 0.97, rationale: "Harness scorer passed." })) };
+  }
+  if (input.action === "metrics") return {
+    traces: { total: traces.length, completed: traces.length, errors: 0 },
+    tokens: { input: 850, output: 120 }, costUsd: 0.032,
+    latencyMs: { average: 1250, p50: 1250, p95: 1250, p99: 1250 }, spans: { agent: 1, llm: 1, retriever: 1, guardrail: 1, tool: 1 },
+    retrieval: { operations: 1, averageLatencyMs: 90, scoredResults: 2, averageScore: 0.94 },
+    citations: { resolved: 1, tracesWithCitations: 1, coverageRate: 1 },
+    actions: { attempted: 1, succeeded: 1, failed: 0, successRate: 1 },
+    policy: { decisions: 1, denied: 0, denyRate: 0 },
+    workflows: { outcomes: 4, verifiedCompleted: 3, failed: 0, escalated: 1, completionRate: 0.75, escalationRate: 0.25, approvalsRequested: 4, approvalsApproved: 3, approvalsRejected: 1, approvalRate: 0.75, averageApprovalWaitMs: 60000 },
+    evaluations: { runs: runs.length, passed: runs.filter(run => run.passed).length, passRate: runs.length ? runs.filter(run => run.passed).length / runs.length : 0 }
+  };
+  if (input.action === "roi") return {
+    workspaceId: input.workspaceId ?? "default", verifiedOutcomes: 3, timeSavedHours: 12.5, laborBenefitUsd: 1500, additionalValueUsd: 300,
+    operatingCostUsd: 35, fixedCostUsd: 200, totalBenefitUsd: 1800, netBenefitUsd: 1565, roi: 6.6596, paybackOutcomes: 0.39,
+    byWorkflow: [{ workflowId: "workflow:invoice-review", verifiedOutcomes: 3, timeSavedHours: 12.5, benefitUsd: 1800 }]
+  };
+  return { error: `Unknown evaluation_action "${input.action}".` };
+}
+
 function contextGraphActionResult(input) {
   const entity = {
     id: "context-entity:acme",
@@ -1337,6 +1422,7 @@ async function handle(req, res) {
     workflowCompilationSeq = 1;
     expertReviews.clear();
     expertReviewSeq = 1;
+    seedEvaluationData();
     return json(res, 200, { ok: true });
   }
   if (method === "GET" && url.pathname === "/") return file(res, "text/html; charset=utf-8", "index.html");
@@ -1830,6 +1916,10 @@ async function handleTool(res, name, rawInput) {
   }
   if (name === "workflow_action") {
     const result = workflowActionResult(input);
+    return json(res, result.error ? 400 : 200, result);
+  }
+  if (name === "evaluation_action") {
+    const result = evaluationActionResult(input);
     return json(res, result.error ? 400 : 200, result);
   }
   if (name === "context_graph_action") {

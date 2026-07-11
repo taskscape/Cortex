@@ -917,6 +917,16 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
     }
+    .evaluation-observability-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr) minmax(280px, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .evaluation-observability-grid .architecture-list {
+      max-height: 260px;
+      margin-bottom: 10px;
+    }
     .workflow-ops-section {
       border: 1px solid #e5e7eb;
       border-radius: 8px;
@@ -995,7 +1005,8 @@
     }
     @media (max-width: 520px) {
       .workflow-ops-summary,
-      .workflow-ops-overview-grid {
+      .workflow-ops-overview-grid,
+      .evaluation-observability-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -4154,6 +4165,7 @@
         <button class="architecture-nav-btn" data-architecture-view="sources" type="button">Sources</button>
         <button class="architecture-nav-btn" data-architecture-view="sql" type="button">SQL Preview</button>
         <button class="architecture-nav-btn" data-architecture-view="workflows" type="button">Workflow Center</button>
+        <button class="architecture-nav-btn" data-architecture-view="evaluation" type="button">Evaluation &amp; ROI</button>
         <button class="architecture-nav-btn" data-architecture-view="graph" type="button">Graph</button>
         <button class="architecture-nav-btn" data-architecture-view="reviews" type="button">Reviews</button>
       </div>
@@ -4342,6 +4354,7 @@
             <button id="architecture-tab-sources" class="architecture-tab active" data-architecture-tab="sources" type="button" role="tab" aria-selected="true" aria-controls="architecture-panel-sources">Sources</button>
             <button id="architecture-tab-sql" class="architecture-tab" data-architecture-tab="sql" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-sql" tabindex="-1">SQL Preview</button>
             <button id="architecture-tab-workflows" class="architecture-tab" data-architecture-tab="workflows" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-workflows" tabindex="-1">Workflows</button>
+            <button id="architecture-tab-evaluation" class="architecture-tab" data-architecture-tab="evaluation" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-evaluation" tabindex="-1">Evaluation &amp; ROI</button>
             <button id="architecture-tab-graph" class="architecture-tab" data-architecture-tab="graph" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-graph" tabindex="-1">Graph</button>
             <button id="architecture-tab-reviews" class="architecture-tab" data-architecture-tab="reviews" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-reviews" tabindex="-1">Reviews</button>
           </div>
@@ -4502,6 +4515,35 @@
               <div id="workflow-ops-shadow-list" class="architecture-list" aria-label="Shadow comparisons"></div>
               <div id="workflow-ops-shadow-detail" class="architecture-detail" aria-live="polite"></div>
             </div>
+          </div>
+        </section>
+
+        <section id="architecture-panel-evaluation" class="architecture-panel" data-architecture-panel="evaluation" role="tabpanel" aria-labelledby="architecture-tab-evaluation" hidden>
+          <div class="architecture-toolbar">
+            <div id="architecture-evaluation-status" class="architecture-status" role="status"></div>
+            <div class="architecture-actions"><button id="architecture-evaluation-refresh" type="button">Refresh</button></div>
+          </div>
+          <div class="workflow-ops-summary" aria-label="Evaluation and ROI summary">
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Traces</div><div id="evaluation-trace-count" class="workflow-ops-metric-value">0</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Eval pass rate</div><div id="evaluation-pass-rate" class="workflow-ops-metric-value">-</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Verified completion</div><div id="evaluation-completion-rate" class="workflow-ops-metric-value">-</div></div>
+            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Net benefit</div><div id="evaluation-net-benefit" class="workflow-ops-metric-value">$0</div></div>
+          </div>
+          <div class="evaluation-observability-grid">
+            <section class="workflow-ops-section">
+              <h3>End-to-end traces</h3>
+              <div id="evaluation-trace-list" class="architecture-list" aria-label="End-to-end traces"></div>
+              <div id="evaluation-trace-detail" class="architecture-detail" aria-live="polite"></div>
+            </section>
+            <section class="workflow-ops-section">
+              <h3>Regression suites</h3>
+              <div id="evaluation-suite-list" class="architecture-list" aria-label="Evaluation suites"></div>
+              <div id="evaluation-suite-detail" class="architecture-detail" aria-live="polite"></div>
+            </section>
+            <section class="workflow-ops-section">
+              <h3>Sponsor evidence</h3>
+              <div id="evaluation-roi-detail" class="architecture-detail" aria-live="polite"></div>
+            </section>
           </div>
         </section>
 

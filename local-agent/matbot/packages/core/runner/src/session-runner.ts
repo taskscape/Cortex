@@ -2,6 +2,7 @@ import type {
   Session, Message, MessageContent, Principal, PromptFn, PipelineEvent,
   Store, ToolRegistry, SystemContextRegistry, Vault, FileStore, Tool,
   ProviderAdapter, ProviderConfig, SessionRunner, SessionView, OpenOpts, SubmitOpenOpts,
+  ObservabilitySink,
 } from './types.js';
 import type { MatbotPlugin } from './plugin.js';
 import type { HookRegistry } from './hooks.js';
@@ -21,6 +22,8 @@ export interface SessionRunnerDeps {
   configPath?:     string;
   loadPlugin:      (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
   unloadPlugin:    (specifier: string) => Promise<boolean>;
+  /** Late-bound so a plugin loaded after runner construction can install the sink. */
+  observability?:  () => ObservabilitySink | undefined;
 }
 
 interface QueuedItem {
@@ -220,9 +223,10 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
           // contextSwitch (not bare runAs): a turn is the transactional unit, so a StorageBackend swap
           // deferred during it lands at this scope's quiescent edge — never mid-CAS.
           await contextSwitch(head.principal, async () => {
+            const observability = deps.observability?.();
             for await (const ev of runSession({
               session,
-              config:         { provider: head.provider, traceId: head.traceId },
+              config:         { provider: head.provider, traceId: head.traceId, rootTraceId: head.rootTraceId, sessionId: id },
               provider:       resolved.adapter,
               providerConfig: resolved.config,
               store:          deps.store,
@@ -239,6 +243,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
               ...(deps.vault         !== undefined ? { vault:         deps.vault         } : {}),
               ...(head.prompt        !== undefined ? { prompt:        head.prompt        } : {}),
               ...(head.redo          !== undefined ? { injectedEphemeral: head.redo.ephemeral } : {}),
+              ...(observability !== undefined ? { observability } : {}),
             })) {
               emit(s, ev);
             }

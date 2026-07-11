@@ -964,6 +964,9 @@ async function main(): Promise<void> {
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workflow-governance', {
       before: './packages/plugins/workspace-rag',
     });
+    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/evaluation-observability', {
+      before: './packages/plugins/workspace-rag',
+    });
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/context-graph', {
       before: './packages/plugins/workspace-rag',
     });
@@ -1375,6 +1378,7 @@ async function main(): Promise<void> {
     configPath,
     loadPlugin:    services.loadPlugin.bind(services),
     unloadPlugin:  services.unloadPlugin.bind(services),
+    observability: () => services.get('Observability'),
   });
 
   sessionRunner = makeRunner(store);

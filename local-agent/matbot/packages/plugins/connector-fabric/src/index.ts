@@ -926,6 +926,7 @@ async function auditDeniedToolCall(registry: ConnectorRegistry, ctx: ToolCallCon
     allowed: false,
     principalId: decision.principalId,
     toolCallId: ctx.toolCall.id,
+    ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}),
     ...(workflowRunId !== undefined ? { workflowRunId } : {}),
     providerName: ctx.config.provider,
     inputHash: hashPayload(ctx.toolCall.input),
@@ -955,6 +956,7 @@ async function auditToolResult(registry: ConnectorRegistry, ctx: ToolResultConte
     principalId: decision.principalId,
     sourceIds,
     toolCallId: ctx.toolCall.id,
+    ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}),
     ...(workflowRunId !== undefined ? { workflowRunId } : {}),
     providerName: ctx.config.provider,
     inputHash: hashPayload(ctx.toolCall.input),
@@ -980,6 +982,24 @@ function registerPolicyHooks(registry: ConnectorRegistry, services: MatbotMachin
       });
       if (!decision.bound || decision.allowed) return;
       await auditDeniedToolCall(registry, ctx, decision);
+      const observability = services.get('Observability');
+      if (observability !== undefined && ctx.config.traceId !== undefined) {
+        const workflowRunId = workflowRunIdFromInput(ctx.toolCall.input);
+        try {
+          await observability.record({
+            traceId: ctx.config.traceId,
+            rootTraceId: ctx.config.rootTraceId ?? ctx.config.traceId,
+            spanId: `connector-policy:${ctx.toolCall.id}`,
+            sessionId: ctx.session.id,
+            ...(workflowRunId !== undefined ? { workflowRunId } : {}),
+            timestamp: new Date().toISOString(),
+            phase: 'end', kind: 'guardrail', name: 'connector.policy', status: 'error',
+            attributes: { policyOutcome: 'denied', toolName: ctx.toolCall.name, capability: decision.capability ?? null, connectorInstanceId: decision.connectorInstance?.id ?? null, approvalPolicyId: decision.approvalPolicyId ?? null, reason: decision.reason ?? null },
+          });
+        } catch (error) {
+          console.warn(`[connector-fabric] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       return { rejectTool: { message: decision.reason ?? `Connector policy denied tool "${ctx.toolCall.name}".` } };
     },
   });
@@ -995,6 +1015,24 @@ function registerPolicyHooks(registry: ConnectorRegistry, services: MatbotMachin
       });
       if (!decision.bound || !decision.allowed) return;
       const result = await auditToolResult(registry, ctx, decision);
+      const observability = services.get('Observability');
+      if (observability !== undefined && ctx.config.traceId !== undefined) {
+        const workflowRunId = workflowRunIdFromInput(ctx.toolCall.input);
+        try {
+          await observability.record({
+            traceId: ctx.config.traceId,
+            rootTraceId: ctx.config.rootTraceId ?? ctx.config.traceId,
+            spanId: `connector-policy:${ctx.toolCall.id}`,
+            sessionId: ctx.session.id,
+            ...(workflowRunId !== undefined ? { workflowRunId } : {}),
+            timestamp: new Date().toISOString(),
+            phase: 'end', kind: 'guardrail', name: 'connector.policy', status: ctx.isError ? 'error' : 'ok', durationMs: ctx.durationMs,
+            attributes: { policyOutcome: 'allowed', toolName: ctx.toolCall.name, capability: decision.capability ?? null, connectorInstanceId: decision.connectorInstance?.id ?? null, approvalPolicyId: decision.approvalPolicyId ?? null },
+          });
+        } catch (error) {
+          console.warn(`[connector-fabric] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       if (result !== ctx.result) return { result };
     },
   });
@@ -1065,6 +1103,15 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       capabilities: ['read' as const, 'write' as const, 'admin' as const],
       description: 'Source-backed business entity graph, relationship assertions, deterministic extraction, and Neo4j projection operations.',
     },
+    {
+      id: 'connector-definition:evaluation-observability',
+      type: 'evaluation-observability',
+      displayName: 'Evaluation, Observability, and ROI',
+      protocol: 'native' as const,
+      sourceTypes: ['trace', 'span', 'evaluation_suite', 'score', 'outcome', 'roi_report'],
+      capabilities: ['read' as const, 'write' as const, 'admin' as const],
+      description: 'End-to-end traces, safe replay, regression suites, governance metrics, and verified ROI evidence.',
+    },
   ];
 
   for (const definition of definitions) await registry.upsertDefinition(definition);
@@ -1077,6 +1124,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
     { id: 'connector-instance:postgres-readonly:local', definitionId: 'connector-definition:postgres-readonly', type: 'postgres-readonly', workspaceId: 'local', displayName: 'Local Postgres Read-Only', scopes: ['postgres:read'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:workflow-governance:local', definitionId: 'connector-definition:workflow-governance', type: 'workflow-governance', workspaceId: 'local', displayName: 'Local Workflow Governance', scopes: ['workflow:read', 'workflow:write', 'workflow:admin'], readEnabled: true, writeEnabled: true },
     { id: 'connector-instance:context-graph:local', definitionId: 'connector-definition:context-graph', type: 'context-graph', workspaceId: 'local', displayName: 'Local Context Graph', scopes: ['context-graph:read', 'context-graph:write', 'context-graph:admin'], readEnabled: true, writeEnabled: true },
+    { id: 'connector-instance:evaluation-observability:local', definitionId: 'connector-definition:evaluation-observability', type: 'evaluation-observability', workspaceId: 'local', displayName: 'Local Evaluation and Observability', scopes: ['evaluation:read', 'evaluation:write', 'evaluation:admin'], readEnabled: true, writeEnabled: true },
   ];
 
   for (const instance of instances) {
@@ -1223,6 +1271,7 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
         compare_shadow_result: 'write',
         approve: 'admin',
         reject: 'admin',
+        escalate: 'admin',
       },
       approvalPolicyId: 'workflow-governance-admin',
       sensitiveFields: ['inputs', 'proposedActions', 'approvalToken', 'transcript', 'messages', 'toolCalls', 'inputHints', 'sampleInputs'],
@@ -1250,6 +1299,31 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       approvalPolicyId: 'context-graph-write',
       sensitiveFields: ['identifiers', 'evidenceSpan', 'parameters', 'text'],
       description: 'Search, retrieve, extract, and maintain source-backed context graph assertions.',
+    },
+    {
+      connectorInstanceId: 'connector-instance:evaluation-observability:local',
+      toolName: 'evaluation_action',
+      capability: 'read',
+      sourceTypes: ['trace', 'span', 'evaluation_suite', 'score', 'outcome', 'roi_report'],
+      sensitivity: 'confidential',
+      requiredScopes: ['evaluation:read'],
+      inputActionField: 'action',
+      actionCapabilities: {
+        traces: 'read',
+        inspect_trace: 'read',
+        replay: 'read',
+        suites: 'read',
+        evaluation_runs: 'read',
+        metrics: 'read',
+        roi: 'read',
+        upsert_suite: 'write',
+        run_suite: 'write',
+        upsert_baseline: 'admin',
+        record_outcome: 'admin',
+      },
+      approvalPolicyId: 'evaluation-observability-admin',
+      sensitiveFields: ['suite', 'baseline', 'outcome'],
+      description: 'Inspect traces, replay safely, execute evaluation suites, and manage verified ROI evidence.',
     },
   ];
 
@@ -1308,6 +1382,14 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
       allowedTools: ['context_graph_action'],
       approvalRules: ['context-graph-write'],
       sensitiveFields: ['identifiers', 'evidenceSpan', 'parameters', 'text'],
+    },
+    {
+      connectorInstanceId: 'connector-instance:evaluation-observability:local',
+      principalId: '*',
+      scopes: ['*'],
+      allowedTools: ['evaluation_action'],
+      approvalRules: ['evaluation-observability-admin'],
+      sensitiveFields: ['suite', 'baseline', 'outcome'],
     },
   ];
 

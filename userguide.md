@@ -22,6 +22,7 @@ details, use the [reference documentation](docs/architecture.md) instead.
 - [Inspect Sources And Source Health](#inspect-sources-and-source-health)
 - [Run Governed SQL Queries](#run-governed-sql-queries)
 - [Use The Workflow Operations Center](#use-the-workflow-operations-center)
+- [Evaluate Deployments And Show ROI](#evaluate-deployments-and-show-roi)
 - [Explore The Context Graph](#explore-the-context-graph)
 - [Create Durable Expert Reviews](#create-durable-expert-reviews)
 - [Manage Plugins](#manage-plugins)
@@ -499,10 +500,38 @@ approval-gated or unattended behavior.
 ### Current workflow limitations
 
 The current Center does not provide arbitrary visual multi-step execution,
-background scheduling, editable version diffs, or an evaluation-results UI.
+background scheduling, or editable version diffs.
 The existing workflow runtime provides typed definitions, run ledgers,
 evidence, proposed actions, approvals, dry-run/shadow semantics, and policy
 enforcement; do not describe an unimplemented step executor as active.
+
+## Evaluate Deployments And Show ROI
+
+Open `Architecture` and select `Evaluation & ROI`. This panel turns runtime
+behavior into release evidence and sponsor-facing operating evidence.
+
+The summary cards show trace volume, regression pass rate, verified workflow
+completion, and net benefit. Use the three detail areas as follows:
+
+1. In `Traces`, select a run to inspect its agent, model, tool, retrieval,
+   policy, evaluator, and workflow spans. The waterfall shows nesting, status,
+   duration, tokens, and cost. `Replay safely` reconstructs the stored timeline
+   and never re-executes writes.
+2. In `Regression suites`, select a versioned suite, review its cases and gate,
+   then select `Run suite`. Required scorer failures or a pass rate below the
+   suite threshold fail the deployment gate.
+3. In `Sponsor evidence`, review retrieval/citation coverage, action and policy
+   outcomes, workflow approvals and escalations, verified time saved, operating
+   cost, benefit, net benefit, ROI, and estimated payback outcomes.
+
+Only outcomes marked `verified_completed` contribute to time-saved and benefit
+calculations, and they must link to a workflow baseline and named verifier.
+Model prices come from provider-reported cost or `CORTEX_MODEL_PRICING_JSON`.
+Use the regression CLI in automation when a failed suite must block a release:
+
+```powershell
+npm run eval:cortex -- <suite-id> --candidate <version> --junit <results.xml>
+```
 
 ## Explore The Context Graph
 

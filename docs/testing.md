@@ -59,7 +59,7 @@ The Playwright config starts `tests\webui\harness.mjs` on
 `http://127.0.0.1:19787` and serves the same static frontend files used by the
 Node WebUI. The harness implements fake Matbot transport endpoints for sessions,
 tools, workspaces, files, plugins, skills, remembered facts, experts, and
-workspace RAG. It validates WebUI behavior without calling real providers,
+workspace RAG, traces, evaluation suites, and ROI summaries. It validates WebUI behavior without calling real providers,
 spending model tokens, writing production memory stores, or touching live RAG
 databases.
 
@@ -87,6 +87,8 @@ Current Playwright coverage includes:
 - workflow approval inspection and decisions;
 - context graph relationship evidence;
 - durable expert-review creation, recommendations, checklists, and risks;
+- evaluation trace inspection and safe replay, regression-suite execution,
+  sponsor metrics, responsive layout, and stale-selection protection;
 - architecture tab semantics and keyboard navigation;
 - expert panel all-expert and selected-expert composer flows;
 - streaming output, tools, usage, and elapsed-time summary;
@@ -108,4 +110,12 @@ Node tests cover:
 - file-broker policy and write backups;
 - hybrid KnowledgeIndex ranking/deduplication;
 - expert-panel plugin behavior and isolated retrieval;
-- workspace-rag runtime ingestion flow.
+- workspace-rag runtime ingestion flow;
+- end-to-end span capture, redaction, safe replay, deterministic and model-based
+  scorers, model-cost accounting, workflow outcome linkage, and ROI arithmetic.
+
+Run only the evaluation and ROI backend coverage:
+
+```powershell
+node --test tests/evaluation-observability.test.mjs
+```
