@@ -3364,16 +3364,21 @@ async function hideSession(id) {
 // reaches the sidebar and header without a page reload. Two passes: a fast model lands well inside the
 // first, a slow local one inside the second.
 const TITLE_REFRESH_DELAYS_MS = [1500, 5000];
+let titleRefreshTimers = [];
 
 function refreshTitlesAfterFollowup() {
+  // Debounce: keep at most one pending pair of refreshes.
+  for (const t of titleRefreshTimers) clearTimeout(t);
+  titleRefreshTimers = [];
+
   for (const delay of TITLE_REFRESH_DELAYS_MS) {
-    setTimeout(() => {
+    titleRefreshTimers.push(setTimeout(() => {
       apiListSessions().then(sessions => {
         renderSessions(sessions);
         const current = sessions.find(s => s.id === currentSessionId);
         if (current?.title && chatHeaderEl) chatTitleEl.textContent = current.title;
       }).catch(() => {});
-    }, delay);
+    }, delay));
   }
 }
 
