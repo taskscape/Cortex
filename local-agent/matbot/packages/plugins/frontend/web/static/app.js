@@ -3298,6 +3298,9 @@ async function runExpertPanelFromUi() {
   } finally {
     expertPanelBusy = false;
     updateExpertControlsState();
+    // This flow consumes the HTTP response directly rather than the stream's `done` event, so it never
+    // reaches the refresh wired in there. The server titles this session out of band too — same hook.
+    refreshTitlesAfterFollowup();
   }
 }
 
@@ -3353,6 +3356,25 @@ async function hideSession(id) {
     }
     renderSessions(sessions);
   } catch (e) { alert('Hide failed: ' + e.message); }
+}
+
+// A session title can be written by a `followup` hook, which runs *post-commit* — after the `done`
+// event carrying the session was already emitted. So the title on that event is the pre-hook value and
+// nothing else announces the later write. Re-read the list a moment afterwards so a hook-written title
+// reaches the sidebar and header without a page reload. Two passes: a fast model lands well inside the
+// first, a slow local one inside the second.
+const TITLE_REFRESH_DELAYS_MS = [1500, 5000];
+
+function refreshTitlesAfterFollowup() {
+  for (const delay of TITLE_REFRESH_DELAYS_MS) {
+    setTimeout(() => {
+      apiListSessions().then(sessions => {
+        renderSessions(sessions);
+        const current = sessions.find(s => s.id === currentSessionId);
+        if (current?.title && chatHeaderEl) chatTitleEl.textContent = current.title;
+      }).catch(() => {});
+    }, delay);
+  }
 }
 
 async function apiNewSession() {
@@ -5271,6 +5293,7 @@ async function renderTurn(sid, traceId) {
             if (det) det.open = false;
           }
           if (ev.session?.title && chatHeaderEl) chatTitleEl.textContent = ev.session.title;
+          refreshTitlesAfterFollowup();
           appendTurnStats();
           loadFiles();
           // Back-fill origIdx on any dividers added without an index this turn.
@@ -5337,10 +5360,11 @@ document.getElementById('sessions-enable-btn').onclick = () => {
 
 inputEl.addEventListener('keydown', e => {
   if (e.key !== 'Enter') return;
-  // Ctrl/Cmd+Enter → queued (own turn, run in order). Shift+Enter → concat (fold into the running
-  // batch). Plain Enter keeps the textarea's newline behaviour.
-  if (e.ctrlKey || e.metaKey) { e.preventDefault(); sendMessage(false); }
-  else if (e.shiftKey)        { e.preventDefault(); sendMessage(true); }
+  // Plain Enter → queued (own turn, run in order). Ctrl/Cmd+Enter → concat (fold into the running
+  // batch). Shift+Enter keeps the textarea's newline behaviour.
+  if (e.shiftKey) return;
+  e.preventDefault();
+  sendMessage(e.ctrlKey || e.metaKey);
 });
 
 inputEl.addEventListener('input', () => {

@@ -1,0 +1,19 @@
+{
+  "name": "@matatbread/matbot-session-titler",
+  "matbotRuntime": ["node", "browser"],
+  "version": "0.1.0",
+  "description": "Names a conversation from its first completed turn: a model writes a short descriptive label, replacing the deterministic prompt-truncation fallback.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}
