@@ -4097,10 +4097,20 @@ function showEmpty() {
     '</div>';
 }
 
+// A title is a handful of words, so a hard character cut lands mid-word for no benefit. Trim back to
+// the last word boundary instead, and mark the elision only when something was actually dropped. A
+// single word longer than the budget still has to be cut hard — there is no boundary to fall back to.
+function truncateAtWord(text, max) {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
 function renderSessions(sessions) {
   sessionListEl.innerHTML = '';
   for (const s of sessions) {
-    const label = (s.title || s.preview || s.id.slice(0, 8)).slice(0, 44);
+    const label = truncateAtWord(s.title || s.preview || s.id.slice(0, 8), 44);
     const el = document.createElement('div');
     el.className = 'session-item' +
       (s.id === currentSessionId ? ' active' : '') +
@@ -4844,10 +4854,10 @@ function connectSessionStream(sid) {
 
 // Read the input box and submit it. The single entry point for *typed* messages; canned/programmatic
 // messages (plugin install banners, etc.) call submit() directly so they aren't gated by the input.
-// concat = true (Shift+Enter / send button): fold into the running turn's batch — fastest way to
-// add more context. concat = false (Ctrl+Enter): a distinct queued turn, run in order — use when the
-// next ask depends on this one's tools/state (e.g. install a plugin, then use it).
-async function sendMessage(concat = true) {
+// concat = false (Enter / send button): a distinct queued turn, run in order — use when the next ask
+// depends on this one's tools/state (e.g. install a plugin, then use it). concat = true
+// (Ctrl/Cmd+Enter): fold into the running turn's batch — fastest way to add more context.
+async function sendMessage(concat = false) {
   if (expertEnabledEl?.checked) {
     await runExpertPanelFromUi();
     return;
@@ -5356,7 +5366,7 @@ async function renderTurn(sid, traceId) {
 sendBtn.onclick = () => {
   if (sendBtn.classList.contains('scroll-down-mode')) scrollToBottomAndReset();
   else if (sending) requestStop();
-  else sendMessage();
+  else sendMessage(false);
 };
 
 document.getElementById('sessions-enable-btn').onclick = () => {
