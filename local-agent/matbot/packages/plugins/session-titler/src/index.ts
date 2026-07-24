@@ -139,6 +139,7 @@ function makeSessionTitler(services: MatbotMachine): SessionTitler {
       const written = await store.cas(session.id, session.version, {
         ...session,
         title,
+        updatedAt: new Date().toISOString(),
         version: crypto.randomUUID(),
       });
       if (!written.ok) return undefined;
