@@ -58,7 +58,7 @@ export const plugin: MatbotPluginSpec = {
     const baseUserId = process.env.MEM0_USER_ID ?? "local-agent";
     const mem0 = new Mem0Client({
       baseUrl: process.env.MEM0_BASE_URL ?? "http://localhost:8888",
-      apiKey: process.env.MEM0_API_KEY,
+      ...(process.env.MEM0_API_KEY !== undefined ? { apiKey: process.env.MEM0_API_KEY } : {}),
       userId: workspaceScopedMem0UserId(baseUserId, workspaceId),
       workspaceId
     });

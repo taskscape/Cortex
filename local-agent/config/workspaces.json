@@ -11,7 +11,7 @@
       "type": "documents"
     }
   ],
-  "excludedPatterns": [
+  "indexExcludedPatterns": [
     "**\\node_modules\\**",
     "**\\.git\\**",
     "**\\bin\\**",

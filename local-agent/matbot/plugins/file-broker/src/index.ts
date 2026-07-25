@@ -79,18 +79,17 @@ export class FileBrokerClient {
     });
   }
 
-  private request(method: string, pathname: string, options: { body?: string; signal?: AbortSignal } = {}): Promise<unknown> {
+  private request(method: string, pathname: string, options: { body?: string | undefined; signal?: AbortSignal | undefined } = {}): Promise<unknown> {
     return this.requestUrl(method, this.url(pathname), options);
   }
 
-  private async requestUrl(method: string, url: URL, options: { body?: string; signal?: AbortSignal } = {}): Promise<unknown> {
+  private async requestUrl(method: string, url: URL, options: { body?: string | undefined; signal?: AbortSignal | undefined } = {}): Promise<unknown> {
     let response: Response;
     try {
       response = await fetch(url, {
         method,
-        headers: options.body !== undefined ? { "content-type": "application/json" } : undefined,
-        body: options.body,
-        signal: options.signal
+        ...(options.body !== undefined ? { headers: { "content-type": "application/json" }, body: options.body } : {}),
+        ...(options.signal !== undefined ? { signal: options.signal } : {})
       });
     } catch (error) {
       throw new Error(`File broker request failed: ${error instanceof Error ? error.message : String(error)}`);

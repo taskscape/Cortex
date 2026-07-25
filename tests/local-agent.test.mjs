@@ -9,7 +9,7 @@ import { indexRoot } from "../local-agent/file-index/dist/indexer.js";
 import { resolveIndexRoot } from "../local-agent/file-index/dist/index-root.js";
 import { emptyStore, loadStore, saveStore } from "../local-agent/file-index/dist/store.js";
 import { searchChunks } from "../local-agent/file-index/dist/search.js";
-import { evaluateAccess } from "../local-agent/paths/dist/index.js";
+import { evaluateAccess, indexExclusions } from "../local-agent/paths/dist/index.js";
 import { ReloadingConfig } from "../local-agent/file-broker/dist/config-cache.js";
 import { writeTextFile } from "../local-agent/file-broker/dist/file-writer.js";
 import { createFileBrokerTool, FileBrokerClient } from "../local-agent/matbot/plugins/file-broker/dist/index.js";
@@ -27,7 +27,7 @@ test("file index stores searchable text with path metadata", async () => {
   try {
     const options = {
       root,
-      excludedPatterns: [],
+      indexExcludedPatterns: [],
       maxFileBytes: 100_000,
       workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
       policy: { deniedPathFragments: [], highRiskExtensions: [], maxReadBytes: 100_000, backupRoot: "backups" }
@@ -93,14 +93,14 @@ test("file index applies the broker security policy to every indexed file", asyn
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-policy-"));
   await mkdir(path.join(root, ".ssh"), { recursive: true });
   await writeFile(path.join(root, "notes.md"), "Ordinary project notes about retrieval.", "utf8");
-  // Matches none of the looksLikeSecret patterns, so only the high-risk extension rule keeps it out.
+  // Matches none of the content secret patterns, so only the high-risk extension rule keeps it out.
   await writeFile(path.join(root, ".env"), "GITHUB_TOKEN=ghp_notarealtokenvalue\n", "utf8");
   await writeFile(path.join(root, ".ssh", "hosts.md"), "Private host inventory for retrieval.", "utf8");
 
   try {
     const store = await indexRoot({
       root,
-      excludedPatterns: [],
+      indexExcludedPatterns: [],
       maxFileBytes: 100_000,
       workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
       policy: {
@@ -121,6 +121,118 @@ test("file index applies the broker security policy to every indexed file", asyn
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("file index exclusion patterns match Windows-style paths and prune whole directories", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-exclude-"));
+  await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await mkdir(path.join(root, "source"), { recursive: true });
+  await writeFile(path.join(root, "node_modules", "pkg", "vendor.js"), "vendored retrieval helper", "utf8");
+  await writeFile(path.join(root, "src", "keep.md"), "kept retrieval source", "utf8");
+  await writeFile(path.join(root, "source", "also-keep.md"), "kept retrieval source too", "utf8");
+
+  try {
+    // These are the patterns as authored in local-agent/config/workspaces.json. They matched nothing
+    // at all until minimatch was told to treat "\" as a separator rather than an escape character.
+    const store = await indexRoot({
+      root,
+      indexExcludedPatterns: ["**\\node_modules\\**"],
+      maxFileBytes: 100_000,
+      workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
+      policy: { deniedPathFragments: [], highRiskExtensions: [], maxReadBytes: 100_000, backupRoot: "backups" }
+    }, emptyStore());
+
+    const indexed = store.chunks.map(chunk => chunk.relativePath).sort();
+    assert.deepEqual(indexed, ["source\\also-keep.md", "src\\keep.md"]);
+    assert.equal(searchChunks(store.chunks, "vendored", 5).length, 0, "excluded trees stay out of the index");
+
+    // Pruned as a directory, so the file inside is never visited and never reported individually.
+    const skippedPaths = store.skipped.map(entry => path.relative(root, entry.path));
+    assert.ok(skippedPaths.includes("node_modules"), "the directory itself is pruned");
+    assert.ok(!skippedPaths.includes(path.join("node_modules", "pkg", "vendor.js")), "pruned trees are not walked");
+    // "source" must survive: a prefix of an excluded name is not an excluded directory.
+    assert.ok(!skippedPaths.includes("source"), "similarly-named directories are not over-pruned");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("file index redacts credential values instead of discarding the whole file", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-redact-"));
+  await writeFile(path.join(root, "config.md"), [
+    "# Service configuration",
+    "The deployment reads its retrieval settings from the environment.",
+    "api_key = A1b2C3d4E5f6G7h8J9k0LmNoPq",
+    ""
+  ].join("\n"), "utf8");
+  // False positives that previously dropped entire files: a type declaration and a placeholder.
+  await writeFile(path.join(root, "types.md"), "interface Config { password: string }\nretrieval notes", "utf8");
+  await writeFile(path.join(root, "sample.md"), 'apiKey: "REPLACE_ME"\nretrieval sample', "utf8");
+
+  try {
+    const store = await indexRoot({
+      root,
+      indexExcludedPatterns: [],
+      maxFileBytes: 100_000,
+      workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
+      policy: { deniedPathFragments: [], highRiskExtensions: [], maxReadBytes: 100_000, backupRoot: "backups" }
+    }, emptyStore());
+
+    assert.deepEqual(store.chunks.map(chunk => chunk.relativePath).sort(),
+      ["config.md", "sample.md", "types.md"], "no file is dropped outright");
+
+    // The secret is gone, but the file around it stayed searchable — the point of redacting.
+    assert.equal(searchChunks(store.chunks, "A1b2C3d4E5f6G7h8J9k0LmNoPq", 5).length, 0, "the value is withheld");
+    assert.equal(searchChunks(store.chunks, "deployment", 5).length, 1, "the rest of the file is still indexed");
+
+    const config = store.chunks.find(chunk => chunk.relativePath === "config.md");
+    assert.match(config.content, /api_key = \[redacted\]/);
+    assert.equal(config.redactions, 1, "redactions are reported so the gap is explainable");
+
+    // Neither false positive is treated as a secret.
+    for (const name of ["types.md", "sample.md"]) {
+      const chunk = store.chunks.find(item => item.relativePath === name);
+      assert.equal(chunk.redactions, undefined, `${name} is not redacted`);
+    }
+    assert.equal(searchChunks(store.chunks, "REPLACE_ME", 5).length, 1, "placeholders are left alone");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("file index survives an unreadable directory instead of failing the whole run", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-unreadable-"));
+  await mkdir(path.join(root, "readable"), { recursive: true });
+  await writeFile(path.join(root, "readable", "notes.md"), "reachable retrieval notes", "utf8");
+
+  const missing = path.join(root, "vanishing");
+  await mkdir(missing, { recursive: true });
+
+  try {
+    // Removing the directory between the parent listing and its own readdir reproduces the class of
+    // failure (ENOENT/EPERM/EBUSY mid-walk) that used to reject out of the generator.
+    await rm(missing, { recursive: true, force: true });
+
+    const store = await indexRoot({
+      root,
+      indexExcludedPatterns: [],
+      maxFileBytes: 100_000,
+      workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
+      policy: { deniedPathFragments: [], highRiskExtensions: [], maxReadBytes: 100_000, backupRoot: "backups" }
+    }, emptyStore());
+
+    assert.equal(searchChunks(store.chunks, "reachable", 5).length, 1, "the readable part is still indexed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace config honours the pre-rename excludedPatterns key", () => {
+  assert.deepEqual(indexExclusions({ roots: [], indexExcludedPatterns: ["**\\dist\\**"] }), ["**\\dist\\**"]);
+  assert.deepEqual(indexExclusions({ roots: [], excludedPatterns: ["**\\legacy\\**"] }), ["**\\legacy\\**"],
+    "existing configs written before the rename keep working");
+  assert.deepEqual(indexExclusions({ roots: [] }), []);
 });
 
 test("file broker blocks writes outside configured roots and allows project writes", () => {

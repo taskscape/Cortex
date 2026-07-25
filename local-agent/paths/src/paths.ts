@@ -32,8 +32,8 @@ export function normalizeWindowsPath(inputPath: string, projectRoot?: string): N
   return {
     nativePath,
     canonicalPath: canonical,
-    relativePath,
-    projectRoot: normalizedRoot
+    ...(relativePath !== undefined ? { relativePath } : {}),
+    ...(normalizedRoot !== undefined ? { projectRoot: normalizedRoot } : {})
   };
 }
 

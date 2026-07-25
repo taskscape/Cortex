@@ -10,7 +10,21 @@ export interface WorkspaceRoot {
 
 export interface WorkspaceConfig {
   roots: WorkspaceRoot[];
-  excludedPatterns: string[];
+  /**
+   * Indexing-only noise filters (build output, vendor trees). Deliberately NOT an access-control
+   * boundary: the shipped patterns are .NET/Node build-artefact filters (`**\packages\**`,
+   * `**\dist\**`, `**\bin\**`), so enforcing them in the broker would make ordinary source
+   * unreadable. What gates broker access is {@link evaluateAccess} — roots, mode, and
+   * `deniedPathFragments`.
+   */
+  indexExcludedPatterns?: string[];
+  /** Former name for {@link indexExcludedPatterns}. Still honoured so existing configs keep working. */
+  excludedPatterns?: string[];
+}
+
+/** The indexing exclusions in force, tolerating the pre-rename config key. */
+export function indexExclusions(config: WorkspaceConfig): string[] {
+  return config.indexExcludedPatterns ?? config.excludedPatterns ?? [];
 }
 
 export interface SecurityPolicy {

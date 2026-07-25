@@ -1,17 +1,20 @@
 import { createHash } from "node:crypto";
 import type { KnowledgeEntry } from "./types.js";
 
+// Every optional here is defaulted by makeKnowledgeEntry, so an explicit `undefined` is a valid way
+// to say "absent" — callers extract these from untyped payloads where undefined is the natural miss.
+// Spelled `?: T | undefined` rather than `?: T` so those call sites need no conditional spreads.
 export interface EntryInput {
-  id?: string;
+  id?: string | undefined;
   sourceType: string;
-  sourceUuid?: string;
+  sourceUuid?: string | undefined;
   content: string;
-  summary?: string;
-  entities?: string[];
-  tags?: string[];
-  confidence?: number;
-  createdAt?: string;
-  updatedAt?: string;
+  summary?: string | undefined;
+  entities?: string[] | undefined;
+  tags?: string[] | undefined;
+  confidence?: number | undefined;
+  createdAt?: string | undefined;
+  updatedAt?: string | undefined;
 }
 
 export function hashText(text: string): string {

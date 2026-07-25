@@ -25,7 +25,7 @@ export async function writeTextFile(targetPath: string, content: string, backupR
 
   return {
     path: targetPath,
-    backupPath,
+    ...(backupPath !== undefined ? { backupPath } : {}),
     diff: createUnifiedDiff(targetPath, before, content)
   };
 }

@@ -12,13 +12,21 @@ Each issue states the problem, the evidence, why it matters, and a proposed fix.
 that have since been addressed carry a **Resolution** note recording what changed and what
 was deliberately left out.
 
-**Status: 2 of 23 fixed, 1 partial** (as of `c315f8c`, suite 22/22).
+**Status: 6 of 23 fixed, 1 partial** (suite 26/26).
 
 | | Issues |
 |---|---|
-| Fixed | [#1](#1-file-index-index-accepts-an-arbitrary-root-with-no-allowlist) (arbitrary index root), [#16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) (duplicated path normalisation) |
+| Fixed | [#1](#1-file-index-index-accepts-an-arbitrary-root-with-no-allowlist) (arbitrary index root), [#10](#10-file-broker-declares-excludedpatterns-but-never-enforces-them) (unenforced exclusions), [#12](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one) (indexer walk), [#16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) (duplicated path normalisation), [#19](#19-typescript-strictness-is-split-between-the-two-halves-of-the-repo) (TypeScript strictness), [#21](#21-secret-detection-discards-whole-files-on-broad-heuristics) (secret detection) |
 | Partial | [#11](#11-path-canonicalisation-does-not-resolve-symlinks) (symlink resolution — file-index done, file-broker outstanding) |
 | Highest-severity open | [#2](#2-three-local-services-bind-all-interfaces-with-no-authentication) (unauthenticated listeners on all interfaces) |
+
+> **Found while fixing #12, and worse than the issue as written:** the exclusion patterns in
+> `workspaces.json` **never matched anything at all**. minimatch treats `\` as an escape
+> character, not a path separator, so every Windows-style pattern (`**\node_modules\**`,
+> `**\.git\**`, …) silently matched nothing — `node_modules`, `.git`, `dist` and `build` were
+> being indexed in full, and their contents were searchable. This was a live defect for the
+> whole life of the feature, not the performance problem #12 described. Fixed and covered by
+> a regression test; see [#12's Resolution](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one).
 
 ---
 
@@ -35,18 +43,18 @@ was deliberately left out.
 | [7](#7-the-bash-tool-leaks-child-processes-and-can-double-finalise) | Medium | Open | The `bash` tool leaks child processes and can double-finalise |
 | [8](#8-workspace-rag-writes-its-index-non-atomically-and-silently-resets-on-corruption) | Medium | Open | `workspace-rag` writes non-atomically and silently resets on corruption |
 | [9](#9-front-end-loads-unpinned-third-party-scripts-from-a-cdn) | Medium | Open | Front end loads unpinned third-party scripts from a CDN |
-| [10](#10-file-broker-declares-excludedpatterns-but-never-enforces-them) | Medium | Open | `file-broker` declares `excludedPatterns` but never enforces them |
+| [10](#10-file-broker-declares-excludedpatterns-but-never-enforces-them) | Medium | **Fixed** | `file-broker` declares `excludedPatterns` but never enforces them |
 | [11](#11-path-canonicalisation-does-not-resolve-symlinks) | Medium | **Partial** | Path canonicalisation does not resolve symlinks |
-| [12](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one) | Medium | Open | The indexer walks into excluded directories and aborts on one unreadable one |
+| [12](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one) | Medium | **Fixed** | The indexer walks into excluded directories and aborts on one unreadable one |
 | [13](#13-indexing-a-second-root-discards-the-first-roots-skip-list) | Low | Open | Indexing a second root discards the first root's skip list |
 | [14](#14-appjs-is-a-5618-line-flat-script-with-ten-duplicated-listdetail-panels) | Refactor | Open | `app.js` is a 5,618-line flat script with ten duplicated list/detail panels |
 | [15](#15-spawnandstream-is-duplicated-across-bash-and-powershell-and-has-diverged) | Refactor | Open | `spawnAndStream` is duplicated across `bash`/`powershell` and has diverged |
 | [16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) | Refactor | **Fixed** | Path normalisation is duplicated across `file-broker` and `file-index` |
 | [17](#17-readjson-is-duplicated-inside-the-workspace-rag-package) | Refactor | Open | `readJson` is duplicated inside the `workspace-rag` package |
 | [18](#18-registry-lookups-use-as-never-casts-that-defeat-the-typed-service-registry) | Refactor | Open | Registry lookups use `as never` casts that defeat the typed service registry |
-| [19](#19-typescript-strictness-is-split-between-the-two-halves-of-the-repo) | Refactor | Open | TypeScript strictness is split between the two halves of the repo |
+| [19](#19-typescript-strictness-is-split-between-the-two-halves-of-the-repo) | Refactor | **Fixed** | TypeScript strictness is split between the two halves of the repo |
 | [20](#20-dead-code-commented-out-routes-and-redundant-version-bumps) | Cleanup | Open | Dead code — commented-out routes and redundant version bumps |
-| [21](#21-secret-detection-discards-whole-files-on-broad-heuristics) | Quality | Open | Secret detection discards whole files on broad heuristics |
+| [21](#21-secret-detection-discards-whole-files-on-broad-heuristics) | Quality | **Fixed** | Secret detection discards whole files on broad heuristics |
 | [22](#22-index-search-ranks-by-term-presence-and-over-weights-path-matches) | Quality | Open | Index search ranks by term presence and over-weights path matches |
 | [23](#23-no-unit-coverage-for-the-http-surface-of-the-web-server) | Quality | Open | No unit coverage for the HTTP surface of the web server |
 
@@ -620,12 +628,35 @@ in issue #16 so there is exactly one implementation. If the exclusions are genui
 meant to be indexing-only, rename the field to `indexExcludedPatterns` so the narrower
 scope is visible in the config.
 
-> **Since `c315f8c`:** unchanged, but the prerequisite is now in place. `evaluateAccess`
-> lives in `@local-agent/paths`, so enforcing the patterns is a local edit there plus
-> moving `isExcluded` alongside it — no new package needed. Note the gap widened in one
-> direction: `file-index` now enforces `evaluateAccess` per file (issue #1), so the two
-> services agree on *denied fragments* and *high-risk extensions* while still disagreeing
-> on *excluded patterns*.
+### Resolution — FIXED, but by scoping rather than enforcement
+
+**The proposed fix above was not applied, and should not be.** Enforcing these patterns in
+`evaluateAccess` would have been a functional regression, not a hardening.
+
+Look at what the patterns actually are: `**\node_modules\**`, `**\bin\**`, `**\obj\**`,
+`**\.vs\**`, `**\packages\**`, `**\dist\**`, `**\build\**`, `**\*.dll`, `**\*.pdb`. That is
+a .NET/Node **build-artefact filter**, not a security boundary. Using it as an access-control
+list is a category error, and the damage is concrete: `**\packages\**` would make
+`local-agent/matbot/packages/**` — the entire matbot runtime source — unreadable through the
+broker, in a repo that lives under the configured `C:\Projects` root. `**\dist\**` would block
+writing build output.
+
+So the defect (two services silently disagreeing about one config field) is resolved by making
+the field say what it means, which is the alternative this issue already proposed:
+
+| Change | Effect |
+|---|---|
+| `excludedPatterns` → `indexExcludedPatterns` in `workspaces.json` and `WorkspaceConfig` | The name now states the scope. The two services no longer *appear* to share a boundary they never shared. |
+| `indexExclusions(config)` helper in `@local-agent/paths` | Reads the new key, falls back to the old one, so configs written before the rename keep working. Covered by a test. |
+| `\.git\` added to `deniedPathFragments` | Closes the **actual** security gap this issue identified — a write into `.git/hooks/` is a code-execution primitive. It now sits where security rules belong, enforced by both services, rather than riding on an indexing filter. |
+
+Verified against the shipped config: a write to `.git\hooks\pre-commit` is denied
+(`Denied path fragment matched: \.git\`), `README.md` still writable, and `node_modules`
+remains writable — deliberately, since that is an indexing concern, not an access one.
+
+`isExcluded` did not move to `@local-agent/paths` after all. With enforcement out of the
+broker it still has exactly one consumer, so it moved to `file-index/src/exclusions.ts`
+instead — extracted for testability, not shared.
 
 ---
 
@@ -730,12 +761,48 @@ Note `walk` also treats a directory symlink as a file (`entry.isDirectory()` is 
 a symlink), yielding it and letting the later `fs.stat` filter it out — correct by
 accident, and worth a comment so it is not "fixed" into an infinite loop later.
 
-> **Since `c315f8c`:** that last point is done — `walk` now documents the symlink behaviour
-> as load-bearing, because issue #1's root authorisation depends on it (a followed junction
-> would escape the authorised subtree mid-walk). **(a)** and **(b)** are unchanged and still
-> the substance of this issue. One knock-on: `evaluateAccess` now runs per file, so an
-> excluded `node_modules` tree costs a policy call per file on top of the `minimatch` —
-> the directory-level pruning in (a) is worth marginally more than it was.
+### Resolution — FIXED, plus a defect this issue understated
+
+**(c) The patterns never matched anything.** Writing the pruning test surfaced that
+`isExcluded` was inert. minimatch treats `\` as an **escape character**, not a path separator,
+so `**\node_modules\**` parsed as the literal `**node_modules**` and matched nothing — while
+`isExcluded` helpfully normalised paths *to* backslashes first, guaranteeing the mismatch:
+
+```ts
+const normalized = relativePath.replace(/\//g, "\\");            // → backslashes
+return patterns.some(p => minimatch(normalized, p, { nocase: true }));   // → never matches
+```
+
+Every configured exclusion was dead. `node_modules`, `.git`, `dist` and `build` were indexed
+in full and their contents were searchable — including `.git` internals, which is a rather
+more interesting disclosure than build noise. This was never a performance issue; it was a
+correctness one that happened to also cost time.
+
+Fixed with `windowsPathsNoEscape: true`, which makes `\` a separator — the meaning the config
+always intended. Confirmed against the shipped patterns: previously all `false`, now
+`node_modules\pkg\a.js`, `Cortex\.git\config` and `Cortex\dist\out.js` all match while
+`Cortex\src\app.ts` does not.
+
+**(a) Directory pruning** — `walk` now prunes before descending, so an excluded subtree is
+never entered. The predicate is separate (`isExcludedDirectory`) because `**\node_modules\**`
+does not match the bare directory `node_modules`; it probes a synthetic direct child.
+minimatch's `partial: true` looked like the right tool and is not — a leading `**` makes it
+match every prefix, so it would have pruned `src` and `source` too. The test asserts
+`source` and `distribution` survive.
+
+**(b) Unreadable directories** — `readdir` is wrapped; a failure records
+`unreadable-directory: <code>` in `skipped` and the walk continues, so one `EPERM` no longer
+discards an entire run's work.
+
+**Symlinks** — `walk`'s non-following of directory links is now documented as load-bearing
+rather than incidental, since issue #1's root authorisation depends on it.
+
+All four covered by tests, including that pruning does not over-match similarly-named
+directories.
+
+> **Note for operators:** because the exclusions were inert, any existing `index.json`
+> contains `node_modules`, `.git` and build output. Reindexing is what removes them — the
+> fix does not retroactively prune the stored chunks.
 
 **Proposed fix.** Prune at the directory level and tolerate per-directory failures:
 
@@ -954,9 +1021,10 @@ Two deliberate carve-outs:
 
 - **The package name now undersells its contents.** It carries the policy engine as well as
   path primitives; `@local-agent/workspace-policy` would be more honest if a rename is wanted.
-- **`isExcluded` was left in `file-index/src/indexer.ts`** rather than moved, because it
-  still has exactly one consumer — moving it now would be the speculative abstraction
-  `CLAUDE.md` warns against. It moves when issue #10 gives it a second.
+- **`isExcluded` was not moved into the package.** It has since been extracted to
+  `file-index/src/exclusions.ts` for testability, but stays in `file-index`: issue #10 was
+  resolved by scoping the exclusions to indexing rather than enforcing them in the broker, so
+  it never gained the second consumer that would justify sharing it.
 
 The original finding, for reference. **The paths below no longer exist** — they describe the
 state at review time, before the extraction:
@@ -1116,13 +1184,29 @@ left to discipline.
 These are the packages handling untrusted paths — the weaker settings are inverted
 relative to risk.
 
-> **Since `c315f8c`:** unchanged, and now slightly worse in principle. The new
-> `@local-agent/paths` package extends the same weak root config, so the containment
-> predicate that authorises index roots — the single most security-sensitive function in
-> the `local-agent/*` half — is compiled without `noUncheckedIndexedAccess` or
-> `exactOptionalPropertyTypes`. The two examples above both now live in code that issue #1
-> introduced or moved, so aligning the config is a smaller job than it was: the fallout is
-> concentrated in one package.
+### Resolution — FIXED
+
+`tsconfig.base.json` now sets `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, and
+`verbatimModuleSyntax`, matching the matbot half and the constraint `CLAUDE.md` states.
+`skipLibCheck: true` and `target: ES2022` were left as they are — the first is noise control,
+the second is a runtime-support choice, and neither catches defects.
+
+**The fallout was wider than this issue estimated.** I predicted it would concentrate in one
+package; it was 17 errors across six: `paths`, `file-broker`, `file-index`, `expert-panel`,
+`file-broker-client`, and `hybrid-knowledge-index`. Every one was `exactOptionalPropertyTypes`
+— `noUncheckedIndexedAccess` and `verbatimModuleSyntax` passed immediately, so the existing
+code was already disciplined about indexing and type-only imports.
+
+Fixed with the conditional-spread idiom `CLAUDE.md` prescribes, with two deliberate
+exceptions where a spread would have obscured the contract rather than clarified it:
+
+- `EntryInput` (`hybrid-knowledge-index`) declares its optionals `?: T | undefined`. Every
+  field is defaulted by `makeKnowledgeEntry`, and callers extract them from untyped payloads
+  where `undefined` is the natural miss — seven conditional spreads would have hidden that.
+- `FileBrokerClient`'s two private request-option types likewise, being internal plumbing that
+  forwards an optional `signal` straight through.
+
+No behaviour changed; this was a type-level pass only, and the suite confirms it.
 
 **Proposed fix.** Align the root config, then fix the fallout in one pass:
 
@@ -1221,13 +1305,33 @@ positive rate, whole-file blast radius, invisible effect.
 4. Keep the `sk-` and `PRIVATE KEY` patterns as whole-file exclusions — those are
    high-precision and the conservative behaviour is right for them.
 
-> **Since `c315f8c`:** unchanged, but no longer load-bearing for the highest-risk files.
-> `evaluateAccess` now excludes high-risk extensions (`.env`, `.pem`, `.key`) by extension
-> before content is ever read, so those no longer depend on this heuristic catching them —
-> which it did not, for `TOKEN=` and `DATABASE_URL=` shapes. `looksLikeSecret` is now
-> explicitly a content backstop for ordinary files, and the false-positive problem described
-> above is the whole of what remains. That makes the "redact the chunk, don't drop the file"
-> fix strictly safer to apply than it was at review time.
+### Resolution — FIXED
+
+Moved to `file-index/src/secrets.ts` and split by precision, which is what the whole-file
+blast radius was really about:
+
+- **`fileLevelSecret`** keeps `sk-…` and `-----BEGIN … PRIVATE KEY-----` as whole-file
+  exclusions. High precision, conservative behaviour is right, and the skip reason now names
+  which shape matched (`possible-secret: private-key-block`) instead of a bare
+  `possible-secret`.
+- **`redactSecrets`** handles the low-precision assignment patterns. A credential-shaped value
+  is replaced with `[redacted]` and the rest of the chunk stays searchable. A value must be
+  ≥12 characters of unbroken token characters and not a recognised placeholder
+  (`REPLACE_ME`, `your-…`, `${…}`, `<…>`, `xxx`, bare type names) before anything is withheld.
+- **Reported.** Chunks carry a `redactions` count, surfaced in `/search` result metadata, so a
+  gap in the text is explainable rather than invisible.
+
+The two false positives from the original finding are now covered by tests and pass through
+untouched: `interface Config { password: string }` (value `string` — too short, and a bare
+type name) and `apiKey: "REPLACE_ME"` (placeholder). Both files stay fully searchable, where
+previously each was dropped from the index entirely.
+
+The file hash is still computed over the **original** content, so redaction rules can change
+without invalidating change detection.
+
+This is also no longer the only line of defence for the highest-risk files: since issue #1,
+`.env`/`.pem`/`.key` are excluded by extension before their content is ever read — which
+matters, because these patterns never matched `TOKEN=` or `DATABASE_URL=` shapes.
 
 ---
 
@@ -1314,18 +1418,28 @@ already has; no browser required.
 
 Grouped so related fixes land together and each group leaves the tree green.
 
-**Done (`c315f8c`):** #1 (arbitrary index root), #16 (shared path package), #11 for
-file-index only. This was the first half of the original group 1.
+**Done:** #1 (arbitrary index root), #16 (shared path package), #10 (exclusion scope + `.git`
+deny), #12 (indexer walk, including the inert-pattern defect), #19 (TypeScript strictness),
+#21 (secret redaction), and #11 for file-index only. That clears the whole of the original
+group 5 except the broker half of #11.
 
 | Order | Group | Issues | Rationale |
 |---|---|---|---|
-| 1 | Close the network exposure | #2 | Now the highest-severity open item, and the one that made #1 remotely reachable. Small diff, independent of everything else. |
+| 1 | Close the network exposure | #2 | The highest-severity open item, and the one that made #1 remotely reachable. Small diff, independent of everything else. |
 | 2 | Contain untrusted content | #3, #9 | Vendoring the assets unblocks the CSP; do them together. |
 | 3 | Lock down tool execution | #4, #7, #15 | The `spawnAndStream` extraction fixes #7 as a side effect. |
 | 4 | Correctness in persistence | #5, #8, #13 | CAS and atomic writes; both have in-repo reference implementations. |
-| 5 | Finish the shared path package | #11 (broker half), #10, #12, #19 | The package exists; what remains is migrating `file-broker` to the real-path predicate, enforcing exclusions, pruning the walk, and raising strictness. All four now touch one package. |
+| 5 | Finish the symlink fix | #11 (broker half) | All that remains of the path work: make `evaluateAccess` async and await at its three call sites, so the broker resolves links the way the indexer now does. |
 | 6 | Front-end structure | #14 | Largest effort; run the Playwright suite after each panel extraction. |
-| 7 | Polish | #6, #17, #18, #20, #21, #22, #23 | Independent; #23 is worth pulling earlier if #14 is scheduled. |
+| 7 | Polish | #6, #17, #18, #20, #22, #23 | Independent; #23 is worth pulling earlier if #14 is scheduled. |
+
+**Operational tasks, not code changes.** Both concern the existing
+`local-agent/file-index/data/index.json`, and both are fixed by deleting it and reindexing:
+
+1. If `/index` was ever pointed at a sensitive tree, those chunks are still served by `/search`
+   (issue #1 stops new leaks; it does not retract stored ones).
+2. Because the exclusion patterns were inert (issue #12), any existing store contains
+   `node_modules`, `.git` and build output.
 
 **One operational task is not a code change and is still outstanding:** purge
 `local-agent/file-index/data/index.json` on any machine whose `/index` may have been

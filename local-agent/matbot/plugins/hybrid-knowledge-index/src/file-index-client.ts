@@ -21,7 +21,7 @@ export class LocalFileIndexClient {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query, limit: 10 }),
-      signal
+      ...(signal !== undefined ? { signal } : {})
     });
 
     if (!response.ok) {

@@ -33,7 +33,7 @@ export class Mem0Client {
     await this.request(["/memories", "/v1/memories"], {
       method: "POST",
       body: JSON.stringify(payload),
-      signal
+      ...(signal !== undefined ? { signal } : {})
     });
   }
 
@@ -47,7 +47,7 @@ export class Mem0Client {
     const data = await this.request(["/search", "/v1/memories/search"], {
       method: "POST",
       body: JSON.stringify(payload),
-      signal
+      ...(signal !== undefined ? { signal } : {})
     });
 
     const rows = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];

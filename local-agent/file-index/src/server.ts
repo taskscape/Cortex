@@ -1,7 +1,7 @@
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
-import { loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
+import { indexExclusions, loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
 import { resolveIndexRoot } from "./index-root.js";
 import { indexRoot, summarize } from "./indexer.js";
 import { searchChunks } from "./search.js";
@@ -36,7 +36,7 @@ const server = http.createServer(async (request, response) => {
 
       const next = await enqueueIndex(async current => indexRoot({
           root,
-          excludedPatterns: config.excludedPatterns,
+          indexExcludedPatterns: indexExclusions(config),
           maxFileBytes: Number(process.env.FILE_INDEX_MAX_FILE_BYTES ?? 1_000_000),
           workspaces: config,
           policy,

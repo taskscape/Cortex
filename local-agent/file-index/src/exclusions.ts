@@ -1,0 +1,25 @@
+import path from "node:path";
+import { minimatch } from "minimatch";
+
+// The configured patterns are Windows-style (`**\node_modules\**`). minimatch treats `\` as an ESCAPE
+// character, not a separator, so those patterns silently matched nothing at all until this option was
+// passed — node_modules, .git, dist and build were being indexed in full. `windowsPathsNoEscape` makes
+// `\` a separator, which is what the config has always meant.
+const MATCH_OPTIONS = { nocase: true, windowsPathsNoEscape: true } as const;
+
+export function isExcluded(relativePath: string, patterns: readonly string[]): boolean {
+  const normalized = relativePath.replace(/\//g, "\\");
+  return patterns.some(pattern => minimatch(normalized, pattern, MATCH_OPTIONS));
+}
+
+// Whether a directory can be skipped without walking it. A pattern like `**\node_modules\**` does not
+// match the bare directory `node_modules`, so containment is probed with a synthetic direct child:
+// prune only when a plain child of any name would be excluded.
+//
+// Deliberately conservative. minimatch's `partial` option is not usable here — a leading `**` makes it
+// match every prefix, which would prune `src` and `source` too. Under-pruning only costs a walk (the
+// per-file check still excludes the contents); over-pruning would silently drop real files.
+export function isExcludedDirectory(relativePath: string, patterns: readonly string[]): boolean {
+  const probe = path.join(relativePath.replace(/\//g, "\\"), "__probe__");
+  return patterns.some(pattern => minimatch(probe, pattern, MATCH_OPTIONS));
+}

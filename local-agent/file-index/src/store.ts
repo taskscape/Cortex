@@ -13,6 +13,8 @@ export interface IndexedChunk {
   size: number;
   chunkIndex: number;
   content: string;
+  /** Number of credential-shaped values replaced with `[redacted]` in this chunk. Absent when none. */
+  redactions?: number;
 }
 
 export interface IndexStore {

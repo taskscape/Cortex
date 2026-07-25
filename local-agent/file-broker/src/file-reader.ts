@@ -32,7 +32,7 @@ export async function listDirectory(directoryPath: string): Promise<Array<{ name
       name: entry.name,
       path: fullPath,
       type: entry.isDirectory() ? "directory" : "file",
-      size
+      ...(size !== undefined ? { size } : {})
     };
   });
 }

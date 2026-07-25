@@ -1,14 +1,17 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { minimatch } from "minimatch";
 import { evaluateAccess, normalizeWindowsPath, type SecurityPolicy, type WorkspaceConfig } from "@local-agent/paths";
+import { isExcluded, isExcludedDirectory } from "./exclusions.js";
 import { chunkText, extractText, isIndexableTextFile } from "./extract.js";
+import { fileLevelSecret, redactSecrets } from "./secrets.js";
 import type { IndexedChunk, IndexStore } from "./store.js";
 
 export interface IndexOptions {
   root: string;
-  excludedPatterns: string[];
+  // Indexing-only noise filters (build output, vendor trees). Not an access-control boundary —
+  // the broker deliberately does not apply these; see evaluateAccess for what actually gates reads.
+  indexExcludedPatterns: string[];
   maxFileBytes: number;
   // Indexing a file is a read, and it is served back through /search, so it clears the same bar as
   // GET /read on the broker: one deny policy, enforced in both services.
@@ -36,11 +39,11 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
     existingByPath.set(chunk.canonicalPath, chunks);
   }
 
-  for await (const filePath of walk(root)) {
+  for await (const filePath of walk(root, root, options.indexExcludedPatterns, skipped)) {
     options.signal?.throwIfAborted();
     const relative = path.relative(root, filePath);
 
-    if (isExcluded(relative, options.excludedPatterns)) {
+    if (isExcluded(relative, options.indexExcludedPatterns)) {
       skipped.push({ path: filePath, reason: "excluded-pattern" });
       continue;
     }
@@ -54,7 +57,7 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
 
     // High-risk files (.env, .pem, .key, ...) are readable through the broker only behind an explicit
     // approval. Nothing approves an index run, and a chunk in the store is readable by anyone who can
-    // reach /search — so they are never indexed. `looksLikeSecret` below is a content backstop for
+    // reach /search — so they are never indexed. The redaction pass below is a content backstop for
     // ordinary files, not a substitute for this: it misses `TOKEN=...` shapes entirely.
     if (decision.highRisk) {
       skipped.push({ path: filePath, reason: "high-risk-file" });
@@ -91,28 +94,35 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
 
     const content = await extractText(filePath, options.maxFileBytes);
 
-    if (looksLikeSecret(content)) {
-      skipped.push({ path: filePath, reason: "possible-secret" });
+    const secret = fileLevelSecret(content);
+    if (secret !== undefined) {
+      skipped.push({ path: filePath, reason: `possible-secret: ${secret}` });
       continue;
     }
 
+    // Hash the original content: this drives change detection, so it must not shift when redaction
+    // rules change.
     const hash = crypto.createHash("sha256").update(content).digest("hex");
     const chunks = chunkText(content);
 
     nextChunks.push(
-      ...chunks.map((chunk, chunkIndex) => ({
-        id: `${normalized.canonicalPath}:${chunkIndex}`,
-        path: normalized.nativePath,
-        canonicalPath: normalized.canonicalPath,
-        relativePath: normalized.relativePath,
-        projectRoot: normalized.projectRoot,
-        extension: path.extname(filePath).toLowerCase(),
-        fileHash: hash,
-        modifiedTime: stats.mtime.toISOString(),
-        size: stats.size,
-        chunkIndex,
-        content: chunk
-      }))
+      ...chunks.map((chunk, chunkIndex) => {
+        const { text, redactions } = redactSecrets(chunk);
+        return {
+          id: `${normalized.canonicalPath}:${chunkIndex}`,
+          path: normalized.nativePath,
+          canonicalPath: normalized.canonicalPath,
+          ...(normalized.relativePath !== undefined ? { relativePath: normalized.relativePath } : {}),
+          ...(normalized.projectRoot !== undefined ? { projectRoot: normalized.projectRoot } : {}),
+          extension: path.extname(filePath).toLowerCase(),
+          fileHash: hash,
+          modifiedTime: stats.mtime.toISOString(),
+          size: stats.size,
+          chunkIndex,
+          content: text,
+          ...(redactions > 0 ? { redactions } : {})
+        };
+      })
     );
   }
 
@@ -141,37 +151,42 @@ export function summarize(store: IndexStore): IndexSummary {
   };
 }
 
-async function* walk(root: string): AsyncGenerator<string> {
-  const entries = await fs.readdir(root, { withFileTypes: true });
+async function* walk(
+  dir: string,
+  base: string,
+  excluded: string[],
+  skipped: IndexStore["skipped"],
+): AsyncGenerator<string> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    // One unreadable directory (EPERM on a protected folder, EBUSY on a locked build output) used to
+    // reject out of the generator and fail the whole run, persisting nothing. Record it and carry on:
+    // a partial index that reports its gaps beats no index at all.
+    skipped.push({ path: dir, reason: `unreadable-directory: ${(error as NodeJS.ErrnoException).code ?? String(error)}` });
+    return;
+  }
 
   for (const entry of entries) {
-    const fullPath = path.join(root, entry.name);
+    const fullPath = path.join(dir, entry.name);
 
     // `isDirectory()` is false for a symlink or junction (readdir does not follow links), so a linked
     // directory falls through to `yield` and is then dropped by the `stats.isFile()` check in the
     // caller. That is load-bearing, not incidental: it keeps the walk inside the real subtree of the
     // root that resolveIndexRoot authorised. Do not "fix" it into following links.
     if (entry.isDirectory()) {
-      yield* walk(fullPath);
+      // Prune before descending. Matching per file meant walking every node_modules tree in full to
+      // discard it a file at a time — the dominant cost of a run over a broad root.
+      if (isExcludedDirectory(path.relative(base, fullPath), excluded)) {
+        skipped.push({ path: fullPath, reason: "excluded-pattern" });
+        continue;
+      }
+
+      yield* walk(fullPath, base, excluded, skipped);
       continue;
     }
 
     yield fullPath;
   }
-}
-
-function isExcluded(relativePath: string, patterns: string[]): boolean {
-  const normalized = relativePath.replace(/\//g, "\\");
-  return patterns.some(pattern => minimatch(normalized, pattern, { nocase: true }));
-}
-
-function looksLikeSecret(content: string): boolean {
-  const patterns = [
-    /sk-[A-Za-z0-9_-]{20,}/,
-    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-    /password\s*[:=]\s*["']?[^"'\s]+/i,
-    /api[_-]?key\s*[:=]\s*["']?[^"'\s]+/i
-  ];
-
-  return patterns.some(pattern => pattern.test(content));
 }

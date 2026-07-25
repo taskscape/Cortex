@@ -10,6 +10,8 @@ export interface SearchResult {
     modifiedTime: string;
     chunkIndex: number;
     size: number;
+    /** Present when values were withheld from this chunk, so a gap in the text is explainable. */
+    redactions?: number;
   };
 }
 
@@ -59,14 +61,15 @@ function scoreChunk(chunk: IndexedChunk, terms: string[]): SearchResult | undefi
 
   return {
     path: chunk.path,
-    relativePath: chunk.relativePath,
+    ...(chunk.relativePath !== undefined ? { relativePath: chunk.relativePath } : {}),
     score,
     snippet: makeSnippet(chunk.content, terms),
     metadata: {
       extension: chunk.extension,
       modifiedTime: chunk.modifiedTime,
       chunkIndex: chunk.chunkIndex,
-      size: chunk.size
+      size: chunk.size,
+      ...(chunk.redactions !== undefined ? { redactions: chunk.redactions } : {})
     }
   };
 }

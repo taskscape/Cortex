@@ -133,7 +133,7 @@ file-index and file-broker:
       "type": "documents"
     }
   ],
-  "excludedPatterns": [
+  "indexExcludedPatterns": [
     "**\\node_modules\\**",
     "**\\.git\\**",
     "**\\dist\\**"
@@ -143,6 +143,12 @@ file-index and file-broker:
 
 `mode` is `read-write` or `read-only`. File-broker writes are allowed only inside
 read-write roots and still pass security checks.
+
+`indexExcludedPatterns` filters what the **file index** walks and stores. It is not an
+access-control boundary: the shipped patterns are build-artefact filters, so applying them
+to file-broker reads would hide ordinary source. What gates broker access is the root list,
+each root's `mode`, and `deniedPathFragments` in the security policy. The field was formerly
+named `excludedPatterns`; that name is still read, so existing configuration keeps working.
 
 `local-agent\config\security-policy.json` blocks sensitive paths, marks high-risk
 extensions, caps reads with `maxReadBytes`, and stores backups under

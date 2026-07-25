@@ -48,7 +48,7 @@ class ExpertPanel {
   private readonly services: MatbotMachine;
   private readonly experts: ExpertRuntime[];
   private readonly reviews: Store<ExpertReviewRecord>;
-  private readonly defaultProvider?: string;
+  private readonly defaultProvider: string | undefined;
 
   constructor(
     services: MatbotMachine,
@@ -378,18 +378,18 @@ function parseInput(input: unknown): ExpertPanelInput & { mode: "parallel" | "re
 
   return {
     action,
-    question: typeof value.question === "string" ? value.question.trim() : undefined,
-    experts,
+    ...(typeof value.question === "string" ? { question: value.question.trim() } : {}),
+    ...(experts !== undefined ? { experts } : {}),
     mode,
     reviewMode,
     targetType,
-    targetId: typeof value.targetId === "string" ? value.targetId : undefined,
-    workflowId: typeof value.workflowId === "string" ? value.workflowId : undefined,
-    workflowRunId: typeof value.workflowRunId === "string" ? value.workflowRunId : undefined,
-    dossierId: typeof value.dossierId === "string" ? value.dossierId : undefined,
-    reviewId: typeof value.reviewId === "string" ? value.reviewId : undefined,
-    query: typeof value.query === "object" && value.query !== null ? value.query as StoreQuery : undefined,
-    maxCitationsPerExpert: typeof value.maxCitationsPerExpert === "number" ? value.maxCitationsPerExpert : undefined,
+    ...(typeof value.targetId === "string" ? { targetId: value.targetId } : {}),
+    ...(typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {}),
+    ...(typeof value.workflowRunId === "string" ? { workflowRunId: value.workflowRunId } : {}),
+    ...(typeof value.dossierId === "string" ? { dossierId: value.dossierId } : {}),
+    ...(typeof value.reviewId === "string" ? { reviewId: value.reviewId } : {}),
+    ...(typeof value.query === "object" && value.query !== null ? { query: value.query as StoreQuery } : {}),
+    ...(typeof value.maxCitationsPerExpert === "number" ? { maxCitationsPerExpert: value.maxCitationsPerExpert } : {}),
     synthesize: typeof value.synthesize === "boolean" ? value.synthesize : true
   };
 }
