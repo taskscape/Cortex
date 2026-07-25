@@ -4,7 +4,7 @@ import { watchPlugins }                      from '@matatbread/matbot-core';
 // Type import also brings the `SkillManager` augmentation of MatbotMachine into scope.
 import type { SkillManager }                 from '@matatbread/matbot-skills';
 import { createWebServer, defaultWebPrincipal } from './server.js';
-import type { WorkspaceManager, WorkspaceRagManager } from './server.js';
+import type { WorkspaceManager, WorkspaceRagManager, SessionTitler } from './server.js';
 import process                               from 'node:process';
 
 let webServer: Awaited<ReturnType<typeof createWebServer>> | undefined;
@@ -75,6 +75,7 @@ export const plugin: MatbotPluginSpec = {
       // so a snapshot would capture undefined forever (services.SkillManager is a live registry getter).
       skills:        () => services.SkillManager,
       workspaceRagManager: () => services.get?.('WorkspaceRagManager' as never) as WorkspaceRagManager | undefined,
+      sessionTitler:       () => services.get?.('SessionTitler' as never) as SessionTitler | undefined,
       // Look up the resolver per request so an override registered in any load order takes effect.
       resolvePrincipal: (req) => (services.WebPrincipalResolver ?? defaultWebPrincipal)(req),
       ...(services.workdir    !== undefined ? { workdir:    services.workdir    } : {}),

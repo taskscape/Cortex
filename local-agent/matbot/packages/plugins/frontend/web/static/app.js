@@ -3298,6 +3298,9 @@ async function runExpertPanelFromUi() {
   } finally {
     expertPanelBusy = false;
     updateExpertControlsState();
+    // This flow consumes the HTTP response directly rather than the stream's `done` event, so it never
+    // reaches the refresh wired in there. The server titles this session out of band too — same hook.
+    refreshTitlesAfterFollowup();
   }
 }
 
@@ -3353,6 +3356,30 @@ async function hideSession(id) {
     }
     renderSessions(sessions);
   } catch (e) { alert('Hide failed: ' + e.message); }
+}
+
+// A session title can be written by a `followup` hook, which runs *post-commit* — after the `done`
+// event carrying the session was already emitted. So the title on that event is the pre-hook value and
+// nothing else announces the later write. Re-read the list a moment afterwards so a hook-written title
+// reaches the sidebar and header without a page reload. Two passes: a fast model lands well inside the
+// first, a slow local one inside the second.
+const TITLE_REFRESH_DELAYS_MS = [1500, 5000];
+let titleRefreshTimers = [];
+
+function refreshTitlesAfterFollowup() {
+  // Debounce: keep at most one pending pair of refreshes.
+  for (const t of titleRefreshTimers) clearTimeout(t);
+  titleRefreshTimers = [];
+
+  for (const delay of TITLE_REFRESH_DELAYS_MS) {
+    titleRefreshTimers.push(setTimeout(() => {
+      apiListSessions().then(sessions => {
+        renderSessions(sessions);
+        const current = sessions.find(s => s.id === currentSessionId);
+        if (current?.title && chatHeaderEl) chatTitleEl.textContent = current.title;
+      }).catch(() => {});
+    }, delay));
+  }
 }
 
 async function apiNewSession() {
@@ -4070,10 +4097,20 @@ function showEmpty() {
     '</div>';
 }
 
+// A title is a handful of words, so a hard character cut lands mid-word for no benefit. Trim back to
+// the last word boundary instead, and mark the elision only when something was actually dropped. A
+// single word longer than the budget still has to be cut hard — there is no boundary to fall back to.
+function truncateAtWord(text, max) {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
 function renderSessions(sessions) {
   sessionListEl.innerHTML = '';
   for (const s of sessions) {
-    const label = (s.title || s.preview || s.id.slice(0, 8)).slice(0, 44);
+    const label = truncateAtWord(s.title || s.preview || s.id.slice(0, 8), 44);
     const el = document.createElement('div');
     el.className = 'session-item' +
       (s.id === currentSessionId ? ' active' : '') +
@@ -4817,10 +4854,10 @@ function connectSessionStream(sid) {
 
 // Read the input box and submit it. The single entry point for *typed* messages; canned/programmatic
 // messages (plugin install banners, etc.) call submit() directly so they aren't gated by the input.
-// concat = true (Shift+Enter / send button): fold into the running turn's batch — fastest way to
-// add more context. concat = false (Ctrl+Enter): a distinct queued turn, run in order — use when the
-// next ask depends on this one's tools/state (e.g. install a plugin, then use it).
-async function sendMessage(concat = true) {
+// concat = false (Enter / send button): a distinct queued turn, run in order — use when the next ask
+// depends on this one's tools/state (e.g. install a plugin, then use it). concat = true
+// (Ctrl/Cmd+Enter): fold into the running turn's batch — fastest way to add more context.
+async function sendMessage(concat = false) {
   if (expertEnabledEl?.checked) {
     await runExpertPanelFromUi();
     return;
@@ -5271,6 +5308,7 @@ async function renderTurn(sid, traceId) {
             if (det) det.open = false;
           }
           if (ev.session?.title && chatHeaderEl) chatTitleEl.textContent = ev.session.title;
+          refreshTitlesAfterFollowup();
           appendTurnStats();
           loadFiles();
           // Back-fill origIdx on any dividers added without an index this turn.
@@ -5328,7 +5366,7 @@ async function renderTurn(sid, traceId) {
 sendBtn.onclick = () => {
   if (sendBtn.classList.contains('scroll-down-mode')) scrollToBottomAndReset();
   else if (sending) requestStop();
-  else sendMessage();
+  else sendMessage(false);
 };
 
 document.getElementById('sessions-enable-btn').onclick = () => {
@@ -5337,10 +5375,11 @@ document.getElementById('sessions-enable-btn').onclick = () => {
 
 inputEl.addEventListener('keydown', e => {
   if (e.key !== 'Enter') return;
-  // Ctrl/Cmd+Enter → queued (own turn, run in order). Shift+Enter → concat (fold into the running
-  // batch). Plain Enter keeps the textarea's newline behaviour.
-  if (e.ctrlKey || e.metaKey) { e.preventDefault(); sendMessage(false); }
-  else if (e.shiftKey)        { e.preventDefault(); sendMessage(true); }
+  // Plain Enter → queued (own turn, run in order). Ctrl/Cmd+Enter → concat (fold into the running
+  // batch). Shift+Enter keeps the textarea's newline behaviour.
+  if (e.shiftKey) return;
+  e.preventDefault();
+  sendMessage(e.ctrlKey || e.metaKey);
 });
 
 inputEl.addEventListener('input', () => {

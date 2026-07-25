@@ -28,6 +28,8 @@ export interface WebServerDeps {
   configPath?:    string;
   workspaceManager?: WorkspaceManager;
   workspaceRagManager?: () => WorkspaceRagManager | undefined;
+  /** Resolved per call, like {@link skills} — the titler plugin may load in any order, or not at all. */
+  sessionTitler?: () => SessionTitler | undefined;
   /** Derives the security principal for each request. Defaults to {@link defaultWebPrincipal}. */
   resolvePrincipal?: WebPrincipalResolver;
 }
@@ -39,6 +41,12 @@ export interface WorkspaceSummary {
   createdAt:  string;
   updatedAt:  string;
   active:     boolean;
+}
+
+/** Structural view of the session-titler plugin's service — kept local so frontend-web carries no
+ *  dependency on an optional plugin (same treatment as {@link WorkspaceRagManager}). */
+export interface SessionTitler {
+  titleSession(input: { sessionId: string; provider: string; signal?: AbortSignal }): Promise<string | undefined>;
 }
 
 export interface WorkspaceManager {
@@ -858,6 +866,12 @@ export function createWebServer(deps: WebServerDeps) {
         const usage = expertPanelUsage(result);
         if (usage) sendToSession(sessionId, sseEvent('usage', { type: 'usage', ...usage, traceId }));
         sendToSession(sessionId, sseEvent('done', { type: 'done', session: committed, traceId }));
+
+        // This path commits messages itself instead of going through the pump, so no `followup` hook
+        // runs and nothing would name the session beyond the truncation above. Fire-and-forget, after
+        // `done`, deliberately without `ac.signal` (the finally below aborts it): the client picks the
+        // new title up on its post-`done` refresh, so the response is not held up for a second call.
+        void deps.sessionTitler?.()?.titleSession({ sessionId, provider: body.provider }).catch(() => {});
 
         json(res, 200, {
           traceId,
