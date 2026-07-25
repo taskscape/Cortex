@@ -1,44 +1,54 @@
 # Cortex — Code Review Findings
 
-Review date: 2026-07-25 · Branch `main` @ `00f9f8f` · ~50k LOC across 232 source files.
+Review date: 2026-07-25 · Reviewed at `main` @ `00f9f8f` · ~50k LOC across 232 source files.
 
 Scope: `local-agent/file-index`, `local-agent/file-broker`, `local-agent/http-utils`,
 `local-agent/matbot/packages/**`, `local-agent/matbot/apps/**`, `scripts/`, `tests/`.
 
-Baseline: `npm test` passes (20/20). Every issue below was confirmed by reading the
+At review time `npm test` passed 20/20. Every issue below was confirmed by reading the
 code, not inferred from test failures.
 
-Each issue states the problem, the evidence, why it matters, and a proposed fix.
+Each issue states the problem, the evidence, why it matters, and a proposed fix. Issues
+that have since been addressed carry a **Resolution** note recording what changed and what
+was deliberately left out.
+
+**Status: 2 of 23 fixed, 1 partial** (as of `c315f8c`, suite 22/22).
+
+| | Issues |
+|---|---|
+| Fixed | [#1](#1-file-index-index-accepts-an-arbitrary-root-with-no-allowlist) (arbitrary index root), [#16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) (duplicated path normalisation) |
+| Partial | [#11](#11-path-canonicalisation-does-not-resolve-symlinks) (symlink resolution — file-index done, file-broker outstanding) |
+| Highest-severity open | [#2](#2-three-local-services-bind-all-interfaces-with-no-authentication) (unauthenticated listeners on all interfaces) |
 
 ---
 
 ## Contents
 
-| # | Severity | Issue |
-|---|---|---|
-| [1](#1-file-index-index-accepts-an-arbitrary-root-with-no-allowlist) | ~~Critical~~ **Fixed** | `file-index` `/index` accepts an arbitrary filesystem root |
-| [2](#2-three-local-services-bind-all-interfaces-with-no-authentication) | High | Three local services bind all interfaces with no authentication |
-| [3](#3-stored-xss-markdown-is-rendered-into-innerhtml-unsanitised) | High | Stored XSS — markdown rendered into `innerHTML` unsanitised |
-| [4](#4-shell-tools-inherit-the-full-process-environment-including-api-keys) | High | Shell tools inherit the full process environment, including API keys |
-| [5](#5-workflow-approvals-are-written-without-compare-and-swap) | High | Workflow approvals are written without compare-and-swap |
-| [6](#6-static-route-handlers-are-not-awaited) | Medium | Static route handlers are not awaited |
-| [7](#7-the-bash-tool-leaks-child-processes-and-can-double-finalise) | Medium | The `bash` tool leaks child processes and can double-finalise |
-| [8](#8-workspace-rag-writes-its-index-non-atomically-and-silently-resets-on-corruption) | Medium | `workspace-rag` writes non-atomically and silently resets on corruption |
-| [9](#9-front-end-loads-unpinned-third-party-scripts-from-a-cdn) | Medium | Front end loads unpinned third-party scripts from a CDN |
-| [10](#10-file-broker-declares-excludedpatterns-but-never-enforces-them) | Medium | `file-broker` declares `excludedPatterns` but never enforces them |
-| [11](#11-path-canonicalisation-does-not-resolve-symlinks) | Medium | Path canonicalisation does not resolve symlinks |
-| [12](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one) | Medium | The indexer walks into excluded directories and aborts on one unreadable one |
-| [13](#13-indexing-a-second-root-discards-the-first-roots-skip-list) | Low | Indexing a second root discards the first root's skip list |
-| [14](#14-appjs-is-a-5618-line-flat-script-with-ten-duplicated-listdetail-panels) | Refactor | `app.js` is a 5,618-line flat script with ten duplicated list/detail panels |
-| [15](#15-spawnandstream-is-duplicated-across-bash-and-powershell-and-has-diverged) | Refactor | `spawnAndStream` is duplicated across `bash`/`powershell` and has diverged |
-| [16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) | Refactor | Path normalisation is duplicated across `file-broker` and `file-index` |
-| [17](#17-readjson-is-duplicated-inside-the-workspace-rag-package) | Refactor | `readJson` is duplicated inside the `workspace-rag` package |
-| [18](#18-registry-lookups-use-as-never-casts-that-defeat-the-typed-service-registry) | Refactor | Registry lookups use `as never` casts that defeat the typed service registry |
-| [19](#19-typescript-strictness-is-split-between-the-two-halves-of-the-repo) | Refactor | TypeScript strictness is split between the two halves of the repo |
-| [20](#20-dead-code-commented-out-routes-and-redundant-version-bumps) | Cleanup | Dead code — commented-out routes and redundant version bumps |
-| [21](#21-secret-detection-discards-whole-files-on-broad-heuristics) | Quality | Secret detection discards whole files on broad heuristics |
-| [22](#22-index-search-ranks-by-term-presence-and-over-weights-path-matches) | Quality | Index search ranks by term presence and over-weights path matches |
-| [23](#23-no-unit-coverage-for-the-http-surface-of-the-web-server) | Quality | No unit coverage for the HTTP surface of the web server |
+| # | Severity | Status | Issue |
+|---|---|---|---|
+| [1](#1-file-index-index-accepts-an-arbitrary-root-with-no-allowlist) | Critical | **Fixed** | `file-index` `/index` accepts an arbitrary filesystem root |
+| [2](#2-three-local-services-bind-all-interfaces-with-no-authentication) | High | Open | Three local services bind all interfaces with no authentication |
+| [3](#3-stored-xss-markdown-is-rendered-into-innerhtml-unsanitised) | High | Open | Stored XSS — markdown rendered into `innerHTML` unsanitised |
+| [4](#4-shell-tools-inherit-the-full-process-environment-including-api-keys) | High | Open | Shell tools inherit the full process environment, including API keys |
+| [5](#5-workflow-approvals-are-written-without-compare-and-swap) | High | Open | Workflow approvals are written without compare-and-swap |
+| [6](#6-static-route-handlers-are-not-awaited) | Medium | Open | Static route handlers are not awaited |
+| [7](#7-the-bash-tool-leaks-child-processes-and-can-double-finalise) | Medium | Open | The `bash` tool leaks child processes and can double-finalise |
+| [8](#8-workspace-rag-writes-its-index-non-atomically-and-silently-resets-on-corruption) | Medium | Open | `workspace-rag` writes non-atomically and silently resets on corruption |
+| [9](#9-front-end-loads-unpinned-third-party-scripts-from-a-cdn) | Medium | Open | Front end loads unpinned third-party scripts from a CDN |
+| [10](#10-file-broker-declares-excludedpatterns-but-never-enforces-them) | Medium | Open | `file-broker` declares `excludedPatterns` but never enforces them |
+| [11](#11-path-canonicalisation-does-not-resolve-symlinks) | Medium | **Partial** | Path canonicalisation does not resolve symlinks |
+| [12](#12-the-indexer-walks-into-excluded-directories-and-aborts-on-a-single-unreadable-one) | Medium | Open | The indexer walks into excluded directories and aborts on one unreadable one |
+| [13](#13-indexing-a-second-root-discards-the-first-roots-skip-list) | Low | Open | Indexing a second root discards the first root's skip list |
+| [14](#14-appjs-is-a-5618-line-flat-script-with-ten-duplicated-listdetail-panels) | Refactor | Open | `app.js` is a 5,618-line flat script with ten duplicated list/detail panels |
+| [15](#15-spawnandstream-is-duplicated-across-bash-and-powershell-and-has-diverged) | Refactor | Open | `spawnAndStream` is duplicated across `bash`/`powershell` and has diverged |
+| [16](#16-path-normalisation-is-duplicated-across-file-broker-and-file-index) | Refactor | **Fixed** | Path normalisation is duplicated across `file-broker` and `file-index` |
+| [17](#17-readjson-is-duplicated-inside-the-workspace-rag-package) | Refactor | Open | `readJson` is duplicated inside the `workspace-rag` package |
+| [18](#18-registry-lookups-use-as-never-casts-that-defeat-the-typed-service-registry) | Refactor | Open | Registry lookups use `as never` casts that defeat the typed service registry |
+| [19](#19-typescript-strictness-is-split-between-the-two-halves-of-the-repo) | Refactor | Open | TypeScript strictness is split between the two halves of the repo |
+| [20](#20-dead-code-commented-out-routes-and-redundant-version-bumps) | Cleanup | Open | Dead code — commented-out routes and redundant version bumps |
+| [21](#21-secret-detection-discards-whole-files-on-broad-heuristics) | Quality | Open | Secret detection discards whole files on broad heuristics |
+| [22](#22-index-search-ranks-by-term-presence-and-over-weights-path-matches) | Quality | Open | Index search ranks by term presence and over-weights path matches |
+| [23](#23-no-unit-coverage-for-the-http-surface-of-the-web-server) | Quality | Open | No unit coverage for the HTTP surface of the web server |
 
 ---
 
@@ -46,7 +56,7 @@ Each issue states the problem, the evidence, why it matters, and a proposed fix.
 
 ## 1. `file-index` `/index` accepts an arbitrary root with no allowlist
 
-**Severity: Critical — FIXED** (see [Resolution](#resolution) at the end of this entry)
+**Severity: Critical · Status: FIXED in `c315f8c`** — see the Resolution at the end of this entry.
 
 **Where:** [local-agent/file-index/src/server.ts:31-49](local-agent/file-index/src/server.ts:31)
 
@@ -573,14 +583,15 @@ exact version and add `integrity` + `crossorigin` attributes.
 
 **Severity: Medium**
 
-**Where:** [local-agent/file-broker/src/policy.ts:13](local-agent/file-broker/src/policy.ts:13) and
-[policy.ts:38-71](local-agent/file-broker/src/policy.ts:38)
+**Where:** [local-agent/paths/src/policy.ts:13](local-agent/paths/src/policy.ts:13) and
+[policy.ts:38-71](local-agent/paths/src/policy.ts:38) — moved out of `file-broker` by
+issue #16; the defect moved with it unchanged.
 
 `WorkspaceConfig` declares `excludedPatterns: string[]`, and
 `local-agent/config/workspaces.json` populates it with eleven patterns
 (`**\node_modules\**`, `**\.git\**`, `**\*.exe`, …). `evaluateAccess()` never reads the
 field. Only `file-index` honours it
-([indexer.ts:39](local-agent/file-index/src/indexer.ts:39)).
+([indexer.ts:43](local-agent/file-index/src/indexer.ts:43)).
 
 **Why it matters.** Two services read one config file and disagree about what it means. A
 path excluded from indexing is still fully readable and writable through
@@ -609,18 +620,34 @@ in issue #16 so there is exactly one implementation. If the exclusions are genui
 meant to be indexing-only, rename the field to `indexExcludedPatterns` so the narrower
 scope is visible in the config.
 
+> **Since `c315f8c`:** unchanged, but the prerequisite is now in place. `evaluateAccess`
+> lives in `@local-agent/paths`, so enforcing the patterns is a local edit there plus
+> moving `isExcluded` alongside it — no new package needed. Note the gap widened in one
+> direction: `file-index` now enforces `evaluateAccess` per file (issue #1), so the two
+> services agree on *denied fragments* and *high-risk extensions* while still disagreeing
+> on *excluded patterns*.
+
 ---
 
 ## 11. Path canonicalisation does not resolve symlinks
 
-**Severity: Medium — partially fixed.** `realCanonicalPath`/`isRealPathInside` now exist in
-`@local-agent/paths` and are used by `file-index`'s root check (issue #1). `file-broker`'s
-`evaluateAccess` still uses the lexical `isPathInside`, so the broker remains escapable via
-a junction inside a configured root. Migrating it means making `evaluateAccess` async and
-awaiting at its three call sites in `file-broker/src/server.ts` plus the test — deliberately
-left out of the issue #1 change to keep the broker's behaviour untouched.
+**Severity: Medium · Status: PARTIAL as of `c315f8c`**
 
-**Where:** [local-agent/file-broker/src/path-normalization.ts:3-11](local-agent/file-broker/src/path-normalization.ts:3)
+`realCanonicalPath`/`isRealPathInside` now exist in `@local-agent/paths` and are used by
+`file-index`'s root check (issue #1), so **the indexer half is closed**: a junction cannot
+redirect an index run out of a configured root.
+
+**Still open: `file-broker`.** Its `evaluateAccess` continues to use the lexical
+`isPathInside`, so `GET /read` and `POST /write` remain escapable through a junction planted
+inside a configured root — the original finding below applies unchanged to the broker.
+Closing it means making `evaluateAccess` async and awaiting at its three call sites in
+`file-broker/src/server.ts` plus the test assertion. That was deliberately left out of the
+issue #1 change, which was scoped to the indexer and should not alter broker behaviour.
+
+The original finding, which still describes the broker:
+
+**Where:** [local-agent/paths/src/paths.ts:16-24](local-agent/paths/src/paths.ts:16) — the
+lexical pair that `file-broker`'s `evaluateAccess` still calls.
 
 ```ts
 export function canonicalPath(inputPath: string): string {
@@ -702,6 +729,13 @@ unreliable rather than merely slow.
 Note `walk` also treats a directory symlink as a file (`entry.isDirectory()` is false for
 a symlink), yielding it and letting the later `fs.stat` filter it out — correct by
 accident, and worth a comment so it is not "fixed" into an infinite loop later.
+
+> **Since `c315f8c`:** that last point is done — `walk` now documents the symlink behaviour
+> as load-bearing, because issue #1's root authorisation depends on it (a followed junction
+> would escape the authorised subtree mid-walk). **(a)** and **(b)** are unchanged and still
+> the substance of this issue. One knock-on: `evaluateAccess` now runs per file, so an
+> excluded `node_modules` tree costs a policy call per file on top of the `minimatch` —
+> the directory-level pruning in (a) is worth marginally more than it was.
 
 **Proposed fix.** Prune at the directory level and tolerate per-directory failures:
 
@@ -907,18 +941,28 @@ input-parsing plus a single call. This is the highest-value extraction in the re
 
 ## 16. Path normalisation is duplicated across `file-broker` and `file-index`
 
-**Severity: Refactor — FIXED.** `@local-agent/paths` now exists and holds the single copy of
-`canonicalPath`, `isPathInside`, `normalizeWindowsPath`, and the policy engine; the three
-duplicated modules are deleted. Two notes: the package name now undersells its contents
-(it carries the workspace/security policy too — `@local-agent/workspace-policy` would be
-more honest, if a rename is wanted), and `isExcluded` was deliberately *left* in
-`file-index/src/indexer.ts` rather than moved, since it still has only one consumer. It
-moves when issue #10 gives it a second.
+**Severity: Refactor · Status: FIXED in `c315f8c`**
 
-The original finding, for reference:
+`@local-agent/paths` now holds the single copy of `canonicalPath`, `isPathInside`,
+`normalizeWindowsPath`, and the workspace/security policy engine. All three duplicated
+modules are deleted (`file-broker/src/path-normalization.ts`, `file-broker/src/policy.ts`,
+`file-index/src/path-normalization.ts`), and the third containment predicate that had been
+inlined as `isWithinRoot` in the indexer is no longer a separate implementation. Git
+recorded the policy move as a rename at 96% similarity, so the history stays legible.
 
-**Where:** [local-agent/file-broker/src/path-normalization.ts](local-agent/file-broker/src/path-normalization.ts) and
-[local-agent/file-index/src/path-normalization.ts](local-agent/file-index/src/path-normalization.ts)
+Two deliberate carve-outs:
+
+- **The package name now undersells its contents.** It carries the policy engine as well as
+  path primitives; `@local-agent/workspace-policy` would be more honest if a rename is wanted.
+- **`isExcluded` was left in `file-index/src/indexer.ts`** rather than moved, because it
+  still has exactly one consumer — moving it now would be the speculative abstraction
+  `CLAUDE.md` warns against. It moves when issue #10 gives it a second.
+
+The original finding, for reference. **The paths below no longer exist** — they describe the
+state at review time, before the extraction:
+
+**Where:** `local-agent/file-broker/src/path-normalization.ts` and
+`local-agent/file-index/src/path-normalization.ts` (both deleted)
 
 Two files with the same name in two packages, implementing the same lowercase-and-
 backslash canonicalisation:
@@ -1055,22 +1099,30 @@ grep -rn "get?.('.*' as never)" --include=*.ts local-agent/matbot/packages
 | `skipLibCheck` | `true` | `false` |
 | `target` | ES2022 | ES2024 |
 
-`file-index`, `file-broker`, and `http-utils` inherit the weaker root config. `CLAUDE.md`
-documents the strict set as a hard constraint (*"Strict TypeScript. `strict`,
+`file-index`, `file-broker`, `http-utils`, and now `paths` inherit the weaker root config.
+`CLAUDE.md` documents the strict set as a hard constraint (*"Strict TypeScript. `strict`,
 `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`"*)
 without scoping it to the matbot subtree.
 
 The gap is visible in the code. `normalizeWindowsPath`
-([file-index/src/path-normalization.ts:16-21](local-agent/file-index/src/path-normalization.ts:16))
-returns `relativePath: undefined` against a `relativePath?: string` field — which
+([local-agent/paths/src/paths.ts:26-38](local-agent/paths/src/paths.ts:26)) returns
+`relativePath: undefined` against a `relativePath?: string` field — which
 `exactOptionalPropertyTypes` rejects, and which the matbot half works around with the
 conditional-spread idiom throughout. `config.roots[0]?.path`
-([file-index/src/server.ts:34](local-agent/file-index/src/server.ts:34)) is optional-chained
-by hand, which `noUncheckedIndexedAccess` would have required rather than left to
-discipline.
+([file-index/src/index-root.ts:12](local-agent/file-index/src/index-root.ts:12)) is
+optional-chained by hand, which `noUncheckedIndexedAccess` would have required rather than
+left to discipline.
 
 These are the packages handling untrusted paths — the weaker settings are inverted
 relative to risk.
+
+> **Since `c315f8c`:** unchanged, and now slightly worse in principle. The new
+> `@local-agent/paths` package extends the same weak root config, so the containment
+> predicate that authorises index roots — the single most security-sensitive function in
+> the `local-agent/*` half — is compiled without `noUncheckedIndexedAccess` or
+> `exactOptionalPropertyTypes`. The two examples above both now live in code that issue #1
+> introduced or moved, so aligning the config is a smaller job than it was: the fallout is
+> concentrated in one package.
 
 **Proposed fix.** Align the root config, then fix the fallout in one pass:
 
@@ -1094,9 +1146,8 @@ relative to risk.
 }
 ```
 
-Expect a small number of errors, concentrated in the two `path-normalization.ts` files and
-the indexer's array indexing — all in code that issues #11 and #16 already touch, so
-sequence this alongside them. `skipLibCheck: true` can stay at the root if third-party
+Expect a small number of errors, now concentrated in `local-agent/paths/src/paths.ts` and
+the indexer's array indexing. `skipLibCheck: true` can stay at the root if third-party
 `.d.ts` files prove noisy; the other three flags are the ones that catch real defects.
 
 ---
@@ -1169,6 +1220,14 @@ positive rate, whole-file blast radius, invisible effect.
    response metadata when a file was partly redacted, so the gap is visible.
 4. Keep the `sk-` and `PRIVATE KEY` patterns as whole-file exclusions — those are
    high-precision and the conservative behaviour is right for them.
+
+> **Since `c315f8c`:** unchanged, but no longer load-bearing for the highest-risk files.
+> `evaluateAccess` now excludes high-risk extensions (`.env`, `.pem`, `.key`) by extension
+> before content is ever read, so those no longer depend on this heuristic catching them —
+> which it did not, for `TOKEN=` and `DATABASE_URL=` shapes. `looksLikeSecret` is now
+> explicitly a content backstop for ordinary files, and the false-positive problem described
+> above is the whole of what remains. That makes the "redact the chunk, don't drop the file"
+> fix strictly safer to apply than it was at review time.
 
 ---
 
@@ -1255,12 +1314,20 @@ already has; no browser required.
 
 Grouped so related fixes land together and each group leaves the tree green.
 
+**Done (`c315f8c`):** #1 (arbitrary index root), #16 (shared path package), #11 for
+file-index only. This was the first half of the original group 1.
+
 | Order | Group | Issues | Rationale |
 |---|---|---|---|
-| ~~1~~ | ~~Close the network exposure~~ | ~~#1~~ **done**, #2 | #1 is fixed (with #16, and #11 for file-index only). #2 is still open and is now the highest-severity remaining item. |
+| 1 | Close the network exposure | #2 | Now the highest-severity open item, and the one that made #1 remotely reachable. Small diff, independent of everything else. |
 | 2 | Contain untrusted content | #3, #9 | Vendoring the assets unblocks the CSP; do them together. |
 | 3 | Lock down tool execution | #4, #7, #15 | The `spawnAndStream` extraction fixes #7 as a side effect. |
 | 4 | Correctness in persistence | #5, #8, #13 | CAS and atomic writes; both have in-repo reference implementations. |
-| 5 | Shared path package | #10, ~~#11~~ (broker half), #12, ~~#16~~ **done**, #19 | Package now exists; remaining work is migrating the broker to the real-path predicate, exclusion enforcement, and the strictness bump. |
+| 5 | Finish the shared path package | #11 (broker half), #10, #12, #19 | The package exists; what remains is migrating `file-broker` to the real-path predicate, enforcing exclusions, pruning the walk, and raising strictness. All four now touch one package. |
 | 6 | Front-end structure | #14 | Largest effort; run the Playwright suite after each panel extraction. |
 | 7 | Polish | #6, #17, #18, #20, #21, #22, #23 | Independent; #23 is worth pulling earlier if #14 is scheduled. |
+
+**One operational task is not a code change and is still outstanding:** purge
+`local-agent/file-index/data/index.json` on any machine whose `/index` may have been
+pointed at a sensitive tree, then reindex. The fix in #1 stops new leaks; it does not
+retract chunks already in the store.
