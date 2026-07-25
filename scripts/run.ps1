@@ -187,7 +187,12 @@ else {
 if (-not $NoStart) {
     Write-Step "Starting local services and Matbot WebUI"
     $env:MATBOT_WEB_PORT = [string]$WebPort
-    $matbotCommand = "Set-Location -LiteralPath '$MatbotRoot'; `$env:MATBOT_WEB_PORT='$WebPort'; pnpm start"
+    # --session create flips the CLI out of its ephemeral default (isEphemeral is true whenever
+    # --session is absent), which is what makes every Store — sessions, remembered_facts, session
+    # titles — persist to .data instead of a MemoryStore that dies with the process. The WebUI is a
+    # long-lived server, so ephemeral-by-default is wrong for it. Filtered form so the flag reaches the
+    # cli entry unambiguously through the single -- boundary.
+    $matbotCommand = "Set-Location -LiteralPath '$MatbotRoot'; `$env:MATBOT_WEB_PORT='$WebPort'; pnpm --filter '@matatbread/matbot-cli' start -- --session create"
     $startArgs = @{
         SkipBuild = $true
         MatbotCommand = $matbotCommand
