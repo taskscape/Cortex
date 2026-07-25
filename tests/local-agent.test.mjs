@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { indexRoot } from "../local-agent/file-index/dist/indexer.js";
+import { resolveIndexRoot } from "../local-agent/file-index/dist/index-root.js";
 import { emptyStore, loadStore, saveStore } from "../local-agent/file-index/dist/store.js";
 import { searchChunks } from "../local-agent/file-index/dist/search.js";
-import { evaluateAccess } from "../local-agent/file-broker/dist/policy.js";
+import { evaluateAccess } from "../local-agent/paths/dist/index.js";
 import { ReloadingConfig } from "../local-agent/file-broker/dist/config-cache.js";
 import { writeTextFile } from "../local-agent/file-broker/dist/file-writer.js";
 import { createFileBrokerTool, FileBrokerClient } from "../local-agent/matbot/plugins/file-broker/dist/index.js";
@@ -27,7 +28,9 @@ test("file index stores searchable text with path metadata", async () => {
     const options = {
       root,
       excludedPatterns: [],
-      maxFileBytes: 100_000
+      maxFileBytes: 100_000,
+      workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
+      policy: { deniedPathFragments: [], highRiskExtensions: [], maxReadBytes: 100_000, backupRoot: "backups" }
     };
     const store = await indexRoot(options, emptyStore());
 
@@ -48,6 +51,73 @@ test("file index stores searchable text with path metadata", async () => {
     await saveStore(storePath, changed);
     await saveStore(storePath, changed);
     assert.equal((await loadStore(storePath)).chunks.length, changed.chunks.length);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("file index rejects index roots outside the configured workspace roots", async () => {
+  const configured = await mkdtemp(path.join(os.tmpdir(), "local-agent-root-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "local-agent-outside-"));
+  const nested = path.join(configured, "project");
+  await mkdir(nested, { recursive: true });
+  const config = { roots: [{ path: configured, mode: "read-write", type: "test" }], excludedPatterns: [] };
+
+  try {
+    assert.equal(await resolveIndexRoot(undefined, config), path.resolve(configured));
+    assert.equal(await resolveIndexRoot(nested, config), path.resolve(nested), "a subtree of a configured root is allowed");
+
+    await assert.rejects(() => resolveIndexRoot(outside, config), /outside the configured workspace roots/);
+    await assert.rejects(() => resolveIndexRoot(path.join(configured, "..", path.basename(outside)), config),
+      /outside the configured workspace roots/, "traversal out of a configured root is rejected");
+    await assert.rejects(() => resolveIndexRoot(configured, { roots: [], excludedPatterns: [] }),
+      /outside the configured workspace roots/, "no configured roots means nothing is indexable");
+
+    // A junction planted inside a configured root must not redirect the walk out of it. Junctions need
+    // no elevation on Windows; where the platform or filesystem refuses, the assertion is skipped
+    // rather than failing the suite for an unrelated reason.
+    const junction = path.join(configured, "escape");
+    let junctionCreated = true;
+    try { await symlink(outside, junction, "junction"); } catch { junctionCreated = false; }
+    if (junctionCreated) {
+      await assert.rejects(() => resolveIndexRoot(junction, config),
+        /outside the configured workspace roots/, "a junction escaping the root is resolved, not trusted lexically");
+    }
+  } finally {
+    await rm(configured, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("file index applies the broker security policy to every indexed file", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-policy-"));
+  await mkdir(path.join(root, ".ssh"), { recursive: true });
+  await writeFile(path.join(root, "notes.md"), "Ordinary project notes about retrieval.", "utf8");
+  // Matches none of the looksLikeSecret patterns, so only the high-risk extension rule keeps it out.
+  await writeFile(path.join(root, ".env"), "GITHUB_TOKEN=ghp_notarealtokenvalue\n", "utf8");
+  await writeFile(path.join(root, ".ssh", "hosts.md"), "Private host inventory for retrieval.", "utf8");
+
+  try {
+    const store = await indexRoot({
+      root,
+      excludedPatterns: [],
+      maxFileBytes: 100_000,
+      workspaces: { roots: [{ path: root, mode: "read-write", type: "test" }], excludedPatterns: [] },
+      policy: {
+        deniedPathFragments: ["\\.ssh\\"],
+        highRiskExtensions: [".env", ".pem", ".key"],
+        maxReadBytes: 100_000,
+        backupRoot: "backups"
+      }
+    }, emptyStore());
+
+    assert.deepEqual(store.chunks.map(chunk => chunk.relativePath), ["notes.md"]);
+    assert.equal(searchChunks(store.chunks, "ghp_notarealtokenvalue", 5).length, 0, "high-risk files never reach /search");
+    assert.equal(searchChunks(store.chunks, "host inventory", 5).length, 0, "denied path fragments never reach /search");
+
+    const reasons = new Map(store.skipped.map(entry => [path.basename(entry.path), entry.reason]));
+    assert.equal(reasons.get(".env"), "high-risk-file");
+    assert.match(reasons.get("hosts.md"), /Denied path fragment matched/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

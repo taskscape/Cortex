@@ -1,6 +1,8 @@
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
+import { loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
+import { resolveIndexRoot } from "./index-root.js";
 import { indexRoot, summarize } from "./indexer.js";
 import { searchChunks } from "./search.js";
 import { loadStore, saveStore } from "./store.js";
@@ -8,11 +10,7 @@ import { loadStore, saveStore } from "./store.js";
 const port = Number(process.env.FILE_INDEX_PORT ?? 8877);
 const storePath = path.resolve(process.env.FILE_INDEX_STORE ?? "local-agent/file-index/data/index.json");
 const workspaceConfigPath = path.resolve(process.env.WORKSPACES_CONFIG ?? "local-agent/config/workspaces.json");
-
-interface WorkspaceConfig {
-  roots: Array<{ path: string; mode: "read-only" | "read-write"; type: string }>;
-  excludedPatterns: string[];
-}
+const securityPolicyPath = path.resolve(process.env.SECURITY_POLICY_CONFIG ?? "local-agent/config/security-policy.json");
 
 let storeSnapshot = loadStore(storePath);
 let indexQueue: Promise<void> = Promise.resolve();
@@ -30,18 +28,18 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/index") {
       const body = await readJsonBody<{ root?: string }>(request, { validate: isIndexRequest });
-      const config = await readWorkspaceConfig();
-      const root = body.root ?? config.roots[0]?.path;
-
-      if (!root) {
-        sendJson(response, 400, { error: "No root supplied and no configured roots exist." });
-        return;
-      }
+      const [config, policy] = await Promise.all([
+        loadWorkspaceConfig(workspaceConfigPath),
+        loadSecurityPolicy(securityPolicyPath)
+      ]);
+      const root = await resolveIndexRoot(body.root, config);
 
       const next = await enqueueIndex(async current => indexRoot({
           root,
           excludedPatterns: config.excludedPatterns,
           maxFileBytes: Number(process.env.FILE_INDEX_MAX_FILE_BYTES ?? 1_000_000),
+          workspaces: config,
+          policy,
           signal
         }, current));
       sendJson(response, 200, { ok: true, root, ...summarize(next) });
@@ -86,11 +84,6 @@ async function enqueueIndex(build: (current: Awaited<typeof storeSnapshot>) => P
 server.listen(port, () => {
   console.log(`file-index listening on http://localhost:${port}`);
 });
-
-async function readWorkspaceConfig(): Promise<WorkspaceConfig> {
-  const raw = await import("node:fs/promises").then(fs => fs.readFile(workspaceConfigPath, "utf8"));
-  return JSON.parse(raw) as WorkspaceConfig;
-}
 
 function isIndexRequest(value: unknown): value is { root?: string } {
   return isJsonObject(value) && (value.root === undefined || typeof value.root === "string");

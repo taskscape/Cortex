@@ -2,14 +2,18 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { minimatch } from "minimatch";
+import { evaluateAccess, normalizeWindowsPath, type SecurityPolicy, type WorkspaceConfig } from "@local-agent/paths";
 import { chunkText, extractText, isIndexableTextFile } from "./extract.js";
-import { normalizeWindowsPath } from "./path-normalization.js";
 import type { IndexedChunk, IndexStore } from "./store.js";
 
 export interface IndexOptions {
   root: string;
   excludedPatterns: string[];
   maxFileBytes: number;
+  // Indexing a file is a read, and it is served back through /search, so it clears the same bar as
+  // GET /read on the broker: one deny policy, enforced in both services.
+  workspaces: WorkspaceConfig;
+  policy: SecurityPolicy;
   signal?: AbortSignal;
 }
 
@@ -38,6 +42,22 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
 
     if (isExcluded(relative, options.excludedPatterns)) {
       skipped.push({ path: filePath, reason: "excluded-pattern" });
+      continue;
+    }
+
+    const decision = evaluateAccess(filePath, "read", options.workspaces, options.policy);
+
+    if (!decision.allowed) {
+      skipped.push({ path: filePath, reason: decision.reason ?? "denied-by-security-policy" });
+      continue;
+    }
+
+    // High-risk files (.env, .pem, .key, ...) are readable through the broker only behind an explicit
+    // approval. Nothing approves an index run, and a chunk in the store is readable by anyone who can
+    // reach /search — so they are never indexed. `looksLikeSecret` below is a content backstop for
+    // ordinary files, not a substitute for this: it misses `TOKEN=...` shapes entirely.
+    if (decision.highRisk) {
+      skipped.push({ path: filePath, reason: "high-risk-file" });
       continue;
     }
 
@@ -127,6 +147,10 @@ async function* walk(root: string): AsyncGenerator<string> {
   for (const entry of entries) {
     const fullPath = path.join(root, entry.name);
 
+    // `isDirectory()` is false for a symlink or junction (readdir does not follow links), so a linked
+    // directory falls through to `yield` and is then dropped by the `stats.isFile()` check in the
+    // caller. That is load-bearing, not incidental: it keeps the walk inside the real subtree of the
+    // root that resolveIndexRoot authorised. Do not "fix" it into following links.
     if (entry.isDirectory()) {
       yield* walk(fullPath);
       continue;

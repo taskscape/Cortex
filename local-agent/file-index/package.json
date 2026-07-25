@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@local-agent/http-utils": "0.1.0",
+    "@local-agent/paths": "0.1.0",
     "minimatch": "^10.0.3"
   }
 }

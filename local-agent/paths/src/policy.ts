@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { canonicalPath, isPathInside } from "./path-normalization.js";
+import { canonicalPath, isPathInside } from "./paths.js";
 
 export interface WorkspaceRoot {
   path: string;

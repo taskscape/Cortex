@@ -1,10 +1,10 @@
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
+import { evaluateAccess, loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
 import { ReloadingConfig } from "./config-cache.js";
 import { listDirectory, readTextFile } from "./file-reader.js";
 import { writeTextFile } from "./file-writer.js";
-import { evaluateAccess, loadSecurityPolicy, loadWorkspaceConfig } from "./policy.js";
 
 const port = Number(process.env.FILE_BROKER_PORT ?? 8878);
 const workspaceConfigPath = path.resolve(process.env.WORKSPACES_CONFIG ?? "local-agent/config/workspaces.json");
