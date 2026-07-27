@@ -95,16 +95,19 @@ export const plugin: MatbotPluginSpec = {
       const server = webServer!.server;
       const startedAt = Date.now();
       let warned = false;
+      let activeListenErrorHandler: ((ex: Error & { code?: string }) => void) | undefined;
       // Attached once, not per attempt: `listen(port, host, cb)` registers cb as a `listening` handler
       // that only fires on success, so a retried listen leaves one behind every time — which is both
       // the MaxListenersExceededWarning and the reason a successful bind after N retries printed the
       // "http://localhost:…" line N times.
       server.once('listening', () => {
+        if (activeListenErrorHandler) server.off('error', activeListenErrorHandler);
         process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
         resolve();
       });
       const listen = (): void => {
-        server.once('error', (ex: Error & { code?: string }) => {
+        const onError = (ex: Error & { code?: string }): void => {
+          activeListenErrorHandler = undefined;
           if (ex.code === 'EADDRINUSE' && Date.now() - startedAt < listenRetryTimeoutMs) {
             if (!warned) {
               warned = true;
@@ -114,7 +117,9 @@ export const plugin: MatbotPluginSpec = {
             return;
           }
           reject(ex);
-        });
+        };
+        activeListenErrorHandler = onError;
+        server.once('error', onError);
         server.listen(port, '0.0.0.0');
       };
       listen();
