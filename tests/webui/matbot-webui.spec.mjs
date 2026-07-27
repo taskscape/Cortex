@@ -885,7 +885,7 @@ test("remembered facts persist across conversations and are used in later answer
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("Memorize my name: Maciej Zagozda");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
   const facts = await page.evaluate(async () => window.matbotTransport.callTool("remembered_facts_action", { action: "query", query: {} }));
@@ -893,7 +893,7 @@ test("remembered facts persist across conversations and are used in later answer
 
   await page.locator("#new-btn").click();
   await page.locator("#input").fill("What is my name?");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Maciej Zagozda");
 });
 
@@ -913,7 +913,7 @@ test("an immediate message after New waits for the new session", async ({ page, 
 
   await page.locator("#new-btn").click();
   await page.locator("#input").fill("Immediate new-session message");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Immediate new-session message");
 
   const newSessionId = await page.evaluate(() => location.hash.slice(1));
@@ -933,7 +933,7 @@ test("remembered facts are isolated between Cortex workspaces", async ({ page, i
 
   await page.locator("#new-btn").click();
   await page.locator("#input").fill("Memorize this: Alpha workspace memory token.");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
   const secondWorkspace = await page.evaluate(async () => window.matbotTransport.createWorkspace("Memory Isolation"));
@@ -947,7 +947,7 @@ test("remembered facts are isolated between Cortex workspaces", async ({ page, i
 
   await page.locator("#new-btn").click();
   await page.locator("#input").fill("Memorize this: Beta workspace memory token.");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
   await page.evaluate(async () => window.matbotTransport.switchWorkspace("default"));
@@ -968,7 +968,7 @@ test("memory sidebar affordance opens the in-page memory browser", async ({ page
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("Memorize this: The memory browser launcher token is Violet.");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
   await openMemorySection(page);
@@ -1029,7 +1029,7 @@ test("direct cognition tool calls can receive session and provider context", asy
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("The direct recall token is Helix.");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
   const sessionId = await page.locator(".session-item.active").getAttribute("data-sid");
@@ -1075,7 +1075,7 @@ test("contextual search returns remembered facts with workspace RAG context", as
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("Memorize this: The QuasarPump owner is Maciej.");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant:not(.marker-block)").last()).toContainText("Workspace RAG says");
 
   const result = await page.evaluate(async () => window.matbotTransport.callTool("contextual_search", {
@@ -1096,7 +1096,7 @@ test("workspace RAG markdown context is automatically used during a conversation
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("What is the QuasarPump calibration value?");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
 
   await expect(page.locator(".marker-block")).toContainText("workspace-rag");
   const answer = page.locator(".message.assistant:not(.marker-block)").last();
@@ -1187,7 +1187,7 @@ test("creates a conversation, sends a message, renders streaming output, tools, 
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
 
   await page.locator("#input").fill("hello panel");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
 
   await expect(page.locator(".message.user")).toContainText("hello panel");
   await expect(page.locator(".thinking-block")).toContainText("Checking harness state");
@@ -1204,7 +1204,7 @@ test("handles interactive prompt controls over the session event stream", async 
   await page.locator("#new-btn").click();
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
   await page.locator("#input").fill("prompt me");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
 
   await expect(page.locator(".prompt-block")).toContainText("Choose a test answer");
   await expect(page.getByRole("button", { name: "Alpha" })).toHaveCSS("background-color", "rgb(37, 99, 235)");
@@ -1336,7 +1336,7 @@ test("shows stop control while a turn is busy and aborts the running turn", asyn
   await page.locator("#new-btn").click();
   await expect(page.locator(".empty-state")).toContainText("Start a conversation");
   await page.locator("#input").fill("slow response please");
-  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.press("Enter");
 
   await expect(page.locator("#send-btn")).toHaveClass(/stop-mode/);
   await expect(page.locator("#send-btn")).toHaveCSS("width", "21px");

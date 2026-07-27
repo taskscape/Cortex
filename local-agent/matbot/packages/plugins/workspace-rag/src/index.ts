@@ -582,6 +582,10 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 
 async function collectMarkdownFiles(root: string): Promise<string[]> {
   const results: string[] = [];
+  // A configured path may name a single markdown file. `readdir` fails on one, which would otherwise
+  // report the context as empty instead of indexing the file the user pointed at.
+  const rootStat = await stat(root).catch(() => null);
+  if (rootStat?.isFile()) return root.toLowerCase().endsWith('.md') ? [root] : [];
   async function walk(dir: string): Promise<void> {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }

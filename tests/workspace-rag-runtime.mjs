@@ -70,9 +70,11 @@ async function main() {
     const workspaceDir = path.join(root, "workspace");
     const docsDir = path.join(root, "docs");
     const financeDir = path.join(root, "finance-docs");
+    const standaloneDir = path.join(root, "standalone");
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(docsDir, { recursive: true });
     await mkdir(financeDir, { recursive: true });
+    await mkdir(standaloneDir, { recursive: true });
     const configPath = path.join(workspaceDir, "matbot.yaml");
     await writeFile(configPath, "plugins:\n  - ./packages/plugins/workspace-rag\n", "utf8");
     await writeFile(
@@ -83,6 +85,12 @@ async function main() {
     await writeFile(
       path.join(financeDir, "finance-probe.md"),
       "# Finance Probe\n\nThe LedgerAlpha reserve ratio is 18 percent. Review cash timing before expansion.",
+      "utf8",
+    );
+    const standaloneFile = path.join(standaloneDir, "single-note.md");
+    await writeFile(
+      standaloneFile,
+      "# Single Note\n\nThe SoloBeacon retry budget is 7 attempts. Escalate after the third failure.",
       "utf8",
     );
 
@@ -216,6 +224,39 @@ async function main() {
     assert.ok(financeSearchResult.hits.length >= 1);
     assert.equal(financeSearchResult.hits[0].contextName, "Finance Notes");
     assert.match(financeSearchResult.hits[0].text, /LedgerAlpha reserve ratio is 18 percent/);
+
+    // A configured path may name one markdown file rather than a folder.
+    const singleFileEvents = [];
+    for await (const event of registeredTool.executor.execute({
+      action: "create_context",
+      contextName: "Single Note",
+      paths: [standaloneFile],
+    }, toolCtx)) {
+      singleFileEvents.push(event);
+    }
+    const singleFileResult = singleFileEvents.find(event => event.type === "result")?.value;
+    assert.equal(singleFileResult.config.contextName, "Single Note");
+    const singleFileSourceEvents = [];
+    for await (const event of sourceTool.executor.execute({ action: "list" }, toolCtx)) {
+      singleFileSourceEvents.push(event);
+    }
+    const singleFileSources = singleFileSourceEvents.find(event => event.type === "result")?.value.sources;
+    assert.ok(
+      singleFileSources.some(source => source.uri.endsWith("single-note.md")),
+      "a path naming one markdown file must index that file, not nothing",
+    );
+
+    const singleFileSearchEvents = [];
+    for await (const event of registeredTool.executor.execute({
+      action: "search",
+      query: "What is the SoloBeacon retry budget?",
+      limit: 3,
+    }, toolCtx)) {
+      singleFileSearchEvents.push(event);
+    }
+    const singleFileSearchResult = singleFileSearchEvents.find(event => event.type === "result")?.value;
+    assert.ok(singleFileSearchResult.hits.length >= 1);
+    assert.match(singleFileSearchResult.hits[0].text, /SoloBeacon retry budget is 7 attempts/);
 
     const selectDefaultEvents = [];
     for await (const event of registeredTool.executor.execute({

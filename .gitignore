@@ -17,3 +17,9 @@ test-results
 # or nested runtime artifact should ever enter version control.
 /local-agent/matbot/cortex-workspaces.json
 /local-agent/matbot/workspaces/**
+
+# Playwright
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
