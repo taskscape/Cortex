@@ -31,7 +31,12 @@ async function filesUnder(dir) {
 // The scenarios must never see, let alone write, a real workspace's memory.
 async function productionMemorySnapshot() {
   const matbotRoot = path.join(process.cwd(), "local-agent", "matbot");
-  const registry = JSON.parse(await readFile(path.join(matbotRoot, "cortex-workspaces.json"), "utf8"));
+  let registry = { workspaces: [] };
+  try {
+    registry = JSON.parse(await readFile(path.join(matbotRoot, "cortex-workspaces.json"), "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const dataRoots = [path.join(matbotRoot, ".data")];
   for (const workspace of registry.workspaces ?? []) {
     const configPath = path.resolve(matbotRoot, workspace.configPath);
