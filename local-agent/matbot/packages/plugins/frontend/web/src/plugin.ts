@@ -82,14 +82,29 @@ export const plugin: MatbotPluginSpec = {
       ...(services.files      !== undefined ? { files:      services.files      } : {}),
       ...(services.configPath !== undefined ? { configPath: services.configPath } : {}),
       ...(workspaceManager    !== undefined ? { workspaceManager } : {}),
+      // Per-process identity, minted here rather than derived from the pid so a client can compare it
+      // across a restart without caring how the process was launched. The workspace is the config this
+      // process actually loaded — not what the registry file claims is active.
+      runtime: {
+        id: crypto.randomUUID(),
+        ...(services.configPath !== undefined ? { workspace: services.configPath } : {}),
+      },
     });
 
     await new Promise<void>((resolve, reject) => {
       const server = webServer!.server;
       const startedAt = Date.now();
       let warned = false;
-      const listen = () => {
-        const onError = (ex: Error & { code?: string }) => {
+      // Attached once, not per attempt: `listen(port, host, cb)` registers cb as a `listening` handler
+      // that only fires on success, so a retried listen leaves one behind every time — which is both
+      // the MaxListenersExceededWarning and the reason a successful bind after N retries printed the
+      // "http://localhost:…" line N times.
+      server.once('listening', () => {
+        process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
+        resolve();
+      });
+      const listen = (): void => {
+        server.once('error', (ex: Error & { code?: string }) => {
           if (ex.code === 'EADDRINUSE' && Date.now() - startedAt < listenRetryTimeoutMs) {
             if (!warned) {
               warned = true;
@@ -99,13 +114,8 @@ export const plugin: MatbotPluginSpec = {
             return;
           }
           reject(ex);
-        };
-        server.once('error', onError);
-        server.listen(port, '0.0.0.0', () => {
-          server.off('error', onError);
-          process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
-          resolve();
         });
+        server.listen(port, '0.0.0.0');
       };
       listen();
     });

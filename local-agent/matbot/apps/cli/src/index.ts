@@ -41,6 +41,12 @@ import { createWorkspaceStore, MemoryStore, workspaceDataDirectory } from './sto
 // Prefix all console output with ISO timestamp + PID so parent and spawned
 // background processes are distinguishable in shared terminal output.
 const _pid = process.pid;
+
+// How long a shutdown may take before the process stops waiting for a clean teardown and exits. Any
+// exit path that waits unconditionally on teardown can be held open forever by one plugin that will
+// not settle — and a server process that will not exit keeps its ports, which is what turned a
+// workspace switch into two live runtimes fighting over one port.
+const SHUTDOWN_DEADLINE_MS = 4000;
 const isBackground = process.env.IS_SUB_AGENT === '1';
 for (const level of ['log', 'warn', 'error'] as const) {
   const orig = console[level].bind(console) as (...a: unknown[]) => void;
@@ -1000,7 +1006,11 @@ async function main(): Promise<void> {
 
   // Ephemeral by default; opt into persistence with --session <id|create>.
   // config ephemeral:true (e.g. background sub-agents) is a hard override.
-  const isEphemeral = opts.ephemeral || matbotConfig.ephemeral === true || opts.session === undefined;
+  // `start` is exempt from the session-less default: a server hosts many sessions over a long life and
+  // has no single `--session` to name, so inferring "throwaway" from its absence silently downgraded
+  // every store — sessions, remembered_facts, skills, triggers — to a MemoryStore that dies with the
+  // process. Persistence must not depend on a launcher remembering to pass a flag.
+  const isEphemeral = opts.ephemeral || matbotConfig.ephemeral === true || (!serverMode && opts.session === undefined);
 
   // Guard: stdin config without a prompt would consume stdin then hang on REPL
   if (opts.config === '-' && argPrompt === undefined) {
@@ -1299,16 +1309,36 @@ async function main(): Promise<void> {
   };
   const services: MatbotMachine = unifyServices(baseServices);
 
+  // Shut the runtime down and give up its ports, but never let the shutdown itself become the reason
+  // the process lingers: a hung teardown (a server close waiting on a keep-alive socket, a backend
+  // that will not settle) used to leave the old process holding the web port forever, so the
+  // replacement could never bind. Past the deadline we stop waiting and exit anyway.
+  const releaseRuntime = async (): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>(resolve => {
+      timer = setTimeout(() => {
+        console.error(`[matbot] shutdown did not complete within ${SHUTDOWN_DEADLINE_MS}ms; exiting anyway`);
+        resolve();
+      }, SHUTDOWN_DEADLINE_MS);
+    });
+    try {
+      await Promise.race([
+        teardownPlugins().then(async () => { await activeStorageBackend?.close?.(); }),
+        deadline,
+      ]);
+    } catch (e) {
+      console.error('[matbot] shutdown failed:', e instanceof Error ? e.message : String(e));
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
   if (workspaceManager !== undefined) {
     workspaceManager.setRestarter(async (workspaceId: string) => {
       if (!serverMode) return;
       if (process.env['CORTEX_SERVICE_SUPERVISED'] === '1') {
         console.error(`[matbot] workspace switch to "${workspaceId}" requested service-supervised restart`);
-        setTimeout(() => {
-          void teardownPlugins()
-            .then(async () => { await activeStorageBackend?.close?.(); process.exit(42); })
-            .catch(() => process.exit(1));
-        }, 250);
+        setTimeout(() => { void releaseRuntime().then(() => process.exit(42)); }, 250);
         return;
       }
       const entryArg = process.argv[1] ?? fileURLToPath(import.meta.url);
@@ -1316,36 +1346,44 @@ async function main(): Promise<void> {
       const entry = nodeEntrySpecifier(entryArg, initialCwd, childCwd);
       const args = [...absolutizeNodeExecArgv(process.execArgv, initialCwd), entry, ...process.argv.slice(2)];
       const logs = matbotLogPaths(workspaceManager.getRegistryPath());
-      appendFileSync(
-        logs.out,
-        `[${new Date().toISOString()} ${_pid}] [matbot] restarting into workspace "${workspaceId}"\n`,
-      );
-      const outFd = openSync(logs.out, 'a');
-      const errFd = openSync(logs.err, 'a');
-      let child: ChildProcess;
-      try {
-        child = spawn(process.execPath, args, {
-          cwd: childCwd,
-          detached: true,
-          stdio: ['ignore', outFd, errFd],
-          env: {
-            ...process.env,
-            INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
-            CORTEX_WORKSPACE_ID: workspaceId,
-            CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
-            CORTEX_RESTART_DELAY_MS: '900',
-          },
-        });
-      } finally {
-        closeSync(outFd);
-        closeSync(errFd);
-      }
-      child.unref();
-      setTimeout(() => {
-        void teardownPlugins()
-          .then(async () => { await activeStorageBackend?.close?.(); process.exit(0); })
-          .catch(() => process.exit(1));
-      }, 250);
+
+      // Deferred so the HTTP response for the switch request can flush before the server goes away.
+      // The order below is the fix for a switch that "did nothing": this process releases its ports
+      // FIRST and only then spawns its replacement. It used to spawn immediately and tear down on a
+      // timer, betting that 900ms of child-side delay would outlast the teardown — and when it didn't,
+      // the child could not bind, dropped its frontend, and ran on headless while the outgoing process
+      // kept serving the old workspace to the browser.
+      setTimeout(() => { void (async () => {
+        await releaseRuntime();
+        appendFileSync(
+          logs.out,
+          `[${new Date().toISOString()} ${_pid}] [matbot] restarting into workspace "${workspaceId}"\n`,
+        );
+        const outFd = openSync(logs.out, 'a');
+        const errFd = openSync(logs.err, 'a');
+        let child: ChildProcess;
+        try {
+          child = spawn(process.execPath, args, {
+            cwd: childCwd,
+            detached: true,
+            stdio: ['ignore', outFd, errFd],
+            env: {
+              ...process.env,
+              INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
+              CORTEX_WORKSPACE_ID: workspaceId,
+              CORTEX_WORKSPACES_FILE: workspaceManager.getRegistryPath(),
+              // Only a margin for the OS to release the listening socket now that teardown has already
+              // finished — no longer the thing the handoff depends on.
+              CORTEX_RESTART_DELAY_MS: '400',
+            },
+          });
+        } finally {
+          closeSync(outFd);
+          closeSync(errFd);
+        }
+        child.unref();
+        process.exit(0);
+      })(); }, 250);
     });
     serviceRegistry.set('WorkspaceManager', workspaceManager);
   }
@@ -1412,7 +1450,24 @@ async function main(): Promise<void> {
   };
   recordOrigPaths(providerModules);
 
-  await loadPluginsWithDescriptions(resolvedPluginMods, services, path.dirname(configPath));
+  const loadedPlugins = await loadPluginsWithDescriptions(resolvedPluginMods, services, path.dirname(configPath));
+
+  // A plugin that fails to load is skipped rather than fatal (one bad entry must not brick startup).
+  // That is wrong for a *frontend* in server mode: the process's whole job is to serve it. A frontend
+  // that could not bind its port leaves a headless process holding this workspace's stores while some
+  // other process still answers the browser — the state that makes a workspace switch look like it
+  // silently did nothing. Fail loudly instead and let the supervisor restart us.
+  if (serverMode) {
+    const requestedFrontends = resolvedPluginMods.filter(m => /frontend/.test(m.spec));
+    const loadedSpecifiers   = new Set(loadedPlugins.map(p => p.specifier));
+    const missing            = requestedFrontends.filter(m => !loadedSpecifiers.has(m.spec));
+    if (missing.length > 0) {
+      throw new Error(
+        `server mode requires its frontend(s), but ${missing.map(m => `"${m.spec}"`).join(', ')} failed to load ` +
+        '(see the error above — a port already in use is the usual cause). Refusing to run headless.',
+      );
+    }
+  }
 
   // The pre-scan opened a manifest storageBackend directly, before the loader knew the plugin's name,
   // so the scoped register() that records a service key never ran. Attribute it now that names exist,
@@ -1440,12 +1495,13 @@ async function main(): Promise<void> {
   // ── Server mode ───────────────────────────────────────────────────────────────
 
   if (serverMode) {
+    process.stderr.write(`[${new Date().toISOString()} ${_pid}] [matbot] memory: ${isEphemeral
+      ? 'EPHEMERAL — sessions and remembered facts will be lost when this process exits'
+      : `persistent (${dotData})`}\n`);
     process.stderr.write(`[${new Date().toISOString()} ${_pid}] [matbot] server running — press Ctrl+C to stop\n`);
     const shutdown = (): void => {
       process.stderr.write('\n[matbot] shutting down…\n');
-      teardownPlugins()
-      .then(async () => { await activeStorageBackend?.close?.(); process.exit(0); })
-      .catch(() => process.exit(1));
+      void releaseRuntime().then(() => process.exit(0));
     };
     process.once('SIGINT',  shutdown);
     process.once('SIGTERM', shutdown);

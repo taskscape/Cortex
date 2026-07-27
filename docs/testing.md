@@ -102,6 +102,9 @@ Current Playwright coverage includes:
 Node tests cover:
 
 - production memory capture using the real cognition tool and filesystem store;
+- memory recall between conversations: a fact stated in one conversation reaching
+  the next, sharing across every conversation in a workspace, and staying inside
+  that workspace (`tests\memory-recall.test.mjs`);
 - memory persistence after runtime recreation and isolation across workspace roots;
 - production `dream_time` fact processing and run-record isolation;
 - production memory-browser workspace switching and CAS conflict handling;
@@ -119,3 +122,27 @@ Run only the evaluation and ROI backend coverage:
 ```powershell
 node --test tests/evaluation-observability.test.mjs
 ```
+
+Run only the cross-conversation memory coverage:
+
+```powershell
+node --test tests/memory-recall.test.mjs
+```
+
+Run only the workspace-switch handoff coverage:
+
+```powershell
+node --test tests/workspace-switch.test.mjs
+```
+
+That suite covers the two properties a switch depends on: shutdown releasing the
+web port promptly even with a connection stuck mid-request, and the workspace
+listing identifying the process that answered it — without which the WebUI cannot
+tell a completed switch from the outgoing process still serving the previous
+workspace's conversations.
+
+Each recall scenario is reported as its own named subtest, so a regression names
+the behavior that broke. The scenarios drive the real capture tool, recall hook,
+and `contextual_search` over temp-directory stores — only the model is faked —
+and the suite hashes every workspace's `remembered_facts` before and after to
+prove it never touched real memory.

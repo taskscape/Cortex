@@ -2678,7 +2678,12 @@ function isWorkspaceFetchFailure(error) {
   return error instanceof TypeError || /failed to fetch|networkerror|fetch failed/i.test(message);
 }
 
-async function waitForWorkspaceRestart(workspaceId) {
+// A switch replaces the process serving this page. The only trustworthy evidence that it completed is
+// that a DIFFERENT process is answering — `active` alone is not evidence, because the outgoing process
+// writes the registry file before it starts shutting down and will happily report the new id while
+// still serving the old workspace's sessions. That is what made a switch look like it worked while the
+// conversation list stayed on the previous workspace.
+async function waitForWorkspaceRestart(workspaceId, previousRuntimeId) {
   const startedAt = Date.now();
   let nextStatusAt = startedAt + WORKSPACE_RESTART_STATUS_INTERVAL_MS;
   let sawUnavailable = false;
@@ -2686,7 +2691,13 @@ async function waitForWorkspaceRestart(workspaceId) {
   while (Date.now() - startedAt < WORKSPACE_RESTART_TIMEOUT_MS) {
     try {
       const nextState = await T.listWorkspaces();
-      if (workspaceStateHasActiveId(nextState, workspaceId) && (sawUnavailable || Date.now() - startedAt >= 1200)) {
+      const runtimeId = nextState?.runtime?.id;
+      // Older servers report no runtime identity; fall back to the previous heuristic rather than
+      // hanging until the timeout.
+      const replaced = runtimeId !== undefined
+        ? (previousRuntimeId === undefined || runtimeId !== previousRuntimeId)
+        : (sawUnavailable || Date.now() - startedAt >= 1200);
+      if (workspaceStateHasActiveId(nextState, workspaceId) && replaced) {
         workspaceState = nextState;
         renderWorkspaces();
         return;
@@ -2815,6 +2826,8 @@ function renderWorkspaces() {
       try {
         setWorkspaceSwitching(true);
         setWorkspaceStatus('Switching...');
+        // Captured before the switch: the process about to be replaced.
+        const previousRuntimeId = workspaceState?.runtime?.id;
         let result;
         try {
           result = await T.switchWorkspace(workspace.id);
@@ -2824,7 +2837,7 @@ function renderWorkspaces() {
         }
         if (result?.restarting) {
           setWorkspaceStatus('Restarting...');
-          await waitForWorkspaceRestart(workspace.id);
+          await waitForWorkspaceRestart(workspace.id, previousRuntimeId);
           window.location.reload();
         } else {
           await loadWorkspaces();

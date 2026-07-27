@@ -26,6 +26,11 @@ export interface WebServerDeps {
   workdir?:       string;
   files?:         FileStore;
   configPath?:    string;
+  /** Identity of the process answering this request. A workspace switch replaces the process, so the
+   *  client cannot tell a completed switch from the outgoing process still serving unless the answer
+   *  says who produced it — the registry file it would otherwise poll is written *before* the handoff,
+   *  so the old process reports the new workspace while still serving the old one's sessions. */
+  runtime?:       { id: string; workspace?: string };
   workspaceManager?: WorkspaceManager;
   workspaceRagManager?: () => WorkspaceRagManager | undefined;
   /** Resolved per call, like {@link skills} — the titler plugin may load in any order, or not at all. */
@@ -121,6 +126,10 @@ interface ExpertPanelSubmitBody {
   maxCitationsPerExpert?: number;
   traceId?:               string;
 }
+
+// How long a connection that is still mid-request may hold up `close()` before it is cut. Long enough
+// for an in-flight response to finish, short enough that shutdown stays bounded.
+const CLOSE_GRACE_MS = 1000;
 
 // Last-resort anonymous identity, used only when no boot principal is established and no resolver
 // override is registered (e.g. tests, or a realm with no carrier).
@@ -557,7 +566,7 @@ export function createWebServer(deps: WebServerDeps) {
 
     if (method === 'GET' && url === '/workspaces') {
       if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
-      json(res, 200, await deps.workspaceManager.list()); return;
+      json(res, 200, { ...await deps.workspaceManager.list(), ...(deps.runtime !== undefined ? { runtime: deps.runtime } : {}) }); return;
     }
 
     const workspaceDeleteCheck = /^\/workspaces\/([^/]+)\/delete-check$/.exec(url);
@@ -1140,6 +1149,15 @@ export function createWebServer(deps: WebServerDeps) {
     for (const entry of pendingPrompts.values()) entry.resolve('');
     pendingPrompts.clear();
 
+    // `server.close()` stops accepting and then waits for every open connection. Node ≥19 drops IDLE
+    // keep-alive sockets itself, but a connection that is mid-request holds the close open with no
+    // deadline — a half-sent body, a slow client, a stream this file does not track. A workspace switch
+    // gates the process's exit on this close, so an unbounded wait here means the outgoing process
+    // keeps the port and its replacement can never bind. Idle sockets go now, the rest get a grace
+    // period and are then cut.
+    server.closeIdleConnections();
+    const graceTimer = setTimeout(() => server.closeAllConnections(), CLOSE_GRACE_MS);
+
     await new Promise<void>((resolve) =>
       server.close(err => {
         if (err) {
@@ -1148,6 +1166,7 @@ export function createWebServer(deps: WebServerDeps) {
         resolve();
       }),
     );
+    clearTimeout(graceTimer);
   }
 
   return { server, close };
