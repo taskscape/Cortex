@@ -86,10 +86,10 @@ interface FactIndex {
 }
 
 // Rare tokens ("helios", "zagozda") carry the identity of a fact; common ones ("user", "name") barely
-// narrow anything. Smoothed so a single-fact store yields a uniform weight rather than a negative log,
-// and so an unseen token (in the query but in no fact) scores as maximally informative — it *should*
-// count against a fact that fails to explain it.
-function indexFacts(facts: readonly RememberedFact[]): FactIndex {
+// narrow anything. Smoothed so a single-fact store yields a uniform weight rather than a negative log.
+//
+// Note: query tokens that appear in NO fact are intentionally ignored later (see `queryWeightOf`) so
+// recall does not depend on how much unrelated padding surrounds the token that matters.
   const documentFrequency = new Map<string, number>();
   for (const fact of facts) {
     for (const token of tokens(fact.fact)) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
