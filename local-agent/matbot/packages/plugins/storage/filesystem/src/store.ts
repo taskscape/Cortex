@@ -40,7 +40,9 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
 
   private safeName(id: string): string {
     if (id.length === 0) throw new Error('Invalid store id: ""');
-    if (FILE_SAFE_ID.test(id)) return id;
+    if (FILE_SAFE_ID.test(id)) {
+      return id.length <= MAX_ENCODED_NAME ? id : `%h%${createHash('sha256').update(id).digest('hex')}`;
+    }
     const encoded = encodeName(id);
     // `%h%` is unreachable through encodeName — a `%` there is always followed by two hex digits —
     // so the digest form for over-long ids cannot shadow an encoded name.
