@@ -108,6 +108,32 @@ churn and less likely to affect a consumer who doesn't use them.
 
 ### Bug fixes
 
+- **A workspace switch no longer leaves two runtimes fighting over one port.** The handoff spawned the
+  replacement process immediately and scheduled its own teardown on a timer, betting that 900ms of
+  child-side start delay would outlast the shutdown. When it didn't, the incoming process could not
+  bind the web port; because a plugin that fails to load is skipped rather than fatal, it dropped its
+  frontend and ran on **headless** — holding the new workspace's stores while the outgoing process kept
+  answering the browser with the *previous* workspace's conversations. The switch now tears down and
+  releases its ports **before** spawning the replacement, so the handoff is ordered rather than raced.
+
+- **Shutdown is bounded.** Every exit path awaited `teardownPlugins()` with no deadline, so one plugin
+  that would not settle kept the process — and its ports — alive indefinitely. Teardown now races a
+  deadline (4s) and the process exits regardless. Relatedly, the web server's `close()` no longer waits
+  forever on a connection that is mid-request (a half-sent body, a slow client): idle sockets are
+  dropped at once and the rest are cut after a 1s grace period.
+
+- **A frontend that cannot start is now fatal in server mode.** `matbot start` exists to serve its
+  frontend; continuing without one produces a process that holds a workspace and serves nobody. It now
+  fails loudly instead, leaving the supervisor to restart it.
+
+- **`start` no longer boots into in-memory stores.** `isEphemeral` was inferred from the absence of
+  `--session`, which is right for a one-shot prompt or a throwaway REPL but wrong for a server: a
+  long-lived host has many sessions and no single one to name, so `matbot start` silently downgraded
+  *every* store — sessions, remembered_facts, skills, triggers — to a `MemoryStore` that died with the
+  process. `start` is now exempt from that default (an explicit `--ephemeral` or config `ephemeral:
+  true` still wins), and server mode logs which mode it booted in. Persistence no longer depends on a
+  launcher remembering to pass a flag.
+
 - **A bad `matbot.yaml` plugin entry no longer aborts startup.** `loadPlugins` only honoured its
   `skip`/`throw` mode (renamed `onIncompatibleRuntime` → `onLoadError`) for the runtime-compat gate;
   an import that rejected or a module that was not plugin-shaped (no `plugin` export, no `apiVersion`,
@@ -170,6 +196,35 @@ churn and less likely to affect a consumer who doesn't use them.
   (a missing secret) are still left in config to retry.
 
 ### Optional
+
+- **frontend/web** — `GET /workspaces` now also reports the identity of the process that answered
+  (`runtime: { id, workspace }`), and the WebUI waits for that id to *change* before treating a
+  workspace switch as complete. It previously polled the registry file for the expected active id —
+  but the outgoing process writes that file before it starts shutting down, so it reported the new
+  workspace while still serving the old one's sessions, and the client reloaded against it. A
+  `sawUnavailable || elapsed >= 1200` fallback meant the "did the server actually go away" check was
+  bypassed after 1.2s in every real switch. Servers that report no runtime identity keep the old
+  behaviour. Also fixes a retried `listen()` leaving a `listening` handler behind on every attempt,
+  which tripped MaxListenersExceededWarning and printed the startup URL once per retry.
+
+- **rumsfeld** — remembered facts are now injected automatically, not only on request. A `screen` hook
+  scores each incoming user message against the `remembered_facts` store and injects matches as
+  ephemeral context (leaving a `memory-inject` marker), so a *new conversation* starts already knowing
+  what earlier ones established instead of depending on the model electing to call `contextual_search`
+  — a judgement it cannot make about a name or a system it has no reason to suspect exists. Local
+  scoring only: no LLM call, no added latency.
+
+  Fact scoring was rebuilt to support this. It was the fraction of *query* tokens found in a fact,
+  which meant adding context to a query lowered the score of a fact that matched it perfectly — fatal
+  when the query is a whole user message. It now takes the better of weighted fact-coverage and
+  weighted query-coverage (the second view keeps a long pasted note reachable from a short question,
+  which fact-coverage alone cannot do), with tokens weighted by how far they narrow the store.
+  Query tokens that appear in no fact are ignored rather than counted as unexplained, so whether an
+  identifier retrieves its fact no longer depends on how many ordinary words surround it. A match
+  needs two query tokens unless one is identifier-like — rare *and* at least a full stem long, since
+  rarity alone makes any function word outside the English stopword list look unique in a small store.
+  Adds diacritic folding and five-character stemming, without which inflected languages cannot match
+  at all. `searchRememberedFacts` and `createMemoryInjectionHook` are exported for direct testing.
 
 - **providers/openai-compat** — opt-in prompt caching. With `parameters.promptCache: true`,
   the adapter sends Anthropic-style `cache_control: {type:'ephemeral'}` breakpoints on the system

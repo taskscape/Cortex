@@ -34,6 +34,50 @@ in an answer if the model does not call retrieval or if the needed memory contex
 is not injected. This is why `contextual_search` now searches raw
 `remembered_facts` directly instead of waiting for `dream_time`.
 
+## Automatic recall (memory injection)
+
+`contextual_search` can only retrieve a fact once the model has decided it is
+missing context — which is exactly the judgement a model cannot make about a name
+or a server it has no reason to suspect exists. So recall does not depend on the
+model electing to call it.
+
+The `rumsfeld` plugin registers a `screen` hook that scores every incoming user
+message against `remembered_facts` and injects the matches as ephemeral context
+for that turn, in the same way `workspace-rag` injects document snippets. This is
+what makes a **new conversation** start out knowing what earlier ones in the same
+workspace established. It is local scoring only — no LLM call, no added latency —
+and a firing injection leaves a `rumsfeld` marker (`event: "memory-inject"`) on
+the session, so a post-mortem can tell whether the model answered from memory or
+in spite of it.
+
+Matching is lexical, weighted so that rare tokens (a name, `HELIOS-7`) count for
+much more than shared vocabulary (`user`, `name`), with diacritic folding and
+five-character stemming so inflected languages match at all
+(`serwerze`/`serwer`/`serwerowni` collapse together). Three rules keep it from
+firing on coincidence:
+
+- a fact must be explained by at least two query tokens, unless one of them is
+  identifier-like (rare *and* full-length) — so a server name alone is enough,
+  but a shared `jest` or `the` is not;
+- query words that appear in no fact at all are ignored rather than counted
+  against a fact, so recall does not depend on how much padding surrounds the
+  word that matters;
+- a fact is scored by the better of "how much of the fact the query explains"
+  and "how much of the query the fact explains", so both a one-line fact and a
+  long pasted note stay reachable.
+
+Two consequences worth knowing:
+
+- a fact stays reachable through a shared proper noun even when the question is
+  asked in another language;
+- a question whose *general vocabulary* is in a different language from the fact
+  will not match ("Jak sie nazywam?" does not retrieve "The user's name is
+  Maciej Zagozda"). Cross-language semantic recall is the `KnowledgeIndex`'s job,
+  and needs Mem0 reachable.
+
+`contextual_search` remains registered for deliberate mid-turn lookups over the
+knowledge index and workspace RAG.
+
 `dream_time` is slower consolidation, not immediate recall. It processes
 unassigned remembered facts and, when a fact strongly matches a skill, merges it
 into skill markdown so it becomes part of the long-term skills/knowledge layer.

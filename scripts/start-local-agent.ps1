@@ -231,6 +231,12 @@ if ($MatbotCommand) {
         if (Test-PortListening $matbotWebPort) {
             Stop-PortListeners $matbotWebPort "Matbot web UI"
         }
+        # A stale Matbot holding the memory-browser port only makes the incoming one warn and carry on
+        # without a memory UI — and means two runtimes are sharing one workspace's .data.
+        $matbotMemoryPort = if ($env:MATBOT_MEMORY_BROWSER_PORT) { [int]$env:MATBOT_MEMORY_BROWSER_PORT } else { 19779 }
+        if (Test-PortListening $matbotMemoryPort) {
+            Stop-PortListeners $matbotMemoryPort "Matbot memory browser"
+        }
         $interactiveMatbotCommand = "Remove-Item Env:CORTEX_SERVICE_SUPERVISED -ErrorAction SilentlyContinue; $MatbotCommand"
         Start-Process -FilePath "powershell" `
             -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $interactiveMatbotCommand `

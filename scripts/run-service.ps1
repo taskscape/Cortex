@@ -1,7 +1,8 @@
 param(
     [switch]$SkipDocker,
     [switch]$SkipCudaIngestion,
-    [int]$WebPort = 19778
+    [int]$WebPort = 19778,
+    [int]$MemoryBrowserPort = 19779
 )
 
 $ErrorActionPreference = "Stop"
@@ -270,10 +271,19 @@ while ($true) {
     if (Test-PortListening $WebPort) {
         Stop-PortListeners $WebPort "Matbot web UI"
     }
+    # The memory browser binds its own port. A stale Matbot that kept it alive leaves the incoming one
+    # with no memory UI (it only warns and carries on), which is how "port 19779 already in use" hid a
+    # second runtime holding the same workspace .data.
+    if (Test-PortListening $MemoryBrowserPort) {
+        Stop-PortListeners $MemoryBrowserPort "Matbot memory browser"
+    }
 
     Write-ServiceLog "Starting Matbot foreground process on http://localhost:$WebPort"
     Set-Location $MatbotRoot
-    & $pnpm.Source start
+    # --session create matches run.ps1. The CLI now also treats `start` as persistent on its own, so
+    # this is belt-and-braces rather than the only thing standing between the service and a memory
+    # store that dies with the process — but the two launch paths should stay identical.
+    & $pnpm.Source --filter '@matatbread/matbot-cli' start -- --session create
     $exitCode = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
     Write-ServiceLog "Matbot foreground process exited with code $exitCode"
 

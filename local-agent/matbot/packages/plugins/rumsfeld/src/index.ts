@@ -1,1 +1,1 @@
-export { createRumsfeldPlugin, plugin } from './plugin.js';
+export { createRumsfeldPlugin, createMemoryInjectionHook, searchRememberedFacts, plugin } from './plugin.js';
