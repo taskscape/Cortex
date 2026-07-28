@@ -1,7 +1,27 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import type { Store, StoreQuery, QueryResult, CASResult } from '@matatbread/matbot-plugin-api';
 import { executeQuery } from '@matatbread/matbot-storage-base';
+
+// A record id is an opaque string — plugins mint ids like `source:<hash>` — but a file name cannot
+// hold every character: `:` is illegal on Windows, and `/` or `..` would escape the directory. Ids
+// that are already file-safe keep their name, so existing files stay addressable; anything else is
+// percent-encoded per UTF-8 byte. The encoding is reversible (`%` encodes to `%25`), so an encoded
+// name can never collide with another id's name.
+const FILE_SAFE_ID = /^[\w-]+$/;
+
+// Leaves room under the common 255-byte file-name limit for the `.json`/`.json.tmp` suffixes.
+const MAX_ENCODED_NAME = 200;
+
+function encodeName(id: string): string {
+  let encoded = '';
+  for (const byte of new TextEncoder().encode(id)) {
+    const char = String.fromCharCode(byte);
+    encoded += byte < 0x80 && FILE_SAFE_ID.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return encoded;
+}
 
 export class FilesystemStore<T extends { id: string; version: string }> implements Store<T> {
   private initPromise: Promise<void> | undefined;
@@ -19,8 +39,14 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
   private safeName(id: string): string {
-    if (!/^[\w-]+$/.test(id)) throw new Error(`Invalid store id: "${id}"`);
-    return id;
+    if (id.length === 0) throw new Error('Invalid store id: ""');
+    if (FILE_SAFE_ID.test(id)) {
+      return id.length <= MAX_ENCODED_NAME ? id : `%h%${createHash('sha256').update(id).digest('hex')}`;
+    }
+    const encoded = encodeName(id);
+    // `%h%` is unreachable through encodeName — a `%` there is always followed by two hex digits —
+    // so the digest form for over-long ids cannot shadow an encoded name.
+    return encoded.length <= MAX_ENCODED_NAME ? encoded : `%h%${createHash('sha256').update(id).digest('hex')}`;
   }
 
   private filePath(id: string): string {
@@ -102,7 +128,7 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
     const pool: T[] = [];
     await Promise.all(
       entries
-        .filter(e => /^[\w-]+\.json$/.test(e))
+        .filter(e => /^[\w%-]+\.json$/.test(e))
         .map(async e => {
           try {
             pool.push(JSON.parse(await fs.readFile(join(this.dir, e), 'utf8')) as T);

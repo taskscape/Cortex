@@ -2,12 +2,14 @@
 
 > Part of the [Cortex Local Agent documentation](../README.md).
 
-The repository has three test layers:
+The repository has four test layers:
 
 - Node tests in `tests\*.test.mjs` for backend/runtime behavior.
 - Matbot CLI tests for ephemeral-store and workspace-storage isolation.
 - Playwright WebUI tests in `tests\webui\matbot-webui.spec.mjs` for browser
   interactions against the real static WebUI and a fake Matbot server.
+- The Playwright README question set in `tests\readme-qa\` for answer quality
+  against a running Cortex, scored 0/1 by static rules.
 
 Run the complete suite before treating a change as verified:
 
@@ -98,6 +100,87 @@ Current Playwright coverage includes:
 - session rename/hide/mark controls;
 - send/stop busy behavior;
 - mobile sidebar behavior.
+
+## README question set (0/1 answer scoring)
+
+`tests\readme-qa\readme-questions.json` is a static question set derived from
+`README.md`. Every entry carries the question, the README passage that supports
+it (`sourceQuote`), and a rubric of regular expressions:
+
+- `expect.required` — groups of alternatives; each group must match once;
+- `expect.forbidden` — patterns that must not appear.
+
+An answer scores `1` only when every required group matches and no forbidden
+pattern does, otherwise `0`. No model grades the answers, so the same answer
+always produces the same score and a failure names the rule that was missed.
+`tests\readme-qa\score.mjs` holds the scoring, normalizing markdown backticks
+and whitespace before matching.
+
+`tests\readme-qa.test.mjs` runs inside `npm test` and validates the rubric
+itself without touching a model or the network: ids are unique, all patterns
+compile, every `sourceQuote` still appears in `README.md`, each quote scores 1
+against its own question, and non-answers score 0. A README edit that
+invalidates a question fails there first.
+
+The Playwright suite `tests\readme-qa\readme-qa.spec.mjs` asks each question
+through the WebUI composer of a **running** Cortex — not the fake harness — so
+real retrieval and a real provider answer it. Start Cortex first:
+
+```powershell
+scripts\run.ps1
+npm run test:readme-qa
+```
+
+Each question runs in a fresh conversation, one Playwright test per question, so
+the run reports 34 individual pass/fail results. Failures do not stop the suite;
+every question is always scored. The run writes
+`test-results\readme-qa\report.json`, `report.md` (the 0/1 table plus the reason
+for each miss), and `answers.jsonl` (raw scored answers, appended as the run
+proceeds so results survive Playwright's worker restart after a failure).
+
+This suite is intentionally excluded from `npm run test:all`: it needs a live
+Cortex and spends provider tokens.
+
+Useful variants:
+
+```powershell
+# Score a single question by id
+npm run test:readme-qa -- --grep "workspace-rag-cuda"
+
+# Point at another Cortex instance
+$env:CORTEX_WEBUI_URL = "http://127.0.0.1:19778"; npm run test:readme-qa
+
+# Change what the assistant is told to answer from (retrieval probe)
+$env:CORTEX_QA_PROMPT_PREFIX = "Answer from the workspace documentation. Question: "; npm run test:readme-qa
+```
+
+`CORTEX_QA_ANSWER_TIMEOUT_MS` (default 180000) and
+`CORTEX_QA_TEST_TIMEOUT_MS` (default 240000) bound a slow turn.
+
+Reading a failing run means separating three causes, which the stored answer
+tells apart at a glance:
+
+- **retrieval miss** — the answer says the README does not cover it. The corpus,
+  not the rubric, is at fault: the workspace RAG context has to include
+  `README.md` before the score means anything.
+- **rubric too strict** — the answer is right but worded differently. Add the
+  alternative to that required group.
+- **wrong answer** — the content is confidently incorrect. This is the failure
+  the suite exists to catch; do not widen the rubric to make it pass.
+
+Tuning a pattern does not need another provider run. `rescore.mjs` re-applies
+the current rubric to the answers of the last run and names every question whose
+score moved:
+
+```powershell
+node tests/readme-qa/rescore.mjs
+node tests/readme-qa/rescore.mjs --verbose   # print the stored answer for each miss
+node tests/readme-qa/rescore.mjs --write     # rewrite report.json / report.md
+```
+
+Adding a question means adding one JSON entry — question, `sourceQuote` copied
+from `README.md`, and the required/forbidden patterns. `npm test` then proves
+the entry is answerable from the document before any model sees it.
 
 Node tests cover:
 

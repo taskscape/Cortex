@@ -1,0 +1,389 @@
+{
+  "version": 1,
+  "source": "README.md",
+  "scoring": "binary",
+  "promptPrefix": "Answer strictly from the Cortex README.md in this workspace. Be concise and reuse the exact names, paths, versions, and library names used by that document. If the README does not answer the question, say so.\n\nQuestion: ",
+  "description": "Static question set derived from README.md. Every question is scored 0/1 by deterministic regular expressions, so answers can be graded without a model in the loop. `sourceQuote` is the passage of README.md that supports the answer; the Node test asserts the quote is still present in README.md and that the quote itself scores 1, which keeps the rubric grounded in the document.",
+  "questions": [
+    {
+      "id": "runtime-foundation",
+      "section": "Cortex Local Agent",
+      "question": "Which runtime is Cortex built on?",
+      "sourceQuote": "Cortex is a Windows-native local assistant built on the Matbot runtime.",
+      "expect": {
+        "required": [["Matbot"]]
+      }
+    },
+    {
+      "id": "projectmem-not-integrated",
+      "section": "Cortex Local Agent",
+      "question": "Is PROJECTMEM integrated into Cortex?",
+      "sourceQuote": "PROJECTMEM is intentionally not integrated.",
+      "expect": {
+        "required": [
+          ["PROJECTMEM"],
+          ["not integrated", "intentionally not", "no PROJECTMEM integration", "isn't integrated"]
+        ],
+        "forbidden": ["PROJECTMEM is integrated", "fully integrated"]
+      }
+    },
+    {
+      "id": "default-workspace-name",
+      "section": "Conceptual Overview",
+      "question": "What is the name of the single workspace a default Cortex installation provides?",
+      "sourceQuote": "The default installation gives one `Default` workspace.",
+      "expect": {
+        "required": [["Default. workspace", "Default workspace", "workspace (named|called) .?Default", "(is|it.s) .?Default[.\"'`]?$", "(is|it.s) .?Default.?[.,]"]]
+      }
+    },
+    {
+      "id": "workspace-config-file",
+      "section": "Conceptual Overview",
+      "question": "Which file inside a workspace defines its providers, active plugins, RAG, memory, skills, and the expert panel?",
+      "sourceQuote": "its `matbot.yaml` defines the OpenAI-compatible providers, the active plugins, the Cortex WebUI, workspace RAG, memory, skills, the expert panel, and file-management tools.",
+      "expect": {
+        "required": [["matbot\\.yaml"]]
+      }
+    },
+    {
+      "id": "local-services",
+      "section": "Conceptual Overview",
+      "question": "Which local services does Cortex expose next to the Matbot process?",
+      "sourceQuote": "local services that expose safe file indexing, safe file access, and Mem0;",
+      "expect": {
+        "required": [
+          ["file index", "file indexing"],
+          ["file access", "file broker", "file-broker"],
+          ["Mem0"]
+        ]
+      }
+    },
+    {
+      "id": "userguide-document",
+      "section": "Documentation",
+      "question": "Which document owns installation instructions and the WebUI tour?",
+      "sourceQuote": "| [Cortex User Guide](userguide.md) | Installation, WebUI tour, conversations, workspaces, files, RAG, memory, skills, experts, sources, SQL, workflows, graph, reviews, plugins, scheduling, safety, and troubleshooting. |",
+      "expect": {
+        "required": [["userguide\\.md", "Cortex User Guide"]]
+      }
+    },
+    {
+      "id": "commands-document",
+      "section": "Documentation",
+      "question": "Which document describes the purpose of every PowerShell script and the run.ps1 switches?",
+      "sourceQuote": "| [Commands](docs/commands.md) | Purpose of every PowerShell script, launcher/service startup paths, `run.ps1` switches, and npm scripts. |",
+      "expect": {
+        "required": [["commands\\.md", "docs[\\\\/]commands"]]
+      }
+    },
+    {
+      "id": "memory-document",
+      "section": "Documentation",
+      "question": "Which document explains remembered_facts, contextual_search, and memory-policy.json?",
+      "sourceQuote": "| [Memory And Retrieval](docs/memory-and-retrieval.md) | The \"remember my name\" flow, `remembered_facts`, `KnowledgeIndex`, workspace RAG, `contextual_search`, and `memory-policy.json`. |",
+      "expect": {
+        "required": [["memory-and-retrieval", "Memory And Retrieval"]]
+      }
+    },
+    {
+      "id": "reading-order",
+      "section": "Documentation",
+      "question": "What reading order does the README recommend for the documentation?",
+      "sourceQuote": "A good reading order is this overview, the [Cortex User Guide](userguide.md), and then [Architecture And Core Systems](docs/architecture.md) or the [Configuration Reference](docs/configuration.md) when deeper operational or implementation detail is needed.",
+      "expect": {
+        "required": [
+          ["User Guide", "userguide"],
+          ["architecture"],
+          ["configuration"]
+        ]
+      }
+    },
+    {
+      "id": "file-index-path",
+      "section": "Repository Map",
+      "question": "Which repository path holds the JSON-backed file index with keyword search and likely-secret skipping?",
+      "sourceQuote": "| `local-agent\\file-index` | JSON-backed file index with keyword search, metadata, hashing, exclusions, and likely-secret skipping. |",
+      "expect": {
+        "required": [
+          ["local-agent"],
+          ["file-index"]
+        ]
+      }
+    },
+    {
+      "id": "file-broker-purpose",
+      "section": "Repository Map",
+      "question": "What is the file-broker module responsible for?",
+      "sourceQuote": "| `local-agent\\file-broker` | Policy-aware file access service for listing, reading, and approved writes with diffs and backups. |",
+      "expect": {
+        "required": [
+          ["file access", "listing", "reading"],
+          ["diff"],
+          ["backup"]
+        ]
+      }
+    },
+    {
+      "id": "mem0-stack-contents",
+      "section": "Repository Map",
+      "question": "Which components make up the Docker Compose stack under local-agent/docker/mem0?",
+      "sourceQuote": "| `local-agent\\docker\\mem0` | Docker Compose stack for Mem0, Postgres/pgvector, Neo4j, and optional CUDA embeddings. |",
+      "expect": {
+        "required": [
+          ["Mem0"],
+          ["Postgres", "PostgreSQL"],
+          ["pgvector"],
+          ["Neo4j"]
+        ]
+      }
+    },
+    {
+      "id": "knowledge-directory",
+      "section": "Repository Map",
+      "question": "What does the local-agent/knowledge directory contain?",
+      "sourceQuote": "| `local-agent\\knowledge` | Minimal file-backed knowledge samples for the default experts. |",
+      "expect": {
+        "required": [
+          ["knowledge sample", "file-backed knowledge", "knowledge"],
+          ["expert"]
+        ]
+      }
+    },
+    {
+      "id": "technology-summary",
+      "section": "Technology",
+      "question": "Which languages and runtimes dominate Cortex overall?",
+      "sourceQuote": "Cortex is predominantly a TypeScript/Node.js system with a Docker-hosted Python memory service and Windows PowerShell operational tooling.",
+      "expect": {
+        "required": [
+          ["TypeScript"],
+          ["Node"],
+          ["PowerShell"]
+        ]
+      }
+    },
+    {
+      "id": "windows-service-wrapper",
+      "section": "Technology",
+      "question": "What wraps Matbot as a Windows service?",
+      "sourceQuote": "[WinSW](https://github.com/winsw/winsw) wraps Matbot as a Windows service; Windows service control (`services.msc`, `Get-Service`).",
+      "expect": {
+        "required": [["WinSW"]]
+      }
+    },
+    {
+      "id": "file-index-glob-library",
+      "section": "Technology",
+      "question": "Which library does the file-index service use for glob exclusions?",
+      "sourceQuote": "Built-in `node:http` server (no web framework); `minimatch` for glob exclusions; `node:crypto` hashing; JSON-file persistence.",
+      "expect": {
+        "required": [["minimatch"]]
+      }
+    },
+    {
+      "id": "file-broker-dependencies",
+      "section": "Technology",
+      "question": "How many runtime dependencies does the file-broker service have?",
+      "sourceQuote": "Built-in `node:http` server; no runtime dependencies; unified diffs and file backups; JSON policy files.",
+      "expect": {
+        "required": [["no runtime dependencies", "zero runtime dependencies", "none"]]
+      }
+    },
+    {
+      "id": "database-versions",
+      "section": "Technology",
+      "question": "Which Postgres and Neo4j versions does the Mem0 stack use?",
+      "sourceQuote": "Postgres 16 with `pgvector` for Mem0 and workspace RAG; optional `workspace-rag-cuda` embedding service under the `cuda` profile; Neo4j 5;",
+      "expect": {
+        "required": [
+          ["Postgres ?16", "PostgreSQL ?16"],
+          ["Neo4j ?5"]
+        ]
+      }
+    },
+    {
+      "id": "mem0-image-architecture",
+      "section": "Technology",
+      "question": "How does the Mem0 API image run on an amd64 host?",
+      "sourceQuote": "Mem0 API runs `linux/arm64` under QEMU on amd64.",
+      "expect": {
+        "required": [
+          ["arm64"],
+          ["QEMU"]
+        ]
+      }
+    },
+    {
+      "id": "node-version-requirement",
+      "section": "Technology",
+      "question": "Which minimum Node.js version does the Matbot runtime require?",
+      "sourceQuote": "TypeScript (strict), Node.js >= 24",
+      "expect": {
+        "required": [["24"]]
+      }
+    },
+    {
+      "id": "monorepo-package-manager",
+      "section": "Technology",
+      "question": "Which package manager does the Matbot runtime monorepo use?",
+      "sourceQuote": "pnpm monorepo; agentic runner, plugin loader, hooks, stores; provider communication via raw `fetch` + SSE (no provider SDKs); `Store` compare-and-swap persistence.",
+      "expect": {
+        "required": [["pnpm"]],
+        "forbidden": ["uses yarn", "uses npm workspaces for the matbot runtime"]
+      }
+    },
+    {
+      "id": "webui-client-stack",
+      "section": "Technology",
+      "question": "Which frontend framework does the Matbot WebUI client use?",
+      "sourceQuote": "Node HTTP + Server-Sent Events server; framework-free `app.js`/`index.html`/CSS; `localStorage` and Web Crypto in the browser.",
+      "expect": {
+        "required": [["framework-free", "no framework", "without a framework", "vanilla"]],
+        "forbidden": ["(built|written|based) (with|on|in) React", "uses React", "React app"]
+      }
+    },
+    {
+      "id": "provider-adapter",
+      "section": "Technology",
+      "question": "What kind of provider adapter ships with Cortex and which endpoints does it work with?",
+      "sourceQuote": "OpenAI-compatible chat-completions adapter; streaming and tool calls over `fetch` + SSE; works with OpenAI and any compatible endpoint.",
+      "expect": {
+        "required": [
+          ["OpenAI-compatible", "OpenAI compatible"],
+          ["chat.completions", "chat completions"]
+        ]
+      }
+    },
+    {
+      "id": "workspace-rag-hashing",
+      "section": "Technology",
+      "question": "Which hash does the workspace-rag plugin use for content hashing?",
+      "sourceQuote": "Markdown chunking and SHA-256 content hashing; Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback;",
+      "expect": {
+        "required": [["SHA-?256"]],
+        "forbidden": ["MD5", "SHA-?1\\b"]
+      }
+    },
+    {
+      "id": "workspace-rag-storage",
+      "section": "Technology",
+      "question": "Where does the workspace-rag plugin store vectors, metadata, and chunk text?",
+      "sourceQuote": "Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback; CPU hash vectorizer fallback;",
+      "expect": {
+        "required": [
+          ["Postgres", "PostgreSQL"],
+          ["pgvector"]
+        ]
+      }
+    },
+    {
+      "id": "workspace-rag-cuda",
+      "section": "Technology",
+      "question": "What has to happen for workspace-rag to use CUDA embeddings?",
+      "sourceQuote": "optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds.",
+      "expect": {
+        "required": [
+          ["workspace-rag-cuda"],
+          ["prob(e|ing)", "launch-time", "launch time"]
+        ]
+      }
+    },
+    {
+      "id": "bge-reranking-plugin",
+      "section": "Technology",
+      "question": "Which retrieval plugin performs optional BGE reranking?",
+      "sourceQuote": "`KnowledgeIndex` implementations querying Mem0 and file-index; optional BGE reranking in `persist-ki-bge`; `contextual_search` tool.",
+      "expect": {
+        "required": [["persist-ki-bge"]]
+      }
+    },
+    {
+      "id": "retrieval-plugin-names",
+      "section": "Technology",
+      "question": "Which three retrieval plugins does the README list?",
+      "sourceQuote": "| Retrieval plugins (`hybrid-knowledge-index`, `persist-ki-bge`, `rumsfeld`) | TypeScript |",
+      "expect": {
+        "required": [
+          ["hybrid-knowledge-index"],
+          ["persist-ki-bge"],
+          ["rumsfeld"]
+        ]
+      }
+    },
+    {
+      "id": "expert-panel-plugin",
+      "section": "Technology",
+      "question": "What does the expert-panel plugin do?",
+      "sourceQuote": "Tool-based multi-expert orchestration over the Matbot single-turn API; per-expert file retrieval and optional synthesis.",
+      "expect": {
+        "required": [
+          ["multi-expert", "expert"],
+          ["synthes"]
+        ]
+      }
+    },
+    {
+      "id": "evaluation-observability-plugin",
+      "section": "Technology",
+      "question": "What does the evaluation-observability plugin provide?",
+      "sourceQuote": "Store-backed end-to-end spans, redacted trace replay, deterministic and model-scored regression suites, operational metrics, cost accounting, and verified ROI evidence.",
+      "expect": {
+        "required": [
+          ["span", "trace"],
+          ["replay"],
+          ["regression"],
+          ["ROI"]
+        ]
+      }
+    },
+    {
+      "id": "test-runners",
+      "section": "Technology",
+      "question": "Which test runners does the tests module use?",
+      "sourceQuote": "Node built-in test runner (`node --test`); Playwright for WebUI tests with a fake Matbot harness.",
+      "expect": {
+        "required": [
+          ["node --test", "built-in test runner"],
+          ["Playwright"]
+        ]
+      }
+    },
+    {
+      "id": "no-provider-sdks",
+      "section": "Technology",
+      "question": "Does Cortex use vendor provider SDKs to reach models, and if not, what does it use?",
+      "sourceQuote": "Provider access never uses vendor SDKs; all model traffic is `fetch` plus Server-Sent Events parsing.",
+      "expect": {
+        "required": [
+          ["never uses vendor SDKs", "no vendor SDKs", "no provider SDKs", "does not use.{0,30}SDK", "without.{0,30}SDK"],
+          ["fetch"],
+          ["Server-Sent Events", "SSE"]
+        ]
+      }
+    },
+    {
+      "id": "node-specific-packages",
+      "section": "Technology",
+      "question": "Where does Node-specific behavior live, given that shared Matbot packages avoid Node-only primitives?",
+      "sourceQuote": "Shared Matbot packages avoid Node-only primitives so they run in both Node and the browser; Node-specific behavior lives in `-node` packages and the host apps.",
+      "expect": {
+        "required": [
+          ["-node.? packages", "packages suffixed .?-node"],
+          ["host app"]
+        ]
+      }
+    },
+    {
+      "id": "no-web-framework-rationale",
+      "section": "Technology",
+      "question": "Why do the local HTTP services use Node's built-in http module instead of a web framework?",
+      "sourceQuote": "The local HTTP services deliberately use Node's built-in `http` module instead of a web framework to keep dependencies minimal.",
+      "expect": {
+        "required": [
+          ["node:http", "built-in .?http", "builtin http"],
+          ["dependencies minimal", "minimal dependencies", "keep dependencies", "fewer dependencies"]
+        ]
+      }
+    }
+  ]
+}
