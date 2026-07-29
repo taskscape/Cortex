@@ -568,11 +568,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     const sources = await this.querySources(input.workspaceId === undefined
       ? undefined
       : { where: { op: 'eq', field: 'workspaceId', value: input.workspaceId } });
+    const latestSourceVersionIds = await this.latestSourceVersionIds(
+      new Set(sources.map(source => source.id)),
+    );
     const generatedAt = nowIso();
     const findings: SourceHealthFinding[] = [];
 
     for (const source of sources) {
-      const sourceVersionId = await this.latestSourceVersionId(source.id);
+      const sourceVersionId = latestSourceVersionIds.get(source.id);
       for (const issueType of this.issueTypesForSource(source, input.includeUnknownFreshness === true)) {
         const severity = this.severityForIssue(issueType);
         findings.push({
@@ -640,10 +643,18 @@ class StoreBackedSourceRegistry implements SourceRegistry {
       : { where: { op: 'eq', field: 'workspaceId', value: workspaceId } });
   }
 
-  private async latestSourceVersionId(sourceId: string): Promise<string | undefined> {
-    const versions = await queryBySource(this.versions, sourceId);
-    versions.sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt));
-    return versions[0]?.id;
+  private async latestSourceVersionIds(sourceIds: ReadonlySet<string>): Promise<Map<string, string>> {
+    if (sourceIds.size === 0) return new Map();
+    const versions = await queryAll(this.versions);
+    const latest = new Map<string, SourceVersion>();
+    for (const version of versions) {
+      if (!sourceIds.has(version.sourceId)) continue;
+      const current = latest.get(version.sourceId);
+      if (current === undefined || Date.parse(version.observedAt) > Date.parse(current.observedAt)) {
+        latest.set(version.sourceId, version);
+      }
+    }
+    return new Map([...latest].map(([sourceId, version]) => [sourceId, version.id]));
   }
 
   private issueTypesForSource(source: SourceRecord, includeUnknownFreshness: boolean): SourceHealthIssueType[] {

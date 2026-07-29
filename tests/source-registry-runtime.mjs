@@ -5,6 +5,7 @@ const { plugin } = await import("../local-agent/matbot/packages/plugins/source-r
 class MemoryStore {
   constructor() {
     this.docs = new Map();
+    this.queryCount = 0;
   }
 
   async get(id) {
@@ -30,6 +31,7 @@ class MemoryStore {
   }
 
   async query(q = {}) {
+    this.queryCount += 1;
     let items = [...this.docs.values()];
     if (q.where !== undefined) items = items.filter(item => matches(item, q.where));
     if (Array.isArray(q.sort)) {
@@ -146,6 +148,23 @@ async function main() {
   });
   assert.equal(versionA.id, versionB.id);
 
+  const healthySource = await registry.upsertSource({
+    workspaceId: "default",
+    connectorType: "workspace-rag",
+    externalId: "default:/docs/healthy.md",
+    uri: "C:/docs/healthy.md",
+    title: "healthy.md",
+    sourceKind: "document",
+    citationPolicy: "cite_path",
+    healthState: "healthy",
+  });
+  await registry.upsertVersion({
+    sourceId: healthySource.id,
+    contentHash: "healthy",
+    observedAt: "2026-01-02T00:00:00.000Z",
+    provenance: { activityId: "test:scan" },
+  });
+
   await registry.recordHealth({ sourceId, state: "degraded", message: "read failed" });
   assert.equal((await registry.getSource(sourceId)).healthState, "degraded");
   await registry.recordAccess({ sourceId, action: "retrieve", allowed: true });
@@ -185,8 +204,10 @@ async function main() {
   assert.equal(events.health.length, 1);
 
   const healthTool = tools.get("source_health_action");
+  const versionStore = stores.get("source_versions");
   const report = await collectTool(healthTool, { action: "report", workspaceId: "default" });
-  assert.equal(report.totalSources, 1);
+  assert.equal(report.totalSources, 2);
+  assert.equal(report.healthySources, 1);
   assert.equal(report.staleSources, 1);
   assert.equal(report.unhealthySources, 1);
   assert.equal(report.warningCount, 2);
@@ -196,11 +217,13 @@ async function main() {
   assert.equal(report.findings[0].sourceVersionId, versionA.id);
   assert.equal(report.connectorHealth.length, 1);
   assert.equal(report.connectorHealth[0].healthState, "degraded");
+  assert.equal(versionStore.queryCount, 1, "health evaluation should query source versions once");
 
   const warnings = await collectTool(healthTool, { action: "warnings", workspaceId: "default" });
   assert.equal(warnings.warningCount, 2);
   assert.equal(warnings.findings.length, 2);
   assert.equal(warnings.connectorHealth.length, 1);
+  assert.equal(versionStore.queryCount, 2, "each health evaluation should use one source-version query");
 
   const reports = await collectTool(healthTool, { action: "reports", workspaceId: "default" });
   assert.equal(reports.reports.length, 1);

@@ -359,6 +359,20 @@ test("architecture product panels expose sources, SQL approval, workflow approva
   ]));
 });
 
+test("architecture sources render before the health report finishes", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop regression coverage");
+  await page.route("**/tools/source_health_action", async route => {
+    await new Promise(resolve => setTimeout(resolve, 5_000));
+    await route.continue();
+  });
+  await page.goto("/");
+
+  await openArchitecturePanel(page, "sources");
+
+  await expect(page.locator("#architecture-source-list")).toContainText("architecture.md", { timeout: 2_000 });
+  await expect(page.locator("#architecture-source-status")).not.toHaveText("Loading sources...", { timeout: 2_000 });
+});
+
 test("architecture SQL actions recover from transient approval and execution failures", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop architecture recovery coverage");
   let failPlanning = true;

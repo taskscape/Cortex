@@ -305,6 +305,7 @@ const WORKSPACE_RESTART_STATUS_INTERVAL_MS = 5000;
 let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
 let architectureView = 'sources';
 let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, healthReport: null, loaded: false };
+let architectureSourcesLoadSeq = 0;
 let architectureSqlState = { plan: null, approvalToken: '', executed: null };
 let architectureSqlBusy = '';
 let architectureSqlPlanRequest = 0;
@@ -1148,19 +1149,25 @@ async function selectArchitectureSource(sourceId) {
 }
 
 async function loadArchitectureSources() {
+  const loadSeq = ++architectureSourcesLoadSeq;
+  const workspaceId = activeWorkspaceId();
   if (architectureSourceRefreshBtn) architectureSourceRefreshBtn.disabled = true;
   architectureStatus(architectureSourceStatusEl, 'Loading sources...');
+  const healthResultPromise = callTool('source_health_action', {
+    action: 'report',
+    workspaceId,
+  }).then(
+    value => ({ status: 'fulfilled', value }),
+    reason => ({ status: 'rejected', reason }),
+  );
   try {
-    const [sourceResult, healthResult] = await Promise.allSettled([
-      callTool('source_action', {
-        action: 'list',
-        query: { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } },
-      }),
-      callTool('source_health_action', { action: 'report', workspaceId: activeWorkspaceId() }),
-    ]);
-    if (sourceResult.status !== 'fulfilled') throw sourceResult.reason;
-    architectureSourcesState.sources = Array.isArray(sourceResult.value?.sources) ? sourceResult.value.sources : [];
-    architectureSourcesState.healthReport = healthResult.status === 'fulfilled' ? healthResult.value : null;
+    const sourceResult = await callTool('source_action', {
+      action: 'list',
+      query: { where: { op: 'eq', field: 'workspaceId', value: workspaceId } },
+    });
+    if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
+    architectureSourcesState.sources = Array.isArray(sourceResult?.sources) ? sourceResult.sources : [];
+    architectureSourcesState.healthReport = null;
     architectureSourcesState.loaded = true;
     const previousId = architectureSourcesState.selected?.id;
     const next = architectureSourcesState.sources.find(source => source.id === previousId) || architectureSourcesState.sources[0] || null;
@@ -1169,15 +1176,23 @@ async function loadArchitectureSources() {
     architectureSourcesState.events = null;
     renderArchitectureSourceList();
     renderArchitectureSourceDetail();
+    void healthResultPromise.then(healthResult => {
+      if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
+      architectureSourcesState.healthReport = healthResult.status === 'fulfilled' ? healthResult.value : null;
+      renderArchitectureSourceDetail();
+    });
     if (next) await selectArchitectureSource(next.id);
     else architectureStatus(architectureSourceStatusEl, 'No sources');
   } catch (err) {
+    if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
     architectureStatus(architectureSourceStatusEl, String(err?.message || err), true);
     architectureSourcesState.loaded = true;
     renderArchitectureSourceList();
     renderArchitectureSourceDetail();
   } finally {
-    if (architectureSourceRefreshBtn) architectureSourceRefreshBtn.disabled = false;
+    if (loadSeq === architectureSourcesLoadSeq && architectureSourceRefreshBtn) {
+      architectureSourceRefreshBtn.disabled = false;
+    }
   }
 }
 
