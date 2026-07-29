@@ -45,7 +45,11 @@ services:
     gpus: all
     environment:
       EMBEDDING_MODEL: ${WORKSPACE_RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_MODEL_REVISION: ${WORKSPACE_RAG_EMBEDDING_MODEL_REVISION:-}
+      EMBEDDING_PROFILE: ${WORKSPACE_RAG_EMBEDDING_PROFILE:-auto}
       EMBEDDING_BATCH_SIZE: ${WORKSPACE_RAG_EMBEDDING_BATCH_SIZE:-32}
+    volumes:
+      - workspace-rag-models:/models
     ports:
       - "8890:8000"
 
@@ -79,3 +83,4 @@ volumes:
   mem0-postgres:
   mem0-neo4j:
   mem0-history:
+  workspace-rag-models:

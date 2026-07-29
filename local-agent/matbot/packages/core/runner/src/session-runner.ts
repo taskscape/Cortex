@@ -33,6 +33,9 @@ interface QueuedItem {
   // ignore unrelated turns — lineage the bare per-turn traceId can't express.
   rootTraceId: string;
   content:     MessageContent[];
+  // Frontend-supplied context for this submission only. It follows screen-hook context at provider
+  // time and is never included in the persisted user message or queued/replay UI events.
+  ephemeral?:   MessageContent[];
   provider:    string;
   principal:   Principal;
   concatQueue: boolean;
@@ -164,6 +167,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
           while (s.queue.length > 0 && s.queue[0]!.concatQueue) batch.push(s.queue.shift()!);
         }
         const content = batch.flatMap(i => i.content);
+        const tailEphemeral = batch.flatMap(i => i.ephemeral ?? []);
         s.replay = [];
         // Seed replay with the running turn's user message as a single merged `queued`, mirroring the
         // message persisted just below. notify() (in open()) reaches only subscribers that are live at
@@ -243,6 +247,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
               ...(deps.vault         !== undefined ? { vault:         deps.vault         } : {}),
               ...(head.prompt        !== undefined ? { prompt:        head.prompt        } : {}),
               ...(head.redo          !== undefined ? { injectedEphemeral: head.redo.ephemeral } : {}),
+              ...(tailEphemeral.length > 0 ? { tailEphemeral } : {}),
               ...(observability !== undefined ? { observability } : {}),
             })) {
               emit(s, ev);
@@ -388,6 +393,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
           traceId,
           rootTraceId:   traceId,
           content:       opts.content,
+          ...(opts.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}),
           provider:      opts.provider,
           principal:     opts.principal,
           concatQueue,

@@ -185,6 +185,12 @@ sessions.set("s0", {
 });
 
 const skills = new Map([
+  ["Inner voice", {
+    name: "Inner voice",
+    content: "# Inner Voice\nAsk the configured critic to review the response.",
+    catalogue: true,
+    knowledge: null
+  }],
   ["Panel Etiquette", {
     name: "Panel Etiquette",
     content: "# Panel Etiquette\nAsk each expert for evidence and disagreement.",
@@ -1523,6 +1529,18 @@ async function handle(req, res) {
     const traceId = body.traceId ?? `trace-${traceSeq++}`;
     const session = sessions.get(sessionId);
     if (!session) return json(res, 404, { error: "Session not found" });
+    if (body.attachments !== undefined) {
+      if (!Array.isArray(body.attachments)) return json(res, 400, { error: '"attachments" must be an array.' });
+      if (body.attachments.length > 20) return json(res, 400, { error: "A message can attach at most 20 workspace files." });
+      for (const attachment of body.attachments) {
+        if (!attachment || attachment.namespace !== "workspace" || typeof attachment.path !== "string") {
+          return json(res, 400, { error: 'Each attachment must identify a workspace file with { namespace: "workspace", path }.' });
+        }
+        if (!files.has(attachment.path)) {
+          return json(res, 400, { error: `Workspace attachment not found: ${JSON.stringify(attachment.path)}.` });
+        }
+      }
+    }
     void runTurn(sessionId, traceId, body);
     return json(res, 200, { queued: 0, traceId });
   }
@@ -2095,11 +2113,20 @@ async function runTurn(sessionId, traceId, body) {
   const session = sessions.get(sessionId);
   const rememberedFacts = rememberedFactsForWorkspace(session?.workspaceId ?? activeHarnessWorkspaceId());
   const content = typeof body.content === "string" ? body.content : JSON.stringify(body.content);
+  const attachmentRefs = (body.attachments ?? []).map(attachment => ({
+    type: "file-ref",
+    fileId: `workspace:${attachment.path}`,
+    name: attachment.path,
+    mimeType: attachment.path.toLowerCase().endsWith(".md") ? "text/markdown" : "application/octet-stream"
+  }));
   const userMessage = {
     id: `m-${traceId}-u`,
     traceId,
     role: "user",
-    content: typeof body.content === "string" ? [{ type: "text", text: body.content }] : [body.content],
+    content: [
+      ...(typeof body.content === "string" ? [{ type: "text", text: body.content }] : [body.content]),
+      ...attachmentRefs
+    ],
     createdAt: now()
   };
   session.messages.push(userMessage);
@@ -2131,6 +2158,47 @@ async function runTurn(sessionId, traceId, body) {
     const assistantText = result.ok
       ? result.message
       : `Could not ${action} plugin "${specifier}": ${result.error}`;
+    sendSession(sessionId, "text-delta", { type: "text-delta", delta: assistantText, traceId });
+    const assistant = {
+      id: `m-${traceId}-a`,
+      traceId,
+      role: "assistant",
+      content: [{ type: "text", text: assistantText }],
+      createdAt: now()
+    };
+    session.messages.push(assistant);
+    session.updatedAt = now();
+    sendSession(sessionId, "done", { type: "done", session, traceId });
+    runningTurns.delete(sessionId);
+    setBusy(sessionId, false);
+    return;
+  }
+
+  const attachedReadme = attachmentRefs.find(ref => ref.name.toLowerCase() === "readme.md");
+  if (attachedReadme && /read|summar/i.test(content)) {
+    sendSession(sessionId, "marker", {
+      type: "marker",
+      content: [{
+        type: "marker",
+        creator: "workspace-rag",
+        data: { hits: [{ path: "C:/RAG-test/README.md", score: 0.94 }] }
+      }],
+      traceId
+    });
+    await sleep(10);
+    const callId = `call-${traceId}-workspace-read`;
+    const input = { action: "read", path: attachedReadme.name };
+    sendSession(sessionId, "tool:start", { type: "tool:start", callId, name: "workspace_action", input, traceId });
+    await sleep(10);
+    const fileContent = files.get(attachedReadme.name)?.toString("utf8") ?? "";
+    sendSession(sessionId, "tool:end", {
+      type: "tool:end",
+      callId,
+      result: fileContent,
+      isError: false,
+      traceId
+    });
+    const assistantText = `Read attached workspace file ${attachedReadme.name} with workspace_action and summarized ${fileContent.length} characters.`;
     sendSession(sessionId, "text-delta", { type: "text-delta", delta: assistantText, traceId });
     const assistant = {
       id: `m-${traceId}-a`,

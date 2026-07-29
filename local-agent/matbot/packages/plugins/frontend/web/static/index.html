@@ -1118,27 +1118,29 @@
       color: #ef4444;
     }
     .file-action-btn:hover { background: #fecaca; }
-
-    .sidebar-action-btn {
-      width: calc(100% - 16px);
-      margin: 8px;
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      background: #fff;
-      color: #374151;
-      font: inherit;
+    .file-attach-btn {
+      background: none;
+      border: none;
+      border-radius: 3px;
+      color: #6b7280;
       cursor: pointer;
-      min-height: 32px;
-      padding: 6px 9px;
-      text-align: left;
+      font-size: 1em;
+      line-height: 1;
+      padding: 2px 4px;
     }
-    .sidebar-action-btn:hover {
-      background: #f3f4f6;
-      color: #111827;
+    .file-attach-btn:hover,
+    .file-attach-btn[aria-pressed="true"] {
+      background: #dbeafe;
+      color: #1d4ed8;
     }
+    .file-item.attached {
+      background: #eff6ff;
+      color: #1e3a8a;
+    }
+    .file-item.attached .file-actions { display: flex; }
+
     #memory-browser-status {
-      min-height: 16px;
-      padding: 0 10px 8px;
+      padding: 2px 11px 6px;
       color: #9ca3af;
       font-size: 0.78em;
       line-height: 1.25;
@@ -3834,6 +3836,58 @@
       backdrop-filter: blur(18px);
       -webkit-backdrop-filter: blur(18px);
     }
+    #attachment-tray {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0 2px 8px;
+    }
+    #attachment-tray[hidden] { display: none; }
+    .attachment-chip,
+    .message-attachment {
+      align-items: center;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 999px;
+      color: #1e40af;
+      display: inline-flex;
+      font-size: 0.78em;
+      gap: 5px;
+      line-height: 1.3;
+      max-width: min(100%, 360px);
+      padding: 4px 8px;
+    }
+    .message-attachment {
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .message-attachment:hover { background: #dbeafe; }
+    .attachment-chip-name,
+    .message-attachment-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .attachment-chip-remove {
+      background: transparent;
+      border: 0;
+      border-radius: 50%;
+      color: #64748b;
+      cursor: pointer;
+      font: inherit;
+      line-height: 1;
+      padding: 0 2px;
+    }
+    .attachment-chip-remove:hover {
+      background: #dbeafe;
+      color: #1e3a8a;
+    }
+    .message-attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 7px;
+    }
     #input-meta {
       max-width: none;
       margin: 0 2px 8px;
@@ -4151,13 +4205,6 @@
       <div class="sidebar-heading">Files<button id="upload-btn" title="Upload files">+📄</button></div>
       <input type="file" id="upload-input" multiple style="display:none">
       <div id="file-list" class="sidebar-list"></div>
-    </div>
-    <div class="sidebar-section collapsed" data-section="memory">
-      <div class="sidebar-heading">Memory</div>
-      <div id="memory-list" class="sidebar-list">
-        <button id="memory-browser-btn" class="sidebar-action-btn" type="button">Open memory browser</button>
-        <div id="memory-browser-status"></div>
-      </div>
     </div>
     <div class="sidebar-section collapsed" data-section="architecture">
       <div class="sidebar-heading">Architecture</div>
@@ -4660,6 +4707,7 @@
           </div>
         </div>
       </div>
+      <div id="attachment-tray" aria-label="Files attached to the next message" hidden></div>
       <div id="input-row">
         <textarea id="input" rows="1" placeholder="Ask Cortex..."></textarea>
         <button id="send-btn" aria-label="Send"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M9 6v12l9-6z"/></svg></button>

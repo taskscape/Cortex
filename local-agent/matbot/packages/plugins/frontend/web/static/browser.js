@@ -53,6 +53,51 @@ function makeInProcessTransport(services) {
       : Promise.reject(new Error(`Non-interactive context (use submit for interactive prompts): "${typeof p === 'string' ? p : p.label}"`));
   };
 
+  async function prepareWorkspaceAttachments(rawAttachments) {
+    if (rawAttachments === undefined) return { refs: [], ephemeral: [] };
+    if (!Array.isArray(rawAttachments)) throw new Error('"attachments" must be an array.');
+    if (rawAttachments.length > 20) throw new Error('A message can attach at most 20 workspace files.');
+    if (rawAttachments.length > 0 && !services.files) {
+      throw new Error('Workspace file attachments are unavailable because no file store is configured.');
+    }
+
+    const refs = [];
+    const paths = new Set();
+    for (const raw of rawAttachments) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+          raw.namespace !== 'workspace' || typeof raw.path !== 'string') {
+        throw new Error('Each attachment must identify a workspace file with { namespace: "workspace", path }.');
+      }
+      const path = raw.path;
+      if (!path.trim() || path.length > 1024) throw new Error('Attachment paths must contain 1 to 1024 characters.');
+      if (paths.has(path)) continue;
+      paths.add(path);
+
+      const handle = await services.files.getByName(path, 'workspace');
+      if (!handle) throw new Error(`Workspace attachment not found: ${JSON.stringify(path)}.`);
+      refs.push({ type: 'file-ref', fileId: handle.id, name: handle.name, mimeType: handle.mimeType });
+    }
+
+    if (!refs.length) return { refs, ephemeral: [] };
+    const calls = refs.map(ref =>
+      `- ${JSON.stringify(ref.name)}: workspace_action ${JSON.stringify({ action: 'read', path: ref.name })}`);
+    return {
+      refs,
+      ephemeral: [{
+        type: 'text',
+        origin: 'robo',
+        text: [
+          '[Explicit Cortex Files attachments]',
+          'The user explicitly attached the workspace files listed below to this message.',
+          'Read them with workspace_action using each exact path. They are imported workspace files, not host filesystem paths.',
+          'Prefer these attachments over same-named paths from Workspace RAG or other retrieved context. Do not use file_broker_action for these attachments.',
+          ...calls,
+          '[End explicit Cortex Files attachments]',
+        ].join('\n'),
+      }],
+    };
+  }
+
   function makeToolCtx(ac, invocation = {}) {
     const now = new Date().toISOString();
     const stubSession = {
@@ -224,9 +269,11 @@ function makeInProcessTransport(services) {
   // owns a tracker that drains its own view to idle, so statusEvents() emits the off transition even
   // when no sessionEvents consumer is attached.
   async function submit(sid, body) {
+    const preparedAttachments = await prepareWorkspaceAttachments(body.attachments);
     const contentArr = typeof body.content === 'string'
       ? [{ type: 'text', text: body.content }]
       : [body.content];
+    contentArr.push(...preparedAttachments.refs);
     const traceId = crypto.randomUUID();
 
     const isTracker = !busyTrackers.has(sid);
@@ -237,6 +284,7 @@ function makeInProcessTransport(services) {
         sessionId:   sid,
         signal:      isTracker ? trackAc.signal : new AbortController().signal,
         content:     contentArr,
+        ...(preparedAttachments.ephemeral.length > 0 ? { ephemeral: preparedAttachments.ephemeral } : {}),
         provider:    body.provider,
         principal:   currentPrincipal(),
         prompt:      makePromptFn(sid, traceId),

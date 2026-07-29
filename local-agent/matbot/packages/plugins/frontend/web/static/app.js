@@ -16,6 +16,8 @@ let sending = false;          // current session busy? mirrors the server's 'ses
 const busySessions   = new Set();
 const unreadSessions = new Set();
 const updatedFiles   = new Set();
+const selectedWorkspaceFiles = new Map();
+let selectedWorkspaceOwner = null;
 
 // ── Scroll control ────────────────────────────────────────────────────────────
 //
@@ -143,6 +145,7 @@ const sessionListEl  = document.getElementById('session-list');
 const chatHeaderEl   = document.getElementById('chat-header');
 const chatTitleEl    = document.getElementById('chat-title');
 const inputEl        = document.getElementById('input');
+const attachmentTrayEl = document.getElementById('attachment-tray');
 const sendBtn        = document.getElementById('send-btn');
 const stopBtn        = document.getElementById('stop-btn');
 const newBtn         = document.getElementById('new-btn');
@@ -179,8 +182,7 @@ const workspaceDeleteDialogEl = document.getElementById('workspace-delete-dialog
 const workspaceDeleteMessageEl = document.getElementById('workspace-delete-message');
 const workspaceDeleteCancelBtn = document.getElementById('workspace-delete-cancel');
 const workspaceDeleteConfirmBtn = document.getElementById('workspace-delete-confirm');
-const memoryBrowserBtn = document.getElementById('memory-browser-btn');
-const memoryBrowserStatusEl = document.getElementById('memory-browser-status');
+let memoryBrowserStatusEl = null;
 const memoryBrowserOverlay = document.getElementById('memory-browser-overlay');
 const memoryBrowserCountEl = document.getElementById('memory-browser-count');
 const memoryBrowserRefreshBtn = document.getElementById('memory-browser-refresh');
@@ -465,6 +467,7 @@ async function callTool(toolName, input) {
 function setMemoryBrowserLauncherStatus(text, isError = false) {
   if (!memoryBrowserStatusEl) return;
   memoryBrowserStatusEl.textContent = text || '';
+  memoryBrowserStatusEl.hidden = !text;
   memoryBrowserStatusEl.classList.toggle('error', Boolean(isError));
 }
 
@@ -678,6 +681,7 @@ async function saveMemoryBrowserSelection(event) {
     renderMemoryBrowserList();
     renderMemoryBrowserDetail();
     setMemoryBrowserPanelStatus('Saved.');
+    closeMemoryBrowser();
   } catch (err) {
     setMemoryBrowserPanelStatus(String(err?.message || err), true);
   } finally {
@@ -760,13 +764,22 @@ function closeMemoryBrowser() {
 }
 
 if (memoryBrowserOverlay) {
-  memoryBrowserBtn?.addEventListener('click', async (e) => {
+  const activateMemoryBrowserLauncher = async (e) => {
     e.stopPropagation();
     try {
       await openMemoryBrowser();
     } catch (err) {
       setMemoryBrowserLauncherStatus(String(err?.message || err), true);
     }
+  };
+  document.getElementById('skill-list')?.addEventListener('click', (e) => {
+    if (!e.target.closest('#memory-browser-btn')) return;
+    void activateMemoryBrowserLauncher(e);
+  });
+  document.getElementById('skill-list')?.addEventListener('keydown', (e) => {
+    if (!e.target.closest('#memory-browser-btn') || (e.key !== 'Enter' && e.key !== ' ')) return;
+    e.preventDefault();
+    void activateMemoryBrowserLauncher(e);
   });
   memoryBrowserOverlay.addEventListener('click', (e) => {
     if (e.target === memoryBrowserOverlay) closeMemoryBrowser();
@@ -3407,6 +3420,89 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+function syncWorkspaceFileAttachmentRows() {
+  document.querySelectorAll('#file-list .file-item').forEach(row => {
+    const selected = selectedWorkspaceFiles.has(row.dataset.path);
+    row.classList.toggle('attached', selected);
+    const button = row.querySelector('.file-attach-btn');
+    if (button) {
+      button.setAttribute('aria-pressed', String(selected));
+      button.title = selected ? 'Remove from next message' : 'Attach to next message';
+      button.setAttribute('aria-label', button.title);
+    }
+  });
+}
+
+function renderAttachmentTray() {
+  if (!attachmentTrayEl) return;
+  attachmentTrayEl.innerHTML = '';
+  for (const file of selectedWorkspaceFiles.values()) {
+    const chip = document.createElement('span');
+    chip.className = 'attachment-chip';
+    chip.dataset.attachmentPath = file.path;
+    chip.title = file.path + (file.size !== undefined ? ` (${formatSize(file.size)})` : '');
+
+    const icon = document.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = '📎';
+    chip.appendChild(icon);
+
+    const name = document.createElement('span');
+    name.className = 'attachment-chip-name';
+    name.textContent = file.path;
+    chip.appendChild(name);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'attachment-chip-remove';
+    remove.title = `Remove ${file.path} from the next message`;
+    remove.setAttribute('aria-label', remove.title);
+    remove.textContent = '×';
+    remove.onclick = () => {
+      selectedWorkspaceFiles.delete(file.path);
+      renderAttachmentTray();
+      syncWorkspaceFileAttachmentRows();
+    };
+    chip.appendChild(remove);
+    attachmentTrayEl.appendChild(chip);
+  }
+  attachmentTrayEl.hidden = selectedWorkspaceFiles.size === 0;
+}
+
+function setWorkspaceFileAttached(file, attached = true) {
+  const owner = workspaceState.active || 'default';
+  if (selectedWorkspaceOwner !== null && selectedWorkspaceOwner !== owner) {
+    selectedWorkspaceFiles.clear();
+  }
+  selectedWorkspaceOwner = owner;
+  if (attached) selectedWorkspaceFiles.set(file.path, { path: file.path, size: file.size });
+  else selectedWorkspaceFiles.delete(file.path);
+  renderAttachmentTray();
+  syncWorkspaceFileAttachmentRows();
+}
+
+function clearWorkspaceFileAttachments() {
+  selectedWorkspaceFiles.clear();
+  selectedWorkspaceOwner = workspaceState.active || 'default';
+  renderAttachmentTray();
+  syncWorkspaceFileAttachmentRows();
+}
+
+function reconcileWorkspaceFileAttachments(files) {
+  const owner = workspaceState.active || 'default';
+  if (selectedWorkspaceOwner !== null && selectedWorkspaceOwner !== owner) {
+    selectedWorkspaceFiles.clear();
+  }
+  selectedWorkspaceOwner = owner;
+  const available = new Map(files.map(file => [file.path, file]));
+  for (const path of [...selectedWorkspaceFiles.keys()]) {
+    const current = available.get(path);
+    if (current) selectedWorkspaceFiles.set(path, { path, size: current.size });
+    else selectedWorkspaceFiles.delete(path);
+  }
+  renderAttachmentTray();
+}
+
 function renderFiles(files) {
   const el = document.getElementById('file-list');
   if (!el) return;
@@ -3440,6 +3536,18 @@ function renderFiles(files) {
     }
     const actions = document.createElement('div');
     actions.className = 'file-actions';
+    const attachBtn = document.createElement('button');
+    attachBtn.type = 'button';
+    attachBtn.className = 'file-attach-btn';
+    attachBtn.textContent = '📎';
+    attachBtn.setAttribute('aria-pressed', String(selectedWorkspaceFiles.has(f.path)));
+    attachBtn.title = selectedWorkspaceFiles.has(f.path) ? 'Remove from next message' : 'Attach to next message';
+    attachBtn.setAttribute('aria-label', attachBtn.title);
+    attachBtn.onclick = (e) => {
+      e.stopPropagation();
+      setWorkspaceFileAttached(f, !selectedWorkspaceFiles.has(f.path));
+    };
+    actions.appendChild(attachBtn);
     const delBtn = document.createElement('button');
     delBtn.className = 'file-action-btn';
     delBtn.textContent = '\u00d7';
@@ -3448,6 +3556,8 @@ function renderFiles(files) {
       e.stopPropagation();
       try {
         await callTool('workspace_action', { action: 'delete', path: f.path });
+        selectedWorkspaceFiles.delete(f.path);
+        renderAttachmentTray();
         loadFiles();
       } catch (err) {
         alert('Delete failed: ' + err.message);
@@ -3457,12 +3567,14 @@ function renderFiles(files) {
     div.appendChild(actions);
     el.appendChild(div);
   }
+  syncWorkspaceFileAttachmentRows();
 }
 
 async function loadFiles() {
   try {
     const data = await callTool('workspace_action', { action: 'list' });
     const files = Array.isArray(data) ? data : (data?.files ?? []);
+    reconcileWorkspaceFileAttachments(files);
     renderFiles(files);
   } catch (e) {
     const msg = String(e);
@@ -3659,6 +3771,7 @@ function renderSkills(skills) {
   el.innerHTML = '';
 
   skills = [...skills].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  let memoryBrowserInserted = false;
 
   for (const s of skills) {
     const row = document.createElement('div');
@@ -3701,14 +3814,37 @@ function renderSkills(skills) {
 
     row.appendChild(actions);
     el.appendChild(row);
+
+    if (!memoryBrowserInserted &&
+        s.name.localeCompare('Inner voice', undefined, { sensitivity: 'base' }) === 0) {
+      appendMemoryBrowserLauncher(el);
+      memoryBrowserInserted = true;
+    }
   }
 
-  if (!skills.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:4px 10px;';
-    empty.textContent = '(none)';
-    el.appendChild(empty);
-  }
+  // Cognition normally seeds "Inner voice". Keep the memory command available at
+  // the end of the list if that skill is unavailable during startup or reload.
+  if (!memoryBrowserInserted) appendMemoryBrowserLauncher(el);
+}
+
+function appendMemoryBrowserLauncher(el) {
+  const row = document.createElement('div');
+  row.id = 'memory-browser-btn';
+  row.className = 'skill-entry';
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
+
+  const label = document.createElement('span');
+  label.className = 'skill-name-label';
+  label.textContent = 'Open memory browser';
+  row.appendChild(label);
+  el.appendChild(row);
+
+  const status = document.createElement('div');
+  status.id = 'memory-browser-status';
+  status.hidden = true;
+  el.appendChild(status);
+  memoryBrowserStatusEl = status;
 }
 
 const skillEditorOverlay = document.getElementById('skill-editor-overlay');
@@ -4008,6 +4144,7 @@ async function uploadFiles(fileList) {
       let bin = '';
       for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
       await callTool('workspace_action', { action: 'write', path: file.name, content: btoa(bin), encoding: 'base64' });
+      setWorkspaceFileAttached({ path: file.name, size: file.size });
     } catch (err) {
       alert('Upload failed for ' + file.name + ': ' + err.message);
     }
@@ -4203,6 +4340,36 @@ function appendRoboBubble(text, msgIdx, traceId) {
   return div;
 }
 
+function appendMessageAttachments(bubble, content) {
+  if (!bubble) return;
+  const refs = (content ?? []).filter(part => part.type === 'file-ref');
+  if (!refs.length) return;
+  let tray = bubble.querySelector('.message-attachments');
+  if (!tray) {
+    tray = document.createElement('div');
+    tray.className = 'message-attachments';
+    bubble.appendChild(tray);
+  }
+  for (const ref of refs) {
+    if ([...tray.children].some(item => item.dataset.attachmentPath === ref.name)) continue;
+    const attachment = document.createElement('button');
+    attachment.type = 'button';
+    attachment.className = 'message-attachment';
+    attachment.dataset.attachmentPath = ref.name;
+    attachment.title = `Open workspace file ${ref.name}`;
+    attachment.onclick = () => T.openFile('workspace', ref.name);
+    const icon = document.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = '📎';
+    attachment.appendChild(icon);
+    const name = document.createElement('span');
+    name.className = 'message-attachment-name';
+    name.textContent = ref.name;
+    attachment.appendChild(name);
+    tray.appendChild(attachment);
+  }
+}
+
 // Render one stored user turn, split by block provenance: contiguous human blocks render as the user
 // bubble, contiguous robo blocks (a hook-injected fragment) as an agent-side robo bubble. One stored
 // message can therefore become two bubbles, under a single turn divider. Returns the last bubble.
@@ -4215,19 +4382,28 @@ function appendUserTurn(content, msgIdx, traceId) {
     if (prev && prev.robo === robo) prev.text += '\n' + c.text;
     else runs.push({ robo, text: c.text });
   }
-  if (!runs.length) return null;
+  const attachments = content.filter(c => c.type === 'file-ref');
+  if (!runs.length && !attachments.length) return null;
   messagesEl.querySelector('.empty-state')?.remove();
   if (messagesEl.querySelector('.message')) {
     messagesEl.appendChild(createMsgDivider(msgIdx));
   }
   let last = null;
+  let lastHuman = null;
   for (const run of runs) {
     last = makeBubble(run.robo ? 'robo' : 'user', run.text);
     // Tag with the turn's traceId so a replayed `queued` for this still-running turn adopts the
     // existing bubble (renderTurn) instead of drawing a second one.
     if (traceId) last.dataset.trace = traceId;
     messagesEl.appendChild(last);
+    if (!run.robo) lastHuman = last;
   }
+  if (!last && attachments.length) {
+    last = makeBubble('user', '');
+    if (traceId) last.dataset.trace = traceId;
+    messagesEl.appendChild(last);
+  }
+  appendMessageAttachments(lastHuman ?? last, attachments);
   scrollMessagesToBottom();
   return last;
 }
@@ -4877,9 +5053,11 @@ async function sendMessage(concat = false) {
   }
   const content = inputEl.value.trim();
   if (!content) return;
+  const attachments = [...selectedWorkspaceFiles.values()]
+    .map(file => ({ namespace: 'workspace', path: file.path }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
-  await submit(content, concat);
+  if (await submit(content, concat, attachments)) clearWorkspaceFileAttachments();
 }
 
 // Submit typed content to the current session, fire-and-forget. The server enqueues it and the
@@ -4888,10 +5066,10 @@ async function sendMessage(concat = false) {
 // concat defaults false: robo/programmatic submits (plugin install/remove banners, etc.) must each be
 // their own ordered turn — one's tools/state are a precondition for the next ("add plugin X" then "use
 // X", X only visible to a later turn). The human path passes its choice explicitly via sendMessage.
-async function submit(content, concat = false) {
+async function submit(content, concat = false, attachments = []) {
   const provider = providerSel.value;
-  if (!content || !provider) return;
-  if (newSessionPromise && !(await newSessionPromise)) return;
+  if (!content || !provider) return false;
+  if (newSessionPromise && !(await newSessionPromise)) return false;
   if (!currentSessionId) {
     const { id } = await apiNewSession();
     currentSessionId = id;
@@ -4899,20 +5077,27 @@ async function submit(content, concat = false) {
   // Ensure the persistent event stream is bound to this session before we enqueue, so the turn's
   // events have a consumer (covers the just-created session and the "New session" button path).
   await connectSessionStream(currentSessionId);
-  await postSubmit(currentSessionId, content, concat);
+  return postSubmit(currentSessionId, content, concat, attachments);
 }
 
 // POST a submission and return. The user bubble + response arrive on the stream as a 'queued' event
 // then turn events. Only *failures* are surfaced here (the stream can't, since no turn was created):
 // a timeout (incl. the socket-exhaustion stall that never errors on its own), network error, or
 // non-2xx is shown inline so the message is never silently lost.
-async function postSubmit(sid, content, concat = false) {
+async function postSubmit(sid, content, concat = false, attachments = []) {
   const provider = providerSel.value;
-  if (!provider) return;
+  if (!provider) return false;
   try {
-    await T.submit(sid, { content, provider, concatQueue: concat });
+    await T.submit(sid, {
+      content,
+      provider,
+      concatQueue: concat,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
+    return true;
   } catch (e) {
     showSubmitError(content, e.name === 'TimeoutError' ? 'submit timed out (no response)' : (e.message || String(e)));
+    return false;
   }
 }
 
@@ -5038,6 +5223,7 @@ async function renderTurn(sid, traceId) {
               userBubble = robo ? appendRoboBubble(text, undefined, traceId) : appendUserBubble(text, undefined, ev.queued > 0, traceId);
               userBubbleText = text;
             }
+            appendMessageAttachments(userBubble, ev.content);
           }
           if (ev.queued === 0) markStarted();
           break;
@@ -5054,6 +5240,7 @@ async function renderTurn(sid, traceId) {
             const inner = userBubble.querySelector('.md-body');
             if (inner) inner.innerHTML = md(userBubbleText);
           }
+          appendMessageAttachments(userBubble, ev.content);
           break;
         }
 

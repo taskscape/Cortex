@@ -21,6 +21,7 @@ export interface VectorizerMetadata {
   backend: VectorizerBackend;
   model: string;
   dimensions: number;
+  signature?: string;
 }
 
 export interface WorkspaceRefLike {
@@ -121,7 +122,7 @@ export interface RagStorage {
 }
 
 export function vectorizerIdentity(info: VectorizerMetadata): string {
-  return `${info.backend}:${info.model}:${info.dimensions}`;
+  return `${info.backend}:${info.model}:${info.dimensions}:${effectiveVectorizerSignature(info)}`;
 }
 
 export function documentMatchesVectorizer(doc: { vectorizer?: VectorizerMetadata }, info: VectorizerMetadata): boolean {
@@ -131,6 +132,10 @@ export function documentMatchesVectorizer(doc: { vectorizer?: VectorizerMetadata
     dimensions: 384,
   };
   return vectorizerIdentity(current) === vectorizerIdentity(info);
+}
+
+function effectiveVectorizerSignature(info: VectorizerMetadata): string {
+  return info.signature ?? 'legacy-v1';
 }
 
 export function vectorDbSummary(db: VectorDbFile): RagStorageSummary {
@@ -328,6 +333,7 @@ interface DocumentRow {
   vectorizer_backend: VectorizerBackend;
   vectorizer_model: string;
   vectorizer_dimensions: number;
+  vectorizer_signature: string | null;
   updated_at: string;
   file_size: string | null;
   source_type: 'file' | 'knowledge';
@@ -385,7 +391,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
   async listDocumentInfo(workspace: WorkspaceRefLike): Promise<StoredDocumentInfo[]> {
     const result = await this.pool.query<DocumentRow>(`
       SELECT id, context_id, path, hash, vectorizer_backend, vectorizer_model,
-             vectorizer_dimensions, updated_at, file_size, source_type
+             vectorizer_dimensions, vectorizer_signature, updated_at, file_size, source_type
       FROM ${this.documentsTableSql}
       WHERE workspace_id = $1
     `, [postgresText(workspace.id)]);
@@ -401,6 +407,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
         backend: row.vectorizer_backend,
         model: row.vectorizer_model,
         dimensions: row.vectorizer_dimensions,
+        ...(row.vectorizer_signature !== null ? { signature: row.vectorizer_signature } : {}),
       },
     }));
   }
@@ -478,18 +485,20 @@ class PostgresPgvectorRagStorage implements RagStorage {
         AND vectorizer_backend = $3
         AND vectorizer_model = $4
         AND vectorizer_dimensions = $5
+        AND vectorizer_signature = $6
         AND (
-          (source_type = 'file' AND context_id = $6)
+          (source_type = 'file' AND context_id = $7)
           OR source_type = 'knowledge'
         )
       ORDER BY embedding <=> $1::vector
-      LIMIT $7
+      LIMIT $8
     `, [
       toPgVector(queryVector),
       postgresText(workspace.id),
       postgresText(vectorizer.backend),
       postgresText(vectorizer.model),
       vectorizer.dimensions,
+      postgresText(effectiveVectorizerSignature(vectorizer)),
       postgresText(activeContext.id),
       searchLimit,
     ]);
@@ -524,6 +533,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
         vectorizer_backend TEXT NOT NULL,
         vectorizer_model TEXT NOT NULL,
         vectorizer_dimensions INTEGER NOT NULL,
+        vectorizer_signature TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         file_size BIGINT,
         source_type TEXT NOT NULL,
@@ -531,6 +541,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
       )
     `);
     await this.pool.query(`ALTER TABLE ${this.documentsTableSql} ADD COLUMN IF NOT EXISTS file_size BIGINT`);
+    await this.pool.query(`ALTER TABLE ${this.documentsTableSql} ADD COLUMN IF NOT EXISTS vectorizer_signature TEXT`);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS ${this.chunksTableSql} (
         id TEXT NOT NULL,
@@ -544,11 +555,13 @@ class PostgresPgvectorRagStorage implements RagStorage {
         vectorizer_backend TEXT NOT NULL,
         vectorizer_model TEXT NOT NULL,
         vectorizer_dimensions INTEGER NOT NULL,
+        vectorizer_signature TEXT NOT NULL,
         source_type TEXT NOT NULL,
         PRIMARY KEY (workspace_id, id),
         FOREIGN KEY (workspace_id, document_id) REFERENCES ${this.documentsTableSql}(workspace_id, id) ON DELETE CASCADE
       )
     `);
+    await this.pool.query(`ALTER TABLE ${this.chunksTableSql} ADD COLUMN IF NOT EXISTS vectorizer_signature TEXT`);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_docs_${this.vectorizer.dimensions}_workspace_context_path`)} ON ${this.documentsTableSql} (workspace_id, context_id, path)`);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_docs_${this.vectorizer.dimensions}_source`)} ON ${this.documentsTableSql} (workspace_id, source_type)`);
     await this.pool.query(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`idx_chunks_${this.vectorizer.dimensions}_document`)} ON ${this.chunksTableSql} (workspace_id, document_id)`);
@@ -597,13 +610,13 @@ class PostgresPgvectorRagStorage implements RagStorage {
     const rows = documents.map(doc => {
       const offset = values.length;
       values.push(...documentValues(workspace, doc, this.vectorizer));
-      return `(${Array.from({ length: 11 }, (_, index) => `$${offset + index + 1}`).join(', ')})`;
+      return `(${Array.from({ length: 12 }, (_, index) => `$${offset + index + 1}`).join(', ')})`;
     });
     try {
       await client.query(`
         INSERT INTO ${this.documentsTableSql} (
           id, workspace_id, context_id, path, hash, vectorizer_backend, vectorizer_model,
-          vectorizer_dimensions, updated_at, file_size, source_type
+          vectorizer_dimensions, vectorizer_signature, updated_at, file_size, source_type
         ) VALUES ${rows.join(', ')}
         ON CONFLICT (workspace_id, id) DO UPDATE SET
           context_id = EXCLUDED.context_id,
@@ -612,6 +625,7 @@ class PostgresPgvectorRagStorage implements RagStorage {
           vectorizer_backend = EXCLUDED.vectorizer_backend,
           vectorizer_model = EXCLUDED.vectorizer_model,
           vectorizer_dimensions = EXCLUDED.vectorizer_dimensions,
+          vectorizer_signature = EXCLUDED.vectorizer_signature,
           updated_at = EXCLUDED.updated_at,
           file_size = EXCLUDED.file_size,
           source_type = EXCLUDED.source_type
@@ -644,16 +658,17 @@ class PostgresPgvectorRagStorage implements RagStorage {
           postgresText(metadata.backend),
           postgresText(metadata.model),
           metadata.dimensions,
+          postgresText(effectiveVectorizerSignature(metadata)),
           postgresText(sourceTypeForDocument(doc)),
         );
-        return `(${Array.from({ length: 12 }, (_, parameter) => `$${offset + parameter + 1}`).join(', ')})`;
+        return `(${Array.from({ length: 13 }, (_, parameter) => `$${offset + parameter + 1}`).join(', ')})`;
       });
       try {
         await client.query(`
           INSERT INTO ${this.chunksTableSql} (
             id, document_id, workspace_id, context_id, path, chunk_index, text, embedding,
-            vectorizer_backend, vectorizer_model, vectorizer_dimensions, source_type
-          ) VALUES ${rows.map((row, rowIndex) => row.replace(`$${rowIndex * 12 + 8}`, `$${rowIndex * 12 + 8}::vector`)).join(', ')}
+            vectorizer_backend, vectorizer_model, vectorizer_dimensions, vectorizer_signature, source_type
+          ) VALUES ${rows.map((row, rowIndex) => row.replace(`$${rowIndex * 13 + 8}`, `$${rowIndex * 13 + 8}::vector`)).join(', ')}
         `, values);
       } catch (error) {
         throw new Error(
@@ -741,6 +756,7 @@ function documentValues(workspace: WorkspaceRefLike, doc: IndexedDocument, fallb
     postgresText(metadata.backend),
     postgresText(metadata.model),
     metadata.dimensions,
+    postgresText(effectiveVectorizerSignature(metadata)),
     postgresText(doc.updatedAt),
     doc.fileSize ?? null,
     postgresText(sourceTypeForDocument(doc)),

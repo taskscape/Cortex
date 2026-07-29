@@ -104,7 +104,15 @@ interface SubmitBody {
   sessionId?:   string;
   traceId?:     string;
   concatQueue?: boolean;      // true (default): merge into the running turn's batch; false: own turn
+  attachments?: WorkspaceAttachment[];
 }
+
+interface WorkspaceAttachment {
+  namespace: 'workspace';
+  path:      string;
+}
+
+const MAX_WORKSPACE_ATTACHMENTS = 20;
 
 interface DirectToolContextSpec {
   provider?:  string;
@@ -179,6 +187,57 @@ function corsHeaders(origin: string): Record<string, string> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function prepareWorkspaceAttachments(
+  files: FileStore | undefined,
+  rawAttachments: unknown,
+): Promise<{ refs: MessageContent[]; ephemeral: MessageContent[] }> {
+  if (rawAttachments === undefined) return { refs: [], ephemeral: [] };
+  if (!Array.isArray(rawAttachments)) throw new Error('"attachments" must be an array.');
+  if (rawAttachments.length > MAX_WORKSPACE_ATTACHMENTS) {
+    throw new Error(`A message can attach at most ${MAX_WORKSPACE_ATTACHMENTS} workspace files.`);
+  }
+  if (rawAttachments.length > 0 && files === undefined) {
+    throw new Error('Workspace file attachments are unavailable because no file store is configured.');
+  }
+
+  const refs: MessageContent[] = [];
+  const paths = new Set<string>();
+  for (const raw of rawAttachments) {
+    if (!isRecord(raw) || raw.namespace !== 'workspace' || typeof raw.path !== 'string') {
+      throw new Error('Each attachment must identify a workspace file with { namespace: "workspace", path }.');
+    }
+    const path = raw.path;
+    if (!path.trim() || path.length > 1024) throw new Error('Attachment paths must contain 1 to 1024 characters.');
+    if (paths.has(path)) continue;
+    paths.add(path);
+
+    const handle = await files!.getByName(path, 'workspace');
+    if (!handle) throw new Error(`Workspace attachment not found: ${JSON.stringify(path)}.`);
+    refs.push({ type: 'file-ref', fileId: handle.id, name: handle.name, mimeType: handle.mimeType });
+  }
+
+  if (refs.length === 0) return { refs, ephemeral: [] };
+  const calls = refs.map(ref => {
+    const name = (ref as Extract<MessageContent, { type: 'file-ref' }>).name;
+    return `- ${JSON.stringify(name)}: workspace_action ${JSON.stringify({ action: 'read', path: name })}`;
+  });
+  return {
+    refs,
+    ephemeral: [{
+      type: 'text',
+      origin: 'robo',
+      text: [
+        '[Explicit Cortex Files attachments]',
+        'The user explicitly attached the workspace files listed below to this message.',
+        'Read them with workspace_action using each exact path. They are imported workspace files, not host filesystem paths.',
+        'Prefer these attachments over same-named paths from Workspace RAG or other retrieved context. Do not use file_broker_action for these attachments.',
+        ...calls,
+        '[End explicit Cortex Files attachments]',
+      ].join('\n'),
+    }],
+  };
 }
 
 // The single interactive prompt implementation is the SSE round-trip built per-submit (see the
@@ -684,9 +743,18 @@ export function createWebServer(deps: WebServerDeps) {
       // Normalise content into MessageContent[]. The runner appends + persists the user message
       // when this submission's turn actually starts (persist-at-turn-start) — never here — so a
       // mid-turn submit queues behind the running turn instead of clobbering session state.
-      const contentArr = typeof body.content === 'string'
+      let preparedAttachments: Awaited<ReturnType<typeof prepareWorkspaceAttachments>>;
+      try {
+        preparedAttachments = await prepareWorkspaceAttachments(deps.files, body.attachments);
+      } catch (error) {
+        json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+
+      const contentArr: MessageContent[] = typeof body.content === 'string'
         ? [{ type: 'text' as const, text: body.content }]
         : [body.content];
+      contentArr.push(...preparedAttachments.refs);
 
       // Fire-and-forget: we enqueue and return immediately. The turn's output — and this prompt —
       // reach the client over its persistent GET /events/sessions/:id stream, not this request.
@@ -719,6 +787,7 @@ export function createWebServer(deps: WebServerDeps) {
           sessionId:   targetId,
           signal:      isTracker ? trackAc.signal : new AbortController().signal,
           content:     contentArr,
+          ...(preparedAttachments.ephemeral.length > 0 ? { ephemeral: preparedAttachments.ephemeral } : {}),
           provider:    body.provider,
           principal,
           prompt:      promptFn,

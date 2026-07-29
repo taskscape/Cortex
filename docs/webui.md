@@ -10,7 +10,7 @@ Current UI capabilities include:
 - provider selector;
 - main chat composer with send/stop behavior;
 - token and elapsed-time summaries per turn;
-- workspace file upload/list/delete;
+- workspace file upload/list/delete plus explicit per-message attachments;
 - plugin catalog display;
 - skill editor;
 - workspace selector in the bottom-left corner;

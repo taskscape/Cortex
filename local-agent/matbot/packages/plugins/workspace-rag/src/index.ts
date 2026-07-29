@@ -36,21 +36,25 @@ const SCAN_FILE_CONCURRENCY = 4;
 
 type Accelerator = 'nvidia' | 'cpu';
 type VectorizerBackend = 'hash-cpu' | 'cuda-http';
+type EmbeddingPurpose = 'query' | 'document';
 
 interface VectorizerMetadata {
   backend: VectorizerBackend;
   model: string;
   dimensions: number;
+  signature: string;
 }
 
 interface VectorizerRuntime extends VectorizerMetadata {
   accelerated: boolean;
   accelerator: Accelerator;
+  profile: string;
+  maxTokens?: number;
 }
 
 interface TextVectorizer {
   readonly info: VectorizerRuntime;
-  embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]>;
+  embed(texts: readonly string[], purpose: EmbeddingPurpose, signal?: AbortSignal): Promise<number[][]>;
 }
 
 interface WorkspaceRegistry {
@@ -123,6 +127,9 @@ interface IngestionStatus {
   embeddingBackend: VectorizerBackend;
   embeddingModel: string;
   embeddingDimensions: number;
+  embeddingProfile: string;
+  embeddingSignature: string;
+  embeddingMaxTokens?: number;
   cudaServiceUrl?: string;
   accelerationMessage?: string;
   storageBackend: 'json' | 'postgres-pgvector';
@@ -371,8 +378,10 @@ function cpuVectorizerInfo(): VectorizerRuntime {
     backend: CPU_VECTOR_BACKEND,
     model: CPU_VECTOR_MODEL,
     dimensions: VECTOR_DIMS,
+    signature: 'hash-cpu-token-hash-v1',
     accelerated: false,
     accelerator: 'cpu',
+    profile: 'token-hash-v1',
   };
 }
 
@@ -381,13 +390,14 @@ function vectorizerMetadata(info: VectorizerRuntime): VectorizerMetadata {
     backend: info.backend,
     model: info.model,
     dimensions: info.dimensions,
+    signature: info.signature,
   };
 }
 
 class HashCpuVectorizer implements TextVectorizer {
   readonly info = cpuVectorizerInfo();
 
-  async embed(texts: readonly string[]): Promise<number[][]> {
+  async embed(texts: readonly string[], _purpose: EmbeddingPurpose): Promise<number[][]> {
     return texts.map(text => vectorize(text));
   }
 }
@@ -398,6 +408,9 @@ interface CudaHealthResponse {
   device?: string;
   model?: string;
   dimensions?: number;
+  profile?: string;
+  signature?: string;
+  maxTokens?: number;
   message?: string;
 }
 
@@ -441,6 +454,9 @@ async function probeCudaEmbeddingService(baseUrl: string): Promise<CudaHealthRes
     if (typeof body.device === 'string') result.device = body.device;
     if (typeof body.model === 'string') result.model = body.model;
     if (typeof body.dimensions === 'number' && Number.isFinite(body.dimensions)) result.dimensions = body.dimensions;
+    if (typeof body.profile === 'string') result.profile = body.profile;
+    if (typeof body.signature === 'string') result.signature = body.signature;
+    if (typeof body.maxTokens === 'number' && Number.isFinite(body.maxTokens)) result.maxTokens = body.maxTokens;
     if (typeof body.message === 'string') result.message = body.message;
     return result;
   } catch (error) {
@@ -453,32 +469,35 @@ class CudaHttpVectorizer implements TextVectorizer {
   readonly info: VectorizerRuntime;
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string, model: string, dimensions: number) {
+  constructor(baseUrl: string, health: Required<Pick<CudaHealthResponse, 'model' | 'dimensions' | 'profile' | 'signature'>> & Pick<CudaHealthResponse, 'maxTokens'>) {
     this.baseUrl = baseUrl;
     this.info = {
       backend: 'cuda-http',
-      model,
-      dimensions,
+      model: health.model,
+      dimensions: health.dimensions,
+      signature: health.signature,
       accelerated: true,
       accelerator: 'nvidia',
+      profile: health.profile,
+      ...(health.maxTokens !== undefined ? { maxTokens: health.maxTokens } : {}),
     };
   }
 
-  async embed(texts: readonly string[], signal?: AbortSignal): Promise<number[][]> {
+  async embed(texts: readonly string[], purpose: EmbeddingPurpose, signal?: AbortSignal): Promise<number[][]> {
     if (texts.length === 0) return [];
     const embeddings: number[][] = [];
     for (let start = 0; start < texts.length; start += CUDA_EMBED_REQUEST_LIMIT) {
       const batch = texts.slice(start, start + CUDA_EMBED_REQUEST_LIMIT);
-      embeddings.push(...await this.embedBatch(batch, start, signal));
+      embeddings.push(...await this.embedBatch(batch, purpose, start, signal));
     }
     return embeddings;
   }
 
-  private async embedBatch(texts: readonly string[], offset: number, signal?: AbortSignal): Promise<number[][]> {
+  private async embedBatch(texts: readonly string[], purpose: EmbeddingPurpose, offset: number, signal?: AbortSignal): Promise<number[][]> {
     const request: RequestInit = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ texts }),
+      body: JSON.stringify({ texts, inputType: purpose }),
     };
     if (signal) request.signal = signal;
     const response = await fetch(`${this.baseUrl}/embed`, request);
@@ -486,7 +505,25 @@ class CudaHttpVectorizer implements TextVectorizer {
       const detail = await response.text().catch(() => '');
       throw new Error(`CUDA embedding service HTTP ${response.status}: ${detail.slice(0, 300)}`);
     }
-    const body = await response.json() as { embeddings?: unknown; dimensions?: unknown; model?: unknown };
+    const body = await response.json() as {
+      embeddings?: unknown;
+      dimensions?: unknown;
+      model?: unknown;
+      signature?: unknown;
+      inputType?: unknown;
+    };
+    if (body.model !== this.info.model) {
+      throw new Error(`CUDA embedding service model changed from "${this.info.model}" to "${String(body.model)}". Restart Matbot after the sidecar is stable.`);
+    }
+    if (body.signature !== this.info.signature) {
+      throw new Error('CUDA embedding service preprocessing signature changed. Restart Matbot and reindex before searching.');
+    }
+    if (body.dimensions !== this.info.dimensions) {
+      throw new Error(`CUDA embedding service dimensions changed from ${this.info.dimensions} to ${String(body.dimensions)}.`);
+    }
+    if (body.inputType !== purpose) {
+      throw new Error(`CUDA embedding service returned inputType="${String(body.inputType)}"; expected "${purpose}".`);
+    }
     if (!Array.isArray(body.embeddings)) throw new Error('CUDA embedding service returned no embeddings array.');
     if (body.embeddings.length !== texts.length) {
       throw new Error(`CUDA embedding service returned ${body.embeddings.length} embeddings for ${texts.length} text(s).`);
@@ -521,10 +558,24 @@ async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
     process.env['CORTEX_RAG_CUDA_EMBEDDING_URL'] ?? process.env['CORTEX_RAG_EMBEDDING_URL'],
   );
   const probe = await probeCudaEmbeddingService(cudaServiceUrl);
-  if (probe.ok && probe.cudaAvailable && probe.model && probe.dimensions && probe.dimensions > 0) {
+  if (
+    probe.ok
+    && probe.cudaAvailable
+    && probe.model
+    && probe.dimensions
+    && probe.dimensions > 0
+    && probe.profile
+    && probe.signature
+  ) {
     const device = probe.device ? ` on ${probe.device}` : '';
     return {
-      vectorizer: new CudaHttpVectorizer(cudaServiceUrl, probe.model, probe.dimensions),
+      vectorizer: new CudaHttpVectorizer(cudaServiceUrl, {
+        model: probe.model,
+        dimensions: probe.dimensions,
+        profile: probe.profile,
+        signature: probe.signature,
+        ...(probe.maxTokens !== undefined ? { maxTokens: probe.maxTokens } : {}),
+      }),
       nvidiaAvailable,
       cudaAvailable: true,
       cudaServiceUrl,
@@ -883,7 +934,7 @@ class WorkspaceRagManager {
     if (!workspace || !query.trim()) return [];
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
-    const queryVector = (await this.embedTexts([query], signal))[0] ?? [];
+    const queryVector = (await this.embedTexts([query], 'query', signal))[0] ?? [];
     const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
     return this.enrichSearchHits(workspace, active, hits, trace);
   }
@@ -900,6 +951,7 @@ class WorkspaceRagManager {
     const chunks = chunkMarkdown(content);
     const vectors = await this.embedTexts(
       chunks.map(text => `${summary}\n${entities.join(' ')}\n${text}`),
+      'document',
     );
     const document: IndexedDocument = {
       id,
@@ -1114,6 +1166,7 @@ class WorkspaceRagManager {
           const chunks = chunkMarkdown(content);
           const vectors = await this.embedTexts(
             chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
+            'document',
           );
           const docId = stableId(contextPathKey);
           return {
@@ -1444,6 +1497,9 @@ class WorkspaceRagManager {
     | 'embeddingBackend'
     | 'embeddingModel'
     | 'embeddingDimensions'
+    | 'embeddingProfile'
+    | 'embeddingSignature'
+    | 'embeddingMaxTokens'
     | 'cudaServiceUrl'
     | 'accelerationMessage'
   > {
@@ -1455,6 +1511,9 @@ class WorkspaceRagManager {
       embeddingBackend: this.vectorizer.info.backend,
       embeddingModel: this.vectorizer.info.model,
       embeddingDimensions: this.vectorizer.info.dimensions,
+      embeddingProfile: this.vectorizer.info.profile,
+      embeddingSignature: this.vectorizer.info.signature,
+      ...(this.vectorizer.info.maxTokens !== undefined ? { embeddingMaxTokens: this.vectorizer.info.maxTokens } : {}),
       ...(this.cudaServiceUrl ? { cudaServiceUrl: this.cudaServiceUrl } : {}),
       accelerationMessage: this.accelerationMessage,
     };
@@ -1482,8 +1541,12 @@ class WorkspaceRagManager {
     return this.storage;
   }
 
-  private async embedTexts(texts: readonly string[], signal?: AbortSignal): Promise<number[][]> {
-    return this.vectorizer.embed(texts, signal);
+  private async embedTexts(
+    texts: readonly string[],
+    purpose: EmbeddingPurpose,
+    signal?: AbortSignal,
+  ): Promise<number[][]> {
+    return this.vectorizer.embed(texts, purpose, signal);
   }
 
   private updateProgress(workspaceId: string, processed: number, total: number, currentFile: string): void {

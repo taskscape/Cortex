@@ -41,6 +41,9 @@ export interface RunSessionOpts {
    * re-run of the originating user turn. Empty/absent for an ordinary turn.
    */
   injectedEphemeral?: MessageContent[];
+  /** Frontend-supplied per-submit context. It follows screen-hook context so an explicit
+   *  interaction choice remains the freshest instruction for the provider. */
+  tailEphemeral?: MessageContent[];
   observability?: ObservabilitySink;
   loadPlugin:     (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
   unloadPlugin:   (specifier: string) => Promise<boolean>;
@@ -132,9 +135,13 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   // role-alternation hazards and survives both adapters (Anthropic folds system→system=; OpenAI
   // drops non-result content from tool-role messages — a separate trailing message would break on
   // one or the other).
-  // injectedEphemeral (a pump-supplied retract-redo's context) leads, then screen's own — both share
-  // the identical tail-fold path below.
-  const ephemeral = [...(opts.injectedEphemeral ?? []), ...screen.ephemeral];
+  // injectedEphemeral (a pump-supplied retract-redo's context) leads, screen's own context follows,
+  // then frontend-supplied tailEphemeral carries the freshest explicit interaction metadata.
+  const ephemeral = [
+    ...(opts.injectedEphemeral ?? []),
+    ...screen.ephemeral,
+    ...(opts.tailEphemeral ?? []),
+  ];
 
   // ── 2. System context (built once per submit, never persisted) ─────────────
 

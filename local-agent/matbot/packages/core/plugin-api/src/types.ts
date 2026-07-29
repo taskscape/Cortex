@@ -717,6 +717,10 @@ export interface SubmitOpenOpts extends OpenOpts {
   content:      MessageContent[];
   provider:     string;
   principal:    Principal;
+  /** Turn-scoped context supplied by the submitting frontend. It is appended after screen-hook
+   *  context for this turn only and is never persisted. Use it for fresh interaction metadata such
+   *  as explicit workspace-file attachments that must remain more salient than retrieval context. */
+  ephemeral?:   MessageContent[];
   /** When true, this submission may be merged with others drained in the same batch. Default false
    *  (queue mode: one turn per submission). */
   concatQueue?: boolean;

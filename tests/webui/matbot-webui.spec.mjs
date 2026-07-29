@@ -26,10 +26,6 @@ async function openExperts(page) {
   await page.locator("#expert-toggle-btn").click();
 }
 
-async function openMemorySection(page) {
-  await page.locator('[data-section="memory"] .sidebar-heading').click();
-}
-
 async function openArchitecturePanel(page, view) {
   const section = page.locator('[data-section="architecture"]');
   const classes = await section.getAttribute("class");
@@ -961,7 +957,7 @@ test("remembered facts are isolated between Cortex workspaces", async ({ page, i
   await page.evaluate(async id => window.matbotTransport.deleteWorkspace(id), secondWorkspace.id);
 });
 
-test("memory sidebar affordance opens the in-page memory browser", async ({ page, isMobile }) => {
+test("memory browser command follows Inner voice and opens the in-page browser", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory browser coverage");
   await page.goto("/");
   await page.locator("#new-btn").click();
@@ -971,12 +967,43 @@ test("memory sidebar affordance opens the in-page memory browser", async ({ page
   await page.keyboard.press("Enter");
   await expect(page.locator(".message.assistant").last()).toContainText("Harness response");
 
-  await openMemorySection(page);
-  await expect(page.locator("#memory-browser-btn")).toBeVisible();
+  await openSkills(page);
+  const innerVoice = page.locator(".skill-entry", {
+    has: page.locator(".skill-name-label", { hasText: "Inner voice" })
+  });
+  const memoryBrowser = page.locator("#memory-browser-btn");
+  await expect(memoryBrowser).toBeVisible();
+  await expect(memoryBrowser).toHaveText("Open memory browser");
+  expect(await innerVoice.evaluate(el => el.nextElementSibling?.id)).toBe("memory-browser-btn");
+  await page.mouse.move(800, 50);
+  await page.waitForTimeout(200);
+
+  const commandAppearance = locator => locator.evaluate(el => {
+    const style = getComputedStyle(el);
+    return {
+      backgroundColor: style.backgroundColor,
+      borderRadius: style.borderRadius,
+      color: style.color,
+      cursor: style.cursor,
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      margin: style.margin,
+      minHeight: style.minHeight,
+      padding: style.padding
+    };
+  });
+  expect(await commandAppearance(memoryBrowser)).toEqual(await commandAppearance(innerVoice));
+  await innerVoice.hover();
+  await page.waitForTimeout(200);
+  const innerVoiceHoverAppearance = await commandAppearance(innerVoice);
+  await memoryBrowser.hover();
+  await page.waitForTimeout(200);
+  expect(await commandAppearance(memoryBrowser)).toEqual(innerVoiceHoverAppearance);
 
   const popups = [];
   page.on("popup", popup => popups.push(popup));
-  await page.locator("#memory-browser-btn").click();
+  await memoryBrowser.click();
   await expect(page.locator("#memory-browser-overlay")).toHaveClass(/open/);
   await expect(page.locator("#memory-browser-title")).toHaveText("Memories");
 
@@ -992,7 +1019,7 @@ test("in-page memory browser can create, edit, search, and delete memories", asy
   test.skip(isMobile, "desktop memory browser CRUD coverage");
   await page.goto("/");
 
-  await openMemorySection(page);
+  await openSkills(page);
   await page.locator("#memory-browser-btn").click();
   await expect(page.locator("#memory-browser-overlay")).toHaveClass(/open/);
 
@@ -1006,6 +1033,11 @@ test("in-page memory browser can create, edit, search, and delete memories", asy
   await page.locator("#memory-browser-dream-skill").fill("Operations");
   await page.locator("#memory-browser-save").click();
   await expect(page.locator("#memory-browser-panel-status")).toContainText("Saved");
+  await expect(page.locator("#memory-browser-overlay")).not.toHaveClass(/open/);
+
+  await expect(page.locator("#memory-browser-btn")).toBeVisible();
+  await page.locator("#memory-browser-btn").click();
+  await expect(page.locator("#memory-browser-overlay")).toHaveClass(/open/);
   await expect(page.locator("#memory-browser-state")).toHaveText("processed");
 
   await page.locator("#memory-browser-search").fill("Copper, revised");
@@ -1228,6 +1260,7 @@ test("uploads and deletes workspace files through the files panel", async ({ pag
   await uploaded.hover();
   await uploaded.locator(".file-action-btn").click();
   await expect(uploaded).toHaveCount(0);
+  await expect(page.locator("#attachment-tray")).toBeHidden();
 
   const reservedName = "report #1?final%.txt";
   await page.setInputFiles("#upload-input", {
@@ -1246,6 +1279,42 @@ test("uploads and deletes workspace files through the files panel", async ({ pag
   await reserved.hover();
   await reserved.locator(".file-action-btn").click();
   await expect(reserved).toHaveCount(0);
+  await expect(page.locator("#attachment-tray")).toBeHidden();
+});
+
+test("attaches an uploaded workspace file to a message and prefers it over a matching RAG host path", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop files coverage");
+  await page.goto("/");
+
+  await page.setInputFiles("#upload-input", {
+    name: "README.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# Attached README\n\nSummarize this workspace copy.", "utf8")
+  });
+
+  const fileRow = page.locator('.file-item[data-path="README.md"]');
+  const attachmentChip = page.locator('#attachment-tray [data-attachment-path="README.md"]');
+  await expect(fileRow).toBeVisible();
+  await expect(attachmentChip).toBeVisible();
+
+  await attachmentChip.locator(".attachment-chip-remove").click();
+  await expect(page.locator("#attachment-tray")).toBeHidden();
+  await fileRow.hover();
+  await fileRow.locator(".file-attach-btn").click();
+  await expect(attachmentChip).toBeVisible();
+
+  await page.locator("#input").fill("Read README.md and summarize its contents");
+  await page.keyboard.press("Enter");
+
+  await expect(page.locator("#attachment-tray")).toBeHidden();
+  await expect(page.locator('.message.user .message-attachment[data-attachment-path="README.md"]').last()).toBeVisible();
+  await expect(page.locator("#messages .marker-block").last()).toContainText("C:/RAG-test/README.md");
+  const modelToolHeaders = page.locator("#messages .message.assistant:not(.marker-block) .tool-header");
+  await expect(modelToolHeaders.last()).toContainText("workspace_action");
+  await expect(modelToolHeaders).not.toContainText("file_broker_action");
+  await expect(page.locator(".message.assistant:not(.marker-block)").last()).toContainText(
+    "Read attached workspace file README.md with workspace_action"
+  );
 });
 
 test("opens skill editor, shows metadata and trigger controls, and saves", async ({ page, isMobile }) => {

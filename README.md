@@ -113,6 +113,143 @@ the installation requirements, first-run commands, WebUI walkthroughs, feature
 instructions, safety guidance, and common troubleshooting steps that previously
 lived in this README or were spread across technical reference files.
 
+### Use workspace files as task inputs and outputs
+
+The `Files` section is a workspace file shelf with explicit per-message
+attachments. Uploading a document adds it to the shelf and selects it for the
+next message; use the paperclip action to attach or detach an existing file.
+This is useful when Cortex needs source material for a task, for example to
+summarize a report, analyze a CSV, compare documents, transform data, or create
+another artifact from it. Cortex can also write results such as reports, charts,
+and exports back to the same area for you to open or download.
+
+Uploaded files remain available to conversations in the active Cortex workspace.
+They are isolated from other Cortex workspaces and are not host filesystem files.
+Attaching does not place the file's full contents in every prompt. It adds a
+scoped reference to the next message so Cortex reads that workspace copy on
+demand, even when Workspace RAG contains a same-named host path. State the task,
+for example:
+
+> Read `sales.csv`, identify unusual changes, and create `analysis.md`.
+
+The attachment selection clears after a successful send, keeping unrelated
+files out of later turns and model context. Workspace files are
+also separate from Workspace RAG: use the file shelf for explicit task inputs,
+temporary working material, and generated outputs; use Workspace RAG when
+Markdown folders should become persistent searchable knowledge. See
+[Use Files And Workspace RAG](userguide.md#use-files-and-workspace-rag) for
+upload, open, and delete instructions.
+
+### Switch the Workspace RAG embedding model
+
+Workspace RAG can use either the default
+`sentence-transformers/all-MiniLM-L6-v2` model or
+`intfloat/multilingual-e5-base`. MiniLM produces 384-dimensional vectors and is
+smaller and faster. Multilingual E5 produces 768-dimensional vectors and is
+intended for multilingual and cross-language retrieval. Cortex automatically
+uses E5's `query: ` and `passage: ` prefixes when
+`WORKSPACE_RAG_EMBEDDING_PROFILE=auto`.
+
+Changing models invalidates the current workspace's vectors and starts a full
+reindex when Matbot starts. Stop Matbot before switching, particularly when a
+workspace contains many files. There is currently no action that cancels an
+in-progress reindex without stopping Matbot. Do not pass `-v` to Docker Compose
+when stopping services because the declared volumes contain Postgres data and
+the downloaded model cache.
+
+1. Stop Cortex before changing the model:
+
+   ```powershell
+   .\scripts\stop-local-agent.ps1
+   ```
+
+2. Edit the gitignored `local-agent\docker\mem0\.env` file. To select
+   multilingual E5, use:
+
+   ```dotenv
+   WORKSPACE_RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+   WORKSPACE_RAG_EMBEDDING_PROFILE=auto
+   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+   ```
+
+   To switch back to MiniLM, use:
+
+   ```dotenv
+   WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+   WORKSPACE_RAG_EMBEDDING_PROFILE=auto
+   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+   ```
+
+   Reduce the batch size if the CUDA worker runs out of GPU memory.
+
+3. Rebuild and recreate the CUDA embedding sidecar:
+
+   ```powershell
+   docker compose `
+     -f .\local-agent\docker\mem0\docker-compose.yml `
+     --profile cuda `
+     up -d --build --force-recreate workspace-rag-cuda
+   ```
+
+   The first E5 start downloads the model into the persistent
+   `workspace-rag-models` Docker volume and can take longer than subsequent
+   starts.
+
+4. Wait for the sidecar and verify its model contract:
+
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:8890/health |
+     Select-Object model, profile, dimensions, maxTokens, normalized,
+       queryPrefix, documentPrefix
+   ```
+
+   E5 should report model `intfloat/multilingual-e5-base`, profile
+   `e5-asymmetric-v1`, 768 dimensions, normalized output, and the `query: ` /
+   `passage: ` prefixes. MiniLM should report
+   `sentence-transformers/all-MiniLM-L6-v2`, profile `plain-v1`, 384
+   dimensions, normalized output, and empty prefixes.
+
+5. Start Cortex and Matbot:
+
+   ```powershell
+   .\scripts\run.ps1 -NoBrowser
+   ```
+
+   Matbot probes the sidecar at startup. The changed model, dimensions, or
+   preprocessing signature causes Workspace RAG to re-embed existing documents
+   automatically. Postgres keeps dimension-specific tables: E5 uses
+   `documents_768` and `chunks_768`, while MiniLM uses `documents_384` and
+   `chunks_384`. Switching models does not delete the other model's tables.
+
+6. Check reindex progress and confirm that Matbot adopted the expected model:
+
+   ```powershell
+   Invoke-RestMethod `
+     -Method Post `
+     -Uri http://127.0.0.1:19778/tools/workspace_rag `
+     -ContentType "application/json" `
+     -Body '{"action":"status"}' |
+     Select-Object state, processedFiles, totalFiles, embeddingBackend,
+       embeddingModel, embeddingDimensions, embeddingProfile,
+       embeddingMaxTokens, storageBackend, postgresTables
+   ```
+
+   Wait for `state` to become `idle` before treating the new index as complete.
+   Do not call `reindex_now` while the status is already `indexing`, because
+   that queues another scan. If startup did not schedule a scan, request one
+   explicitly:
+
+   ```powershell
+   Invoke-RestMethod `
+     -Method Post `
+     -Uri http://127.0.0.1:19778/tools/workspace_rag `
+     -ContentType "application/json" `
+     -Body '{"action":"reindex_now"}'
+   ```
+
+For additional storage, CUDA, and troubleshooting options, see
+[Workspace RAG configuration](docs/configuration.md#workspace-rag).
+
 Use [Commands](docs/commands.md) for the complete operational command reference
 and [Configuration Reference](docs/configuration.md) for provider, secret,
 workspace, RAG, file-access, and expert configuration.

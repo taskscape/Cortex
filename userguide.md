@@ -192,15 +192,22 @@ Cortex exposes two distinct file concepts:
 - Workspace RAG indexes `.md` files from absolute folders configured in the
   active workspace settings.
 
-### Upload, open, and delete workspace files
+### Upload, attach, open, and delete workspace files
 
 1. Select the upload control beside `Files`.
 2. Choose one or more files.
-3. Select a file in the list to open it.
-4. Hover over a file and use its action button to delete it.
+3. Confirm the selected files appear as attachment chips above the composer.
+4. To attach an existing workspace file, hover over it and select the paperclip.
+5. Enter the task and send the message. The attachment selection clears after
+   the message is accepted.
+6. Select a file row to open it.
+7. Hover over a file and use the delete action to remove it.
 
 These files remain scoped to the active workspace. They are not unrestricted
-access to the host filesystem.
+access to the host filesystem. An attachment tells Cortex to read the imported
+workspace copy with `workspace_action`; it does not grant access to the file's
+original host directory. If Workspace RAG returns a same-named external path,
+the explicit attachment takes precedence for that turn.
 
 ### Index local Markdown folders
 
@@ -264,8 +271,8 @@ not used if the later turn does not retrieve relevant context.
 
 ### Browse and edit memories
 
-1. Expand `Memory` in the sidebar.
-2. Select `Open memory browser`.
+1. Expand `Skills` in the sidebar.
+2. Select `Open memory browser` below `Inner voice`.
 3. Search remembered facts or filter by processing state.
 4. Select a memory to inspect its fact, session/message provenance, creation
    time, version, dream-skill assignment, and ignore-until value.

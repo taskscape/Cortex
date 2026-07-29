@@ -100,6 +100,8 @@ OPENAI_API_KEY=CHANGE_ME
 
 # Optional CUDA embedding service for workspace-rag.
 WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=
+WORKSPACE_RAG_EMBEDDING_PROFILE=auto
 WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
 ```
 
@@ -489,6 +491,9 @@ Status responses include:
 | `embeddingBackend` | `cuda-http` when CUDA embeddings are active, otherwise `hash-cpu`. |
 | `embeddingModel` | Active embedding model or CPU vectorizer name. |
 | `embeddingDimensions` | Vector dimensions used by the current backend. |
+| `embeddingProfile` | Preprocessing profile used to distinguish query and document embeddings. |
+| `embeddingSignature` | Stable fingerprint of the model revision, preprocessing profile, prefixes, normalization, and token limit. |
+| `embeddingMaxTokens` | Maximum input-token length reported by the active embedding model, when available. |
 | `cudaServiceUrl` | CUDA embedding service URL when configured/probed. |
 | `accelerationMessage` | Human-readable launch-time CUDA/CPU decision. |
 | `storageBackend` | `postgres-pgvector` for Postgres vectors, metadata, and chunk text, or `json` for the legacy fallback. |
@@ -508,6 +513,29 @@ Docker Compose profile `cuda` only when `nvidia-smi -L` succeeds and Docker
 reports the `nvidia` runtime. The plugin then probes `/health`; it enables CUDA
 only if that endpoint reports `cudaAvailable: true`. Otherwise ingestion stays
 on CPU and reports the reason through `accelerationMessage`.
+
+The CUDA service uses purpose-aware embedding requests. Search text is encoded
+as `query` input, while indexed file and knowledge chunks are encoded as
+`document` input. The `auto` embedding profile selects `e5-asymmetric-v1` for
+E5-family models, which prepends `query: ` and `passage: ` respectively. Other
+models retain the plain, unprefixed profile unless explicitly configured.
+
+For example, to use the 768-dimensional multilingual E5 base model:
+
+```dotenv
+WORKSPACE_RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+WORKSPACE_RAG_EMBEDDING_PROFILE=auto
+WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+```
+
+The service stores downloaded Hugging Face artifacts in the
+`workspace-rag-models` Docker volume so container recreation does not download
+the model again. Changing the model, revision, profile, prefixes, normalization,
+or token limit changes the embedding signature. Cortex then treats existing
+vectors as stale and rebuilds them during the next workspace scan. Postgres
+tables remain dimension-specific, so this model uses `documents_768` and
+`chunks_768`; earlier 384-dimensional tables are retained until deliberately
+cleaned up.
 
 To force CPU ingestion even on CUDA-capable hardware:
 
