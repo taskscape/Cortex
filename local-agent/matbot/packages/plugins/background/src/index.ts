@@ -62,6 +62,11 @@ interface Schedule {
   name?:      string;
   output?:    string;
   lastRun?:   string;
+  lastStartedAt?: string;
+  lastStatus?: 'running' | 'succeeded' | 'failed' | 'launch_failed';
+  lastExitCode?: number | null;
+  lastOccurrenceId?: string;
+  runCount?: number;
   provider?:  string;
   // Creator identity, captured at creation and replayed each fire so a recurring job runs as the
   // user who scheduled it. Absent on legacy rows ⇒ the child falls back to its own boot default.
@@ -154,6 +159,29 @@ function spawnJob(configPath: string, prompt: string, output?: string, files?: F
   return child;
 }
 
+type BackgroundJobLauncher = typeof spawnJob;
+let backgroundJobLauncher: BackgroundJobLauncher = spawnJob;
+let startupDelayOverrideMs: number | undefined;
+
+/**
+ * Deterministic seam for the runtime integration suite. Production callers do
+ * not use this; returning a restore function prevents hooks leaking across
+ * tests in the same process.
+ */
+export function installBackgroundTestHooks(hooks: {
+  launchJob?: BackgroundJobLauncher;
+  startupDelayMs?: number;
+}): () => void {
+  const previousLauncher = backgroundJobLauncher;
+  const previousDelay = startupDelayOverrideMs;
+  if (hooks.launchJob !== undefined) backgroundJobLauncher = hooks.launchJob;
+  if (hooks.startupDelayMs !== undefined) startupDelayOverrideMs = hooks.startupDelayMs;
+  return () => {
+    backgroundJobLauncher = previousLauncher;
+    startupDelayOverrideMs = previousDelay;
+  };
+}
+
 // ── Scheduler loop ────────────────────────────────────────────────────────────
 
 // wakeSignal interrupts the sleep without killing the loop (used by suspend/resume).
@@ -187,9 +215,9 @@ function armSchedule(sched: Schedule): void {
     // Skip the stagger for suspended schedules — they'll wait indefinitely anyway.
     const { intervalMs } = sched;
     if (sched.active !== false) {
-      const startupDelay = intervalMs <= 10_000
+      const startupDelay = startupDelayOverrideMs ?? (intervalMs <= 10_000
         ? intervalMs
-        : 10_000 + Math.floor(Math.pow(Math.random(), 2) * (intervalMs - 10_000));
+        : 10_000 + Math.floor(Math.pow(Math.random(), 2) * (intervalMs - 10_000)));
       const wakeAc = new AbortController();
       sleepControllers.set(sched.id, wakeAc);
       await sleep(startupDelay, ac.signal, wakeAc.signal);
@@ -211,11 +239,23 @@ function armSchedule(sched: Schedule): void {
         continue;
       }
 
-      const child = spawnJob(activeConfigPath!, sched.prompt, sched.output, activeFiles, sched.provider, sched.principal);
+      const startedAt = Date.now();
+      const occurrenceId = randomUUID();
+      sched = {
+        ...sched,
+        version: startedAt.toString(),
+        lastStartedAt: new Date(startedAt).toISOString(),
+        lastStatus: 'running',
+        lastOccurrenceId: occurrenceId,
+      };
+      await scheduleStore?.set(sched.id, sched);
+      const child = backgroundJobLauncher(activeConfigPath!, sched.prompt, sched.output, activeFiles, sched.provider, sched.principal);
+      let exitCode: number | null = null;
       if (child !== undefined) {
         const killChild = () => { child.kill(); };
         ac.signal.addEventListener('abort', killChild, { once: true });
-        await new Promise<void>(r => child.once('exit', () => {
+        await new Promise<void>(r => child.once('exit', code => {
+          exitCode = code;
           ac.signal.removeEventListener('abort', killChild);
           r();
         }));
@@ -228,6 +268,9 @@ function armSchedule(sched: Schedule): void {
 
       const now = Date.now();
       sched.lastRun = new Date(now).toISOString();
+      sched.lastStatus = child === undefined ? 'launch_failed' : (exitCode === 0 ? 'succeeded' : 'failed');
+      sched.lastExitCode = exitCode;
+      sched.runCount = (sched.runCount ?? 0) + 1;
       sched.nextRun = new Date(now + intervalMs).toISOString();
       sched.version = now.toString();
       await scheduleStore?.set(sched.id, sched);
@@ -425,7 +468,14 @@ id "*" to act on ALL schedules at once. cancel requires a specific id — "*" is
               active:   s.active !== false,
               ...(s.name    !== undefined ? { name:    s.name    } : {}),
               ...(s.lastRun !== undefined ? { lastRun: s.lastRun } : {}),
+              ...(s.lastStartedAt !== undefined ? { lastStartedAt: s.lastStartedAt } : {}),
+              ...(s.lastStatus !== undefined ? { lastStatus: s.lastStatus } : {}),
+              ...(s.lastExitCode !== undefined ? { lastExitCode: s.lastExitCode } : {}),
+              ...(s.lastOccurrenceId !== undefined ? { lastOccurrenceId: s.lastOccurrenceId } : {}),
+              ...(s.runCount !== undefined ? { runCount: s.runCount } : {}),
               ...(s.output  !== undefined ? { output:  s.output  } : {}),
+              ...(s.provider !== undefined ? { provider: s.provider } : {}),
+              ...(s.principal !== undefined ? { principalId: s.principal.id } : {}),
             })),
           };
           return;

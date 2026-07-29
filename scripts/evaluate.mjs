@@ -13,6 +13,19 @@ function xml(value) {
   return String(value ?? "").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character]);
 }
 
+function redactSecrets(value, key = "") {
+  if (/secret|token|password|authorization|credential|api.?key|cookie/i.test(key)) return "[REDACTED]";
+  if (Array.isArray(value)) return value.map(item => redactSecrets(item, key));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, redactSecrets(child, childKey)]));
+  }
+  if (typeof value !== "string") return value;
+  return value
+    .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*\b/gi, "Bearer [REDACTED]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^:/\s]+:)[^@\s]+@/gi, "$1[REDACTED]@");
+}
+
 function junit(result) {
   const rows = Array.isArray(result.results) ? result.results : [];
   const failures = rows.filter(row => !row.passed).length;
@@ -48,8 +61,9 @@ const text = await response.text();
 let result;
 try { result = JSON.parse(text); }
 catch { throw new Error(`Cortex evaluation returned non-JSON (${response.status}): ${text.slice(0, 500)}`); }
-if (!response.ok || result?.error) throw new Error(result?.error ?? `Cortex evaluation failed with HTTP ${response.status}.`);
+if (!response.ok || result?.error) throw new Error(redactSecrets(result?.error) ?? `Cortex evaluation failed with HTTP ${response.status}.`);
 
+result = redactSecrets(result);
 console.log(JSON.stringify(result, null, 2));
 const junitPath = option(args, "--junit");
 if (junitPath) await writeFile(junitPath, junit(result), "utf8");

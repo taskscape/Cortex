@@ -5,7 +5,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("workspace-rag runtime ingestion flow passes under the Matbot TypeScript loader", async () => {
+test("T2-E2E-009 / T3-E2E-011 workspace-rag normalizes paths and reconciles the runtime ingestion flow", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

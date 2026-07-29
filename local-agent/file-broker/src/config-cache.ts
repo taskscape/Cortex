@@ -8,11 +8,16 @@ interface CachedConfig<T> {
 export class ReloadingConfig<T> {
   private cached: CachedConfig<T> | undefined;
   private loading: { fingerprint: string; promise: Promise<T> } | undefined;
+  private readonly filePath: string;
+  private readonly loader: (filePath: string) => Promise<T>;
 
   constructor(
-    private readonly filePath: string,
-    private readonly loader: (filePath: string) => Promise<T>
-  ) {}
+    filePath: string,
+    loader: (filePath: string) => Promise<T>
+  ) {
+    this.filePath = filePath;
+    this.loader = loader;
+  }
 
   async get(): Promise<T> {
     const info = await stat(this.filePath);

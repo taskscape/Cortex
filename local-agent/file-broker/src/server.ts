@@ -1,7 +1,7 @@
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
-import { evaluateAccess, loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
+import { evaluateRealAccess, loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
 import { ReloadingConfig } from "./config-cache.js";
 import { listDirectory, readTextFile } from "./file-reader.js";
 import { writeTextFile } from "./file-writer.js";
@@ -26,7 +26,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/list") {
       signal.throwIfAborted();
       const target = requiredQuery(url, "path");
-      const decision = evaluateAccess(target, "list", workspaces, policy);
+      const decision = await evaluateRealAccess(target, "list", workspaces, policy);
       if (!decision.allowed) {
         sendJson(response, 403, decision);
         return;
@@ -39,7 +39,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/read") {
       signal.throwIfAborted();
       const target = requiredQuery(url, "path");
-      const decision = evaluateAccess(target, "read", workspaces, policy);
+      const decision = await evaluateRealAccess(target, "read", workspaces, policy);
       if (!decision.allowed) {
         sendJson(response, 403, decision);
         return;
@@ -52,7 +52,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/write") {
       const body = await readJsonBody<{ path: string; content: string; approved?: boolean }>(request, { validate: isWriteRequest });
       signal.throwIfAborted();
-      const decision = evaluateAccess(body.path, "write", workspaces, policy);
+      const decision = await evaluateRealAccess(body.path, "write", workspaces, policy);
       if (!decision.allowed) {
         sendJson(response, 403, decision);
         return;

@@ -11,13 +11,27 @@ const LS_PROVIDER       = 'provider';
 const LS_SIDEBAR        = 'sidebarSections';
 const LS_SIDEBAR_WIDTH  = 'sidebarWidth';
 
+function providerStorageKey(workspaceId = activeWorkspaceId()) {
+  return `${LS_PROVIDER}:${workspaceId || 'default'}`;
+}
+
+function savedProviderForWorkspace(workspaceId = activeWorkspaceId()) {
+  const scoped = localStorage.getItem(providerStorageKey(workspaceId));
+  if (scoped) return scoped;
+  // Migrate the former global preference for the default workspace only.
+  return workspaceId === 'default' ? (localStorage.getItem(LS_PROVIDER) || '') : '';
+}
+
 let currentSessionId = null;
 let sending = false;          // current session busy? mirrors the server's 'session-busy' status
 const busySessions   = new Set();
 const unreadSessions = new Set();
 const updatedFiles   = new Set();
 const selectedWorkspaceFiles = new Map();
+const knownWorkspaceFiles = new Set();
 let selectedWorkspaceOwner = null;
+let workspaceGeneration = 0;
+let providerDiscoveryFailed = false;
 
 // ── Scroll control ────────────────────────────────────────────────────────────
 //
@@ -415,9 +429,39 @@ function escHtml(s) {
 function md(text) {
   if (!text) return '';
   if (typeof marked === 'undefined') return '<p>' + escHtml(text) + '</p>';
-  const result = marked.parse(text);
-  // Open all links in new tab
-  return result.replace(/<a /g, '<a target=\"_blank\" rel=\"noopener noreferrer\" ');
+  const template = document.createElement('template');
+  template.innerHTML = marked.parse(text);
+  const blocked = 'script,style,iframe,object,embed,form,input,button,textarea,select,option,meta,link,base,img';
+  for (const node of template.content.querySelectorAll(blocked)) node.remove();
+  const safeUrl = value => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return true;
+    if (/^\/\//.test(trimmed)) return false;
+    if (/^(?:https?:|mailto:|#|\/(?!\/)|\.{0,2}\/)/i.test(trimmed)) return true;
+    try {
+      const parsed = new URL(trimmed, window.location.href);
+      return ['http:', 'https:', 'mailto:'].includes(parsed.protocol);
+    } catch {
+      return false;
+    }
+  };
+  for (const element of template.content.querySelectorAll('*')) {
+    for (const attribute of [...element.attributes]) {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith('on') || name === 'style' || name === 'srcdoc') {
+        element.removeAttribute(attribute.name);
+        continue;
+      }
+      if ((name === 'href' || name === 'src' || name === 'xlink:href') && !safeUrl(attribute.value)) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  }
+  for (const anchor of template.content.querySelectorAll('a[href]')) {
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+  }
+  return template.innerHTML;
 }
 
 // ── Transport ───────────────────────────────────────────────────────────────
@@ -442,19 +486,45 @@ async function apiListSessions() {
 }
 async function apiGetSession(id)  { try { return await callTool('session_action', { action: 'get', sessionId: id }); } catch { return null; } }
 async function apiSessionBusy(id) { return T.sessionBusy(id); }
-async function apiListProviders() { try { return (await callTool('provider', { action: 'list' })).providers.map(p => p.name); } catch { return []; } }
+async function apiListProviders() {
+  try {
+    const providers = (await callTool('provider', { action: 'list' })).providers.map(p => p.name);
+    providerDiscoveryFailed = false;
+    return providers;
+  } catch {
+    providerDiscoveryFailed = true;
+    return [];
+  }
+}
 
 async function refreshProviderSelect() {
-  const current  = providerSel.value;
-  const providers = await apiListProviders();
+  const generation = workspaceGeneration;
+  const workspaceId = activeWorkspaceId();
+  const previous = providerSel.value || savedProviderForWorkspace(workspaceId);
+  let providers;
+  try {
+    providers = (await callTool('provider', { action: 'list' })).providers.map(p => p.name);
+    providerDiscoveryFailed = false;
+  } catch {
+    providerSel.dataset.error = 'Provider list unavailable. Check the active workspace and retry after Cortex restarts.';
+    providerSel.title = providerSel.dataset.error;
+    return false;
+  }
+  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return false;
+  const saved = savedProviderForWorkspace(workspaceId);
   providerSel.innerHTML = '';
+  delete providerSel.dataset.error;
+  providerSel.title = '';
   for (const p of providers) {
     const opt = document.createElement('option');
     opt.value = opt.textContent = p;
     providerSel.appendChild(opt);
   }
-  providerSel.value = providers.includes(current) ? current : (providers[0] ?? '');
-  localStorage.setItem(LS_PROVIDER, providerSel.value);
+  providerSel.value = providers.includes(saved)
+    ? saved
+    : (providers.includes(previous) ? previous : (providers[0] ?? ''));
+  localStorage.setItem(providerStorageKey(workspaceId), providerSel.value);
+  return true;
 }
 
 // ── Tool API ──────────────────────────────────────────────────────────────────
@@ -1209,6 +1279,15 @@ function architectureSqlPlanInput() {
   return { workspaceId: activeWorkspaceId(), metricName, dimensions, filters, limit };
 }
 
+function invalidateArchitectureSqlPlan() {
+  if (!architectureSqlBusy && !architectureSqlState.plan && !architectureSqlState.approvalToken && !architectureSqlState.executed) return;
+  architectureSqlPlanRequest += 1;
+  architectureSqlBusy = '';
+  architectureSqlState = { plan: null, approvalToken: '', executed: null };
+  architectureStatus(architectureSqlStatusEl, 'Query inputs changed. Plan and approve again.');
+  renderArchitectureSqlResults();
+}
+
 function renderArchitectureSqlResults() {
   if (architectureSqlPreviewEl) {
     architectureSqlPreviewEl.textContent = architectureSqlState.plan?.queryRun?.sql || '';
@@ -1649,6 +1728,7 @@ function workflowOpsActionCards(actions, emptyText) {
     wrap.appendChild(architectureCard(action.toolName || action.id, [
       action.id,
       action.reason,
+      action.error,
       `Sources: ${architectureString(action.sourceIds)}`,
     ].filter(Boolean), action.status));
   }
@@ -2054,7 +2134,17 @@ function architectureGraphRelationships() {
   for (const fact of facts) {
     if (fact?.relationship) relationships.push(fact.relationship);
   }
-  return relationships;
+  const entityIds = new Set(architectureGraphEntities().map(entity => entity.id));
+  return relationships.filter(relationship => {
+    if (!relationship?.subjectEntityId || !relationship?.objectEntityId) return false;
+    if (relationship.subjectEntityId === relationship.objectEntityId) return false;
+    if (!entityIds.has(relationship.subjectEntityId) || !entityIds.has(relationship.objectEntityId)) return false;
+    if (relationship.confidence !== undefined) {
+      const confidence = Number(relationship.confidence);
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return false;
+    }
+    return true;
+  });
 }
 
 function evaluationPercent(value) {
@@ -2362,7 +2452,11 @@ function renderArchitectureGraphDetail() {
   }
 
   const facts = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts : [];
-  const entityFacts = facts.filter(fact => fact?.subject?.id === entity.id || fact?.object?.id === entity.id);
+  const validRelationships = new Set(architectureGraphRelationships());
+  const entityFacts = facts.filter(fact =>
+    validRelationships.has(fact?.relationship)
+    && (fact?.subject?.id === entity.id || fact?.object?.id === entity.id)
+  );
   if (entityFacts.length) {
     architectureGraphDetailEl.appendChild(architectureHeading(4, 'Evidence'));
     const grid = document.createElement('div');
@@ -2432,14 +2526,14 @@ async function retrieveArchitectureGraph(event) {
   if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = true;
   if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
   architectureStatus(architectureGraphStatusEl, 'Retrieving graph context...');
-  const terms = (architectureGraphSearchEl?.value || '')
+  const terms = [...new Set((architectureGraphSearchEl?.value || '')
     .split(',')
     .map(value => value.trim())
-    .filter(Boolean);
-  const sourceIds = (architectureGraphSourceEl?.value || '')
+    .filter(Boolean))];
+  const sourceIds = [...new Set((architectureGraphSourceEl?.value || '')
     .split(',')
     .map(value => value.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
   try {
     const retrieve = await callTool('context_graph_action', {
       action: 'retrieve',
@@ -2584,13 +2678,22 @@ async function createArchitectureReview(event) {
     architectureStatus(architectureReviewStatusEl, 'Question is required.', true);
     return;
   }
-  const experts = (architectureReviewExpertsEl?.value || '')
+  const experts = [...new Set((architectureReviewExpertsEl?.value || '')
     .split(',')
     .map(value => value.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
   const targetId = architectureReviewTargetIdEl?.value.trim() || undefined;
   const workflowId = architectureReviewWorkflowIdEl?.value.trim() || undefined;
   const workflowRunId = architectureReviewRunIdEl?.value.trim() || undefined;
+  const targetType = architectureReviewTargetTypeEl?.value || 'workflow';
+  if (!targetId) {
+    architectureStatus(architectureReviewStatusEl, 'Target ID is required.', true);
+    return;
+  }
+  if (targetType === 'workflow' && !workflowId) {
+    architectureStatus(architectureReviewStatusEl, 'Workflow ID is required for workflow reviews.', true);
+    return;
+  }
   architectureStatus(architectureReviewStatusEl, 'Creating review...');
   if (architectureReviewCreateBtn) architectureReviewCreateBtn.disabled = true;
   try {
@@ -2599,7 +2702,7 @@ async function createArchitectureReview(event) {
       question,
       mode: 'review',
       reviewMode: 'pre_automation_review',
-      targetType: architectureReviewTargetTypeEl?.value || 'workflow',
+      targetType,
       ...(targetId ? { targetId } : {}),
       ...(workflowId ? { workflowId } : {}),
       ...(workflowRunId ? { workflowRunId } : {}),
@@ -2664,6 +2767,13 @@ if (architectureScreenEl) {
   architectureSqlForm?.addEventListener('submit', planArchitectureSql);
   architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
   architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);
+  [
+    architectureSqlMetricEl,
+    architectureSqlDimensionEl,
+    architectureSqlFilterColumnEl,
+    architectureSqlFilterValueEl,
+    architectureSqlLimitEl,
+  ].forEach(control => control?.addEventListener('input', invalidateArchitectureSqlPlan));
   architectureWorkflowRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('workflows', true));
   architectureEvaluationRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('evaluation', true));
   workflowOpsCompileForm?.addEventListener('submit', compileWorkflowOperation);
@@ -2690,6 +2800,20 @@ function setWorkspaceSwitching(value) {
   if (workspaceNewBtn) workspaceNewBtn.disabled = workspaceSwitching;
   if (workspaceRenameBtn) workspaceRenameBtn.disabled = workspaceSwitching;
   if (workspaceConfigBtn) workspaceConfigBtn.disabled = workspaceSwitching;
+  if (inputEl) {
+    inputEl.disabled = workspaceSwitching;
+    inputEl.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
+  }
+  if (sendBtn) {
+    sendBtn.disabled = workspaceSwitching;
+    sendBtn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
+  }
+  if (newBtn) {
+    newBtn.disabled = workspaceSwitching;
+    newBtn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
+  }
+  const workspaceUploadInput = document.getElementById('upload-input');
+  if (workspaceUploadInput) workspaceUploadInput.disabled = workspaceSwitching;
   renderWorkspaces();
 }
 
@@ -2813,6 +2937,15 @@ function confirmWorkspaceDelete(workspace) {
     };
     const onKeyDown = (event) => {
       if (event.key === 'Escape') finish(false);
+      if (event.key === 'Tab') {
+        const focusable = [workspaceDeleteConfirmBtn, workspaceDeleteCancelBtn].filter(button => !button.disabled);
+        const current = focusable.indexOf(document.activeElement);
+        const next = event.shiftKey
+          ? (current <= 0 ? focusable.length - 1 : current - 1)
+          : (current < 0 || current === focusable.length - 1 ? 0 : current + 1);
+        event.preventDefault();
+        focusable[next]?.focus();
+      }
     };
     workspaceDeleteCancelBtn.addEventListener('click', onCancel);
     workspaceDeleteConfirmBtn.addEventListener('click', onConfirm);
@@ -2918,7 +3051,21 @@ function renderWorkspaces() {
 async function loadWorkspaces() {
   if (!T.listWorkspaces || !workspaceToggleBtn) return;
   try {
-    workspaceState = await T.listWorkspaces();
+    const previousWorkspaceId = activeWorkspaceId();
+    const nextWorkspaceState = await T.listWorkspaces();
+    workspaceState = nextWorkspaceState;
+    if (activeWorkspaceId() !== previousWorkspaceId) {
+      workspaceGeneration += 1;
+      selectedWorkspaceFiles.clear();
+      selectedWorkspaceOwner = null;
+      renderAttachmentTray();
+      architectureSourcesLoadSeq += 1;
+      architectureSqlPlanRequest += 1;
+      architectureWorkflowLoadRequest += 1;
+      architectureEvaluationLoadRequest += 1;
+      architectureGraphRetrieveRequest += 1;
+      workspaceRagLoadSeq += 1;
+    }
     workspaceRagConfig = null;
     renderWorkspaces();
     if (workspaceSettingsScreenEl?.classList.contains('open')) void loadWorkspaceRagConfig();
@@ -3521,6 +3668,10 @@ function reconcileWorkspaceFileAttachments(files) {
 function renderFiles(files) {
   const el = document.getElementById('file-list');
   if (!el) return;
+  knownWorkspaceFiles.clear();
+  for (const file of files || []) {
+    if (file?.path) knownWorkspaceFiles.add(file.path);
+  }
   el.innerHTML = '';
   if (!files || !files.length) {
     const empty = document.createElement('div');
@@ -3586,8 +3737,11 @@ function renderFiles(files) {
 }
 
 async function loadFiles() {
+  const generation = workspaceGeneration;
+  const workspaceId = activeWorkspaceId();
   try {
     const data = await callTool('workspace_action', { action: 'list' });
+    if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
     const files = Array.isArray(data) ? data : (data?.files ?? []);
     reconcileWorkspaceFileAttachments(files);
     renderFiles(files);
@@ -3637,6 +3791,8 @@ function makePluginLabel(name) {
 }
 
 async function loadPlugins() {
+  const generation = workspaceGeneration;
+  const workspaceId = activeWorkspaceId();
   let listResult;
   try {
     listResult = await callTool('plugin', { action: 'list' });
@@ -3647,6 +3803,7 @@ async function loadPlugins() {
   try {
     localResult = await callTool('plugin', { action: 'discover_local' });
   } catch { /* discover_local optional */ }
+  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
   renderPlugins(listResult.loaded ?? [], Array.isArray(localResult) ? localResult : []);
 }
 
@@ -3655,6 +3812,12 @@ async function loadPlugins() {
 // An absent/empty declaration means "unknown" — allow it (the backend's load/rollback gate is the
 // real arbiter; we only suppress installs that are guaranteed to fail).
 const HOST_RUNTIME = T.hostRuntime || 'node';
+const CORE_PLUGIN_NAMES = new Set([
+  '@matatbread/matbot-sessions',
+  '@matatbread/matbot-tool-workspace',
+  '@matatbread/matbot-workflow-governance',
+  '@matatbread/matbot-frontend',
+]);
 function runsHere(p) {
   const rt = p && p.matbotRuntime;
   if (!Array.isArray(rt) || rt.length === 0) return true;
@@ -3692,7 +3855,7 @@ function renderPlugins(loaded, local) {
       main.appendChild(badges);
     }
     sum.appendChild(main);
-    if (p.specifier) {
+    if (p.specifier && !CORE_PLUGIN_NAMES.has(p.name)) {
       const actions = document.createElement('div');
       actions.className = 'plugin-actions';
       const removeBtn = document.createElement('button');
@@ -3769,6 +3932,8 @@ function renderPlugins(loaded, local) {
 // ── Skills ──────────────────────────────────────────────────────────────────
 
 async function loadSkills() {
+  const generation = workspaceGeneration;
+  const workspaceId = activeWorkspaceId();
   let result;
   try {
     result = await callTool('skill_action', { action: 'list' });
@@ -3777,6 +3942,7 @@ async function loadSkills() {
     renderSkills([]);
     return;
   }
+  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
   renderSkills(Array.isArray(result.skills) ? result.skills : []);
 }
 
@@ -3872,6 +4038,7 @@ const skillTriggerList   = document.getElementById('skill-trigger-list');
 const TRIGGER_KINDS = ['ephemeral', 'contextual', 'retract', 'followup'];
 let editingSkillName = null;
 let skillEditor = null;   // TinyMDE.Editor, created lazily on first open
+let editingSkillSavedContent = '';
 // A skill is fired by (at most) one Trigger whose invoke is skill_action(use, {name}); its
 // `conditions` are what the Triggers tab edits. `editingTriggerId` is that trigger's id (null when
 // the skill has no trigger yet — we create one on save if conditions are added).
@@ -4096,7 +4263,8 @@ async function openSkillEditor(name) {
   skillEditorSave.disabled = true;
   try {
     const result = await callTool('skill_action', { action: 'load', name });
-    editor.setContent(result.content ?? '');
+    editingSkillSavedContent = result.content ?? '';
+    editor.setContent(editingSkillSavedContent);
   } catch (err) {
     editor.setContent('');
     skillEditorError.textContent = 'Failed to load: ' + (err?.message ?? err);
@@ -4105,17 +4273,23 @@ async function openSkillEditor(name) {
   skillEditorOverlay.querySelector('.TinyMDE')?.focus();
 }
 
-function closeSkillEditor() {
+function closeSkillEditor(force = false) {
+  const currentContent = skillEditor?.getContent?.() ?? skillEditorText?.value ?? '';
+  if (!force && editingSkillName !== null && currentContent !== editingSkillSavedContent) {
+    if (!window.confirm('Discard unsaved skill changes?')) return false;
+  }
   skillEditorOverlay.classList.remove('open');
   editingSkillName = null;
+  editingSkillSavedContent = '';
+  return true;
 }
 
 if (skillEditorOverlay) {
   skillEditorOverlay.addEventListener('click', (e) => {
     if (e.target === skillEditorOverlay) closeSkillEditor();
   });
-  document.getElementById('skill-editor-close').onclick  = closeSkillEditor;
-  document.getElementById('skill-editor-cancel').onclick = closeSkillEditor;
+  document.getElementById('skill-editor-close').onclick  = () => closeSkillEditor();
+  document.getElementById('skill-editor-cancel').onclick = () => closeSkillEditor();
   for (const btn of document.querySelectorAll('.skill-tab')) btn.onclick = () => setSkillTab(btn.dataset.tab);
   document.getElementById('skill-trigger-add').onclick = () => {
     const row = makeTriggerRow();
@@ -4140,7 +4314,8 @@ if (skillEditorOverlay) {
       skillEditorSave.disabled = false;
       return;
     }
-    closeSkillEditor();
+    editingSkillSavedContent = skillEditor?.getContent?.() ?? editingSkillSavedContent;
+    closeSkillEditor(true);
     loadSkills();
   };
   document.addEventListener('keydown', (e) => {
@@ -4153,6 +4328,9 @@ async function uploadFiles(fileList) {
   if (!files.length) return;
   for (const file of files) {
     try {
+      if (knownWorkspaceFiles.has(file.name) && !window.confirm(`Replace existing workspace file "${file.name}"?`)) {
+        continue;
+      }
       const buffer = await file.arrayBuffer();
       const bytes = new Uint8Array(buffer);
       const CHUNK = 0x8000;
@@ -5072,7 +5250,11 @@ async function sendMessage(concat = false) {
     .map(file => ({ namespace: 'workspace', path: file.path }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
-  if (await submit(content, concat, attachments)) clearWorkspaceFileAttachments();
+  if (await submit(content, concat, attachments)) {
+    clearWorkspaceFileAttachments();
+  } else {
+    inputEl.value = content;
+  }
 }
 
 // Submit typed content to the current session, fire-and-forget. The server enqueues it and the
@@ -5083,7 +5265,11 @@ async function sendMessage(concat = false) {
 // X", X only visible to a later turn). The human path passes its choice explicitly via sendMessage.
 async function submit(content, concat = false, attachments = []) {
   const provider = providerSel.value;
-  if (!content || !provider) return false;
+  if (!content) return false;
+  if (!provider) {
+    showSubmitError(content, 'no model provider is available in the active workspace');
+    return false;
+  }
   if (newSessionPromise && !(await newSessionPromise)) return false;
   if (!currentSessionId) {
     const { id } = await apiNewSession();
@@ -5674,14 +5860,25 @@ async function init() {
     opt.value = opt.textContent = p;
     providerSel.appendChild(opt);
   }
+  if (providerDiscoveryFailed) {
+    const unavailable = document.createElement('option');
+    unavailable.value = '';
+    unavailable.textContent = 'Provider list unavailable — retry after restart';
+    unavailable.disabled = true;
+    unavailable.selected = true;
+    providerSel.appendChild(unavailable);
+    providerSel.dataset.error = unavailable.textContent;
+    providerSel.title = 'Check the active workspace provider configuration and retry after Cortex restarts.';
+  }
 
-  const savedProvider = localStorage[LS_PROVIDER];
+  const savedProvider = savedProviderForWorkspace();
   if (savedProvider && providers.includes(savedProvider)) {
     providerSel.value = savedProvider;
   }
+  localStorage.setItem(providerStorageKey(), providerSel.value);
 
   providerSel.addEventListener('change', () => {
-    localStorage.setItem(LS_PROVIDER, providerSel.value);
+    localStorage.setItem(providerStorageKey(), providerSel.value);
   });
 
   // Subscribe to session busy/idle transitions (the transport owns the wire + reconnect).

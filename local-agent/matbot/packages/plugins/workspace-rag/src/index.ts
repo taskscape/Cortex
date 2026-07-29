@@ -307,7 +307,15 @@ function uniqueContextId(base: string, existing: Set<string>): string {
 
 function normalizeFolderPaths(paths: unknown): string[] {
   if (!Array.isArray(paths)) return [];
-  return [...new Set(paths.map(item => String(item).trim()).filter(Boolean))].map(item => path.resolve(item));
+  const normalized = new Map<string, string>();
+  for (const item of paths) {
+    const raw = String(item).trim();
+    if (!raw) continue;
+    const resolved = path.resolve(raw);
+    const key = process.platform === 'win32' ? normalizePathForId(resolved).toLowerCase() : normalizePathForId(resolved);
+    if (!normalized.has(key)) normalized.set(key, resolved);
+  }
+  return [...normalized.values()];
 }
 
 function normalizeConfig(value: unknown, workspace: WorkspaceRef): RagConfig {

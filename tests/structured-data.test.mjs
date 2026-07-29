@@ -5,7 +5,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("structured-data runtime flow passes under the Matbot TypeScript loader", async () => {
+test("E2E-015 / T3-E2E-015 structured-data runtime enforces approval expiry and governed SQL boundaries", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

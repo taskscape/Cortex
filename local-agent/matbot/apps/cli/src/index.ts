@@ -403,7 +403,7 @@ function absolutizeLocalConfigSpecifiers(text: string, configDir: string): strin
   );
 }
 
-class FileWorkspaceManager implements CortexWorkspaceManager {
+export class FileWorkspaceManager implements CortexWorkspaceManager {
   private restarter: ((id: string) => Promise<void>) | undefined;
   private readonly registryPath: string;
   private readonly rootConfigPath: string;
@@ -1627,7 +1627,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(e => {
-  process.stderr.write(`Fatal: ${String(e)}\n`);
-  process.exit(1);
-});
+const invokedEntry = process.argv[1] === undefined ? undefined : pathToFileURL(path.resolve(process.argv[1])).href;
+if (invokedEntry === import.meta.url) {
+  main().catch(e => {
+    process.stderr.write(`Fatal: ${String(e)}\n`);
+    process.exit(1);
+  });
+}

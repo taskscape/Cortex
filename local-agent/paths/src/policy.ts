@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { canonicalPath, isPathInside } from "./paths.js";
+import { canonicalPath, isPathInside, realCanonicalPath } from "./paths.js";
 
 export interface WorkspaceRoot {
   path: string;
@@ -82,4 +82,33 @@ export function evaluateAccess(
   }
 
   return { allowed: true, mode: root.mode, highRisk };
+}
+
+/**
+ * Apply the normal policy after resolving junctions, symlinks, and Windows
+ * short-name aliases. The synchronous check remains useful for pure config
+ * validation; filesystem operations must use this variant.
+ */
+export async function evaluateRealAccess(
+  targetPath: string,
+  action: "read" | "write" | "delete" | "list",
+  workspaces: WorkspaceConfig,
+  policy: SecurityPolicy
+): Promise<AccessDecision> {
+  const lexical = evaluateAccess(targetPath, action, workspaces, policy);
+  if (!lexical.allowed) return lexical;
+
+  const realTarget = await realCanonicalPath(targetPath);
+  const deniedFragment = policy.deniedPathFragments.find(fragment => {
+    return realTarget.includes(fragment.toLowerCase());
+  });
+  if (deniedFragment) {
+    return { allowed: false, reason: `Denied path fragment matched after resolving links: ${deniedFragment}` };
+  }
+
+  for (const root of workspaces.roots) {
+    const realRoot = await realCanonicalPath(root.path);
+    if (isPathInside(realTarget, realRoot)) return lexical;
+  }
+  return { allowed: false, reason: "Resolved path is outside configured workspace roots." };
 }

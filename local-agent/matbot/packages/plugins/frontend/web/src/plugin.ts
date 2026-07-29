@@ -11,6 +11,7 @@ let webServer: Awaited<ReturnType<typeof createWebServer>> | undefined;
 let toolRegistry: ToolRegistry | undefined;
 const port = Number(process.env['MATBOT_WEB_PORT'] ?? 19778); // 19778 is "MB" in hex, a cute easter egg :)
 const listenRetryTimeoutMs = Number(process.env['MATBOT_WEB_LISTEN_RETRY_TIMEOUT_MS'] ?? 15000);
+export const WEB_LISTEN_HOST = '127.0.0.1';
 
 // Mint a shareable URL for a stored file — but only one this server actually serves: a file marked
 // `allowed` (default-deny). The path mirrors the GET /files/<namespace>/<name> route in server.ts.
@@ -120,7 +121,7 @@ export const plugin: MatbotPluginSpec = {
         };
         activeListenErrorHandler = onError;
         server.once('error', onError);
-        server.listen(port, '0.0.0.0');
+        server.listen(port, WEB_LISTEN_HOST);
       };
       listen();
     });

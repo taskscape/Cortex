@@ -319,7 +319,13 @@ function hashId(namespace: string, values: unknown[]): string {
 function sanitize(value: unknown, key = '', depth = 0): unknown {
   if (/secret|token|password|authorization|credential|api.?key|cookie/i.test(key)) return '[REDACTED]';
   if (depth > 7) return '[TRUNCATED_DEPTH]';
-  if (typeof value === 'string') return value.length > 4_000 ? `${value.slice(0, 4_000)}…[TRUNCATED]` : value;
+  if (typeof value === 'string') {
+    const redacted = value
+      .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
+      .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*\b/gi, 'Bearer [REDACTED]')
+      .replace(/([a-z][a-z0-9+.-]*:\/\/[^:/\s]+:)[^@\s]+@/gi, '$1[REDACTED]@');
+    return redacted.length > 4_000 ? `${redacted.slice(0, 4_000)}…[TRUNCATED]` : redacted;
+  }
   if (Array.isArray(value)) return value.slice(0, 100).map(item => sanitize(item, key, depth + 1));
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).slice(0, 200).map(([childKey, child]) => [childKey, sanitize(child, childKey, depth + 1)]));
   return value;

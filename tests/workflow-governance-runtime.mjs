@@ -407,6 +407,40 @@ async function main() {
   assert.deepEqual(inspection.events.map(event => event.sequence), inspection.events.map((_, index) => index + 1));
   assert.ok(inspection.events.some(event => event.eventType === "tool_executed"));
 
+  const failingRun = await collectTool(workflowTool, {
+    action: "start",
+    workspaceId: "default",
+    workflowId: draft.definition.id,
+    mode: "approval_gated",
+    inputs: { ticketId: "T-500" },
+    evidenceSourceIds: [source.id],
+    proposedActions: [{
+      toolName: "file_broker_action",
+      input: { action: "write", path: "outbox/failing-followup.txt", content: "hello" },
+      capability: "write",
+      connectorInstanceId: "connector-instance:file-broker:local",
+      sourceIds: [source.id],
+      confidence: 0.9,
+      costEstimateUsd: 0.01,
+    }],
+  });
+  assert.equal(failingRun.status, "waiting_for_approval");
+  assert.equal(failingRun.executedActions.length, 0);
+  await collectTool(workflowTool, { action: "approve", runId: failingRun.id, reason: "Approved failure-path test" });
+  await services.WorkflowRunner.recordToolResult(
+    failingRun.id,
+    "file_broker_action",
+    { ok: false, error: "simulated external write failure", sourceIds: [source.id] },
+    true,
+    17,
+  );
+  const failedActionInspection = await collectTool(workflowTool, { action: "inspect_run", runId: failingRun.id });
+  assert.equal(failedActionInspection.run.status, "failed");
+  assert.equal(failedActionInspection.run.completionState, "failed");
+  assert.equal(failedActionInspection.run.executedActions.length, 1);
+  assert.equal(failedActionInspection.run.executedActions[0].status, "failed");
+  assert.ok(failedActionInspection.events.some(event => event.eventType === "tool_execution_failed"));
+
   const accesses = await services.SourceRegistry.accessEvents(source.id);
   assert.ok(accesses.some(event => event.workflowRunId === dryRun.id));
   assert.ok(accesses.some(event => event.workflowRunId === started.id));

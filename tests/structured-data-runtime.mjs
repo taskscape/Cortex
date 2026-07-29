@@ -197,6 +197,34 @@ async function main() {
   assert.equal(missingLimit.valid, false);
   assert.ok(missingLimit.reasons.some(reason => reason.includes("explicit LIMIT")));
 
+  const crossJoin = await collectTool(structuredTool, {
+    action: "validate_sql",
+    sql: "SELECT o.id FROM public.orders o CROSS JOIN public.orders other LIMIT 10",
+  });
+  assert.equal(crossJoin.valid, false);
+  assert.ok(crossJoin.reasons.some(reason => reason.includes("CROSS JOIN")));
+
+  const multipleStatements = await collectTool(structuredTool, {
+    action: "validate_sql",
+    sql: "SELECT id FROM public.orders LIMIT 1; SELECT id FROM public.orders LIMIT 1",
+  });
+  assert.equal(multipleStatements.valid, false);
+  assert.ok(multipleStatements.reasons.some(reason => reason.includes("Multiple SQL statements")));
+
+  const dataModifyingCte = await collectTool(structuredTool, {
+    action: "validate_sql",
+    sql: "WITH removed AS (DELETE FROM public.orders RETURNING id) SELECT id FROM removed LIMIT 1",
+  });
+  assert.equal(dataModifyingCte.valid, false);
+  assert.ok(dataModifyingCte.reasons.some(reason => reason.includes("Only SELECT")));
+  assert.ok(dataModifyingCte.reasons.some(reason => reason.includes("disallowed write")));
+
+  const harmlessComment = await collectTool(structuredTool, {
+    action: "validate_sql",
+    sql: "SELECT id /* DELETE is documentation here */ FROM public.orders LIMIT 1",
+  });
+  assert.equal(harmlessComment.valid, true);
+
   const unknownDimension = await collectTool(structuredTool, {
     action: "plan_query",
     plan: {
@@ -206,6 +234,34 @@ async function main() {
     },
   });
   assert.match(unknownDimension.error, /Unknown dimension column/);
+
+  const unknownMetric = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: { workspaceId: "default", metricName: "not_a_metric" },
+  });
+  assert.match(unknownMetric.error, /known metricId or metricName/);
+
+  const unknownFilter = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      filters: [{ columnId: "not_a_filter", op: "eq", value: "paid" }],
+    },
+  });
+  assert.match(unknownFilter.error, /Unknown filter column/);
+
+  const zeroLimit = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      dimensions: [orderDate.id],
+      limit: 0,
+    },
+  });
+  assert.equal(zeroLimit.queryRun.rowLimit, 1);
+  assert.match(zeroLimit.queryRun.sql, /LIMIT 1/);
 
   const approval = await collectTool(structuredTool, { action: "approve_query", queryRunId: plan.queryRun.id });
   assert.equal(approval.queryRun.status, "approved");
@@ -218,9 +274,59 @@ async function main() {
   });
   assert.match(badExecution.error, /Invalid approval token/);
 
+  const runStore = stores.get("structured_data_query_runs");
+  const expiringPlan = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      dimensions: [orderDate.id],
+      limit: 5,
+    },
+  });
+  const expiringApproval = await collectTool(structuredTool, {
+    action: "approve_query",
+    queryRunId: expiringPlan.queryRun.id,
+  });
+  const expiringRun = await runStore.get(expiringPlan.queryRun.id);
+  await runStore.set(expiringRun.id, {
+    ...expiringRun,
+    approvalExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  const expiredExecution = await collectTool(structuredTool, {
+    action: "execute_query",
+    queryRunId: expiringRun.id,
+    approvalToken: expiringApproval.approvalToken,
+  });
+  assert.match(expiredExecution.error, /approval expired/);
+  const resetExpiredRun = await runStore.get(expiringRun.id);
+  assert.equal(resetExpiredRun.status, "planned");
+  assert.equal(Object.hasOwn(resetExpiredRun, "approvalTokenHash"), false);
+
+  const approvedRun = await runStore.get(plan.queryRun.id);
+  await runStore.set(plan.queryRun.id, {
+    ...approvedRun,
+    sql: "DELETE FROM public.orders WHERE id = 1",
+  });
+  const tamperedExecution = await collectTool(structuredTool, {
+    action: "execute_query",
+    queryRunId: plan.queryRun.id,
+    approvalToken: approval.approvalToken,
+  });
+  assert.match(tamperedExecution.error, /SQL validation failed before execution/);
+
+  await runStore.set(plan.queryRun.id, { ...approvedRun, status: "succeeded" });
+  const reusedApproval = await collectTool(structuredTool, {
+    action: "execute_query",
+    queryRunId: plan.queryRun.id,
+    approvalToken: approval.approvalToken,
+  });
+  assert.match(reusedApproval.error, /must be approved before execution/);
+
   const runs = await collectTool(structuredTool, { action: "runs" });
-  assert.equal(runs.runs.length, 1);
-  assert.equal(runs.runs[0].status, "approved");
+  assert.equal(runs.runs.length, 3);
+  assert.equal(runs.runs.find(run => run.id === plan.queryRun.id).status, "succeeded");
+  assert.equal(runs.runs.find(run => run.id === zeroLimit.queryRun.id).status, "planned");
 
   const sources = await collectTool(sourceTool, { action: "list" });
   assert.ok(sources.sources.some(source => source.id === storedTable.sourceId && source.sourceKind === "table"));

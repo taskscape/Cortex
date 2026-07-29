@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -82,6 +82,10 @@ async function main() {
       "# Retrieval Probe\n\nThe QuasarPump calibration value is 42.\0 Use the amber valve before startup.",
       "utf8",
     );
+    await writeFile(path.join(docsDir, "ignored.txt"), "NON_MARKDOWN_CANARY_771", "utf8");
+    const renamedOld = path.join(docsDir, "rename-old.md");
+    const renamedNew = path.join(docsDir, "rename-new.md");
+    await writeFile(renamedOld, "# Rename Old\n\nRAG_OLD_PATH_CANARY_882", "utf8");
     await writeFile(
       path.join(financeDir, "finance-probe.md"),
       "# Finance Probe\n\nThe LedgerAlpha reserve ratio is 18 percent. Review cash timing before expansion.",
@@ -140,7 +144,7 @@ async function main() {
     for await (const event of registeredTool.executor.execute({
       action: "configure",
       contextName: "Probe Knowledge",
-      paths: [docsDir],
+      paths: [docsDir, `${docsDir}${path.sep}.`],
     }, toolCtx)) {
       configureEvents.push(event);
     }
@@ -151,6 +155,7 @@ async function main() {
     assert.equal(configureResult.status.accelerated, false);
     assert.equal(configureResult.status.embeddingBackend, "hash-cpu");
     assert.equal(configureResult.status.currentFile, undefined);
+    assert.deepEqual(configureResult.config.paths, [docsDir]);
 
     const idleStatusEvents = [];
     for await (const event of registeredTool.executor.execute({ action: "status" }, toolCtx)) {
@@ -162,6 +167,14 @@ async function main() {
     const dbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
     assert.match(dbText, /QuasarPump/);
     assert.doesNotMatch(dbText, /\\u0000/);
+    assert.doesNotMatch(dbText, /NON_MARKDOWN_CANARY_771/);
+
+    await rename(renamedOld, renamedNew);
+    await writeFile(renamedNew, "# Rename New\n\nRAG_NEW_PATH_CANARY_993", "utf8");
+    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
+    const reconciledDbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
+    assert.doesNotMatch(reconciledDbText, /RAG_OLD_PATH_CANARY_882/);
+    assert.match(reconciledDbText, /RAG_NEW_PATH_CANARY_993/);
     const sourceListEvents = [];
     for await (const event of sourceTool.executor.execute({ action: "list" }, toolCtx)) {
       sourceListEvents.push(event);

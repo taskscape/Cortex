@@ -9,6 +9,7 @@ export {
 
 export {
   evaluateAccess,
+  evaluateRealAccess,
   indexExclusions,
   loadSecurityPolicy,
   loadWorkspaceConfig,

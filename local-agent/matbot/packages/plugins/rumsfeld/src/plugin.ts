@@ -90,6 +90,7 @@ interface FactIndex {
 //
 // Note: query tokens that appear in NO fact are intentionally ignored later (see `queryWeightOf`) so
 // recall does not depend on how much unrelated padding surrounds the token that matters.
+function indexFacts(facts: readonly RememberedFact[]): FactIndex {
   const documentFrequency = new Map<string, number>();
   for (const fact of facts) {
     for (const token of tokens(fact.fact)) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);

@@ -191,6 +191,8 @@ export interface QueryRun {
   resultSourceId?: string;
   error?: string;
   approvalTokenHash?: string;
+  approvedAt?: string;
+  approvalExpiresAt?: string;
 }
 
 export interface QueryPlan {
@@ -568,11 +570,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     if (run === null) throw new Error(`Unknown query run "${queryRunId}".`);
     if (run.status !== 'planned' && run.status !== 'approved') throw new Error(`Cannot approve query run in status "${run.status}".`);
     const token = randomUUID();
+    const approvedAt = new Date();
+    const configuredTtl = Number(process.env['CORTEX_SQL_APPROVAL_TTL_MS'] ?? 300_000);
+    const ttlMs = Number.isFinite(configuredTtl) && configuredTtl > 0 ? configuredTtl : 300_000;
     const approved: QueryRun = {
       ...run,
       version: randomUUID(),
       status: 'approved',
       approvalTokenHash: hashText(token),
+      approvedAt: approvedAt.toISOString(),
+      approvalExpiresAt: new Date(approvedAt.getTime() + ttlMs).toISOString(),
       updatedAt: nowIso(),
     };
     await this.queryRunStore.set(run.id, approved);
@@ -584,6 +591,21 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     if (run === null) throw new Error(`Unknown query run "${queryRunId}".`);
     if (run.status !== 'approved') throw new Error(`Query run "${queryRunId}" must be approved before execution.`);
     if (run.approvalTokenHash !== hashText(approvalToken)) throw new Error('Invalid approval token for query execution.');
+    if (run.principalId !== principalId()) throw new Error('Query approval belongs to a different principal.');
+    if (run.approvalExpiresAt !== undefined && Date.parse(run.approvalExpiresAt) <= Date.now()) {
+      const {
+        approvalTokenHash: _approvalTokenHash,
+        approvedAt: _approvedAt,
+        approvalExpiresAt: _approvalExpiresAt,
+        ...unapproved
+      } = run;
+      await this.updateRun({
+        ...unapproved,
+        status: 'planned',
+        updatedAt: nowIso(),
+      });
+      throw new Error('Query approval expired; review and approve the plan again.');
+    }
     const connection = await this.catalog.getConnection(run.dataConnectionId);
     if (connection === null) throw new Error(`Missing data connection "${run.dataConnectionId}".`);
     if (!connection.readOnly || connection.dialect !== 'postgres') throw new Error('Structured data execution requires a read-only Postgres connection.');

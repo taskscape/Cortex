@@ -22,6 +22,7 @@ const sessionStreams = new Map();
 const globalStreams = new Set();
 const pendingPrompts = new Map();
 const runningTurns = new Map();
+const queuedTurns = new Map();
 let workspaceSeq = 1;
 let rememberedFactSeq = 1;
 const rememberedFactsByWorkspace = new Map();
@@ -89,9 +90,10 @@ const architectureSourceVersion = {
   provenance: { activityId: "playwright:source-registry" }
 };
 
-const files = new Map([
+const initialWorkspaceFiles = [
   ["brief.md", Buffer.from("# Brief\nInitial workspace file.", "utf8")]
-]);
+];
+const filesByWorkspace = new Map();
 
 const workspaces = [
   {
@@ -108,6 +110,17 @@ function activeHarnessWorkspaceId() {
   return workspaces.find(workspace => workspace.active)?.id ?? "default";
 }
 
+function filesForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  let store = filesByWorkspace.get(workspaceId);
+  if (!store) {
+    store = new Map(workspaceId === "default"
+      ? initialWorkspaceFiles.map(([name, contents]) => [name, Buffer.from(contents)])
+      : []);
+    filesByWorkspace.set(workspaceId, store);
+  }
+  return store;
+}
+
 function rememberedFactsForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
   let store = rememberedFactsByWorkspace.get(workspaceId);
   if (!store) {
@@ -119,6 +132,15 @@ function rememberedFactsForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
 
 function sessionWorkspaceId(sessionId) {
   return sessions.get(sessionId)?.workspaceId ?? activeHarnessWorkspaceId();
+}
+
+function queuedTurnsForSession(sessionId) {
+  let queue = queuedTurns.get(sessionId);
+  if (!queue) {
+    queue = [];
+    queuedTurns.set(sessionId, queue);
+  }
+  return queue;
 }
 let workspaceRagConfig = {
   activeContextId: "default",
@@ -146,6 +168,7 @@ let workspaceRagStatus = {
   storageBackend: "json",
   storageMessage: "Legacy JSON workspace RAG storage active."
 };
+const workspaceRagStateByWorkspace = new Map();
 
 function activeRagContext() {
   return workspaceRagConfig.contexts.find(context => context.id === workspaceRagConfig.activeContextId) ?? workspaceRagConfig.contexts[0];
@@ -164,12 +187,53 @@ function setWorkspaceRagStatusForActive(overrides = {}) {
   const context = activeRagContext();
   const nextStatus = {
     ...workspaceRagStatus,
+    workspaceId: activeHarnessWorkspaceId(),
     contextName: context.name,
     paths: context.paths,
     ...overrides
   };
   if (nextStatus.state !== "indexing") delete nextStatus.currentFile;
   workspaceRagStatus = nextStatus;
+}
+
+function persistWorkspaceRagState(workspaceId = activeHarnessWorkspaceId()) {
+  workspaceRagStateByWorkspace.set(workspaceId, {
+    config: structuredClone(workspaceRagConfig),
+    status: structuredClone(workspaceRagStatus)
+  });
+}
+
+function restoreWorkspaceRagState(workspaceId, workspaceName = "Workspace") {
+  const stored = workspaceRagStateByWorkspace.get(workspaceId);
+  if (stored) {
+    workspaceRagConfig = structuredClone(stored.config);
+    workspaceRagStatus = { ...structuredClone(stored.status), workspaceId };
+    return;
+  }
+  workspaceRagConfig = {
+    activeContextId: "default",
+    contexts: [{ id: "default", name: workspaceName, paths: [] }]
+  };
+  workspaceRagStatus = {
+    workspaceId,
+    contextName: workspaceName,
+    paths: [],
+    state: "pending",
+    totalFiles: 0,
+    processedFiles: 0,
+    percent: 0,
+    message: "No markdown folders configured.",
+    nvidiaAvailable: false,
+    cudaAvailable: false,
+    accelerated: false,
+    accelerator: "cpu",
+    embeddingBackend: "hash-cpu",
+    embeddingModel: "token-hash-v1",
+    embeddingDimensions: 384,
+    accelerationMessage: "Using CPU hash vectorizer.",
+    storageBackend: "json",
+    storageMessage: "Legacy JSON workspace RAG storage active."
+  };
 }
 
 sessions.set("s0", {
@@ -184,7 +248,7 @@ sessions.set("s0", {
   updatedAt: now()
 });
 
-const skills = new Map([
+const initialSkills = [
   ["Inner voice", {
     name: "Inner voice",
     content: "# Inner Voice\nAsk the configured critic to review the response.",
@@ -201,18 +265,20 @@ const skills = new Map([
       tags: ["panel", "orchestration"]
     }
   }]
-]);
+];
+const skillsByWorkspace = new Map();
 
-const triggers = new Map([
+const initialTriggers = [
   ["trigger-panel", {
     id: "trigger-panel",
     tool: "skill_action",
     params: { action: "use", name: "Panel Etiquette" },
     conditions: [{ kind: "ephemeral", rule: "MATCH when the user asks for expert panel etiquette." }]
   }]
-]);
+];
+const triggersByWorkspace = new Map();
 
-const loadedPlugins = [
+const initialLoadedPlugins = [
   {
     name: "@local-agent/expert-panel",
     specifier: "./plugins/expert-panel",
@@ -322,6 +388,45 @@ const loadedPlugins = [
   }
 ];
 
+const loadedPluginsByWorkspace = new Map();
+const providersByWorkspace = new Map();
+const defaultProviders = ["openai", "Local", "panel-test"];
+
+function cloneEntries(entries) {
+  return new Map(entries.map(([key, value]) => [key, structuredClone(value)]));
+}
+
+function skillsForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  let store = skillsByWorkspace.get(workspaceId);
+  if (!store) {
+    store = cloneEntries(initialSkills);
+    skillsByWorkspace.set(workspaceId, store);
+  }
+  return store;
+}
+
+function triggersForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  let store = triggersByWorkspace.get(workspaceId);
+  if (!store) {
+    store = cloneEntries(initialTriggers);
+    triggersByWorkspace.set(workspaceId, store);
+  }
+  return store;
+}
+
+function loadedPluginsForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  let plugins = loadedPluginsByWorkspace.get(workspaceId);
+  if (!plugins) {
+    plugins = initialLoadedPlugins.map(plugin => structuredClone(plugin));
+    loadedPluginsByWorkspace.set(workspaceId, plugins);
+  }
+  return plugins;
+}
+
+function providersForWorkspace(workspaceId = activeHarnessWorkspaceId()) {
+  return providersByWorkspace.get(workspaceId) ?? defaultProviders;
+}
+
 const expertConfigs = [
   {
     id: "design",
@@ -378,7 +483,8 @@ function clonePlugin(plugin) {
   };
 }
 
-function addLoadedPlugin(specifier) {
+function addLoadedPlugin(specifier, workspaceId = activeHarnessWorkspaceId()) {
+  const loadedPlugins = loadedPluginsForWorkspace(workspaceId);
   if (loadedPlugins.some(plugin => plugin.specifier === specifier || plugin.name === specifier)) {
     const plugin = loadedPlugins.find(item => item.specifier === specifier || item.name === specifier);
     return { ok: true, plugin, message: `Plugin "${plugin.name}" is already loaded.` };
@@ -395,7 +501,8 @@ function addLoadedPlugin(specifier) {
   return { ok: true, plugin: loaded, message: `Added plugin "${loaded.name}".` };
 }
 
-function removeLoadedPlugin(specifier) {
+function removeLoadedPlugin(specifier, workspaceId = activeHarnessWorkspaceId()) {
+  const loadedPlugins = loadedPluginsForWorkspace(workspaceId);
   const index = loadedPlugins.findIndex(plugin => plugin.specifier === specifier || plugin.name === specifier);
   if (index < 0) return { ok: false, error: `Plugin "${specifier}" is not loaded.` };
   const [plugin] = loadedPlugins.splice(index, 1);
@@ -588,6 +695,15 @@ function expertPanelResult(input) {
   if (unknown.length) return { error: `Unknown expert(s): ${unknown.join(", ")}` };
   const opinions = requested.map(id => {
     const expert = expertConfigs.find(item => item.id === id);
+    if (/partial expert failure/i.test(String(input.question)) && id === "finance") {
+      return {
+        expertId: expert.id,
+        title: expert.title,
+        error: "Simulated finance expert timeout.",
+        citations: [],
+        usage: { inputTokens: 3, outputTokens: 0 }
+      };
+    }
     return {
       expertId: expert.id,
       title: expert.title,
@@ -607,7 +723,13 @@ function expertPanelResult(input) {
     experts: opinions
   };
   if (input.synthesize !== false) {
-    response.synthesis = `Synthesis for ${requested.join(", ")}.`;
+    if (/synthesis only failure/i.test(String(input.question))) {
+      response.synthesisError = "Simulated synthesis timeout; independent expert evidence remains available.";
+    } else {
+      response.synthesis = /partial expert failure/i.test(String(input.question))
+        ? "Synthesis used the successful experts and excluded Finance Expert after its timeout."
+        : `Synthesis for ${requested.join(", ")}.`;
+    }
   }
   return { result: response };
 }
@@ -619,6 +741,7 @@ function formatExpertPanelResult(result) {
   for (const rawOpinion of opinions) {
     const opinion = rawOpinion && typeof rawOpinion === "object" && !Array.isArray(rawOpinion) ? rawOpinion : {};
     lines.push("", `### ${textValue(opinion.title, textValue(opinion.expertId, "Expert"))}`, textValue(opinion.answer, "(No answer returned.)"));
+    if (typeof opinion.error === "string" && opinion.error) lines.push(`Error: ${opinion.error}`);
     const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
     if (citations.length) {
       lines.push("", "Citations:");
@@ -631,6 +754,9 @@ function formatExpertPanelResult(result) {
     }
   }
   if (typeof record.synthesis === "string" && record.synthesis) lines.push("", "### Synthesis", record.synthesis);
+  if (typeof record.synthesisError === "string" && record.synthesisError) {
+    lines.push("", "### Synthesis unavailable", record.synthesisError);
+  }
   if (!opinions.length && !record.synthesis) lines.push("", "No expert response was returned.");
   return lines.join("\n");
 }
@@ -919,6 +1045,8 @@ function structuredDataActionResult(input) {
     const catalog = structuredCatalog();
     const id = `query-run:playwright-${queryRunSeq++}`;
     const timestamp = now();
+    const metricName = String(input.plan?.metricName ?? "total_revenue");
+    const isOrdersMetric = metricName === "orders";
     const run = {
       id,
       version: "query-run-version",
@@ -926,9 +1054,11 @@ function structuredDataActionResult(input) {
       dataConnectionId: catalog.connections[0].id,
       principalId: "system",
       status: "planned",
-      sql: 'SELECT "order_date" AS "order_date", sum("amount") AS "total_revenue" FROM "public"."orders" WHERE "status" = $1 GROUP BY "order_date" LIMIT 50',
-      sqlHash: "sql-hash:playwright",
-      semanticInputs: ["metric:total_revenue", "data-column:orders:order_date", "data-column:orders:status"],
+      sql: isOrdersMetric
+        ? 'SELECT count(*) AS "orders" FROM "public"."orders" WHERE "status" = $1 LIMIT 50'
+        : 'SELECT "order_date" AS "order_date", sum("amount") AS "total_revenue" FROM "public"."orders" WHERE "status" = $1 GROUP BY "order_date" LIMIT 50',
+      sqlHash: `sql-hash:playwright:${metricName}`,
+      semanticInputs: [`metric:${metricName}`, "data-column:orders:order_date", "data-column:orders:status"],
       parameters: ["paid"],
       sourceIds: [architectureSource.id],
       rowLimit: 50,
@@ -938,7 +1068,9 @@ function structuredDataActionResult(input) {
     queryRuns.set(id, run);
     return {
       queryRun: run,
-      metric: catalog.metrics[0],
+      metric: isOrdersMetric
+        ? { ...catalog.metrics[0], id: "metric:orders", name: "orders", businessName: "Order Count", aggregation: "count" }
+        : catalog.metrics[0],
       table: catalog.tables[0],
       dimensions: [catalog.columns[1]],
       filters: [{ columnId: "data-column:orders:status", op: "eq", value: "paid" }],
@@ -1339,6 +1471,7 @@ function expertPanelReviewResult(input) {
     version: "expert-review-version",
     createdAt: now(),
     updatedAt: now(),
+    workspaceId: input.workspaceId ?? activeHarnessWorkspaceId(),
     question: input.question,
     mode: input.mode ?? "review",
     reviewMode: input.reviewMode ?? "pre_automation_review",
@@ -1418,8 +1551,70 @@ async function handle(req, res) {
 
   if (method === "GET" && url.pathname === "/health") return json(res, 200, { status: "ok" });
   if (method === "POST" && url.pathname === "/__test/reset-memory") {
+    for (const run of runningTurns.values()) run.aborted = true;
+    sessions.clear();
+    hidden.clear();
+    busy.clear();
+    pendingPrompts.clear();
+    runningTurns.clear();
+    queuedTurns.clear();
+    sessionSeq = 1;
+    traceSeq = 1;
+    sessions.set("s0", {
+      id: "s0",
+      version: "v1",
+      status: "active",
+      title: "Conversation s0",
+      workspaceId: "default",
+      messages: [],
+      contexts: [],
+      createdAt: now(),
+      updatedAt: now()
+    });
+    workspaces.splice(0, workspaces.length, {
+      id: "default",
+      name: "Default",
+      configPath: "matbot.yaml",
+      createdAt: now(),
+      updatedAt: now(),
+      active: true
+    });
+    workspaceSeq = 1;
     rememberedFactsByWorkspace.clear();
     rememberedFactSeq = 1;
+    filesByWorkspace.clear();
+    skillsByWorkspace.clear();
+    triggersByWorkspace.clear();
+    loadedPluginsByWorkspace.clear();
+    providersByWorkspace.clear();
+    workspaceRagStateByWorkspace.clear();
+    workspaceRagConfig = {
+      activeContextId: "default",
+      contexts: [{ id: "default", name: "Default", paths: ["C:\\Projects\\Cortex\\docs"] }]
+    };
+    workspaceRagStatus = {
+      workspaceId: "default",
+      contextName: "Default",
+      paths: activeRagContext().paths,
+      state: "idle",
+      totalFiles: 2,
+      processedFiles: 2,
+      percent: 100,
+      message: "Indexed 2 markdown file(s).",
+      nvidiaAvailable: false,
+      cudaAvailable: false,
+      accelerated: false,
+      accelerator: "cpu",
+      embeddingBackend: "hash-cpu",
+      embeddingModel: "token-hash-v1",
+      embeddingDimensions: 384,
+      accelerationMessage: "Using CPU hash vectorizer.",
+      storageBackend: "json",
+      storageMessage: "Legacy JSON workspace RAG storage active."
+    };
+    persistWorkspaceRagState("default");
+    queryRuns.clear();
+    queryRunSeq = 1;
     workflowCompilations.clear();
     workflowRuns.clear();
     workflowApprovals.clear();
@@ -1430,6 +1625,27 @@ async function handle(req, res) {
     expertReviewSeq = 1;
     seedEvaluationData();
     return json(res, 200, { ok: true });
+  }
+  const testSessionEvent = /^\/__test\/sessions\/([^/]+)\/event$/.exec(url.pathname);
+  if (method === "POST" && testSessionEvent) {
+    const sessionId = decodeURIComponent(testSessionEvent[1]);
+    const body = await readJson(req);
+    sendSession(sessionId, String(body.event ?? "text-delta"), body.data ?? {});
+    return json(res, 200, { ok: true, sessionId });
+  }
+  const testWorkspaceState = /^\/__test\/workspaces\/([^/]+)\/state$/.exec(url.pathname);
+  if (method === "GET" && testWorkspaceState) {
+    const id = decodeURIComponent(testWorkspaceState[1]);
+    return json(res, 200, {
+      exists: workspaces.some(workspace => workspace.id === id),
+      sessions: [...sessions.values()].filter(session => session.workspaceId === id).length,
+      files: filesByWorkspace.get(id)?.size ?? 0,
+      skills: skillsByWorkspace.get(id)?.size ?? 0,
+      memories: rememberedFactsByWorkspace.get(id)?.size ?? 0,
+      hasRagState: workspaceRagStateByWorkspace.has(id),
+      hasPluginState: loadedPluginsByWorkspace.has(id),
+      hasProviderState: providersByWorkspace.has(id)
+    });
   }
   if (method === "GET" && url.pathname === "/") return file(res, "text/html; charset=utf-8", "index.html");
   if (method === "GET" && url.pathname === "/app.js") return file(res, "application/javascript; charset=utf-8", "app.js");
@@ -1459,6 +1675,20 @@ async function handle(req, res) {
     return json(res, 201, workspace);
   }
 
+  const testWorkspaceProviders = /^\/__test\/workspaces\/([^/]+)\/providers$/.exec(url.pathname);
+  if (method === "POST" && testWorkspaceProviders) {
+    const id = decodeURIComponent(testWorkspaceProviders[1]);
+    if (!workspaces.some(workspace => workspace.id === id)) {
+      return json(res, 404, { error: "Workspace not found" });
+    }
+    const body = await readJson(req);
+    if (!Array.isArray(body.providers) || body.providers.some(provider => typeof provider !== "string" || !provider.trim())) {
+      return json(res, 400, { error: '"providers" must contain non-empty strings.' });
+    }
+    providersByWorkspace.set(id, body.providers.map(provider => provider.trim()));
+    return json(res, 200, { workspaceId: id, providers: providersForWorkspace(id) });
+  }
+
   const workspaceRename = /^\/workspaces\/([^/]+)\/rename$/.exec(url.pathname);
   if (method === "POST" && workspaceRename) {
     const workspace = workspaces.find(w => w.id === decodeURIComponent(workspaceRename[1]));
@@ -1476,7 +1706,9 @@ async function handle(req, res) {
     const id = decodeURIComponent(workspaceSwitch[1]);
     const workspace = workspaces.find(w => w.id === id);
     if (!workspace) return json(res, 404, { error: "Workspace not found" });
+    persistWorkspaceRagState();
     for (const item of workspaces) item.active = item.id === id;
+    restoreWorkspaceRagState(id, workspace.name);
     return json(res, 200, { active: id, restarting: true });
   }
 
@@ -1496,6 +1728,21 @@ async function handle(req, res) {
     if (index < 0) return json(res, 404, { error: "Workspace not found" });
     if (workspaces[index].active) return json(res, 409, { error: "Cannot delete the active workspace" });
     rememberedFactsByWorkspace.delete(id);
+    filesByWorkspace.delete(id);
+    skillsByWorkspace.delete(id);
+    triggersByWorkspace.delete(id);
+    loadedPluginsByWorkspace.delete(id);
+    providersByWorkspace.delete(id);
+    workspaceRagStateByWorkspace.delete(id);
+    for (const [sessionId, session] of sessions) {
+      if (session.workspaceId === id) {
+        sessions.delete(sessionId);
+        hidden.delete(sessionId);
+      }
+    }
+    for (const [reviewId, review] of expertReviews) {
+      if (review.workspaceId === id) expertReviews.delete(reviewId);
+    }
     workspaces.splice(index, 1);
     return json(res, 200, { ok: true, deleted: id });
   }
@@ -1529,6 +1776,7 @@ async function handle(req, res) {
     const traceId = body.traceId ?? `trace-${traceSeq++}`;
     const session = sessions.get(sessionId);
     if (!session) return json(res, 404, { error: "Session not found" });
+    const sessionFiles = filesForWorkspace(session.workspaceId);
     if (body.attachments !== undefined) {
       if (!Array.isArray(body.attachments)) return json(res, 400, { error: '"attachments" must be an array.' });
       if (body.attachments.length > 20) return json(res, 400, { error: "A message can attach at most 20 workspace files." });
@@ -1536,10 +1784,25 @@ async function handle(req, res) {
         if (!attachment || attachment.namespace !== "workspace" || typeof attachment.path !== "string") {
           return json(res, 400, { error: 'Each attachment must identify a workspace file with { namespace: "workspace", path }.' });
         }
-        if (!files.has(attachment.path)) {
+        if (!sessionFiles.has(attachment.path)) {
           return json(res, 400, { error: `Workspace attachment not found: ${JSON.stringify(attachment.path)}.` });
         }
       }
+    }
+    if (busy.get(sessionId)) {
+      const queue = queuedTurnsForSession(sessionId);
+      queue.push({ traceId, body });
+      await waitForSessionStream(sessionId);
+      const content = typeof body.content === "string" ? [{ type: "text", text: body.content }] : [body.content];
+      sendSession(sessionId, "queued", {
+        type: "queued",
+        content,
+        queued: queue.length,
+        concatQueue: body.concatQueue === true,
+        traceId,
+        rootTraceId: traceId
+      });
+      return json(res, 200, { queued: queue.length, traceId });
     }
     void runTurn(sessionId, traceId, body);
     return json(res, 200, { queued: 0, traceId });
@@ -1618,8 +1881,42 @@ async function handle(req, res) {
       sendSession(sessionId, "aborted", { type: "aborted", reason: "user-abort", session: sessions.get(sessionId), traceId: run.traceId });
       runningTurns.delete(sessionId);
     }
+    const queue = queuedTurnsForSession(sessionId);
+    for (const queued of queue.splice(0)) {
+      sendSession(sessionId, "cancelled", {
+        type: "cancelled",
+        reason: "user-abort",
+        session: sessions.get(sessionId),
+        traceId: queued.traceId
+      });
+    }
     setBusy(sessionId, false);
     return json(res, 200, { ok: true });
+  }
+
+  const testSessionComplete = /^\/__test\/sessions\/([^/]+)\/complete$/.exec(url.pathname);
+  if (method === "POST" && testSessionComplete) {
+    const sessionId = decodeURIComponent(testSessionComplete[1]);
+    const session = sessions.get(sessionId);
+    if (!session) return json(res, 404, { error: "session not found" });
+    const body = await readJson(req);
+    const running = runningTurns.get(sessionId);
+    const traceId = running?.traceId ?? String(body.traceId ?? `test-complete-${Date.now()}`);
+    const text = String(body.text ?? "Recovered terminal response.");
+    if (!session.messages.some(message => message.role === "assistant" && message.traceId === traceId)) {
+      session.messages.push({
+        id: `m-${traceId}-a`,
+        traceId,
+        role: "assistant",
+        content: [{ type: "text", text }],
+        createdAt: now()
+      });
+    }
+    session.updatedAt = now();
+    runningTurns.delete(sessionId);
+    setBusy(sessionId, false);
+    sendSession(sessionId, "done", { type: "done", session, traceId });
+    return json(res, 200, { ok: true, traceId });
   }
 
   const prompt = /^\/sessions\/([^/]+)\/prompt$/.exec(url.pathname);
@@ -1639,7 +1936,7 @@ async function handle(req, res) {
   const fileMatch = /^\/files\/workspace\/(.+)$/.exec(url.pathname);
   if (method === "GET" && fileMatch) {
     const name = decodeURIComponent(fileMatch[1]);
-    const data = files.get(name);
+    const data = filesForWorkspace().get(name);
     if (!data) return json(res, 404, { error: "Not found" });
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
     return void res.end(data);
@@ -1755,7 +2052,7 @@ async function handleTool(res, name, rawInput) {
   );
 
   if (name === "provider") {
-    return json(res, 200, { providers: [{ name: "openai" }, { name: "Local" }, { name: "panel-test" }] });
+    return json(res, 200, { providers: providersForWorkspace().map(name => ({ name })) });
   }
   if (name === "open_memory_browser") {
     return json(res, 200, { url: memoryBrowserUrl });
@@ -1763,6 +2060,7 @@ async function handleTool(res, name, rawInput) {
   if (name === "session_action") {
     if (input.action === "list") {
       return json(res, 200, [...sessions.values()]
+        .filter(session => session.workspaceId === activeHarnessWorkspaceId())
         .filter(session => !hidden.has(session.id))
         .map(session => ({
           id: session.id,
@@ -1782,8 +2080,14 @@ async function handleTool(res, name, rawInput) {
     }
   }
   if (name === "workspace_action") {
+    const files = filesForWorkspace(context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId());
     if (input.action === "list") {
       return json(res, 200, [...files.entries()].map(([fileName, buffer]) => ({ path: fileName, size: buffer.byteLength })));
+    }
+    if (input.action === "read") {
+      const content = files.get(input.path);
+      if (!content) return json(res, 404, { error: `Workspace file not found: ${input.path}` });
+      return json(res, 200, content.toString(input.encoding === "base64" ? "base64" : "utf8"));
     }
     if (input.action === "write") {
       const content = input.encoding === "base64" ? Buffer.from(input.content ?? "", "base64") : Buffer.from(input.content ?? "", "utf8");
@@ -2039,23 +2343,31 @@ async function handleTool(res, name, rawInput) {
     });
   }
   if (name === "plugin") {
+    const workspaceId = context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId();
+    const loadedPlugins = loadedPluginsForWorkspace(workspaceId);
     if (input.action === "list") return json(res, 200, { loaded: loadedPlugins });
     if (input.action === "discover_local") return json(res, 200, localPlugins);
     if (input.action === "add") {
-      const result = addLoadedPlugin(String(input.specifier ?? input.name ?? ""));
+      const result = addLoadedPlugin(String(input.specifier ?? input.name ?? ""), workspaceId);
       return json(res, result.ok ? 200 : 400, result);
     }
     if (input.action === "remove" || input.action === "unload") {
-      const result = removeLoadedPlugin(String(input.specifier ?? input.name ?? ""));
+      const result = removeLoadedPlugin(String(input.specifier ?? input.name ?? ""), workspaceId);
       return json(res, result.ok ? 200 : 400, result);
     }
   }
   if (name === "expert_panel") {
+    const workspaceId = context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId();
     if (input.action === "list") return json(res, 200, { experts: expertConfigs });
-    if (input.action === "get_review") return json(res, 200, { review: expertReviews.get(input.reviewId) ?? null });
-    if (input.action === "list_reviews") return json(res, 200, { reviews: [...expertReviews.values()] });
+    if (input.action === "get_review") {
+      const review = expertReviews.get(input.reviewId);
+      return json(res, 200, { review: review?.workspaceId === workspaceId ? review : null });
+    }
+    if (input.action === "list_reviews") {
+      return json(res, 200, { reviews: [...expertReviews.values()].filter(review => review.workspaceId === workspaceId) });
+    }
     if (input.action === "review") {
-      const review = expertPanelReviewResult(input);
+      const review = expertPanelReviewResult({ ...input, workspaceId });
       if (review.error) return json(res, 400, { error: review.error });
       return json(res, 200, review.result);
     }
@@ -2064,6 +2376,7 @@ async function handleTool(res, name, rawInput) {
     return json(res, 200, panel.result);
   }
   if (name === "skill_action") {
+    const skills = skillsForWorkspace(context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId());
     if (input.action === "list") return json(res, 200, { skills: [...skills.values()].map(({ name: skillName }) => ({ name: skillName })) });
     if (input.action === "load") return json(res, 200, { content: skills.get(input.name)?.content ?? "" });
     if (input.action === "metadata") {
@@ -2085,6 +2398,7 @@ async function handleTool(res, name, rawInput) {
     }
   }
   if (name === "trigger_action") {
+    const triggers = triggersForWorkspace(context.sessionId ? sessionWorkspaceId(context.sessionId) : activeHarnessWorkspaceId());
     if (input.action === "query") {
       return json(res, 200, { triggers: [...triggers.values()].filter(t => t.tool === input.tool && t.params?.name === input.params?.name) });
     }
@@ -2127,7 +2441,8 @@ async function runTurn(sessionId, traceId, body) {
       ...(typeof body.content === "string" ? [{ type: "text", text: body.content }] : [body.content]),
       ...attachmentRefs
     ],
-    createdAt: now()
+    createdAt: now(),
+    ...(body.provider ? { providerName: body.provider } : {})
   };
   session.messages.push(userMessage);
   setBusy(sessionId, true);
@@ -2153,7 +2468,9 @@ async function runTurn(sessionId, traceId, body) {
     await sleep(10);
     sendSession(sessionId, "tool:start", { type: "tool:start", callId: `call-${traceId}`, name: "plugin", input: { action, specifier }, traceId });
     await sleep(10);
-    const result = action === "add" ? addLoadedPlugin(specifier) : removeLoadedPlugin(specifier);
+    const result = action === "add"
+      ? addLoadedPlugin(specifier, session.workspaceId)
+      : removeLoadedPlugin(specifier, session.workspaceId);
     sendSession(sessionId, "tool:end", { type: "tool:end", callId: `call-${traceId}`, result, isError: !result.ok, traceId });
     const assistantText = result.ok
       ? result.message
@@ -2190,7 +2507,7 @@ async function runTurn(sessionId, traceId, body) {
     const input = { action: "read", path: attachedReadme.name };
     sendSession(sessionId, "tool:start", { type: "tool:start", callId, name: "workspace_action", input, traceId });
     await sleep(10);
-    const fileContent = files.get(attachedReadme.name)?.toString("utf8") ?? "";
+    const fileContent = filesForWorkspace(session.workspaceId).get(attachedReadme.name)?.toString("utf8") ?? "";
     sendSession(sessionId, "tool:end", {
       type: "tool:end",
       callId,
@@ -2276,7 +2593,8 @@ async function runTurn(sessionId, traceId, body) {
       : /quasarpump/i.test(content)
         ? "Workspace RAG says the QuasarPump calibration value is 42 and the amber valve is required."
         : /prompt me/i.test(content) ? "Prompt handled." : `Harness response to: ${content}` }],
-    createdAt: now()
+    createdAt: now(),
+    ...(body.provider ? { providerName: body.provider } : {})
   };
   session.messages.push(assistant);
   session.updatedAt = now();
