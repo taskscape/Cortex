@@ -23,11 +23,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-function runCli(args) {
+function runCli(args, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["scripts/evaluate.mjs", ...args], {
       cwd: process.cwd(),
-      windowsHide: true
+      windowsHide: true,
+      env: { ...process.env, ...env },
     });
     let stdout = "";
     let stderr = "";
@@ -39,10 +40,12 @@ function runCli(args) {
 }
 
 test("T2-E2E-016 evaluation CLI returns release-gate exit codes and valid escaped JUnit", async () => {
+  const received = [];
   const server = createServer(async (req, res) => {
     let raw = "";
     for await (const chunk of req) raw += chunk;
     const input = JSON.parse(raw);
+    received.push(input);
     const passed = input.suiteId === "passing-suite";
     const result = {
       run: { id: `run:${input.suiteId}`, passed },
@@ -69,8 +72,17 @@ test("T2-E2E-016 evaluation CLI returns release-gate exit codes and valid escape
   try {
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const passingJunit = path.join(root, "passing.xml");
-    const passing = await runCli(["passing-suite", "--url", baseUrl, "--junit", passingJunit]);
+    const passing = await runCli([
+      "passing-suite", "--candidate", "release-candidate-42", "--provider", "openai-enterprise",
+      "--url", baseUrl, "--junit", passingJunit,
+    ]);
     assert.equal(passing.code, 0, passing.stderr);
+    assert.deepEqual(received.at(-1), {
+      action: "run_suite",
+      suiteId: "passing-suite",
+      candidate: "release-candidate-42",
+      provider: "openai-enterprise",
+    }, "explicit candidate and provider must reach the governed evaluation endpoint unchanged");
     const passingXml = await readFile(passingJunit, "utf8");
     assert.match(passingXml, /tests="1" failures="0"/);
     assert.match(passingXml, /case:&lt;invoice&gt;&amp;&quot;quote&quot;/);
@@ -82,6 +94,11 @@ test("T2-E2E-016 evaluation CLI returns release-gate exit codes and valid escape
     assert.match(failingXml, /tests="1" failures="1"/);
     assert.match(failingXml, /expected &lt;safe&gt; &amp; &quot;escaped&quot;/);
     assert.doesNotMatch(failingXml, /<safe>/);
+
+    const environmentCandidate = await runCli(["passing-suite", "--url", baseUrl], { GIT_COMMIT: "build-from-env" });
+    assert.equal(environmentCandidate.code, 0, environmentCandidate.stderr);
+    assert.equal(received.at(-1).candidate, "build-from-env", "the CLI uses the CI commit as its default candidate");
+    assert.equal("provider" in received.at(-1), false, "the provider stays unpinned unless explicitly selected");
   } finally {
     await new Promise(resolve => server.close(resolve));
     await rm(root, { recursive: true, force: true });

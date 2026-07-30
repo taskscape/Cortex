@@ -66,6 +66,12 @@ async function result(tool, value) {
   return events.find(event => event.type === "result")?.value;
 }
 
+async function queuedScanCount(workspace) {
+  const logPath = path.join(workspace, ".data", "workspace-rag", "ingestion.log");
+  const log = await readFile(logPath, "utf8");
+  return (log.match(/"event":"scan_queued"/g) ?? []).length;
+}
+
 /**
  * Validates that the RAG system correctly reports indexing states, error states,
  * and queues exactly one reindex scan after completing an indexing operation.
@@ -106,6 +112,11 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   const initial = await result(tool, { action: "configure", contextName: "State", paths: [docs] });
   assert.equal(initial.status.state, "idle");
   assert.equal(initial.status.processedFiles, initial.status.totalFiles);
+  // `start()` intentionally begins a background scan without awaiting it. If
+  // it overlaps this first configure call it may legitimately have consumed a
+  // queued scan already; measure the two explicit reindexes relative to that
+  // settled baseline rather than treating startup work as their follow-up.
+  const queuedBeforeExplicitReindex = await queuedScanCount(workspace);
 
   await writeFile(document, "# State\n\nsecond marker", "utf8");
   holdNextDocumentEmbedding = true;
@@ -121,8 +132,11 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   const terminal = await result(tool, { action: "status" });
   assert.equal(terminal.state, "idle");
   assert.equal(terminal.processedFiles, terminal.totalFiles);
-  const log = await readFile(path.join(workspace, ".data", "workspace-rag", "ingestion.log"), "utf8");
-  assert.equal((log.match(/"event":"scan_queued"/g) ?? []).length, 1, "exactly one follow-up scan is queued");
+  assert.equal(
+    (await queuedScanCount(workspace)) - queuedBeforeExplicitReindex,
+    1,
+    "exactly one follow-up scan is queued for the two explicit overlapping reindex requests",
+  );
 
   await writeFile(document, "# State\n\nthird marker", "utf8");
   failNextDocumentEmbedding = true;

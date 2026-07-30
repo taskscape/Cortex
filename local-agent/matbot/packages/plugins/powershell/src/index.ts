@@ -44,12 +44,24 @@ function spawnAndStream(
 
   const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, shell: false });
 
-  const killOnAbort = (): void => { child.kill('SIGTERM'); };
-  opts.signal.addEventListener('abort', killOnAbort, { once: true });
-
   let stdoutAcc = '';
   let stderrAcc = '';
   let finalized = false;
+  let stopped = false;
+  let stopReason: 'timeout' | 'aborted' | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const stop = (reason: 'timeout' | 'aborted'): void => {
+    if (stopped || finalized) return;
+    stopped = true;
+    stopReason = reason;
+    // On Windows Node maps SIGTERM to TerminateProcess.  Keep the signal named
+    // rather than using a shell command so timeout and abort input cannot alter
+    // what is executed.
+    child.kill('SIGTERM');
+  };
+  const killOnAbort = (): void => { stop('aborted'); };
+  opts.signal.addEventListener('abort', killOnAbort, { once: true });
 
   child.stdout?.on('data', (d: Buffer) => {
     const chunk = d.toString();
@@ -70,7 +82,16 @@ function spawnAndStream(
   child.on('close', (code: number | null) => {
     if (finalized) return;
     finalized = true;
-    if (code !== null && code !== 0) {
+    if (timer !== undefined) clearTimeout(timer);
+    if (stopReason !== undefined) {
+      const why = stopReason === 'timeout'
+        ? `timed out after ${opts.timeout ?? 0}ms`
+        : 'was aborted';
+      push({ type: 'error', message: `Process ${why} and was killed.`,
+        ...(stdoutAcc ? { stdout: stdoutAcc } : {}),
+        ...(stderrAcc ? { stderr: stderrAcc } : {}),
+      });
+    } else if (code !== null && code !== 0) {
       push({ type: 'error', message: `Process exited with code ${code}`, code,
         ...(stdoutAcc ? { stdout: stdoutAcc } : {}),
         ...(stderrAcc ? { stderr: stderrAcc } : {}),
@@ -81,9 +102,8 @@ function spawnAndStream(
     push(null);
   });
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
   if (opts.timeout !== undefined) {
-    timer = setTimeout(() => child.kill('SIGTERM'), opts.timeout);
+    timer = setTimeout(() => stop('timeout'), opts.timeout);
   }
 
   async function finish(): Promise<void> {
@@ -109,7 +129,7 @@ function spawnAndStream(
           return { done: false, value: item };
         },
         async return(): Promise<IteratorResult<ToolEvent>> {
-          child.kill('SIGTERM');
+          stop('aborted');
           await finish();
           return { done: true, value: undefined as never };
         },

@@ -1,4 +1,28 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+
+// Exercise the real execution path without requiring a local Postgres service. The plugin imports
+// `pg` from its own package boundary, so resolve and replace that exact Pool prototype before the
+// plugin module is loaded.
+const structuredDataRequire = createRequire(new URL("../local-agent/matbot/packages/plugins/structured-data/src/index.ts", import.meta.url));
+const { Pool } = structuredDataRequire("pg");
+const sqlClientCalls = [];
+Pool.prototype.connect = async () => ({
+  async query(sql, values) {
+    sqlClientCalls.push({ sql, values });
+    if (/^SELECT\b/i.test(sql)) {
+      return {
+        rows: [{ order_date: "2026-01-01", total_revenue: "42.00" }],
+        fields: [{ name: "order_date" }, { name: "total_revenue" }],
+      };
+    }
+    return { rows: [], fields: [] };
+  },
+  release() {
+    sqlClientCalls.push({ sql: "RELEASE" });
+  },
+});
+Pool.prototype.end = async () => undefined;
 
 const { plugin } = await import("../local-agent/matbot/packages/plugins/structured-data/src/index.ts");
 const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
@@ -116,7 +140,7 @@ async function main() {
     connection: {
       workspaceId: "default",
       displayName: "Warehouse",
-      credentialRef: "${MISSING_STRUCTURED_DATA_URL}",
+      credentialRef: "postgres://readonly:fake@127.0.0.1:5432/warehouse",
       rowLimitDefault: 50,
       timeoutMsDefault: 2500,
       defaultSchema: "public",
@@ -274,6 +298,44 @@ async function main() {
   });
   assert.match(badExecution.error, /Invalid approval token/);
 
+  const executablePlan = await collectTool(structuredTool, {
+    action: "plan_query",
+    plan: {
+      workspaceId: "default",
+      metricName: "total_revenue",
+      dimensions: [orderDate.id],
+      filters: [{ columnId: status.id, op: "eq", value: "paid" }],
+      limit: 5,
+    },
+  });
+  const executableApproval = await collectTool(structuredTool, {
+    action: "approve_query",
+    queryRunId: executablePlan.queryRun.id,
+  });
+  const executed = await collectTool(structuredTool, {
+    action: "execute_query",
+    queryRunId: executablePlan.queryRun.id,
+    approvalToken: executableApproval.approvalToken,
+  });
+  assert.equal(executed.run.status, "succeeded");
+  assert.equal(executed.run.rowCount, 1);
+  assert.deepEqual(executed.rows, [{ order_date: "2026-01-01", total_revenue: "42.00" }]);
+  assert.deepEqual(executed.fields, ["order_date", "total_revenue"]);
+  assert.ok(executed.citation?.sourceId, "execution records a durable result source for provenance");
+  assert.equal(executed.run.resultSourceId, executed.citation.sourceId);
+  assert.deepEqual(sqlClientCalls.map(call => call.sql), [
+    "BEGIN READ ONLY",
+    "SET LOCAL statement_timeout = 2500",
+    executablePlan.queryRun.sql,
+    "COMMIT",
+    "RELEASE",
+  ]);
+  assert.deepEqual(sqlClientCalls[2].values, ["paid"], "the approved semantic filter is bound as a query parameter");
+
+  const resultVersion = (await stores.get("source_versions").query()).items
+    .find(version => version.sourceId === executed.citation.sourceId);
+  assert.equal(resultVersion?.provenance.activityId, `structured-data:${executablePlan.queryRun.id}:execute`);
+
   const runStore = stores.get("structured_data_query_runs");
   const expiringPlan = await collectTool(structuredTool, {
     action: "plan_query",
@@ -324,12 +386,14 @@ async function main() {
   assert.match(reusedApproval.error, /must be approved before execution/);
 
   const runs = await collectTool(structuredTool, { action: "runs" });
-  assert.equal(runs.runs.length, 3);
+  assert.equal(runs.runs.length, 4);
   assert.equal(runs.runs.find(run => run.id === plan.queryRun.id).status, "succeeded");
+  assert.equal(runs.runs.find(run => run.id === executablePlan.queryRun.id).status, "succeeded");
   assert.equal(runs.runs.find(run => run.id === zeroLimit.queryRun.id).status, "planned");
 
   const sources = await collectTool(sourceTool, { action: "list" });
   assert.ok(sources.sources.some(source => source.id === storedTable.sourceId && source.sourceKind === "table"));
+  assert.ok(sources.sources.some(source => source.id === executed.citation.sourceId && source.sourceKind === "query_result"));
 }
 
 await main();

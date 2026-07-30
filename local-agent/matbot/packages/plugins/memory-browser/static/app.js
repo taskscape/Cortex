@@ -183,10 +183,37 @@
     if (!confirm('Delete this memory?')) return;
     setStatus('Deleting...');
     try {
-      await api('/api/memories/' + encodeURIComponent(state.selected.id), {
+      const deleted = await api('/api/memories/' + encodeURIComponent(state.selected.id), {
         method: 'DELETE',
         body: JSON.stringify({ expected: state.selected.version }),
       });
+      if (!deleted.deleted) {
+        // The DELETE endpoint deliberately makes stale CAS deletes idempotent
+        // (rather than turning them into a 4xx). Re-read the record so the
+        // browser never removes a memory that another tab has just changed.
+        let latest;
+        try {
+          latest = await api('/api/memories/' + encodeURIComponent(state.selected.id));
+        } catch (error) {
+          if (error && error.message === 'Memory not found.') {
+            const deletedId = state.selected.id;
+            state.items = state.items.filter(item => item.id !== deletedId);
+            state.selected = null;
+            renderList();
+            renderDetail();
+            setStatus('Delete did not apply because it was already deleted.', true);
+            return;
+          }
+          throw error;
+        }
+        state.selected = latest;
+        const idx = state.items.findIndex(item => item.id === latest.id);
+        if (idx >= 0) state.items[idx] = latest;
+        renderList();
+        renderDetail();
+        setStatus('Delete did not apply. Latest server version loaded; review and retry.', true);
+        return;
+      }
       const deletedId = state.selected.id;
       state.items = state.items.filter(item => item.id !== deletedId);
       state.selected = null;

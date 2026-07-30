@@ -110,8 +110,26 @@ test("MISSING-11 standalone memory browser provides health, filtering, CRUD, and
   assert.equal(updated.fact, "Manual gamma updated");
   assert.notEqual(updated.version, created.version);
 
-  const staleDelete = await fetch(`${service.baseUrl}/api/memories/${created.id}?expected=${encodeURIComponent(created.version)}`, { method: "DELETE" });
+  // Two independently issued edits based on the same version must leave exactly
+  // one winner. This exercises the HTTP/CAS boundary instead of only passing a
+  // deliberately invalid version string.
+  const concurrentResponses = await Promise.all([
+    fetch(`${service.baseUrl}/api/memories/${created.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ expected: updated.version, fact: "Concurrent writer one" }) }),
+    fetch(`${service.baseUrl}/api/memories/${created.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ expected: updated.version, fact: "Concurrent writer two" }) }),
+  ]);
+  const concurrentBodies = await Promise.all(concurrentResponses.map(response => response.json()));
+  assert.deepEqual(concurrentResponses.map(response => response.status).sort(), [200, 409]);
+  const winnerIndex = concurrentResponses.findIndex(response => response.status === 200);
+  const loserIndex = concurrentResponses.findIndex(response => response.status === 409);
+  const winner = concurrentBodies[winnerIndex];
+  const loser = concurrentBodies[loserIndex];
+  assert.match(winner.fact, /^Concurrent writer /);
+  assert.equal(loser.current.id, created.id);
+  assert.equal(loser.current.version, winner.version);
+  assert.equal((await (await fetch(`${service.baseUrl}/api/memories/${created.id}`)).json()).fact, winner.fact);
+
+  const staleDelete = await fetch(`${service.baseUrl}/api/memories/${created.id}?expected=${encodeURIComponent(updated.version)}`, { method: "DELETE" });
   assert.deepEqual(await staleDelete.json(), { deleted: false });
-  const deleteResponse = await fetch(`${service.baseUrl}/api/memories/${created.id}`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ expected: updated.version }) });
+  const deleteResponse = await fetch(`${service.baseUrl}/api/memories/${created.id}`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ expected: winner.version }) });
   assert.deepEqual(await deleteResponse.json(), { deleted: true });
 });

@@ -92,13 +92,29 @@ def embed(request: EmbedRequest):
 
     prefix = QUERY_PREFIX if request.inputType == "query" else DOCUMENT_PREFIX
     prepared_texts = [f"{prefix}{text}" for text in request.texts]
-    embeddings = model.encode(
-        prepared_texts,
-        batch_size=BATCH_SIZE,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
+    try:
+        embeddings = model.encode(
+            prepared_texts,
+            batch_size=BATCH_SIZE,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+    except RuntimeError as error:
+        # PyTorch reports CUDA allocation failures as RuntimeError subclasses across
+        # supported releases.  Return a retryable HTTP response instead of letting
+        # FastAPI turn an expected capacity problem into an opaque 500.
+        if "out of memory" not in str(error).lower():
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CUDA embedding request ran out of memory. "
+                "Reduce EMBEDDING_BATCH_SIZE and retry."
+            ),
+        ) from error
     return {
         "model": MODEL_NAME,
         "profile": PROFILE,

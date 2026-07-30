@@ -129,6 +129,18 @@ async function seed(services, facts) {
   }
 }
 
+/**
+ * Scenario 1: Recall in separate conversations
+ *
+ * Tests that a durable fact captured in one conversation is successfully
+ * recalled in a later, separate conversation within the same workspace.
+ *
+ * Assumptions:
+ * - Memory capture works correctly (fact is stored in the workspace's memory)
+ * - Memory recall is triggered automatically when a new conversation starts
+ * - The recalled fact is injected into the conversation context
+ * - A memory-injection audit marker is left for observability
+ */
 const scenarios = [
   {
     name: "a fact stated in one conversation is recalled in a later, separate conversation",
@@ -142,6 +154,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 2: Process restart persistence
+ *
+ * Tests that memory persists across runtime restarts (simulated by creating
+ * a new services object over the same data directory).
+ *
+ * Assumptions:
+ * - Memory is persisted to disk in the workspace's .data directory
+ * - A fresh services object over the same directory can access persisted memory
+ * - The restart doesn't corrupt or lose any facts
+ */
   {
     name: "recall survives a process restart",
     async run(workspace) {
@@ -154,6 +177,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 3: Global fact sharing
+ *
+ * Tests that a single captured fact is available to ALL conversations within
+ * a workspace, not just the conversation where it was captured.
+ *
+ * Assumptions:
+ * - Memory is workspace-scoped, not conversation-scoped
+ * - Every new conversation in a workspace can access all previously captured facts
+ * - Multiple questions about the same fact all succeed in recalling it
+ */
   {
     name: "one fact is shared by every conversation in the workspace",
     async run(workspace) {
@@ -166,6 +200,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 4: Workspace isolation (baseline)
+ *
+ * Tests that memory is properly isolated between different workspaces.
+ * A fact captured in workspace A should NOT be available in workspace B.
+ *
+ * Assumptions:
+ * - Each workspace has its own isolated memory store
+ * - Memory capture in one workspace doesn't affect other workspaces
+ * - Memory recall in one workspace doesn't access facts from other workspaces
+ */
   {
     name: "facts do not leak from one workspace into another",
     async run(workspace) {
@@ -180,6 +225,18 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 5: Independent workspace memory
+ *
+ * Tests that each workspace maintains its own independent set of facts,
+ * and that recall correctly returns only the facts from the current workspace.
+ *
+ * Assumptions:
+ * - Each workspace can have its own unique facts
+ * - Recall in workspace A returns only workspace A's facts
+ * - Recall in workspace B returns only workspace B's facts
+ * - No cross-contamination between workspaces
+ */
   {
     name: "each workspace recalls only its own facts",
     async run(workspace) {
@@ -199,6 +256,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 6: Zero-cost recall
+ *
+ * Tests that memory recall is an internal operation that doesn't require
+ * an external model API call. This is important for cost and latency.
+ *
+ * Assumptions:
+ * - Memory recall is performed locally by the system
+ * - No external LLM API call is made for recall operations
+ * - The modelCalls counter remains unchanged during recall
+ */
   {
     name: "recall costs no model call",
     async run(workspace) {
@@ -211,6 +279,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 7: Provenance tracking
+ *
+ * Tests that each captured fact records its complete provenance: the session
+ * ID, message ID, and timestamp when it was captured.
+ *
+ * Assumptions:
+ * - Fact capture records the originating session and message
+ * - The createdAt timestamp is a valid parseable date
+ * - This provenance is used for debugging and audit purposes
+ */
   {
     name: "capture records which session and message a fact came from",
     async run(workspace) {
@@ -224,6 +303,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 8: Irrelevant question handling
+ *
+ * Tests that memory recall only triggers for relevant questions and doesn't
+ * inject context for unrelated queries.
+ *
+ * Assumptions:
+ * - Recall is context-aware and only triggers on relevant queries
+ * - Unrelated questions don't trigger unnecessary recall
+ * - Empty messages also don't trigger recall
+ */
   {
     name: "an unrelated question recalls nothing",
     async run(workspace) {
@@ -240,6 +330,19 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 9: Function word handling (Polish example)
+ *
+ * Tests that common words (like Polish function words "Jaka", "Jak", "Gdzie")
+ * don't cause false-positive recall of unrelated facts that happen to contain
+ * the same word. This tests the scoring algorithm's ability to distinguish
+ * between meaningful and function words.
+ *
+ * Assumptions:
+ * - Function words are not strong enough matches on their own
+ * - The recall scoring algorithm requires more than just shared function words
+ * - A fact with many words won't be recalled by a question containing just one shared word
+ */
   {
     name: "a shared function word does not drag in an unrelated note",
     async run(workspace) {
@@ -258,6 +361,17 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 10: Distinctive identifier matching
+ *
+ * Tests that a unique identifier (like "HELIOS-7") can be sufficient to trigger
+ * recall even when the rest of the question doesn't contain other matching words.
+ *
+ * Assumptions:
+ * - Distinctive identifiers are strong match signals
+ * - A single unique term can be enough to retrieve the associated fact
+ * - The recalled fact should not include unrelated content
+ */
   {
     name: "a distinctive identifier carries its fact when nothing else in the question matches",
     async run(workspace) {
@@ -273,6 +387,20 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 11: Inflection handling (Polish example)
+ *
+ * Tests that the recall system can match facts even when the question uses
+ * different inflections of the same root words. This is critical for Polish
+ * and other highly inflected languages where the same concept can appear in
+ * many different grammatical forms.
+ *
+ * Assumptions:
+ * - Token equality alone is not required for matches
+ * - The system can match different inflections of the same root
+ * - "serwerze" (locative) and "serwer" (nominative) should match
+ * - "produkcyjnym" and "produkcyjny" should match
+ */
   {
     name: "an inflected question recalls a fact stored in another word form",
     async run(workspace) {
@@ -285,6 +413,18 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 12: Long document recall from short query
+ *
+ * Tests that a long fact (60+ tokens) can be recalled from a short question
+ * (4-5 tokens). This tests the scoring algorithm's ability to find partial
+ * matches in long documents, rather than requiring full coverage.
+ *
+ * Assumptions:
+ * - A long fact can be retrieved from a short query
+ * - Scoring doesn't require full document coverage
+ * - The key information from the long document is retrieved
+ */
   {
     name: "a long pasted note stays recallable from a short question",
     async run(workspace) {
@@ -302,6 +442,18 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 13: Context dilution prevention
+ *
+ * Tests that adding irrelevant context to a question doesn't dilute the
+ * match score for the actual relevant terms. A perfect match should still
+ * succeed even with extra filler text.
+ *
+ * Assumptions:
+ * - Extra context doesn't reduce the match score below threshold
+ * - A perfect match on relevant terms is not diluted by irrelevant context
+ * - The system can identify and prioritize the relevant query terms
+ */
   {
     name: "extra context in a query does not lose a match",
     async run(workspace) {
@@ -317,6 +469,18 @@ const scenarios = [
     },
   },
 
+/**
+ * Scenario 14: Duplicate deduplication
+ *
+ * Tests that if the same fact is captured multiple times with slight variations
+ * (same content, different capitalization/punctuation), it's deduplicated in
+ * the recall results.
+ *
+ * Assumptions:
+ * - Multiple captures of the same fact are deduplicated in recall
+ * - Variations in capitalization or punctuation don't create separate entries
+ * - The recalled context contains only one instance of the fact
+ */
   {
     name: "repeated facts are collapsed to one line of recalled context",
     async run(workspace) {
@@ -333,9 +497,10 @@ const scenarios = [
     },
   },
 
-  {
-    name: "a fact with unusable provenance is still recalled",
-    async run(workspace) {
+/**
+ * Scenario 15: Provenance resilience
+ *
+ * Tests that facts captured with minimal or
       const alpha = createWorkspace(workspace("alpha"));
       // The shape hand-written entries arrive in through `remembered_facts_action`.
       await seed(alpha, [

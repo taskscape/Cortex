@@ -64,6 +64,27 @@ async function productionMemorySnapshot() {
   return snapshot;
 }
 
+/**
+ * Production memory integration test
+ *
+ * Validates the complete production memory system including:
+ * - Memory capture and storage in .data/remembered_facts/
+ * - Memory recall and injection into conversations
+ * - Dream-time processing (async consolidation in .data/dream_runs/)
+ * - Workspace isolation (no cross-contamination between workspaces)
+ * - Memory browser CAS (compare-and-swap) conflict handling
+ * - Safety: the test never modifies production workspace memory
+ *
+ * This test uses SHA-256 checksums of all memory files to verify that no
+ * production data was modified during the test run.
+ *
+ * Assumptions:
+ * - The production memory system stores data in .data/ directories under each workspace
+ * - The runtime script exercises all memory operations without touching production workspaces
+ * - Memory files include remembered_facts, dream_runs, and store_tools
+ * - Success is indicated by the runtime output containing the expected success message
+ * - The productionMemorySnapshot() function correctly computes file checksums
+ */
 test("production memory runtime is persistent, workspace-isolated, and test-safe", { timeout: 60_000 }, async () => {
   const before = await productionMemorySnapshot();
   const { stdout, stderr } = await execFileAsync(process.execPath, [

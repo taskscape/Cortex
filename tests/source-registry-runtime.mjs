@@ -250,6 +250,68 @@ async function main() {
 
   const reports = await collectTool(healthTool, { action: "reports", workspaceId: "default" });
   assert.equal(reports.reports.length, 1);
+
+  // Cover the report edge cases that are easy to miss when the only unhealthy
+  // source is a normal stale/down document: expired evidence, denied access,
+  // unknown freshness, and strict workspace filtering all have distinct
+  // severity and count semantics.
+  const expiredDenied = await registry.upsertSource({
+    workspaceId: "default",
+    connectorType: "sharepoint",
+    externalId: "default:/docs/expired-denied.md",
+    uri: "https://example.invalid/expired-denied.md",
+    title: "Expired and denied evidence",
+    sourceKind: "document",
+    citationPolicy: "cite_path",
+    healthState: "degraded",
+    stalenessState: "expired",
+    permissionState: "denied",
+  });
+  const unknownFreshness = await registry.upsertSource({
+    workspaceId: "default",
+    connectorType: "mcp",
+    externalId: "default:/docs/unknown-freshness.md",
+    uri: "https://example.invalid/unknown-freshness.md",
+    title: "Unknown freshness evidence",
+    sourceKind: "document",
+    citationPolicy: "cite_path",
+    healthState: "healthy",
+  });
+  await registry.upsertSource({
+    workspaceId: "other-workspace",
+    connectorType: "workspace-rag",
+    externalId: "other:/docs/private.md",
+    uri: "C:/docs/private.md",
+    title: "Other workspace source",
+    sourceKind: "document",
+    citationPolicy: "cite_path",
+    healthState: "down",
+    stalenessState: "expired",
+    permissionState: "denied",
+  });
+
+  const connectorSnapshot = await collectTool(healthTool, { action: "connectors" });
+  assert.equal(connectorSnapshot.connectors.length, 1);
+  assert.equal(connectorSnapshot.connectors[0].healthState, "degraded", "latest connector event overrides its stored state");
+
+  const edgeReport = await collectTool(healthTool, {
+    action: "report",
+    workspaceId: "default",
+    includeUnknownFreshness: true,
+  });
+  assert.equal(edgeReport.totalSources, 4, "the report must exclude another workspace's source");
+  assert.equal(edgeReport.healthySources, 0, "a source without a successful read is not healthy when unknown freshness is requested");
+  assert.equal(edgeReport.staleSources, 2);
+  assert.equal(edgeReport.unhealthySources, 2);
+  assert.equal(edgeReport.warningCount, 4);
+  assert.equal(edgeReport.criticalCount, 3);
+  assert.deepEqual(
+    edgeReport.findings.map(finding => finding.issueType).sort(),
+    ["degraded", "down", "expired", "permission_denied", "stale", "unknown_freshness", "unknown_freshness"],
+  );
+  assert.equal(edgeReport.findings.filter(finding => finding.sourceId === expiredDenied.id).length, 3);
+  assert.ok(edgeReport.findings.some(finding => finding.sourceId === unknownFreshness.id && finding.issueType === "unknown_freshness"));
+  assert.ok(edgeReport.findings.every(finding => finding.workspaceId === "default"));
 }
 
 await main();
