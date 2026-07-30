@@ -173,6 +173,12 @@ in-progress reindex without stopping Matbot. Do not pass `-v` to Docker Compose
 when stopping services because the declared volumes contain Postgres data and
 the downloaded model cache.
 
+For large workspaces, Cortex batches chunks across files and stores
+high-cardinality source/graph metadata in WAL-mode SQLite. Context-graph
+expansion is skipped automatically above 10,000 files while vector and source
+indexing continue. Set `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES=-1` only when an
+unbounded graph expansion is intentional.
+
 1. Stop Cortex before changing the model:
 
    ```powershell

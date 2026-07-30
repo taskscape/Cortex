@@ -297,6 +297,16 @@ async function main() {
     operation.parameters.sourceVersionId === version.id &&
     operation.status === "queued"
   )));
+  assert.equal(
+    projectionLog.operations.filter(operation => operation.operationType === "merge_entity" && operation.parameters.id === aliceA.id).length,
+    1,
+    "repeated entity updates keep one durable projection operation",
+  );
+  assert.equal(
+    projectionLog.operations.filter(operation => operation.operationType === "merge_relationship" && operation.parameters.id === relationshipA.id).length,
+    1,
+    "repeated relationship updates keep one durable projection operation",
+  );
 
   const accessEvents = await registry.accessEvents(source.id);
   assert.ok(accessEvents.some(event => event.action === "retrieve" && event.allowed === true));

@@ -851,7 +851,13 @@ class StoreBackedContextGraph implements ContextGraph {
 
   private async upsertProjectionOperation(operationType: Neo4jProjectionOperation['operationType'], workspaceId: string, cypher: string, parameters: Record<string, unknown>): Promise<void> {
     const operationHash = hashPayload({ operationType, cypher, parameters });
-    const id = hashId('context-neo4j-projection', [workspaceId, operationHash]);
+    const targetId = typeof parameters['id'] === 'string'
+      ? parameters['id']
+      : hashPayload({ operationType, cypher, parameters: { ...parameters, updatedAt: undefined } });
+    // Projection rows are a durable outbox, not an append-only audit log. Keep one row per
+    // graph target so repeated source scans update/requeue the operation instead of creating
+    // millions of records whose only identity difference is the volatile updatedAt value.
+    const id = hashId('context-neo4j-projection', [workspaceId, operationType, targetId]);
     const existing = await this.projectionOps.get(id);
     const timestamp = nowIso();
     await this.projectionOps.set(id, {
@@ -862,7 +868,7 @@ class StoreBackedContextGraph implements ContextGraph {
       operationType,
       cypher,
       parameters,
-      status: existing?.status ?? 'queued',
+      status: existing?.operationHash === operationHash ? existing.status : 'queued',
       createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
       ...(existing?.error !== undefined ? { error: existing.error } : {}),

@@ -13,6 +13,22 @@ let holdNextDocumentEmbedding = false;
 let documentEmbeddingStarted;
 let releaseDocumentEmbedding;
 let failNextDocumentEmbedding = false;
+const documentEmbeddingRequestSizes = [];
+const documentEmbeddingTexts = [];
+
+function hasUnpairedSurrogate(text) {
+  for (let index = 0; index < text.length; index++) {
+    const codeUnit = text.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (next < 0xDC00 || next > 0xDFFF) return true;
+      index++;
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function vectorFor() {
   const vector = new Array(dimensions).fill(0);
@@ -34,6 +50,10 @@ const server = createServer(async (request, response) => {
     let raw = "";
     for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
+    if (body.inputType === "document") {
+      documentEmbeddingRequestSizes.push(body.texts.length);
+      documentEmbeddingTexts.push(...body.texts);
+    }
     if (body.inputType === "document" && holdNextDocumentEmbedding) {
       holdNextDocumentEmbedding = false;
       documentEmbeddingStarted?.();
@@ -99,6 +119,9 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   await writeFile(path.join(workspace, "matbot.yaml"), "plugins:\n  - ./packages/plugins/workspace-rag\n");
   const document = path.join(docs, "state.md");
   await writeFile(document, "# State\n\nfirst marker", "utf8");
+  for (let index = 1; index < 32; index++) {
+    await writeFile(path.join(docs, `state-${index}.md`), `# State ${index}\n\nmarker ${index}`, "utf8");
+  }
   const tools = new Map();
   const registry = new Map();
   await plugin.setup({
@@ -112,6 +135,32 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   const initial = await result(tool, { action: "configure", contextName: "State", paths: [docs] });
   assert.equal(initial.status.state, "idle");
   assert.equal(initial.status.processedFiles, initial.status.totalFiles);
+  assert.ok(
+    documentEmbeddingRequestSizes.includes(32),
+    `expected one cross-file embedding batch of 32 chunks, saw ${documentEmbeddingRequestSizes.join(", ")}`,
+  );
+
+  const unicodeBoundaryDocument = `# Unicode\n\n${"a".repeat(1788)}👉 tail marker`;
+  assert.equal(
+    unicodeBoundaryDocument.charCodeAt(1799),
+    0xD83D,
+    "the regression fixture must place the emoji's high surrogate at the old chunk boundary",
+  );
+  const unicodeEmbeddingStart = documentEmbeddingTexts.length;
+  await writeFile(path.join(docs, "unicode-boundary.md"), unicodeBoundaryDocument, "utf8");
+  await result(tool, { action: "reindex_now" });
+  const unicodeStatus = await result(tool, { action: "status" });
+  assert.equal(unicodeStatus.state, "idle");
+  const unicodeEmbeddingTexts = documentEmbeddingTexts.slice(unicodeEmbeddingStart);
+  assert.ok(
+    unicodeEmbeddingTexts.some(text => text.includes("👉")),
+    "the emoji must remain intact in one embedding chunk",
+  );
+  assert.ok(
+    unicodeEmbeddingTexts.every(text => !hasUnpairedSurrogate(text)),
+    "embedding chunks must not contain unpaired UTF-16 surrogates",
+  );
+
   // `start()` intentionally begins a background scan without awaiting it. If
   // it overlaps this first configure call it may legitimately have consumed a
   // queued scan already; measure the two explicit reindexes relative to that
@@ -125,7 +174,7 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   await gated;
   const indexing = await result(tool, { action: "status" });
   assert.equal(indexing.state, "indexing");
-  assert.ok(indexing.processedFiles <= indexing.totalFiles);
+  assert.equal(indexing.processedFiles, 0, "progress advances only after the held embedding batch completes");
   const secondReindex = result(tool, { action: "reindex_now" });
   releaseDocumentEmbedding?.();
   await Promise.all([firstReindex, secondReindex]);
@@ -144,7 +193,7 @@ test("MISSING-01/MISSING-03 RAG reports explicit indexing and error states and q
   const failed = await result(tool, { action: "status" });
   assert.equal(failed.state, "error");
   assert.ok(failed.totalFiles >= 1);
-  assert.ok(failed.processedFiles >= 1, "failure retains useful progress counters");
+  assert.equal(failed.processedFiles, 0, "a failed embedding batch is not reported as processed");
 });
 
 test.after(() => new Promise(resolve => server.close(resolve)));

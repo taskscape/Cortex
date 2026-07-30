@@ -26,6 +26,7 @@ providers:
         interleaved_reasoning: false
 
 plugins:
+  - ./packages/plugins/storage/high-cardinality
   - ./plugins/hybrid-knowledge-index
   - ./plugins/file-broker
   - ./packages/plugins/source-registry

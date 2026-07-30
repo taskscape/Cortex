@@ -1,0 +1,23 @@
+{
+  "name": "@matatbread/matbot-storage-high-cardinality",
+  "matbotRuntime": ["node"],
+  "version": "0.1.0",
+  "description": "Tiered storage backend that keeps ordinary state on the filesystem and moves high-cardinality source and graph stores to SQLite.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-files-node": "workspace:*",
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-storage-filesystem": "workspace:*",
+    "@matatbread/matbot-storage-sqlite": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

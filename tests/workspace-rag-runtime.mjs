@@ -194,9 +194,45 @@ async function main() {
     assert.ok(graphListResult.extractionRuns.some(run => run.sourceId === retrievalSource.id && run.status === "succeeded"));
     assert.ok(graphListResult.relationships.some(relationship => relationship.sourceId === retrievalSource.id && relationship.sourceVersionId !== undefined));
 
+    const retrievalSourceVersion = retrievalSource.version;
+    const healthEventsBeforeUnchangedScan = stores.get("source_health_events")?.docs.size ?? 0;
+    const extractionRunsBeforeUnchangedScan = stores.get("context_graph_extraction_runs")?.docs.size ?? 0;
+    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
+    assert.equal(
+      stores.get("sources")?.docs.get(retrievalSource.id)?.version,
+      retrievalSourceVersion,
+      "unchanged files do not rewrite source records",
+    );
+    assert.equal(
+      stores.get("source_health_events")?.docs.size ?? 0,
+      healthEventsBeforeUnchangedScan,
+      "unchanged files do not append health-history records",
+    );
+    assert.equal(
+      stores.get("context_graph_extraction_runs")?.docs.size ?? 0,
+      extractionRunsBeforeUnchangedScan,
+      "unchanged files do not rerun context-graph extraction",
+    );
+
+    process.env.CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES = "0";
+    await writeFile(
+      path.join(docsDir, "retrieval-probe.md"),
+      "# Retrieval Probe\n\nThe QuasarPump calibration value is 42. Use the amber valve before startup.\n\nBulk guard update.",
+      "utf8",
+    );
+    const extractionRunsBeforeBulkGuard = stores.get("context_graph_extraction_runs")?.docs.size ?? 0;
+    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
+    assert.equal(
+      stores.get("context_graph_extraction_runs")?.docs.size ?? 0,
+      extractionRunsBeforeBulkGuard,
+      "the bulk-scan guard keeps changed documents out of context-graph extraction",
+    );
+    delete process.env.CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES;
+
     const ingestionLog = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "ingestion.log"), "utf8");
     assert.match(ingestionLog, /"event":"file_sanitized"/);
     assert.match(ingestionLog, /"nulCharsRemoved":1/);
+    assert.match(ingestionLog, /"event":"context_graph_enrichment_skipped"/);
 
     const searchEvents = [];
     for await (const event of registeredTool.executor.execute({

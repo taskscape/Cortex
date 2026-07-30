@@ -958,6 +958,9 @@ async function main(): Promise<void> {
       : path.join(path.dirname(requestedConfigPath), 'cortex-workspaces.json');
     workspaceManager = new FileWorkspaceManager(registryPath, requestedConfigPath);
     await workspaceManager.ensurePluginInAllWorkspaces('./plugins/file-broker');
+    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/storage/high-cardinality', {
+      before: './packages/plugins/source-registry',
+    });
     await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/source-registry', {
       before: './packages/plugins/workspace-rag',
     });

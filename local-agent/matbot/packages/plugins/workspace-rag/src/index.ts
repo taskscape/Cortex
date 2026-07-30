@@ -11,7 +11,7 @@ import type {
 } from '@matatbread/matbot-plugin-api';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { access, appendFile, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   createRagStorage,
@@ -22,6 +22,7 @@ import {
 const CONFIG_FILE = 'cortex-rag.json';
 const REGISTRY_FILE = 'cortex-workspaces.json';
 const LOG_FILE = 'ingestion.log';
+const MAX_INGESTION_LOG_BYTES = 25 * 1024 * 1024;
 const VECTOR_DIMS = 384;
 const SCAN_INTERVAL_MS = 60_000;
 const MAX_CHUNK_CHARS = 1800;
@@ -32,7 +33,10 @@ const CPU_VECTOR_BACKEND = 'hash-cpu';
 const CPU_VECTOR_MODEL = 'token-hash-v1';
 const STORED_VECTOR_DECIMAL_PLACES = 6;
 const STORED_VECTOR_SCALE = 10 ** STORED_VECTOR_DECIMAL_PLACES;
-const SCAN_FILE_CONCURRENCY = 4;
+const SCAN_FILE_CONCURRENCY = 32;
+const SOURCE_ENRICHMENT_CONCURRENCY = 4;
+const SOURCE_ENRICHMENT_BACKLOG = 128;
+const DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES = 10_000;
 
 type Accelerator = 'nvidia' | 'cpu';
 type VectorizerBackend = 'hash-cpu' | 'cuda-http';
@@ -108,6 +112,19 @@ interface IndexedDocument {
   updatedAt: string;
   fileSize?: number;
   chunks: VectorChunk[];
+}
+
+interface PreparedScanFile {
+  context: RagContextConfig;
+  file: string;
+  normalized: string;
+  contextPathKey: string;
+  updatedAt: string;
+  fileSize: number;
+  hash: string;
+  content: string;
+  chunks: string[];
+  embeddingTexts: string[];
 }
 
 interface IngestionStatus {
@@ -212,6 +229,48 @@ interface ContextGraphLike {
     text?: string;
     extractionMethod?: 'deterministic' | 'connector_metadata' | 'model_extracted' | 'user_confirmed';
   }): Promise<unknown>;
+}
+
+class BoundedTaskPool {
+  private readonly queue: Array<() => Promise<void>> = [];
+  private readonly capacityWaiters: Array<() => void> = [];
+  private readonly drainWaiters: Array<() => void> = [];
+  private readonly concurrency: number;
+  private readonly capacity: number;
+  private active = 0;
+
+  constructor(concurrency: number, capacity: number) {
+    this.concurrency = concurrency;
+    this.capacity = capacity;
+  }
+
+  async add(task: () => Promise<void>): Promise<void> {
+    while (this.active + this.queue.length >= this.capacity) {
+      await new Promise<void>(resolve => this.capacityWaiters.push(resolve));
+    }
+    this.queue.push(task);
+    this.pump();
+  }
+
+  async drain(): Promise<void> {
+    if (this.active === 0 && this.queue.length === 0) return;
+    await new Promise<void>(resolve => this.drainWaiters.push(resolve));
+  }
+
+  private pump(): void {
+    while (this.active < this.concurrency && this.queue.length > 0) {
+      const task = this.queue.shift()!;
+      this.active++;
+      void task().catch(() => undefined).finally(() => {
+        this.active--;
+        this.capacityWaiters.shift()?.();
+        if (this.active === 0 && this.queue.length === 0) {
+          for (const waiter of this.drainWaiters.splice(0)) waiter();
+        }
+        this.pump();
+      });
+    }
+  }
 }
 
 interface SearchHit {
@@ -474,6 +533,15 @@ function isTruthyEnv(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
 }
 
+function contextGraphEnabledForScan(totalFiles: number): boolean {
+  const configured = Number.parseInt(
+    String(process.env['CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES'] ?? ''),
+    10,
+  );
+  const limit = Number.isFinite(configured) ? configured : DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES;
+  return limit < 0 || totalFiles <= limit;
+}
+
 function normalizeBaseUrl(value: string | undefined): string {
   return (value?.trim() || DEFAULT_CUDA_EMBEDDING_URL).replace(/\/+$/, '');
 }
@@ -662,8 +730,19 @@ function chunkMarkdown(content: string): string[] {
       chunks.push(trimmed);
       continue;
     }
-    for (let i = 0; i < trimmed.length; i += MAX_CHUNK_CHARS) {
-      chunks.push(trimmed.slice(i, i + MAX_CHUNK_CHARS).trim());
+    for (let start = 0; start < trimmed.length;) {
+      let end = Math.min(start + MAX_CHUNK_CHARS, trimmed.length);
+      if (
+        end < trimmed.length
+        && trimmed.charCodeAt(end - 1) >= 0xD800
+        && trimmed.charCodeAt(end - 1) <= 0xDBFF
+        && trimmed.charCodeAt(end) >= 0xDC00
+        && trimmed.charCodeAt(end) <= 0xDFFF
+      ) {
+        end--;
+      }
+      chunks.push(trimmed.slice(start, end).trim());
+      start = end;
     }
   }
   return chunks;
@@ -787,6 +866,7 @@ class WorkspaceRagManager {
   private readonly scanInFlight = new Set<string>();
   private readonly scanQueued = new Set<string>();
   private readonly scanPromises = new Map<string, Promise<void>>();
+  private readonly logRotationChecked = new Set<string>();
   private backgroundScanPromise: Promise<void> | undefined;
   private backgroundScanQueued = false;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -1165,8 +1245,10 @@ class WorkspaceRagManager {
         files: (await Promise.all(context.paths.map(collectMarkdownFiles))).flat(),
       })));
       const allFiles = contextFiles.flatMap(item => item.files.map(file => ({ context: item.context, file })));
+      const enrichContextGraph = this.contextGraph !== undefined && contextGraphEnabledForScan(allFiles.length);
       await this.log(workspace, 'scan_files_collected', {
         totalFiles: allFiles.length,
+        contextGraphEnrichment: enrichContextGraph ? 'enabled' : 'skipped_for_bulk_scan',
         contexts: contextFiles.map(item => ({
           contextId: item.context.id,
           contextName: item.context.name,
@@ -1174,14 +1256,27 @@ class WorkspaceRagManager {
           files: item.files.length,
         })),
       });
+      if (this.contextGraph !== undefined && !enrichContextGraph) {
+        await this.log(workspace, 'context_graph_enrichment_skipped', {
+          totalFiles: allFiles.length,
+          defaultMaxFiles: DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES,
+          configuredMaxFiles: process.env['CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES'] ?? null,
+          reason: 'bulk_scan_limit',
+        });
+      }
       const storage = this.getStorage();
       const byContextPath = new Map((await storage.listDocumentInfo(workspace)).map(doc => [`${doc.contextId ?? 'default'}:${normalizePathForId(doc.path)}`, doc]));
       const seen = new Set<string>();
       let processed = 0;
       let changedDocuments = 0;
       let changedChunks = 0;
+      let sourceEnrichmentFailures = 0;
       let pendingDocuments: IndexedDocument[] = [];
       let pendingChunks = 0;
+      const sourceEnrichmentPool = new BoundedTaskPool(
+        SOURCE_ENRICHMENT_CONCURRENCY,
+        SOURCE_ENRICHMENT_BACKLOG,
+      );
       const flushPendingDocuments = async (reason: string, currentFile?: string): Promise<void> => {
         if (pendingDocuments.length === 0) return;
         const batchDocuments = pendingDocuments.length;
@@ -1214,20 +1309,10 @@ class WorkspaceRagManager {
 
       for (let start = 0; start < allFiles.length; start += SCAN_FILE_CONCURRENCY) {
         const batch = allFiles.slice(start, start + SCAN_FILE_CONCURRENCY);
-        const results = await Promise.all(batch.map(async ({ context, file }): Promise<IndexedDocument | undefined> => {
+        const preparedResults = await Promise.all(batch.map(async ({ context, file }): Promise<PreparedScanFile | undefined> => {
           const normalized = normalizePathForId(file);
           const contextPathKey = `${context.id}:${normalized}`;
           seen.add(contextPathKey);
-          processed++;
-          this.updateProgress(workspace.id, processed, allFiles.length, file);
-          if (processed === 1 || processed === allFiles.length || processed % 100 === 0) {
-            await this.log(workspace, 'scan_progress', {
-              processedFiles: processed,
-              totalFiles: allFiles.length,
-              percent: allFiles.length === 0 ? 100 : Math.round((processed / allFiles.length) * 100),
-              currentFile: file,
-            });
-          }
           const fileStat = await stat(file).catch(() => null);
           if (fileStat === null) {
             const error = new Error('File disappeared before it could be indexed.');
@@ -1242,7 +1327,6 @@ class WorkspaceRagManager {
             existing.updatedAt === updatedAt &&
             documentMatchesVectorizer(existing, this.vectorizer.info)
           ) {
-            await this.registerFileSource(workspace, context, normalized, updatedAt, existing.hash);
             return undefined;
           }
           let content: string;
@@ -1261,40 +1345,119 @@ class WorkspaceRagManager {
             });
           }
           const hash = sha256(content);
-          await this.registerFileSource(workspace, context, normalized, updatedAt, hash, content);
           const chunks = chunkMarkdown(content);
-          const vectors = await this.embedTexts(
-            chunks.map(text => `${path.basename(file)}\n${extractSummary(content)}\n${text}`),
-            'document',
-          );
-          const docId = stableId(contextPathKey);
+          const summary = extractSummary(content);
           return {
-            id: docId,
-            contextId: context.id,
-            path: normalized,
-            hash,
-            vectorizer: vectorizerMetadata(this.vectorizer.info),
+            context,
+            file,
+            normalized,
+            contextPathKey,
             updatedAt,
             fileSize: fileStat.size,
-            chunks: chunks.map((text, index) => ({
-              id: `${docId}:${index}`,
-              text,
-              vector: compactStoredVector(vectors[index] ?? []),
-            })),
+            hash,
+            content,
+            chunks,
+            embeddingTexts: chunks.map(text => `${path.basename(file)}\n${summary}\n${text}`),
           };
         }));
-        for (const doc of results) {
-          if (doc === undefined) continue;
-          pendingDocuments.push(doc);
-          pendingChunks += doc.chunks.length;
+
+        const prepared = preparedResults.filter((value): value is PreparedScanFile => value !== undefined);
+        const vectors = await this.embedTexts(prepared.flatMap(item => item.embeddingTexts), 'document');
+        let vectorOffset = 0;
+        const completed: Array<{ document: IndexedDocument; source: PreparedScanFile }> = [];
+        for (const source of prepared) {
+          const docId = stableId(source.contextPathKey);
+          const documentVectors = vectors.slice(vectorOffset, vectorOffset + source.chunks.length);
+          vectorOffset += source.chunks.length;
+          completed.push({
+            source,
+            document: {
+              id: docId,
+              contextId: source.context.id,
+              path: source.normalized,
+              hash: source.hash,
+              vectorizer: vectorizerMetadata(this.vectorizer.info),
+              updatedAt: source.updatedAt,
+              fileSize: source.fileSize,
+              chunks: source.chunks.map((text, index) => ({
+                id: `${docId}:${index}`,
+                text,
+                vector: compactStoredVector(documentVectors[index] ?? []),
+              })),
+            },
+          });
+        }
+
+        const previousProcessed = processed;
+        processed += batch.length;
+        const currentFile = batch.at(-1)?.file;
+        if (currentFile !== undefined) this.updateProgress(workspace.id, processed, allFiles.length, currentFile);
+        if (
+          previousProcessed === 0
+          || processed === allFiles.length
+          || Math.floor(previousProcessed / 100) !== Math.floor(processed / 100)
+        ) {
+          await this.log(workspace, 'scan_progress', {
+            processedFiles: processed,
+            totalFiles: allFiles.length,
+            percent: allFiles.length === 0 ? 100 : Math.round((processed / allFiles.length) * 100),
+            ...(currentFile !== undefined ? { currentFile } : {}),
+          });
+        }
+
+        for (const { document } of completed) {
+          pendingDocuments.push(document);
+          pendingChunks += document.chunks.length;
           changedDocuments++;
-          changedChunks += doc.chunks.length;
+          changedChunks += document.chunks.length;
         }
         if (pendingDocuments.length >= 32 || pendingChunks >= 1024) {
-          await flushPendingDocuments('batch', batch.at(-1)?.file);
+          await flushPendingDocuments('batch', currentFile);
+        }
+
+        for (const { source } of completed) {
+          await sourceEnrichmentPool.add(async () => {
+            try {
+              await this.registerFileSource(
+                workspace,
+                source.context,
+                source.normalized,
+                source.updatedAt,
+                source.hash,
+                source.content,
+                enrichContextGraph,
+              );
+            } catch (error) {
+              sourceEnrichmentFailures++;
+              await this.log(workspace, 'source_enrichment_error', {
+                file: source.file,
+                error: errorMessage(error),
+              });
+            }
+          });
         }
       }
       await flushPendingDocuments('final');
+      if (changedDocuments > 0) {
+        const finalizingStatus = { ...this.statuses.get(workspace.id)! };
+        delete finalizingStatus.currentFile;
+        this.statuses.set(workspace.id, {
+          ...finalizingStatus,
+          processedFiles: allFiles.length,
+          percent: 100,
+          message: 'Finalizing source metadata.',
+        });
+        await this.log(workspace, 'source_enrichment_wait', {
+          changedDocuments,
+          concurrency: SOURCE_ENRICHMENT_CONCURRENCY,
+          backlog: SOURCE_ENRICHMENT_BACKLOG,
+        });
+        await sourceEnrichmentPool.drain();
+        await this.log(workspace, 'source_enrichment_complete', {
+          changedDocuments,
+          failures: sourceEnrichmentFailures,
+        });
+      }
 
       const configuredContextIds = new Set(config.contexts.map(context => context.id));
       await this.log(workspace, 'storage_finalize_start', {
@@ -1323,7 +1486,11 @@ class WorkspaceRagManager {
         processedFiles: allFiles.length,
         percent: 100,
         lastIndexedAt: nowIso(),
-        message: allFiles.length === 0 ? 'No markdown files found.' : `Indexed ${allFiles.length} markdown file(s).`,
+        message: allFiles.length === 0
+          ? 'No markdown files found.'
+          : sourceEnrichmentFailures > 0
+            ? `Indexed ${allFiles.length} markdown file(s); source metadata failed for ${sourceEnrichmentFailures} file(s).`
+            : `Indexed ${allFiles.length} markdown file(s).`,
         ...this.accelerationStatusFields(),
         ...this.storageStatusFields(workspace),
       });
@@ -1331,6 +1498,7 @@ class WorkspaceRagManager {
         totalFiles: allFiles.length,
         changedDocuments,
         changedChunks,
+        sourceEnrichmentFailures,
         storage: storage.describe(workspace),
         ...dbSummary,
       });
@@ -1380,7 +1548,8 @@ class WorkspaceRagManager {
     normalizedPath: string,
     updatedAt: string,
     contentHash: string,
-    content?: string,
+    content: string,
+    enrichContextGraph: boolean,
   ): Promise<void> {
     if (this.sourceRegistry === undefined) return;
     const externalId = this.fileSourceExternalId(context.id, normalizedPath);
@@ -1404,15 +1573,6 @@ class WorkspaceRagManager {
         'Search hits are chunk-level excerpts, not full document reads.',
       ],
     });
-    if (content === undefined) {
-      await this.sourceRegistry.recordHealth({
-        sourceId: source.id,
-        state: 'healthy',
-        checkedAt: nowIso(),
-        message: 'Workspace RAG confirmed this markdown source is unchanged.',
-      });
-      return;
-    }
     const version = await this.sourceRegistry.upsertVersion({
       sourceId: source.id,
       contentHash,
@@ -1421,13 +1581,9 @@ class WorkspaceRagManager {
         activityId: `workspace-rag:${workspace.id}:${context.id}:scan`,
       },
     });
-    await this.sourceRegistry.recordHealth({
-      sourceId: source.id,
-      state: 'healthy',
-      checkedAt: nowIso(),
-      message: 'Workspace RAG read and indexed this markdown source.',
-    });
-    await this.extractContextGraphSource(workspace, source.id, version.id, content, 'deterministic');
+    if (enrichContextGraph) {
+      await this.extractContextGraphSource(workspace, source.id, version.id, content, 'deterministic');
+    }
   }
 
   private async registerKnowledgeSource(
@@ -1755,6 +1911,7 @@ class WorkspaceRagManager {
   }
 
   private async log(workspace: WorkspaceRef, event: string, fields: Record<string, unknown> = {}): Promise<void> {
+    const logPath = this.logPath(workspace);
     const entry = {
       timestamp: nowIso(),
       event,
@@ -1765,8 +1922,17 @@ class WorkspaceRagManager {
     };
     const line = `${JSON.stringify(entry)}\n`;
     try {
-      await mkdir(path.dirname(this.logPath(workspace)), { recursive: true });
-      await appendFile(this.logPath(workspace), line, 'utf8');
+      await mkdir(path.dirname(logPath), { recursive: true });
+      if (!this.logRotationChecked.has(workspace.id)) {
+        this.logRotationChecked.add(workspace.id);
+        const logStat = await stat(logPath).catch(() => null);
+        if (logStat !== null && logStat.size > MAX_INGESTION_LOG_BYTES) {
+          const archivePath = `${logPath}.1`;
+          await rm(archivePath, { force: true });
+          await rename(logPath, archivePath);
+        }
+      }
+      await appendFile(logPath, line, 'utf8');
     } catch (error) {
       console.warn(`[workspace-rag] failed to write ingestion log for ${workspace.id}: ${errorMessage(error)}`);
     }

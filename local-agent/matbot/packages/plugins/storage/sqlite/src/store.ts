@@ -26,6 +26,71 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
       .run(id, value.version, JSON.stringify(value));
   }
 
+  /**
+   * Import legacy records without overwriting newer rows already present in SQLite.
+   * The transaction turns a filesystem migration from one fsync per record into one
+   * commit per chunk while remaining safely resumable after an interrupted startup.
+   */
+  importMissing(values: readonly T[]): number {
+    if (values.length === 0) return 0;
+    const insert = this.db.prepare(
+      `INSERT OR IGNORE INTO "${this.table}" (id, version, doc) VALUES (?, ?, ?)`,
+    );
+    let imported = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const value of values) {
+        const result = insert.run(value.id, value.version, JSON.stringify(value));
+        imported += Number(result.changes);
+      }
+      this.db.exec('COMMIT');
+      return imported;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  importLatestByUpdatedAt(values: readonly T[]): number {
+    if (values.length === 0) return 0;
+    const insert = this.db.prepare(`
+      INSERT INTO "${this.table}" (id, version, doc) VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        version = excluded.version,
+        doc = excluded.doc
+      WHERE COALESCE(json_extract(excluded.doc, '$.updatedAt'), '') >=
+            COALESCE(json_extract("${this.table}".doc, '$.updatedAt'), '')
+    `);
+    let imported = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const value of values) {
+        const result = insert.run(value.id, value.version, JSON.stringify(value));
+        imported += Number(result.changes);
+      }
+      this.db.exec('COMMIT');
+      return imported;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  deleteMany(ids: readonly string[]): number {
+    if (ids.length === 0) return 0;
+    const remove = this.db.prepare(`DELETE FROM "${this.table}" WHERE id = ?`);
+    let deleted = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of ids) deleted += Number(remove.run(id).changes);
+      this.db.exec('COMMIT');
+      return deleted;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
     this.db.exec('BEGIN IMMEDIATE');
     try {

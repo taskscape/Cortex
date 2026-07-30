@@ -58,6 +58,7 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_PASSWORD` | `POSTGRES_PASSWORD` or Docker `.env` | Postgres password used by workspace RAG. |
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
+| `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES` | `10000` | Maximum workspace scan size that receives per-file context-graph extraction. Larger scans still get vectors and source metadata but skip graph expansion. Use `-1` only when intentionally enabling graph extraction for an unbounded scan. |
 | `CORTEX_STRUCTURED_POSTGRES_URL` | unset | Optional Postgres connection string used by the `structured-data` plugin for approved read-only semantic SQL execution. Use a database role with read-only privileges. |
 | `CORTEX_MODEL_PRICING_JSON` | unset | Optional JSON object keyed by model id with `inputPerMillionUsd`, `cachedInputPerMillionUsd`, and `outputPerMillionUsd`; used when a provider does not report model cost directly. |
 | `CORTEX_APPROVAL_SLA_HOURS` | `24` | Hours before a pending workflow approval is considered overdue in observability and governance metrics. |
@@ -184,6 +185,7 @@ providers:
       maxTokens: 4096
 
 plugins:
+  - ./packages/plugins/storage/high-cardinality
   - ./packages/plugins/sessions
   - ./plugins/hybrid-knowledge-index
   - ./plugins/file-broker
@@ -216,7 +218,11 @@ Optional top-level keys supported by the loader:
 | `language_models` | Higher-level provider shorthand for OpenAI-compatible local providers. |
 | `plugins` | Ordered startup plugin list. |
 
-Plugin order matters when one plugin provides a service consumed by another. For
+Plugin order matters when one plugin provides a service consumed by another. The
+`storage/high-cardinality` backend must load before plugins create stores; it
+routes source-registry and context-graph namespaces to WAL-mode SQLite while
+leaving sessions, skills, and workspace files in their existing filesystem
+stores. Existing JSON records are imported once and retained as recovery copies. For
 example, `hybrid-knowledge-index` registers `KnowledgeIndex` before `rumsfeld`
 uses it, `source-registry` loads before `workspace-rag` so indexed markdown gets
 durable source ids, and `connector-fabric` loads before `workspace-rag` so
@@ -364,7 +370,7 @@ Matbot process with `CORTEX_WORKSPACE_ID`.
 
 The `workspace-rag` plugin provides workspace-scoped markdown retrieval for every
 conversation. It is installed by default in `matbot.yaml`, and the CLI ensures
-`source-registry`, `connector-fabric`, `structured-data`,
+`storage/high-cardinality`, `source-registry`, `connector-fabric`, `structured-data`,
 `workflow-governance`, `context-graph`, and `workspace-rag` are present in every
 workspace config when Matbot starts.
 
@@ -400,10 +406,14 @@ The ingestion manager:
 - scans the active workspace first, then scans inactive workspaces from `cortex-workspaces.json` serially in the background;
 - indexes markdown files under configured paths;
 - chunks markdown, hashes document content, and stores chunk text, metadata, and vectors in Postgres/pgvector;
-- writes source records and versions, then invokes `ContextGraph.ingestSource` when the context graph plugin is loaded;
+- batches chunks across up to 32 files per embedding request and advances progress only after that batch completes;
+- skips source and graph writes for unchanged files;
+- writes source records and versions through a bounded enrichment queue while vector ingestion continues;
+- invokes `ContextGraph.ingestSource` when the context graph plugin is loaded and the scan does not exceed `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES`;
 - re-indexes changed files when the markdown hash changes;
 - removes deleted markdown files from the index;
 - writes changed documents incrementally, so ingestion does not serialize one giant JSON file at the end;
+- rotates `ingestion.log` at 25 MiB, retaining one `.1` archive;
 - continues in the background while the WebUI is open;
 - rescans configured folders every minute after the initial pass, coalescing overlapping timer scans instead of running them concurrently;
 - restarts ingestion for the current workspace immediately when saved paths change.
