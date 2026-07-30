@@ -26,6 +26,26 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the workspace switching process correctly handles process handoff,
+ * including cleaning up the outgoing process and starting a new one for the target
+ * workspace.
+ *
+ * This test ensures:
+ * - The outgoing process releases its HTTP port promptly, even if a request is stuck
+ *   mid-request (preventing port bind conflicts)
+ * - The workspace registry correctly identifies which process is serving each workspace
+ * - The WebUI can reliably determine when a switch has completed vs. when the old
+ *   process is still active
+ * - The switch operation is atomic and doesn't leave workspaces in an inconsistent state
+ *
+ * Assumptions:
+ * - The Matbot runtime properly implements process shutdown with HTTP connection draining
+ * - The workspace registry stores process PID and port information
+ * - The runtime script exercises the workspace-switching flow and reports results
+ *   via ##RESULT## lines to stdout
+ * - Each scenario in the runtime must pass (ok: true) for the overall test to pass
+ */
 test("workspace switch handoff", { timeout: 120_000 }, async t => {
   let stdout = "", stderr = "", spawnError;
   try {

@@ -30,6 +30,7 @@ const server = createServer(async (request, response) => {
       signature,
       dimensions,
       maxTokens: 512,
+      batchSize: 7,
       normalized: true,
       queryPrefix: "query: ",
       documentPrefix: "passage: ",
@@ -125,6 +126,7 @@ async function main() {
     assert.equal(status.embeddingProfile, profile);
     assert.equal(status.embeddingSignature, signature);
     assert.equal(status.embeddingMaxTokens, 512);
+    assert.equal(status.embeddingBatchSize, 7);
 
     const searchEvents = [];
     for await (const event of tool.executor.execute({

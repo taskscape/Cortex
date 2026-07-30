@@ -11,6 +11,25 @@ const LS_PROVIDER       = 'provider';
 const LS_SIDEBAR        = 'sidebarSections';
 const LS_SIDEBAR_WIDTH  = 'sidebarWidth';
 
+function applyBranding(value) {
+  if (!value || typeof value !== 'object') return;
+  const productName = typeof value.productName === 'string' && value.productName.trim() ? value.productName.trim() : 'Cortex';
+  const title = typeof value.title === 'string' && value.title.trim() ? value.title.trim() : productName;
+  document.title = title;
+  const brandTitle = document.getElementById('brand-title');
+  if (brandTitle) brandTitle.textContent = productName;
+  const composer = document.getElementById('input');
+  if (composer) composer.placeholder = `Ask ${productName}...`;
+  const root = document.documentElement;
+  for (const [key, cssVariable] of [['brand', '--brand'], ['brandStrong', '--brand-strong'], ['brandSoft', '--brand-soft']]) {
+    if (typeof value[key] === 'string') root.style.setProperty(cssVariable, value[key]);
+  }
+}
+
+// Branding is install-scoped and fetched before the ordinary UI settles. A missing
+// endpoint is harmless for older servers and preserves the Cortex defaults.
+void fetch('/branding', { cache: 'no-store' }).then(response => response.ok ? response.json() : null).then(applyBranding).catch(() => {});
+
 function providerStorageKey(workspaceId = activeWorkspaceId()) {
   return `${LS_PROVIDER}:${workspaceId || 'default'}`;
 }

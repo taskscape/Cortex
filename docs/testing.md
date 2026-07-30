@@ -218,6 +218,42 @@ Run only the workspace-switch handoff coverage:
 node --test tests/workspace-switch.test.mjs
 ```
 
+## Guarded Docker and CUDA integration tests
+
+The ordinary suite never starts Docker, rebuilds CUDA images, downloads an
+embedding model, or deletes volumes. The guarded integration command creates a
+generated `cortex-test-*` Compose project, an isolated temporary environment
+file, and project-owned volumes; its cleanup removes only that generated
+project.
+
+Run it only on a disposable Docker host:
+
+```powershell
+$env:CORTEX_DOCKER_INTEGRATION = "1"
+npm run test:integration:docker
+```
+
+The test checks Postgres/pgvector, Neo4j authentication, Mem0 API reachability,
+and the documented password-rotation behaviour. Rotation intentionally uses
+`down --volumes`, so the test proves fixture data is gone after recreation; it
+does not and must not target a developer's existing Mem0 data.
+
+CUDA checks require both Docker opt-in and an available NVIDIA Docker runtime:
+
+```powershell
+$env:CORTEX_DOCKER_INTEGRATION = "1"
+$env:CORTEX_CUDA_INTEGRATION = "1"
+npm run test:integration:cuda
+```
+
+This starts the MiniLM CUDA sidecar and polls its real health payload. To also
+exercise the larger E5 model download, set `CORTEX_CUDA_E5_INTEGRATION=1`; it is
+separate because a cold model cache materially increases run time.
+
+The deterministic CUDA contract tests remain in `npm test`: they validate the
+model, embedding dimensions, profile, normalization, and E5 prefixes against a
+local fake sidecar without requiring a GPU.
+
 That suite covers the two properties a switch depends on: shutdown releasing the
 web port promptly even with a connection stuck mid-request, and the workspace
 listing identifying the process that answered it — without which the WebUI cannot

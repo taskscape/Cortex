@@ -210,6 +210,23 @@ async function main() {
   const duplicateCheck = (await graph.queryRelationships()).filter(relationship => relationship.id === relationshipA.id);
   assert.equal(duplicateCheck.length, 1);
 
+  const gate = await graph.upsertEntity({ workspaceId: "default", type: "decision", canonicalName: "Operations approval gate" });
+  const outcome = await graph.upsertEntity({ workspaceId: "default", type: "outcome", canonicalName: "Escalation completed" });
+  const hopOne = await graph.assertRelationship({
+    workspaceId: "default", subjectEntityId: task.id, predicate: "requires", objectEntityId: gate.id,
+    sourceId: source.id, sourceVersionId: version.id, confidence: 2, evidenceSpan: { text: "The task requires the approval gate." },
+  });
+  const hopTwo = await graph.assertRelationship({
+    workspaceId: "default", subjectEntityId: gate.id, predicate: "enables", objectEntityId: outcome.id,
+    sourceId: source.id, sourceVersionId: version.id, confidence: -1, evidenceSpan: { text: "Approval enables escalation completion." },
+  });
+  assert.equal(hopOne.confidence, 1, "confidence is bounded at one");
+  assert.equal(hopTwo.confidence, 0, "confidence is bounded at zero");
+  const multiHop = await graph.pathSearch(aliceA.id, outcome.id, { maxDepth: 3, maxPaths: 5 });
+  assert.ok(multiHop.some(path => path.relationships.map(relationship => relationship.id).join(",") === [relationshipA.id, hopOne.id, hopTwo.id].join(",")));
+  const twoHopNeighbors = await graph.neighbors(task.id, { depth: 2, maxRelationships: 10 });
+  assert.ok(twoHopNeighbors.entities.some(entity => entity.id === outcome.id));
+
   const retrieve = await collectTool(graphTool, {
     action: "retrieve",
     workspaceId: "default",

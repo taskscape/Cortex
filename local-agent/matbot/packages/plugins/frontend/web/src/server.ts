@@ -9,6 +9,46 @@ import { sseComment, sseEvent } from './sse-writer.js';
 import { promises } from "node:fs";
 const { readFile } = promises;
 
+export interface WebBranding {
+  productName: string;
+  title: string;
+  brand?: string;
+  brandStrong?: string;
+  brandSoft?: string;
+}
+
+const DEFAULT_WEB_BRANDING: WebBranding = { productName: 'Cortex', title: 'Cortex' };
+const CSS_COLOR = /^(?:#[0-9a-fA-F]{3,8}|(?:rgb|hsl)a?\([^<>]{1,80}\))$/;
+
+/** Parse only presentation-safe branding values. Invalid input falls back per field. */
+export function parseWebBranding(raw = process.env['CORTEX_WEBUI_BRANDING_JSON']): WebBranding {
+  if (!raw) return { ...DEFAULT_WEB_BRANDING };
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!isRecord(value)) return { ...DEFAULT_WEB_BRANDING };
+    const text = (key: 'productName' | 'title', fallback: string) => {
+      const candidate = value[key];
+      return typeof candidate === 'string' && candidate.trim() && candidate.trim().length <= 80 ? candidate.trim() : fallback;
+    };
+    const color = (key: 'brand' | 'brandStrong' | 'brandSoft') => {
+      const candidate = value[key];
+      return typeof candidate === 'string' && CSS_COLOR.test(candidate.trim()) ? candidate.trim() : undefined;
+    };
+    const brand = color('brand');
+    const brandStrong = color('brandStrong');
+    const brandSoft = color('brandSoft');
+    return {
+      productName: text('productName', DEFAULT_WEB_BRANDING.productName),
+      title: text('title', text('productName', DEFAULT_WEB_BRANDING.title)),
+      ...(brand !== undefined ? { brand } : {}),
+      ...(brandStrong !== undefined ? { brandStrong } : {}),
+      ...(brandSoft !== undefined ? { brandSoft } : {}),
+    };
+  } catch {
+    return { ...DEFAULT_WEB_BRANDING };
+  }
+}
+
 export interface WebServerDeps {
   store:          Store<Session>;
   /** Per-session turn serialiser — submits queue instead of running concurrently. */
@@ -37,6 +77,8 @@ export interface WebServerDeps {
   sessionTitler?: () => SessionTitler | undefined;
   /** Derives the security principal for each request. Defaults to {@link defaultWebPrincipal}. */
   resolvePrincipal?: WebPrincipalResolver;
+  /** Install-scoped display configuration. Never read from workspace-local state. */
+  branding?: WebBranding;
 }
 
 export interface WorkspaceSummary {
@@ -368,6 +410,7 @@ function titleFromQuestion(question: string): string | undefined {
 export function createWebServer(deps: WebServerDeps) {
   const origin = deps.cors ?? '*';
   const resolvePrincipal = deps.resolvePrincipal ?? defaultWebPrincipal;
+  const branding = deps.branding ?? DEFAULT_WEB_BRANDING;
 
   // Persistent per-session event subscribers (the GET /events/sessions/:id SSE streams). Submits are
   // fire-and-forget — all turn output, and interactive prompts, reach clients over these. Holding one
@@ -598,6 +641,11 @@ export function createWebServer(deps: WebServerDeps) {
   async function handleRequest(
     req: IncomingMessage, res: ServerResponse, method: string, url: string, principal: Principal,
   ): Promise<void> {
+
+    if (method === 'GET' && url === '/branding') {
+      json(res, 200, branding);
+      return;
+    }
 
     // --- Static UI ---
     const staticRoutes: Record<string, () => Promise<void>> = {

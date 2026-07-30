@@ -25,7 +25,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("T2-E2E-009 / T3-E2E-011 workspace-rag normalizes paths and reconciles the runtime ingestion flow", async () => {
+test("T2-E2E-009 / T3-E2E-011 / MISSING-03 / MISSING-12 workspace-rag normalizes paths, reconciles reindexing, and manages isolated contexts", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

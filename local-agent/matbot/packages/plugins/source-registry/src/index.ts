@@ -152,6 +152,7 @@ export interface SourceAccessEvent {
   id: string;
   version: string;
   sourceId: string;
+  sourceVersionId?: string;
   action: SourceAccessAction;
   timestamp: string;
   allowed: boolean;
@@ -164,6 +165,7 @@ export interface SourceAccessEvent {
 
 export type SourceAccessInput = {
   sourceId: string;
+  sourceVersionId?: string;
   action: SourceAccessAction;
   allowed: boolean;
   timestamp?: string;
@@ -277,6 +279,20 @@ function optional<T>(value: T | undefined): { include: false } | { include: true
   return value === undefined ? { include: false } : { include: true, value };
 }
 
+function redactAuditValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, match => {
+      const separator = match.includes('=') ? '=' : ':';
+      return `${match.slice(0, match.indexOf(separator) + 1)}[redacted]`;
+    });
+  }
+  if (Array.isArray(value)) return value.map(redactAuditValue);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, redactAuditValue(item)]));
+  }
+  return value;
+}
+
 function computeStaleAfter(input: {
   lastSuccessfulReadAt?: string | undefined;
   freshnessSlaSeconds?: number | undefined;
@@ -289,7 +305,7 @@ function computeStaleAfter(input: {
   return new Date(readAt + input.freshnessSlaSeconds * 1000).toISOString();
 }
 
-function effectiveStaleness(input: {
+export function effectiveStaleness(input: {
   stalenessState?: SourceStalenessState | undefined;
   staleAfter?: string | undefined;
   lastSuccessfulReadAt?: string | undefined;
@@ -487,8 +503,8 @@ class StoreBackedSourceRegistry implements SourceRegistry {
       sourceId: input.sourceId,
       state: input.state,
       checkedAt: input.checkedAt ?? nowIso(),
-      ...(input.message !== undefined ? { message: input.message } : {}),
-      ...(input.details !== undefined ? { details: input.details } : {}),
+      ...(input.message !== undefined ? { message: redactAuditValue(input.message) as string } : {}),
+      ...(input.details !== undefined ? { details: redactAuditValue(input.details) as Record<string, unknown> } : {}),
     };
     await this.health.set(event.id, event);
     return event;
@@ -499,6 +515,7 @@ class StoreBackedSourceRegistry implements SourceRegistry {
       id: randomUUID(),
       version: randomUUID(),
       sourceId: input.sourceId,
+      ...(input.sourceVersionId !== undefined ? { sourceVersionId: input.sourceVersionId } : {}),
       action: input.action,
       timestamp: input.timestamp ?? nowIso(),
       allowed: input.allowed,
@@ -506,7 +523,7 @@ class StoreBackedSourceRegistry implements SourceRegistry {
       ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
       ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
       ...(input.workflowRunId !== undefined ? { workflowRunId: input.workflowRunId } : {}),
-      ...(input.message !== undefined ? { message: input.message } : {}),
+      ...(input.message !== undefined ? { message: redactAuditValue(input.message) as string } : {}),
     };
     await this.access.set(event.id, event);
     return event;

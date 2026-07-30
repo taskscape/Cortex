@@ -22,7 +22,25 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("context-graph runtime flow passes under the Matbot TypeScript loader", async () => {
+/**
+ * Validates that the context graph correctly extracts relationships between entities
+ * from conversation content and supports multi-hop provenance queries with confidence
+ * bounds.
+ *
+ * This test ensures:
+ * - Source-backed relationships are identified from conversation content
+ * - The graph stores edges (relationships) between nodes (entities)
+ * - Relationship attributes (confidence, timestamp, context) are captured
+ * - The graph can be queried to find related entities or paths
+ * - New relationships can be added and existing ones updated
+ *
+ * Assumptions:
+ * - The context-graph plugin extracts relationships from conversation content
+ * - The runtime script creates sample conversations with explicit relationships
+ * - The plugin stores the graph in a durable backend (e.g., Neo4j)
+ * - Success is indicated by the runtime output containing the expected success message
+ */
+test("MISSING-07 context-graph runtime flow covers multi-hop provenance and confidence bounds", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

@@ -23,7 +23,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("T3-E2E-004 high-risk file-broker writes require approval and cannot escape through junctions", async () => {
+test("T3-E2E-004 / MISSING-06 high-risk file-broker writes require approval and cannot escape through junctions", async () => {
   const { stdout } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

@@ -23,7 +23,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("T3-E2E-005 scheduled execution records one policy-bound occurrence with inherited identity", async () => {
+test("T3-E2E-005 / MISSING-10 scheduled execution records one policy-bound occurrence with inherited identity", async () => {
   const { stdout } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

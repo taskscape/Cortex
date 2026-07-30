@@ -58,7 +58,11 @@
       },
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (!res.ok) {
+      const error = new Error(data.error || ('HTTP ' + res.status));
+      if (data.current) error.current = data.current;
+      throw error;
+    }
     return data;
   }
 
@@ -119,9 +123,7 @@
       state.selected = item;
       renderList();
       renderDetail();
-    } catch (e) {
-      setStatus(e.message || String(e), true);
-    }
+    } catch (e) { setStatus(e.message || String(e), true); }
   }
 
   function renderDetail() {
@@ -163,6 +165,15 @@
       renderDetail();
       setStatus('Saved.');
     } catch (e) {
+      if (e && e.current) {
+        state.selected = e.current;
+        const idx = state.items.findIndex(item => item.id === e.current.id);
+        if (idx >= 0) state.items[idx] = e.current;
+        renderList();
+        renderDetail();
+        setStatus('Version conflict. Latest server version loaded; review and retry.', true);
+        return;
+      }
       setStatus(e.message || String(e), true);
     }
   }

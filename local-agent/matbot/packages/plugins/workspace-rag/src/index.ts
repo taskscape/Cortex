@@ -50,6 +50,7 @@ interface VectorizerRuntime extends VectorizerMetadata {
   accelerator: Accelerator;
   profile: string;
   maxTokens?: number;
+  batchSize?: number;
 }
 
 interface TextVectorizer {
@@ -130,6 +131,7 @@ interface IngestionStatus {
   embeddingProfile: string;
   embeddingSignature: string;
   embeddingMaxTokens?: number;
+  embeddingBatchSize?: number;
   cudaServiceUrl?: string;
   accelerationMessage?: string;
   storageBackend: 'json' | 'postgres-pgvector';
@@ -410,7 +412,7 @@ class HashCpuVectorizer implements TextVectorizer {
   }
 }
 
-interface CudaHealthResponse {
+export interface CudaHealthResponse {
   ok?: boolean;
   cudaAvailable?: boolean;
   device?: string;
@@ -419,7 +421,45 @@ interface CudaHealthResponse {
   profile?: string;
   signature?: string;
   maxTokens?: number;
+  batchSize?: number;
+  normalized?: boolean;
+  queryPrefix?: string;
+  documentPrefix?: string;
   message?: string;
+}
+
+/**
+ * Keep the CUDA sidecar contract in one testable place.  A status code alone is
+ * not enough: vectors from a changed model or preprocessing profile cannot be
+ * mixed safely with an existing Workspace RAG index.
+ */
+export function validateCudaEmbeddingHealth(health: CudaHealthResponse): string | undefined {
+  if (health.ok !== true) return 'Embedding service did not report ok=true.';
+  if (typeof health.model !== 'string' || !health.model.trim()) return 'Embedding service did not report a model.';
+  if (!Number.isInteger(health.dimensions) || health.dimensions! <= 0) return 'Embedding service reported invalid dimensions.';
+  if (typeof health.profile !== 'string' || !health.profile.trim()) return 'Embedding service did not report a profile.';
+  if (typeof health.signature !== 'string' || !health.signature.trim()) return 'Embedding service did not report a preprocessing signature.';
+  if (health.normalized !== true) return 'Embedding service must report normalized output.';
+  if (!Number.isInteger(health.batchSize) || health.batchSize! <= 0 || health.batchSize! > CUDA_EMBED_REQUEST_LIMIT) {
+    return `Embedding service reported invalid batch size (expected 1-${CUDA_EMBED_REQUEST_LIMIT}).`;
+  }
+  if (health.profile === 'e5-asymmetric-v1') {
+    if (health.queryPrefix !== 'query: ' || health.documentPrefix !== 'passage: ') {
+      return 'E5 embedding service must report query: and passage: preprocessing prefixes.';
+    }
+    if (health.model === 'intfloat/multilingual-e5-base' && health.dimensions !== 768) {
+      return 'intfloat/multilingual-e5-base must report 768 dimensions.';
+    }
+  }
+  if (health.profile === 'plain-v1') {
+    if (health.queryPrefix !== '' || health.documentPrefix !== '') {
+      return 'plain-v1 embedding service must not report asymmetric preprocessing prefixes.';
+    }
+    if (health.model === 'sentence-transformers/all-MiniLM-L6-v2' && health.dimensions !== 384) {
+      return 'sentence-transformers/all-MiniLM-L6-v2 must report 384 dimensions.';
+    }
+  }
+  return undefined;
 }
 
 interface VectorizerLaunchState {
@@ -465,7 +505,13 @@ async function probeCudaEmbeddingService(baseUrl: string): Promise<CudaHealthRes
     if (typeof body.profile === 'string') result.profile = body.profile;
     if (typeof body.signature === 'string') result.signature = body.signature;
     if (typeof body.maxTokens === 'number' && Number.isFinite(body.maxTokens)) result.maxTokens = body.maxTokens;
+    if (typeof body.batchSize === 'number' && Number.isFinite(body.batchSize)) result.batchSize = body.batchSize;
+    if (typeof body.normalized === 'boolean') result.normalized = body.normalized;
+    if (typeof body.queryPrefix === 'string') result.queryPrefix = body.queryPrefix;
+    if (typeof body.documentPrefix === 'string') result.documentPrefix = body.documentPrefix;
     if (typeof body.message === 'string') result.message = body.message;
+    const validationError = validateCudaEmbeddingHealth(result);
+    if (validationError !== undefined) return { ...result, ok: false, message: validationError };
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -477,7 +523,7 @@ class CudaHttpVectorizer implements TextVectorizer {
   readonly info: VectorizerRuntime;
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string, health: Required<Pick<CudaHealthResponse, 'model' | 'dimensions' | 'profile' | 'signature'>> & Pick<CudaHealthResponse, 'maxTokens'>) {
+  constructor(baseUrl: string, health: Required<Pick<CudaHealthResponse, 'model' | 'dimensions' | 'profile' | 'signature' | 'batchSize'>> & Pick<CudaHealthResponse, 'maxTokens'>) {
     this.baseUrl = baseUrl;
     this.info = {
       backend: 'cuda-http',
@@ -487,6 +533,7 @@ class CudaHttpVectorizer implements TextVectorizer {
       accelerated: true,
       accelerator: 'nvidia',
       profile: health.profile,
+      batchSize: health.batchSize,
       ...(health.maxTokens !== undefined ? { maxTokens: health.maxTokens } : {}),
     };
   }
@@ -574,6 +621,7 @@ async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
     && probe.dimensions > 0
     && probe.profile
     && probe.signature
+    && probe.batchSize
   ) {
     const device = probe.device ? ` on ${probe.device}` : '';
     return {
@@ -582,6 +630,7 @@ async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
         dimensions: probe.dimensions,
         profile: probe.profile,
         signature: probe.signature,
+        batchSize: probe.batchSize,
         ...(probe.maxTokens !== undefined ? { maxTokens: probe.maxTokens } : {}),
       }),
       nvidiaAvailable,
@@ -814,14 +863,22 @@ class WorkspaceRagManager {
       ? config.contextId.trim()
       : current.activeContextId;
     const context = current.contexts.find(item => item.id === targetId) ?? activeContext(current);
+    if (typeof config.contextName === 'string' && !config.contextName.trim()) {
+      throw new Error('Workspace RAG context name must not be blank.');
+    }
+    const nextName = typeof config.contextName === 'string' ? config.contextName.trim() : context.name;
+    if (current.contexts.some(item => item.id !== context.id && item.name.localeCompare(nextName, undefined, { sensitivity: 'accent' }) === 0)) {
+      throw new Error(`Workspace RAG context name "${nextName}" is already in use.`);
+    }
     const previousPaths = context.paths;
     const nextPaths = Array.isArray(config.paths) ? normalizeFolderPaths(config.paths) : context.paths;
+    await this.assertAccessiblePaths(nextPaths);
     const pathsChanged = JSON.stringify(previousPaths) !== JSON.stringify(nextPaths);
     const next: RagConfig = {
       activeContextId: context.id,
       contexts: current.contexts.map(item => item.id === context.id ? {
         ...item,
-        name: typeof config.contextName === 'string' && config.contextName.trim() ? config.contextName.trim() : item.name,
+        name: nextName,
         paths: nextPaths,
       } : item),
     };
@@ -858,13 +915,19 @@ class WorkspaceRagManager {
   async createContextCurrent(contextName?: string, paths?: string[]): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
+    if (contextName !== undefined && !contextName.trim()) throw new Error('Workspace RAG context name must not be blank.');
     const name = contextName?.trim() || `Context ${current.contexts.length + 1}`;
+    if (current.contexts.some(context => context.name.localeCompare(name, undefined, { sensitivity: 'accent' }) === 0)) {
+      throw new Error(`Workspace RAG context name "${name}" is already in use.`);
+    }
     const seen = new Set(current.contexts.map(context => context.id));
     const id = uniqueContextId(name, seen);
+    const nextPaths = normalizeFolderPaths(paths);
+    await this.assertAccessiblePaths(nextPaths);
     const nextContext: RagContextConfig = {
       id,
       name,
-      paths: normalizeFolderPaths(paths),
+      paths: nextPaths,
     };
     const next: RagConfig = {
       activeContextId: id,
@@ -876,6 +939,24 @@ class WorkspaceRagManager {
       contextName: name,
       paths: nextContext.paths,
     });
+    this.statuses.delete(workspace.id);
+    await this.requestScanWorkspace(workspace);
+    return configView(next);
+  }
+
+  async deleteContextCurrent(contextId: string): Promise<RagConfigView> {
+    const workspace = await this.currentWorkspace();
+    const current = await this.readConfig(workspace);
+    const context = current.contexts.find(item => item.id === contextId);
+    if (!context) throw new Error(`Unknown workspace RAG context "${contextId}".`);
+    if (current.contexts.length === 1) throw new Error('Workspace RAG must retain one context. Configure its paths instead of deleting it.');
+    const contexts = current.contexts.filter(item => item.id !== context.id);
+    const next: RagConfig = {
+      activeContextId: current.activeContextId === context.id ? contexts[0]!.id : current.activeContextId,
+      contexts,
+    };
+    await writeJson(this.configPath(workspace), next);
+    await this.log(workspace, 'delete_context', { contextId: context.id, contextName: context.name });
     this.statuses.delete(workspace.id);
     await this.requestScanWorkspace(workspace);
     return configView(next);
@@ -1009,6 +1090,16 @@ class WorkspaceRagManager {
         return leftPriority - rightPriority || left.index - right.index;
       })
       .map(item => item.workspace);
+  }
+
+  private async assertAccessiblePaths(paths: readonly string[]): Promise<void> {
+    for (const folder of paths) {
+      try {
+        await access(folder);
+      } catch {
+        throw new Error(`Workspace RAG path is inaccessible: ${folder}`);
+      }
+    }
   }
 
   private async requestScanWorkspace(workspace: WorkspaceRef): Promise<void> {
@@ -1508,6 +1599,7 @@ class WorkspaceRagManager {
     | 'embeddingProfile'
     | 'embeddingSignature'
     | 'embeddingMaxTokens'
+    | 'embeddingBatchSize'
     | 'cudaServiceUrl'
     | 'accelerationMessage'
   > {
@@ -1522,6 +1614,7 @@ class WorkspaceRagManager {
       embeddingProfile: this.vectorizer.info.profile,
       embeddingSignature: this.vectorizer.info.signature,
       ...(this.vectorizer.info.maxTokens !== undefined ? { embeddingMaxTokens: this.vectorizer.info.maxTokens } : {}),
+      ...(this.vectorizer.info.batchSize !== undefined ? { embeddingBatchSize: this.vectorizer.info.batchSize } : {}),
       ...(this.cudaServiceUrl ? { cudaServiceUrl: this.cudaServiceUrl } : {}),
       accelerationMessage: this.accelerationMessage,
     };
@@ -1723,8 +1816,8 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['status', 'get_config', 'configure', 'select_context', 'create_context', 'search', 'reindex_now'] },
-        contextId: { type: 'string', description: 'Workspace RAG context id for select_context or configure.' },
+        action: { type: 'string', enum: ['status', 'get_config', 'configure', 'select_context', 'create_context', 'delete_context', 'search', 'reindex_now'] },
+        contextId: { type: 'string', description: 'Workspace RAG context id for select_context, delete_context, or configure.' },
         contextName: { type: 'string', description: 'Human-facing name for this workspace RAG context.' },
         paths: { type: 'array', items: { type: 'string' }, description: 'Absolute local folder paths containing markdown files.' },
         query: { type: 'string', description: 'Search query for action=search.' },
@@ -1765,6 +1858,13 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
               typeof value.contextName === 'string' ? value.contextName : undefined,
               Array.isArray(value.paths) ? value.paths.map(item => String(item)) : undefined,
             );
+            yield { type: 'result', value: { config: next, status: await manager.statusCurrent() } };
+            return;
+          }
+          if (action === 'delete_context') {
+            const contextId = typeof value.contextId === 'string' ? value.contextId : '';
+            if (!contextId.trim()) { yield { type: 'error', message: 'workspace_rag delete_context requires "contextId".' }; return; }
+            const next = await manager.deleteContextCurrent(contextId.trim());
             yield { type: 'result', value: { config: next, status: await manager.statusCurrent() } };
             return;
           }

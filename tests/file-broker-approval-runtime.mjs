@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -40,6 +40,8 @@ try {
   await mkdir(allowed, { recursive: true });
   await mkdir(outside, { recursive: true });
   await writeFile(path.join(allowed, "deploy.ps1"), "before\n", "utf8");
+  await mkdir(path.join(allowed, "blocked"), { recursive: true });
+  await writeFile(path.join(allowed, "blocked", "secret.txt"), "do not touch\n", "utf8");
   await writeFile(path.join(outside, "sentinel.ps1"), "outside\n", "utf8");
   const workspacesPath = path.join(temp, "workspaces.json");
   const policyPath = path.join(temp, "policy.json");
@@ -47,7 +49,7 @@ try {
     roots: [{ path: allowed, mode: "read-write", type: "test" }]
   }), "utf8");
   await writeFile(policyPath, JSON.stringify({
-    deniedPathFragments: [],
+    deniedPathFragments: ["\\blocked\\"],
     highRiskExtensions: [".ps1"],
     maxReadBytes: 10_000,
     backupRoot: backups
@@ -79,6 +81,7 @@ try {
   });
   assert.equal(denied.status, 409);
   assert.equal(await readFile(target, "utf8"), "before\n");
+  assert.deepEqual(await readdir(backups).catch(() => []), [], "an unapproved write must not create a backup artifact");
 
   const approved = await fetch(`${baseUrl}/write`, {
     method: "POST",
@@ -91,6 +94,33 @@ try {
   assert.match(result.diff, /-before/);
   assert.match(result.diff, /\+after/);
   assert.equal(await readFile(result.backupPath, "utf8"), "before\n");
+
+  const approvedAgain = await fetch(`${baseUrl}/write`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: target, content: "after twice\n", approved: true }),
+  });
+  assert.equal(approvedAgain.status, 200);
+  const secondResult = await approvedAgain.json();
+  assert.notEqual(secondResult.backupPath, result.backupPath, "each approved overwrite needs its own attributable backup");
+  assert.equal(await readFile(secondResult.backupPath, "utf8"), "after\n");
+  assert.match(secondResult.diff, /-after/);
+  assert.match(secondResult.diff, /\+after twice/);
+
+  const traversal = await fetch(`${baseUrl}/write`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: path.join(allowed, "..", "outside", "sentinel.ps1"), content: "traversal\n", approved: true }),
+  });
+  assert.equal(traversal.status, 403);
+  assert.equal(await readFile(path.join(outside, "sentinel.ps1"), "utf8"), "outside\n");
+
+  const policyDenied = await fetch(`${baseUrl}/write`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: path.join(allowed, "blocked", "secret.txt"), content: "escaped policy\n", approved: true }),
+  });
+  assert.equal(policyDenied.status, 403);
+  assert.equal(await readFile(path.join(allowed, "blocked", "secret.txt"), "utf8"), "do not touch\n");
 
   let junctionCreated = true;
   const linked = path.join(allowed, "linked");

@@ -145,6 +145,20 @@ test("expert panel runs selected experts with isolated knowledge and synthesis",
   assert.ok(reviews.some(review => review.id === reviewResult.review.id));
 });
 
+/**
+ * Validates that the expert panel correctly reports unknown experts as tool errors
+ * when attempting to run with non-existent experts.
+ *
+ * This test ensures:
+ * - Unknown experts (e.g., "nonexistent") are detected and reported as errors
+ * - The singleTurn function is not called for unknown experts (optimization)
+ * - The error message contains "Unknown expert"
+ *
+ * Assumptions:
+ * - The expert panel plugin has a list of known experts
+ * - The test creates a request with an unknown expert
+ * - Success is indicated by the error event containing the expected error message
+ */
 test("expert panel reports unknown experts as tool errors", async () => {
   let registeredTool;
   const services = {

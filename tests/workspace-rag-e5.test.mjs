@@ -5,6 +5,22 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the RAG system sends purpose-aware embedding requests (with query
+ * vs document prefixes) and correctly persists the embedding model signature for
+ * future compatibility checks.
+ *
+ * This test ensures:
+ * - Query and document embeddings are sent with their respective prefixes
+ * - The embedding signature is persisted and validated
+ * - The embedding service is compatible with the configured model
+ *
+ * Assumptions:
+ * - The RAG plugin's workspace_rag tool sends embedding requests to a CUDA service
+ * - The test creates a temporary workspace and documents, then triggers indexing
+ * - The CUDA service returns the correct embedding signature and model information
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 test("workspace-rag sends purpose-aware requests and persists the embedding signature", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

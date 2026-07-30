@@ -117,7 +117,7 @@ function textFromMessage(message) {
  * - The WebUI serves on http://127.0.0.1:19778 by default
  */
 
-test("T2-E2E-020 complete Windows first-run configures hidden secrets and starts Docker-backed services", {
+test("E2E-008 / T2-E2E-020 complete Windows first-run configures hidden secrets and starts Docker-backed services", {
   skip: fullEnabled
     ? false
     : "requires the three lifecycle opt-ins on a dedicated disposable Windows host",

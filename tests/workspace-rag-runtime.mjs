@@ -271,6 +271,19 @@ async function main() {
     assert.ok(singleFileSearchResult.hits.length >= 1);
     assert.match(singleFileSearchResult.hits[0].text, /SoloBeacon retry budget is 7 attempts/);
 
+    const deleteContextEvents = [];
+    for await (const event of registeredTool.executor.execute({
+      action: "delete_context",
+      contextId: "single-note",
+    }, toolCtx)) {
+      deleteContextEvents.push(event);
+    }
+    const deleteContextResult = deleteContextEvents.find(event => event.type === "result")?.value;
+    assert.ok(!deleteContextResult.config.contexts.some(context => context.id === "single-note"));
+    assert.equal(deleteContextResult.status.state, "idle");
+    const persistedConfig = JSON.parse(await readFile(path.join(workspaceDir, "cortex-rag.json"), "utf8"));
+    assert.ok(!persistedConfig.contexts.some(context => context.id === "single-note"));
+
     const selectDefaultEvents = [];
     for await (const event of registeredTool.executor.execute({
       action: "select_context",

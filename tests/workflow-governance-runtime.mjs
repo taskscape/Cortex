@@ -139,6 +139,10 @@ async function main() {
   assert.ok(services.WorkflowRegistry, "WorkflowRegistry should be registered");
   assert.ok(services.WorkflowRunner, "WorkflowRunner should be registered");
   assert.ok(services.WorkflowCompiler, "WorkflowCompiler should be registered");
+  const emptyShadowReport = await collectTool(workflowTool, { action: "shadow_report" });
+  assert.deepEqual(emptyShadowReport.summary, {
+    total: 0, accepted: 0, rejected: 0, mixed: 0, unlabeled: 0, acceptanceRate: 0, byWorkflow: [],
+  });
 
   const invalidDefinition = await collectTool(workflowTool, {
     action: "validate",
@@ -343,12 +347,40 @@ async function main() {
   assert.deepEqual(compared.comparison.proposedToolNames, ["file_broker_action"]);
   assert.deepEqual(compared.comparison.sourceIds, [source.id]);
   assert.equal(typeof compared.comparison.recommendationHash, "string");
+  const comparisonEventsBeforeRepeat = (await collectTool(workflowTool, { action: "inspect_run", runId: shadow.id }))
+    .events.filter(event => event.eventType === "shadow_result_compared");
+  const repeatedComparison = await collectTool(workflowTool, {
+    action: "compare_shadow_result", runId: shadow.id, labels: ["accepted"],
+  });
+  assert.equal(repeatedComparison.comparison.id, compared.comparison.id);
+  const comparisonEventsAfterRepeat = (await collectTool(workflowTool, { action: "inspect_run", runId: shadow.id }))
+    .events.filter(event => event.eventType === "shadow_result_compared");
+  assert.equal(comparisonEventsAfterRepeat.length, comparisonEventsBeforeRepeat.length, "repeating the same decision must be idempotent");
 
   const shadowReport = await collectTool(workflowTool, { action: "shadow_report" });
   assert.equal(shadowReport.summary.total, 1);
   assert.equal(shadowReport.summary.accepted, 1);
   assert.equal(shadowReport.summary.acceptanceRate, 1);
   assert.equal(shadowReport.comparisons[0].runId, shadow.id);
+
+  const shadowWithLabels = async labels => {
+    const run = await collectTool(workflowTool, {
+      action: "start", workspaceId: "default", workflowId: draft.definition.id, mode: "shadow",
+      inputs: { ticketId: `T-${labels.join("-")}` }, evidenceSourceIds: [source.id],
+      proposedActions: [{ toolName: "file_broker_action", input: { action: "write", path: "outbox/labels.txt", content: "hello" }, capability: "write", connectorInstanceId: "connector-instance:file-broker:local", sourceIds: [source.id] }],
+    });
+    return collectTool(workflowTool, { action: "compare_shadow_result", runId: run.id, labels, note: "label matrix" });
+  };
+  const rejectedShadow = await shadowWithLabels(["reject"]);
+  const mixedShadow = await shadowWithLabels(["accepted", "reject"]);
+  assert.equal(rejectedShadow.comparison.outcome, "rejected");
+  assert.equal(mixedShadow.comparison.outcome, "mixed");
+  const aggregateShadowReport = await collectTool(workflowTool, { action: "shadow_report" });
+  assert.deepEqual(aggregateShadowReport.summary, {
+    total: 3, accepted: 1, rejected: 1, mixed: 1, unlabeled: 0, acceptanceRate: 1 / 3,
+    byWorkflow: aggregateShadowReport.summary.byWorkflow,
+  });
+  assert.ok(aggregateShadowReport.summary.byWorkflow[0].acceptanceRate >= 0 && aggregateShadowReport.summary.byWorkflow[0].acceptanceRate <= 1);
 
   const shadowInspection = await collectTool(workflowTool, { action: "inspect_run", runId: shadow.id });
   assert.ok(shadowInspection.events.some(event => event.eventType === "shadow_result_compared"));

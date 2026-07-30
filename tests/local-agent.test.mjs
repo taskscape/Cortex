@@ -56,6 +56,25 @@ test("file index stores searchable text with path metadata", async () => {
   }
 });
 
+/**
+ * Validates that the file index resolution logic enforces workspace root boundaries
+ * and prevents access to directories outside the configured workspace roots.
+ *
+ * This test ensures:
+ * - Index roots must be within configured workspace roots
+ * - Subtrees of configured roots are allowed
+ * - Direct access to paths outside configured roots is rejected
+ * - Path traversal attempts (e.g., using ..) are blocked
+ * - No configured roots means nothing is indexable
+ * - Windows junctions cannot be used to escape the root directory
+ *
+ * Assumptions:
+ * - The resolveIndexRoot() function validates paths against configured roots
+ * - The test creates temporary directories inside and outside the configured root
+ * - A Windows junction can be created to test symlink-based escaping
+ * - Success is indicated by appropriate rejections for invalid paths and
+ *   allowance of valid paths
+ */
 test("file index rejects index roots outside the configured workspace roots", async () => {
   const configured = await mkdtemp(path.join(os.tmpdir(), "local-agent-root-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "local-agent-outside-"));
@@ -89,6 +108,23 @@ test("file index rejects index roots outside the configured workspace roots", as
   }
 });
 
+/**
+ * Validates that the file broker security policy is applied consistently to all
+ * indexed files, blocking access to sensitive files and directories.
+ *
+ * This test ensures:
+ * - Files matching high-risk extensions (e.g., .env, .pem, .key) are skipped
+ * - Files in denied path fragments (e.g., .ssh) are not indexed
+ * - High-risk files are never exposed in search results
+ * - Skipped files are recorded with appropriate reasons
+ *
+ * Assumptions:
+ * - The indexRoot() function applies the security policy from the broker config
+ * - The test creates files with various risk levels (normal, high-risk, in denied paths)
+ * - The searchChunks() function queries the index
+ * - Success is indicated by only safe files being indexed and high-risk files being
+ *   rejected with appropriate reasons
+ */
 test("file index applies the broker security policy to every indexed file", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-policy-"));
   await mkdir(path.join(root, ".ssh"), { recursive: true });
@@ -123,6 +159,22 @@ test("file index applies the broker security policy to every indexed file", asyn
   }
 });
 
+/**
+ * Validates that exclusion patterns correctly match Windows-style paths and prune
+ * entire directory trees while avoiding over-pruning similar directory names.
+ *
+ * This test ensures:
+ * - Exclusion patterns match Windows-style paths (with backslashes)
+ * - Whole directories are pruned (their files are not individually reported)
+ * - Similar directory names (e.g., "node_modules" vs "source") are not over-pruned
+ * - Pruned directories are not walked, saving traversal time
+ *
+ * Assumptions:
+ * - The indexRoot() function uses minimatch with backslash-separated patterns
+ * - The test creates directories that should be excluded and directories that should
+ *   be included
+ * - Success is indicated by correct directory pruning and file indexing behavior
+ */
 test("file index exclusion patterns match Windows-style paths and prune whole directories", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-exclude-"));
   await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
@@ -158,6 +210,24 @@ test("file index exclusion patterns match Windows-style paths and prune whole di
   }
 });
 
+/**
+ * Validates that credential values are redacted (replaced with placeholders) while
+ * the rest of the file content remains searchable, instead of discarding the entire
+ * file when a potential credential is found.
+ *
+ * This test ensures:
+ * - Files containing credential-like values are not discarded
+ * - Credential values are replaced with a placeholder (e.g., [redacted])
+ * - Non-credential content in the same file remains indexed
+ * - False positives (e.g., type declarations, placeholders) are not treated as secrets
+ *
+ * Assumptions:
+ * - The indexRoot() function detects credential patterns in file content
+ * - The test creates files with actual credentials, false positives, and normal content
+ * - The redaction is reported in the chunk's redactions count
+ * - Success is indicated by files with credentials being indexed with redactions and
+ *   the redacted values not being searchable
+ */
 test("file index redacts credential values instead of discarding the whole file", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-redact-"));
   await writeFile(path.join(root, "config.md"), [
@@ -201,6 +271,24 @@ test("file index redacts credential values instead of discarding the whole file"
   }
 });
 
+/**
+ * Validates that the file indexing process continues gracefully when encountering
+ * directories that become unreadable mid-walk (e.g., due to race conditions, permission
+ * changes, or deletion), rather than failing the entire run.
+ *
+ * This test ensures:
+ * - The indexer handles ENOENT/EPERM/EBUSY errors during directory traversal
+ * - Readable parts of the file system are still indexed even when some directories
+ *   are inaccessible
+ * - No partial failures leave the system in an inconsistent state
+ *
+ * Assumptions:
+ * - The indexRoot() function uses a generator that yields chunks incrementally
+ * - The test creates a directory that is removed between the parent listing and
+ *   its own readdir to simulate mid-walk failures
+ * - Success is indicated by the readable part of the file system being indexed
+ *   despite the error
+ */
 test("file index survives an unreadable directory instead of failing the whole run", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "local-agent-unreadable-"));
   await mkdir(path.join(root, "readable"), { recursive: true });
@@ -228,6 +316,20 @@ test("file index survives an unreadable directory instead of failing the whole r
   }
 });
 
+/**
+ * Validates that the workspace configuration continues to honor the legacy
+ * "excludedPatterns" key after the rename to "indexExcludedPatterns".
+ *
+ * This test ensures:
+ * - The new "indexExcludedPatterns" key works correctly
+ * - The legacy "excludedPatterns" key still works for backward compatibility
+ * - Empty configuration returns an empty array
+ *
+ * Assumptions:
+ * - The indexExclusions() function handles both key names
+ * - Success is indicated by the function returning the correct patterns
+ *   for each configuration variant
+ */
 test("workspace config honours the pre-rename excludedPatterns key", () => {
   assert.deepEqual(indexExclusions({ roots: [], indexExcludedPatterns: ["**\\dist\\**"] }), ["**\\dist\\**"]);
   assert.deepEqual(indexExclusions({ roots: [], excludedPatterns: ["**\\legacy\\**"] }), ["**\\legacy\\**"],
@@ -235,6 +337,22 @@ test("workspace config honours the pre-rename excludedPatterns key", () => {
   assert.deepEqual(indexExclusions({ roots: [] }), []);
 });
 
+/**
+ * Validates that the file broker's access evaluation correctly blocks writes outside
+ * configured workspace roots while allowing writes within them.
+ *
+ * This test ensures:
+ * - Writes to paths outside configured roots are blocked
+ * - Writes to paths within configured roots are allowed
+ * - High-risk files (e.g., .env) are identified regardless of path
+ *
+ * Assumptions:
+ * - The evaluateAccess() function checks write permissions against the workspace
+ *   configuration and security policy
+ * - The test creates a configuration with specific roots and policies
+ * - Success is indicated by the access evaluation returning the correct allowed/highRisk
+ *   flags for each path
+ */
 test("file broker blocks writes outside configured roots and allows project writes", () => {
   const workspaces = {
     roots: [{ path: "C:\\Projects", mode: "read-write", type: "projects" }],
@@ -252,6 +370,36 @@ test("file broker blocks writes outside configured roots and allows project writ
   assert.equal(evaluateAccess("C:\\Projects\\Bot\\.env", "write", workspaces, policy).highRisk, true);
 });
 
+/**
+ * Validates that the file broker's configuration cache correctly reuses unchanged
+ * configuration values and reloads the configuration file when it changes.
+ *
+ * This test ensures:
+ * - The cache returns the same configuration instance when the file hasn't changed
+ * - The cache detects file modifications and reloads the configuration
+ * - The configuration file is only re-read when necessary
+ *
+ * Assumptions:
+ * - The ReloadingConfig class implements caching with file modification detection
+ * - The test creates a temporary configuration file and modifies it
+ * - Success is indicated by the cache behavior matching the expected pattern
+ *   (reuse unchanged, reload changed)
+ */
+/**
+ * Validates that the file broker's configuration cache correctly reuses unchanged
+ * configuration values and reloads the configuration file when it changes.
+ *
+ * This test ensures:
+ * - The cache returns the same configuration instance when the file hasn't changed
+ * - The cache detects file modifications and reloads the configuration
+ * - The configuration file is only re-read when necessary
+ *
+ * Assumptions:
+ * - The ReloadingConfig class implements caching with file modification detection
+ * - The test creates a temporary configuration file and modifies it
+ * - Success is indicated by the cache behavior matching the expected pattern
+ *   (reuse unchanged, reload changed)
+ */
 test("file broker config cache reuses unchanged values and reloads changed files", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "file-broker-config-"));
   const configPath = path.join(root, "config.json");
@@ -330,6 +478,23 @@ test("file writer creates a backup and a diff for overwrites", async () => {
   }
 });
 
+/**
+ * Validates that the hybrid ranking function deduplicates entries that have the
+ * same sourceType and sourceUuid, keeping the entry with the highest confidence.
+ *
+ * This test ensures:
+ * - Entries from the same source (e.g., same file) are deduplicated
+ * - The entry with the highest confidence is kept
+ * - Entries from different sources (e.g., different source types) are kept separately
+ *
+ * Assumptions:
+ * - The mergeRankAndDeduplicate() function takes an array of knowledge entries
+ *   and returns a deduplicated list
+ * - The test creates entries that should be deduplicated (same source) and entries
+ *   that should be kept (different sources)
+ * - Success is indicated by the output having the expected number of entries
+ *   with the correct content
+ */
 test("hybrid ranking deduplicates entries", () => {
   const ranked = mergeRankAndDeduplicate([
     knowledgeEntry({ id: "file-index:a", content: "same", sourceType: "file-index", sourceUuid: "a", confidence: 2 }),
@@ -341,6 +506,22 @@ test("hybrid ranking deduplicates entries", () => {
   assert.equal(ranked[0].content, "same");
 });
 
+/**
+ * Validates that Mem0 identities are isolated per Cortex workspace by ensuring
+ * that each workspace gets a unique user ID for Mem0 requests.
+ *
+ * This test ensures:
+ * - Each Cortex workspace gets a unique Mem0 user ID (workspace-scoped)
+ * - The same workspace always gets the same user ID (deterministic)
+ * - Different workspaces get different user IDs (isolation)
+ *
+ * Assumptions:
+ * - The workspaceScopedMem0UserId() function generates unique IDs per workspace
+ * - The workspaceIdFromConfigPath() function extracts a stable ID from a config path
+ * - The test creates three workspaces: default, alpha, and beta
+ * - Success is indicated by the user ID function returning the expected values
+ *   for each workspace and distinct values for different workspaces
+ */
 test("Mem0 identities are isolated for every Cortex workspace", () => {
   const root = path.join(os.tmpdir(), "cortex", "local-agent", "matbot");
   const rootConfig = path.join(root, "matbot.yaml");
@@ -357,6 +538,22 @@ test("Mem0 identities are isolated for every Cortex workspace", () => {
   );
 });
 
+/**
+ * Validates that Mem0 add and search requests include the workspace-scoped user ID
+ * and workspace metadata in the request body.
+ *
+ * This test ensures:
+ * - Mem0 add requests include the workspace-scoped user_id and metadata.workspaceId
+ * - Mem0 search requests include the workspace-scoped user_id
+ * - The identity is correctly propagated to all Mem0 API calls
+ *
+ * Assumptions:
+ * - The Mem0Client class sends requests to a remote Mem0 API server
+ * - The test creates a mock HTTP server that captures all requests
+ * - The test adds a memory and performs a search under a specific workspace
+ * - Success is indicated by the captured requests containing the correct
+ *   user_id and workspaceId values
+ */
 test("Mem0 add and search requests carry the workspace-scoped identity", async () => {
   const requests = [];
   const server = createServer(async (request, response) => {

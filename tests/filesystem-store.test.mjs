@@ -24,6 +24,24 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the filesystem store correctly persists and retrieves record IDs
+ * containing special characters that would normally be invalid for file names
+ * (e.g., slashes, colons, Unicode characters).
+ *
+ * This test ensures:
+ * - Record IDs with non-file-name-safe characters are encoded or escaped correctly
+ * - The store can persist, retrieve, and delete records with such IDs
+ * - No data corruption or loss occurs due to the ID encoding
+ * - Cross-platform compatibility (Windows vs Unix path separators)
+ *
+ * Assumptions:
+ * - The filesystem store uses file paths to store record data
+ * - The runtime script creates records with specially crafted IDs that would fail
+ *   on typical file systems (e.g., containing path separators)
+ * - The store's encoding layer properly handles these IDs
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 test("filesystem store persists record ids that are not file-name safe", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

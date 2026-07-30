@@ -49,7 +49,7 @@ function declaredScenarioIds(markdown) {
 function scenarioIdsInTestTitles(source) {
   const ids = [];
   for (const line of source.split(/\r?\n/)) {
-    const title = /\b(?:test|it)(?:\.[a-z]+)?\(\s*( ["'`])([^"'`]+)\1/.exec(line)?.[2];
+    const title = /\b(?:test|it)(?:\.[a-z]+)?\(\s*(["'`])([^"'`]+)\1/.exec(line)?.[2];
     if (!title) continue;
     ids.push(...title.matchAll(/\b(?:T[23]-)?E2E-\d{3}\b/g));
   }

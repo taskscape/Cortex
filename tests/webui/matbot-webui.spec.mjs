@@ -143,7 +143,7 @@ test("default file broker tool reads host files through the WebUI transport", as
   expect(result.content).toContain("C:\\Projects\\Cortex\\readme.md");
 });
 
-test("architecture source and connector health tools work through the WebUI transport", async ({ page, isMobile }) => {
+test("MISSING-13 architecture source and connector health tools work through the WebUI transport", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop architecture direct tool coverage");
   await page.goto("/");
 
@@ -361,6 +361,17 @@ test("architecture product panels expose sources, SQL approval, workflow approva
       input: expect.objectContaining({ query: { where: { op: "eq", field: "workspaceId", value: "default" } } })
     })
   ]));
+});
+
+test("MISSING-15 applies install-scoped branding consistently without unsafe HTML", async ({ page }) => {
+  await page.route("**/branding", route => route.fulfill({ contentType: "application/json", body: JSON.stringify({
+    productName: "Northstar", title: "Northstar Console", brand: "#123abc", brandStrong: "#102030", brandSoft: "#eaf1ff",
+  }) }));
+  await page.goto("/");
+  await expect(page.locator("#brand-title")).toHaveText("Northstar");
+  await expect(page.locator("#input")).toHaveAttribute("placeholder", "Ask Northstar...");
+  await expect(page).toHaveTitle("Northstar Console");
+  await expect(page.locator("html")).toHaveCSS("--brand", "#123abc");
 });
 
 test("architecture sources render before the health report finishes", async ({ page, isMobile }) => {
@@ -617,7 +628,7 @@ test("E2E-016 workflow compiler publishes a library entry and starts an approval
   await expect(page.locator("#architecture-approval-list")).toContainText("Write/admin tool requires approval");
 });
 
-test("workflow shadow lab records a human outcome and refreshes readiness metrics", async ({ page, isMobile }) => {
+test("MISSING-08 workflow shadow lab records a human outcome and refreshes readiness metrics", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workflow shadow coverage");
   await page.goto("/");
   const shadowRunId = await page.evaluate(async () => {
@@ -713,7 +724,7 @@ test("workflow operations center keeps partial data usable and refreshes a faile
   await expect(page.locator("#workflow-ops-library-list")).toContainText("Recovery Workflow");
 });
 
-test("evaluation observability and ROI panel traces replay regressions and sponsor evidence", async ({ page, isMobile }) => {
+test("MISSING-09 evaluation observability and ROI panel traces replay regressions and sponsor evidence", async ({ page, isMobile }) => {
   await page.goto("/");
   if (isMobile) await page.locator("#burger").click();
 
@@ -845,7 +856,7 @@ test("workspace selector lists, creates, renames, and switches workspaces", asyn
   await page.evaluate(async () => window.matbotTransport.switchWorkspace("default"));
 });
 
-test("workspace RAG configuration panel saves paths and shows indexing progress", async ({ page, isMobile }) => {
+test("MISSING-03/MISSING-12 workspace RAG configuration panel saves paths and shows indexing progress", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workspace RAG coverage");
   await page.goto("/");
 
@@ -975,7 +986,7 @@ test("remembered facts are isolated between Cortex workspaces", async ({ page, i
   await page.evaluate(async id => window.matbotTransport.deleteWorkspace(id), secondWorkspace.id);
 });
 
-test("memory browser command follows Inner voice and opens the in-page browser", async ({ page, isMobile }) => {
+test("MISSING-11 memory browser command follows Inner voice and opens the in-page browser", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory browser coverage");
   await page.goto("/");
   await page.locator("#new-btn").click();
@@ -1031,6 +1042,46 @@ test("memory browser command follows Inner voice and opens the in-page browser",
   await page.waitForTimeout(100);
   expect(popups).toHaveLength(0);
   await expect(page.locator("#memory-browser-status")).toHaveText("");
+});
+
+test("MISSING-11 standalone memory browser loads, creates, edits, filters, and deletes through its own base URL", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop standalone memory browser coverage");
+  await page.goto("http://127.0.0.1:19788/");
+  await expect(page.locator("#count-label")).toContainText("0");
+  await expect(page.locator("#search-input")).toHaveAttribute("placeholder", "Search remembered facts");
+  await page.locator("#new-fact").fill("Standalone browser verification marker");
+  await page.locator("#add-memory-btn").click();
+  await expect(page.locator("#memory-list")).toContainText("Standalone browser verification marker");
+  await page.locator("#state-filter").selectOption("unprocessed");
+  await expect(page.locator("#memory-list")).toContainText("Standalone browser verification marker");
+  const memoryButton = page.locator("#memory-list button").first();
+  const selectedId = await memoryButton.getAttribute("data-id");
+  const selectedResponse = page.waitForResponse(response => response.url().endsWith(`/api/memories/${encodeURIComponent(selectedId)}`) && response.request().method() === "GET");
+  await memoryButton.click();
+  await selectedResponse;
+  await expect(page.locator("#fact-input")).toHaveValue("Standalone browser verification marker");
+  await page.locator("#fact-input").fill("Standalone browser verification marker revised");
+  await page.locator("#save-btn").click();
+  await expect(page.locator("#status")).toHaveText("Saved.");
+  await expect(page.locator("#memory-list")).toContainText("revised");
+  const id = await page.locator("#memory-title").textContent();
+  const version = await page.locator("#version").inputValue();
+  await page.locator("#fact-input").fill("Standalone browser local stale edit");
+  await page.evaluate(async ({ id, version }) => {
+    await fetch(`/api/memories/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected: version, fact: "Standalone browser server edit" }),
+    });
+  }, { id, version });
+  await page.locator("#save-btn").click();
+  await expect(page.locator("#status")).toContainText("Version conflict");
+  await expect(page.locator("#fact-input")).toHaveValue("Standalone browser server edit");
+  await page.locator("#fact-input").fill("Standalone browser conflict resolved");
+  await page.locator("#save-btn").click();
+  await expect(page.locator("#status")).toHaveText("Saved.");
+  page.once("dialog", dialog => dialog.accept());
+  await page.locator("#delete-btn").click();
+  await expect(page.locator("#memory-list")).not.toContainText("Standalone browser conflict resolved");
 });
 
 test("in-page memory browser can create, edit, search, and delete memories", async ({ page, isMobile }) => {
@@ -1298,6 +1349,19 @@ test("uploads and deletes workspace files through the files panel", async ({ pag
   await reserved.locator(".file-action-btn").click();
   await expect(reserved).toHaveCount(0);
   await expect(page.locator("#attachment-tray")).toBeHidden();
+});
+
+test("MISSING-05 plugin discovery returns stable compatible entries before runtime activation", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop plugin discovery coverage");
+  await page.goto("/");
+  const discovered = await page.evaluate(() => window.matbotTransport.callTool("plugin", { action: "discover_local" }));
+  const background = discovered.find(entry => entry.specifier === "./packages/plugins/background");
+  expect(background).toBeTruthy();
+  expect(background.configuredVia).toBeUndefined();
+  expect(Array.isArray(background.matbotRuntime)).toBeTruthy();
+  expect(background.matbotRuntime).toContain("node");
+  await openPlugins(page);
+  await expect(page.locator(".plugin-entry-inactive", { hasText: "@matatbread/matbot-tool-background" })).toBeVisible();
 });
 
 test("attaches an uploaded workspace file to a message and prefers it over a matching RAG host path", async ({ page, isMobile }) => {

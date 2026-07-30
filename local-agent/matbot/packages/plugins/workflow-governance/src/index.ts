@@ -1260,7 +1260,15 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     if (run.mode !== 'shadow') throw new Error(`Workflow run "${runId}" is not a shadow-mode run.`);
     let updatedRun = run;
     const normalized = normalizedLabels(labels);
-    if (normalized.length > 0) {
+    const labelsChanged = normalized.some(label => !run.labels.includes(label));
+    const comparisonId = hashId('workflow-shadow-comparison', [run.id]);
+    const existingComparison = await this.shadowComparisonsStore.get(comparisonId);
+    if (!labelsChanged && existingComparison !== null && note === undefined) {
+      // Repeating the same decision is idempotent: preserve the immutable
+      // comparison/event history rather than emitting a second decision event.
+      return { run, comparison: existingComparison };
+    }
+    if (labelsChanged) {
       updatedRun = await this.updateRun({
         ...run,
         labels: uniq([...run.labels, ...normalized]),

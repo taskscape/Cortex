@@ -68,6 +68,7 @@ def health():
         "signature": signature,
         "dimensions": dimensions,
         "maxTokens": max_tokens,
+        "batchSize": BATCH_SIZE,
         "normalized": True,
         "queryPrefix": QUERY_PREFIX,
         "documentPrefix": DOCUMENT_PREFIX,

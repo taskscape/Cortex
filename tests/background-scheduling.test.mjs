@@ -24,7 +24,26 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-test("E2E-020 / T2-E2E-006 background scheduling is persistent, manageable, principal-bound, and workspace-isolated", async () => {
+/**
+ * Validates that background scheduling correctly creates and manages scheduled tasks
+ * with persistence, principal-bound execution, and workspace isolation.
+ *
+ * This test ensures:
+ * - Background schedules validate duration parameters (e.g., minimum interval)
+ * - Schedule lifecycle state is persisted (created, running, completed, failed)
+ * - Bulk cancellation is prevented for safety (must cancel individually)
+ * - Schedules are isolated per workspace (cannot access other workspace schedules)
+ * - Scheduled tasks run with the correct principal (user identity)
+ * - Schedule state survives runtime restarts
+ *
+ * Assumptions:
+ * - The runtime script creates background schedules, verifies their state, and tests
+ *   the cancellation safety mechanism
+ * - Schedule state is stored in a durable backend (e.g., filesystem or database)
+ * - The workspace isolation boundary prevents cross-workspace schedule access
+ * - Success is indicated by the runtime output containing the expected success message
+ */
+test("E2E-020 / T2-E2E-006 / MISSING-10 background scheduling is persistent, manageable, principal-bound, and workspace-isolated", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

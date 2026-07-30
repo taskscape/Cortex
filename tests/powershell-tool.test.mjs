@@ -23,6 +23,23 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the PowerShell tool can execute PowerShell scripts under the Matbot
+ * runtime and correctly capture their output (stdout, stderr, exit code).
+ *
+ * This test ensures:
+ * - PowerShell scripts can be submitted and executed through the tool
+ * - The tool captures stdout and stderr from the script
+ * - Exit codes are properly reported
+ * - Script execution is isolated and secure
+ *
+ * Assumptions:
+ * - The test runs on Windows (process.platform === "win32")
+ * - PowerShell is installed and accessible
+ * - The runtime script creates a simple PowerShell script and submits it
+ * - The tool executes the script and returns its output
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 test("powershell tool runs scripts under the Matbot TypeScript loader", { skip: process.platform !== "win32" }, async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

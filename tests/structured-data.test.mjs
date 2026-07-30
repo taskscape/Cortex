@@ -23,6 +23,24 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the structured-data runtime enforces SQL approval expiry and governed
+ * SQL boundaries, ensuring that SQL queries are safe and properly authorized.
+ *
+ * This test ensures:
+ * - SQL queries must be explicitly approved before execution (approval workflow)
+ * - Approvals have an expiry time and are invalidated after expiration
+ * - Generated SQL is governed by the configured boundaries (allowed tables, columns)
+ * - The SQL plan is validated against the database schema before execution
+ * - Unauthorized or unsafe SQL is rejected (no DROP, ALTER, etc.)
+ *
+ * Assumptions:
+ * - The structured-data plugin implements an approval workflow for SQL generation
+ * - The runtime script creates SQL plans and validates them against the governance rules
+ * - The approval system stores approvals with expiry timestamps
+ * - The database schema is known and the plugin can validate queries against it
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 test("E2E-015 / T3-E2E-015 structured-data runtime enforces approval expiry and governed SQL boundaries", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

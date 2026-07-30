@@ -22,6 +22,22 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validates that the connector fabric runtime correctly enforces connector grants
+ * and access control under the Matbot TypeScript loader.
+ *
+ * This test ensures:
+ * - The connector fabric plugin loads and executes correctly under the Matbot runtime
+ * - Connector grants define access permissions for data sources
+ * - Access requests are validated against the configured grants
+ * - Unauthorized access attempts are rejected
+ *
+ * Assumptions:
+ * - The connector-fabric plugin implements a grant-based access control system
+ * - The runtime script tests various access scenarios (allowed and denied)
+ * - The plugin correctly enforces access control rules
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 test("connector-fabric runtime flow passes under the Matbot TypeScript loader", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

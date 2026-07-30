@@ -390,7 +390,8 @@ function workflowIdsFromEvent(event: ObservabilityEvent): string[] {
   return uniq(ids);
 }
 
-function pricedCost(attributes: Record<string, unknown> | undefined): number {
+/** Deterministic token-cost calculation used by trace aggregation and pricing-contract tests. */
+export function pricedCost(attributes: Record<string, unknown> | undefined): number {
   const direct = asNumber(attributes?.['costUsd']);
   if (direct > 0) return direct;
   const model = attributes?.['model'];
@@ -404,8 +405,12 @@ function pricedCost(attributes: Record<string, unknown> | undefined): number {
     const input = asNumber(attributes?.['inputTokens']);
     const output = asNumber(attributes?.['outputTokens']);
     const cached = asNumber(attributes?.['cacheReadTokens']);
+    const inputRate = asNumber(price['inputPerMillionUsd']);
+    const cachedRate = asNumber(price['cachedInputPerMillionUsd'], inputRate);
+    const outputRate = asNumber(price['outputPerMillionUsd']);
+    if ([input, output, cached, inputRate, cachedRate, outputRate].some(value => value < 0)) return 0;
     const uncachedInput = Math.max(0, input - cached);
-    return (uncachedInput * asNumber(price['inputPerMillionUsd']) + cached * asNumber(price['cachedInputPerMillionUsd'], asNumber(price['inputPerMillionUsd'])) + output * asNumber(price['outputPerMillionUsd'])) / 1_000_000;
+    return (uncachedInput * inputRate + cached * cachedRate + output * outputRate) / 1_000_000;
   } catch {
     return 0;
   }

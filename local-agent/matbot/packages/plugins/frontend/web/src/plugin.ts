@@ -3,7 +3,7 @@ import { PLUGIN_API_VERSION }                from '@matatbread/matbot-plugin-api
 import { watchPlugins }                      from '@matatbread/matbot-core';
 // Type import also brings the `SkillManager` augmentation of MatbotMachine into scope.
 import type { SkillManager }                 from '@matatbread/matbot-skills';
-import { createWebServer, defaultWebPrincipal } from './server.js';
+import { createWebServer, defaultWebPrincipal, parseWebBranding } from './server.js';
 import type { WorkspaceManager, WorkspaceRagManager, SessionTitler } from './server.js';
 import process                               from 'node:process';
 
@@ -79,6 +79,7 @@ export const plugin: MatbotPluginSpec = {
       sessionTitler:       () => services.get?.('SessionTitler' as never) as SessionTitler | undefined,
       // Look up the resolver per request so an override registered in any load order takes effect.
       resolvePrincipal: (req) => (services.WebPrincipalResolver ?? defaultWebPrincipal)(req),
+      branding: parseWebBranding(),
       ...(services.workdir    !== undefined ? { workdir:    services.workdir    } : {}),
       ...(services.files      !== undefined ? { files:      services.files      } : {}),
       ...(services.configPath !== undefined ? { configPath: services.configPath } : {}),

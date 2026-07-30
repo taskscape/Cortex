@@ -147,6 +147,13 @@ async function main() {
     provenance: { activityId: "test:scan" },
   });
   assert.equal(versionA.id, versionB.id);
+  const versionC = await registry.upsertVersion({
+    sourceId,
+    contentHash: "def",
+    observedAt: "2026-01-03T00:00:00.000Z",
+    provenance: { activityId: "test:rescan" },
+  });
+  assert.notEqual(versionC.id, versionA.id, "changed content must retain a distinct source version");
 
   const healthySource = await registry.upsertSource({
     workspaceId: "default",
@@ -165,9 +172,17 @@ async function main() {
     provenance: { activityId: "test:scan" },
   });
 
+  await registry.recordHealth({ sourceId, state: "healthy", message: "recovered" });
   await registry.recordHealth({ sourceId, state: "degraded", message: "read failed" });
-  assert.equal((await registry.getSource(sourceId)).healthState, "degraded");
-  await registry.recordAccess({ sourceId, action: "retrieve", allowed: true });
+  await registry.recordHealth({ sourceId, state: "down", message: "connector unavailable" });
+  assert.equal((await registry.getSource(sourceId)).healthState, "down");
+  const auditTimestamp = "2026-01-04T00:00:00.000Z";
+  await registry.recordAccess({ sourceId, action: "read", allowed: true, sourceVersionId: versionC.id, principalId: "source-auditor", timestamp: auditTimestamp });
+  await registry.recordAccess({ sourceId, action: "retrieve", allowed: true, sourceVersionId: versionC.id, principalId: "source-auditor" });
+  await registry.recordAccess({ sourceId, action: "cite", allowed: true, sourceVersionId: versionC.id, principalId: "source-auditor" });
+  await registry.recordAccess({ sourceId, action: "write", allowed: false, principalId: "source-auditor", message: "password=source-secret" });
+  await registry.recordAccess({ sourceId, action: "delete", allowed: false, principalId: "source-auditor" });
+  await registry.recordAccess({ sourceId, action: "health_check", allowed: true, principalId: "source-auditor" });
 
   servicesByKey.set("ConnectorRegistry", {
     async queryInstances() {
@@ -200,8 +215,16 @@ async function main() {
   assert.equal(stale.sources[0].id, sourceId);
 
   const events = await collectTool(sourceTool, { action: "events", sourceId });
-  assert.equal(events.access.length, 1);
-  assert.equal(events.health.length, 1);
+  assert.equal(events.access.length, 6);
+  assert.equal(events.health.length, 3);
+  assert.deepEqual(events.health.map(event => event.state), ["healthy", "degraded", "down"]);
+  assert.equal((await registry.accessEvents(sourceId)).find(event => event.action === "cite")?.sourceVersionId, versionC.id);
+  const accessAudit = await registry.accessEvents(sourceId);
+  assert.deepEqual(accessAudit.map(event => event.action), ["read", "retrieve", "cite", "write", "delete", "health_check"]);
+  assert.equal(accessAudit[0].timestamp, auditTimestamp);
+  assert.ok(accessAudit.every(event => event.principalId === "source-auditor"));
+  assert.ok(accessAudit.every(event => event.sourceVersionId === versionC.id || event.action === "write" || event.action === "delete" || event.action === "health_check"));
+  assert.doesNotMatch(JSON.stringify(accessAudit), /source-secret/);
 
   const healthTool = tools.get("source_health_action");
   const versionStore = stores.get("source_versions");
@@ -210,17 +233,17 @@ async function main() {
   assert.equal(report.healthySources, 1);
   assert.equal(report.staleSources, 1);
   assert.equal(report.unhealthySources, 1);
-  assert.equal(report.warningCount, 2);
-  assert.equal(report.criticalCount, 0);
+  assert.equal(report.warningCount, 1);
+  assert.equal(report.criticalCount, 1);
   assert.equal(report.findings.length, 2);
-  assert.deepEqual(report.findings.map(finding => finding.issueType).sort(), ["degraded", "stale"]);
-  assert.equal(report.findings[0].sourceVersionId, versionA.id);
+  assert.deepEqual(report.findings.map(finding => finding.issueType).sort(), ["down", "stale"]);
+  assert.equal(report.findings.find(finding => finding.sourceId === sourceId)?.sourceVersionId, versionC.id);
   assert.equal(report.connectorHealth.length, 1);
   assert.equal(report.connectorHealth[0].healthState, "degraded");
   assert.equal(versionStore.queryCount, 1, "health evaluation should query source versions once");
 
   const warnings = await collectTool(healthTool, { action: "warnings", workspaceId: "default" });
-  assert.equal(warnings.warningCount, 2);
+  assert.equal(warnings.warningCount, 1);
   assert.equal(warnings.findings.length, 2);
   assert.equal(warnings.connectorHealth.length, 1);
   assert.equal(versionStore.queryCount, 2, "each health evaluation should use one source-version query");

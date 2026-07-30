@@ -22,7 +22,25 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
-test("E2E-005 workflow-governance runtime flow passes under the Matbot TypeScript loader", async () => {
+/**
+ * Validates that workflow governance correctly records workflow executions with
+ * their inputs, outputs, and metadata through an event-sourced architecture,
+ * including approval workflows and audit trails.
+ *
+ * This test ensures:
+ * - Workflow runs are recorded with their inputs, outputs, and metadata
+ * - Approval workflows are enforced before workflow execution (if required)
+ * - Event sourcing captures the complete history of each workflow run
+ * - Workflow state (pending, running, completed, failed) is persisted
+ * - Audit trails can be reconstructed from the event log
+ *
+ * Assumptions:
+ * - The runtime script creates a workflow, submits it for approval (if needed),
+ *   and verifies the event-sourced recording
+ * - Events are stored in a durable append-only log
+ * - Success is indicated by the runtime output containing the expected success message
+ */
+test("E2E-005 / MISSING-08 workflow-governance runtime flow covers shadow labels and approval ledgers", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",
