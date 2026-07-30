@@ -1,3 +1,24 @@
+/**
+ * Production memory runtime validation ensures that memory capture, recall,
+ * dream-time processing, and workspace isolation all work correctly in the
+ * production memory system.
+ *
+ * This test ensures:
+ * - Production memory capture works correctly using the real cognition tool
+ * - Memory recall works between conversations within a workspace
+ * - Memory is isolated across different workspaces (no cross-contamination)
+ * - Dream-time processing works (async memory consolidation after the turn)
+ * - Memory browser CAS (compare-and-swap) conflict handling works correctly
+ * - The test never modifies production workspace memory (verified via SHA-256 checksums)
+ *
+ * Assumptions:
+ * - The runtime script creates temporary test workspaces and manipulates their memory
+ * - Production memory is stored in .data/remembered_facts/, .data/dream_runs/, and
+ *   .data/store_tools/ directories (one per workspace)
+ * - The productionMemorySnapshot() function computes SHA-256 hashes of all memory files
+ *   before and after the test to verify no production data was modified
+ * - Success is indicated by a specific stdout message about all checks passing
+ */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";

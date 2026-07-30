@@ -1,3 +1,24 @@
+/**
+ * HTTP JSON helpers validation ensures that the shared utilities for parsing
+ * and responding with JSON over HTTP work correctly and safely.
+ *
+ * This test ensures:
+ * - isJsonObject() validates that the value is a proper JSON object (not array, null, etc.)
+ * - readJsonBody() validates Content-Type is application/json before parsing
+ * - readJsonBody() enforces maximum body size to prevent DoS
+ * - readJsonBody() validates the parsed JSON shape against a custom validator
+ * - sendJson() sends proper JSON responses with 200 status
+ * - sendJsonError() sends proper error responses with appropriate HTTP status codes
+ * - Content-Type validation returns 415 Unsupported Media Type
+ * - Invalid JSON shape returns 400 Bad Request
+ * - Oversized bodies return 413 Payload Too Large
+ *
+ * Assumptions:
+ * - The test server uses the shared HTTP utilities from http-utils
+ * - The validator function receives the parsed JSON value and returns true/false
+ * - The readJsonBody() function is async and returns the parsed body
+ * - The server correctly handles errors and sends appropriate responses
+ */
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";

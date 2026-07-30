@@ -1,3 +1,23 @@
+/**
+ * E2E-023: User guide contract validation ensures that the userguide.md file
+ * is internally consistent and matches the actual shipped code.
+ *
+ * This test suite validates:
+ * - All relative links in userguide.md resolve to existing files
+ * - All heading anchors referenced in links exist in their target files
+ * - Documented PowerShell commands actually exist in the scripts/ directory
+ * - The documented WebUI port in the user guide matches the actual run.ps1 default
+ * - Documented WebUI labels are present in the actual shipped UI files
+ * - Product limitations and destructive warnings are present and in correct locations
+ * - The localhost safety boundary is documented and matches the production listener
+ *
+ * Assumptions:
+ * - The user guide is in userguide.md at the project root
+ * - PowerShell scripts are in scripts/ with documented names
+ * - WebUI static files are at the expected paths
+ * - Heading anchors follow markdown conventions (lowercase, hyphens)
+ * - Success is indicated by all validation checks passing
+ */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { access, readFile } from "node:fs/promises";
@@ -109,5 +129,5 @@ test("user guide localhost safety boundary matches the production listener", asy
   assert.match(guide, /WebUI is intended for localhost use/);
   assert.match(frontendPlugin, /WEB_LISTEN_HOST\s*=\s*['"]127\.0\.0\.1['"]/);
   assert.match(frontendPlugin, /server\.listen\(port,\s*WEB_LISTEN_HOST\)/);
-  assert.doesNotMatch(frontendPlugin, /server\.listen\(port,\s*['"]0\.0\.0\.0['"]\)/);
+  assert.doesNotMatch(frontendPlugin, /server\.listen\(port,\s*['"]0\.0\.0\.0['"]/);
 });

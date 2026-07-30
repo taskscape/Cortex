@@ -1,3 +1,22 @@
+/**
+ * Test audit contract validation ensures that the test scenario tracking documents
+ * (`tests-to-implement.md`, `tests-to-implement2.md`, `tests-to-implement3.md`)
+ * are properly synchronized with the actual executable tests.
+ *
+ * This test suite validates:
+ * - Each audit document declares exactly the ordered scenario series 001-023
+ * - Every declared scenario ID (E2E-XXX) has a corresponding executable test
+ * - Every executable test with an E2E-XXX ID in its title is declared in an audit
+ * - Scenario IDs follow the format T2-E2E-XXX or T3-E2E-XXX for tracking
+ * - No scenario IDs are missing or duplicated in the audit documents
+ *
+ * Assumptions:
+ * - The audit documents are in the project root with specific filenames
+ * - Test files are in tests/ and follow the naming pattern *.test.mjs or *.test.ts
+ * - Scenario IDs in test titles match the pattern E2E-XXX or T2-E2E-XXX/T3-E2E-XXX
+ * - The audit documents use a structured format with #### E2E-XXX: headings
+ * - Success is indicated by perfect 1:1 mapping between declared and implemented scenarios
+ */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readdir, readFile } from "node:fs/promises";
@@ -30,7 +49,7 @@ function declaredScenarioIds(markdown) {
 function scenarioIdsInTestTitles(source) {
   const ids = [];
   for (const line of source.split(/\r?\n/)) {
-    const title = /\b(?:test|it)(?:\.[a-z]+)?\(\s*(["'`])([^"'`]+)\1/.exec(line)?.[2];
+    const title = /\b(?:test|it)(?:\.[a-z]+)?\(\s*( ["'`])([^"'`]+)\1/.exec(line)?.[2];
     if (!title) continue;
     ids.push(...title.matchAll(/\b(?:T[23]-)?E2E-\d{3}\b/g));
   }

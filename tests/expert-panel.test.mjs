@@ -1,3 +1,30 @@
+/**
+ * Expert panel: validates the multi-expert orchestration tool that runs domain experts
+ * independently and can synthesize their opinions into a consolidated response.
+ *
+ * The expert panel plugin provides a single tool that can:
+ * - List available experts (finance, security, legal, design, etc.)
+ * - Run a selected set of experts on a question (parallel orchestration)
+ * - Collect citations from each expert's knowledge source
+ * - Synthesize a single consolidated response from all expert inputs
+ * - Create and retrieve expert reviews with checklists and risk registers
+ *
+ * This test ensures:
+ * - The plugin registers the "expert_panel" tool correctly
+ * - Expert list shows all configured experts without exposing system prompts
+ * - Selected experts run in parallel with isolated knowledge retrieval
+ * - Each expert's response includes citations from workspace RAG or skills
+ * - Synthesis aggregates expert opinions into a single response
+ * - Review mode creates structured reviews with approval checklists and risks
+ * - Review lifecycle (create, get, list) works correctly
+ *
+ * Assumptions:
+ * - The plugin loads under the Matbot runtime without a full Matbot server
+ * - A simple in-memory store is provided to simulate the persistence layer
+ * - Expert files (e.g., "panel-probe.md") exist in the knowledge directory
+ * - The fake singleTurn() returns predictable responses for deterministic testing
+ * - Each expert has access to the same knowledge sources but provides independent input
+ */
 import assert from "node:assert/strict";
 import test from "node:test";
 

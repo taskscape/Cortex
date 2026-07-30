@@ -1,3 +1,25 @@
+/**
+ * evaluation-observability: validates the end-to-end flow of the evaluation and
+ * observability plugin, which captures traces, supports safe replay, runs regression
+ * test suites, and computes model cost accounting and ROI metrics.
+ *
+ * This test ensures:
+ * - The plugin loads correctly under the Matbot TypeScript loader
+ * - End-to-end spans are captured and stored
+ * - Redacted trace replay works (sensitive data is removed before replay)
+ * - Deterministic scorers produce consistent results
+ * - Model-based scorers can evaluate outputs
+ * - Operational metrics (tokens, latency) are tracked
+ * - Cost accounting works with the pricing configuration
+ * - Workflow outcomes can be linked to evaluation results
+ * - ROI arithmetic is correct (savings vs. costs)
+ *
+ * Assumptions:
+ * - The runtime script simulates a complete evaluation lifecycle
+ * - CORTEX_MODEL_PRICING_JSON provides a simple pricing model for cost accounting
+ * - The plugin's storage backend (filesystem or database) is accessible
+ * - The runtime reports success via a specific stdout message
+ */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

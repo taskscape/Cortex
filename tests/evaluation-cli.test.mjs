@@ -1,3 +1,20 @@
+/**
+ * E2E-016 / T2-E2E-016: Evaluation CLI validation ensures that the command-line
+ * tool for running evaluation suites returns appropriate exit codes and generates
+ * valid, properly escaped JUnit XML output.
+ *
+ * This test ensures:
+ * - Passing suites exit with code 0, failing suites exit with code 1
+ * - JUnit XML output is properly escaped (XML entities are encoded)
+ * - Suite IDs and case IDs with special characters are handled correctly
+ * - The CLI correctly reports pass/fail status based on the evaluation results
+ *
+ * Assumptions:
+ * - A fake evaluation server returns predetermined results based on the suite ID
+ * - The JUnit XML format follows standard conventions with proper escaping
+ * - Special characters in IDs (<, >, &, ") are XML-escaped
+ * - Success is indicated by matching XML content and correct exit codes
+ */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
@@ -71,6 +88,26 @@ test("T2-E2E-016 evaluation CLI returns release-gate exit codes and valid escape
   }
 });
 
+/**
+ * T3-E2E-007: Credential redaction validation ensures that sensitive data
+ * (API keys, tokens, etc.) is removed from all output, including stdout,
+ * stderr, and JUnit XML reports.
+ *
+ * This test ensures:
+ * - API keys and other credentials are not exposed in stdout
+ * - Credentials are not exposed in stderr
+ * - Credentials are not exposed in JUnit XML output
+ * - Redacted values are replaced with a placeholder (e.g., "REDACTED")
+ * - The CLI correctly detects and redacts credential patterns
+ *
+ * Assumptions:
+ * - The fake evaluation server returns results containing a synthetic API key
+ * - The CLI has a credential detection mechanism that identifies patterns like
+ *   "sk-...", "Bearer ...", etc.
+ * - The redaction is applied before any output is written
+ * - Success is indicated by absence of the secret in all outputs and presence
+ *   of "REDACTED" placeholder
+ */
 test("T3-E2E-007 evaluation CLI redacts credentials from stdout and JUnit", async () => {
   const secret = "sk-proj-THIS_IS_A_SYNTHETIC_CANARY_123456";
   const server = createServer(async (req, res) => {

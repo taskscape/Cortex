@@ -1,11 +1,27 @@
-// Static validation of the README question set.
-//
-// This suite never talks to a model. It proves the rubric in
-// `tests/readme-qa/readme-questions.json` is well formed, still grounded in the
-// current README.md, and discriminating: the supporting quote scores 1 and
-// non-answers score 0. A README edit that invalidates a question fails here
-// instead of silently turning the Playwright run red.
-
+/**
+ * Static validation of the README question set for the Playwright README QA test.
+ *
+ * This suite validates the question set in `tests/readme-qa/readme-questions.json`
+ * that is used by the Playwright test `tests/readme-qa/readme-qa.spec.mjs` to ask
+ * questions about the README and score answers against rubrics.
+ *
+ * This suite never talks to a model. It proves:
+ * - Question IDs are unique, follow a valid format, and end with '?'
+ * - Every question has a section field
+ * - Expectations are well-formed: required patterns are grouped arrays of valid regexes
+ * - Forbidden patterns are valid regexes
+ * - Each question's sourceQuote (a passage from README.md) is still present
+ * - Each sourceQuote scores 1 against its own question (answers match all required patterns)
+ * - Non-answers (empty, vague, or non-answers) score 0 against all questions
+ * - The summary function produces correct binary arithmetic
+ *
+ * Assumptions:
+ * - The question set is in `tests/readme-qa/readme-questions.json`
+ * - The scoreAnswer() function implements the 0/1 scoring logic based on required
+ *   and forbidden patterns
+ * - The normalizeText() function normalizes whitespace and backticks for comparison
+ * - A README edit that invalidates a question will fail here first (fail-fast)
+ */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

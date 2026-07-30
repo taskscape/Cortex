@@ -1,3 +1,20 @@
+/**
+ * T3-E2E-003: Workspace deletion is ownership-safe and protects the active workspace
+ * from accidental deletion.
+ *
+ * This test ensures:
+ * - Deletion requires the correct ownership ID (id-bound check)
+ * - The active workspace cannot be deleted (safety check)
+ * - Workspace metadata is properly cleaned up when a workspace is deleted
+ * - No partial deletions leave the system in an inconsistent state
+ * - The operation fails cleanly with no stderr output when the safety checks pass
+ *
+ * Assumptions:
+ * - The runtime script attempts to delete workspaces with correct and incorrect IDs
+ * - The workspace registry enforces ownership-based deletion
+ * - The active workspace is identified and protected from deletion
+ * - All workspace data (config, .data directory, etc.) is properly removed
+ */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

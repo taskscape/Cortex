@@ -113,6 +113,22 @@ the installation requirements, first-run commands, WebUI walkthroughs, feature
 instructions, safety guidance, and common troubleshooting steps that previously
 lived in this README or were spread across technical reference files.
 
+## Running Tests
+
+Before committing changes, run the complete test suite:
+
+```powershell
+npm run test:all
+```
+
+This runs:
+- Node tests for backend/runtime behavior (`npm test`)
+- Matbot CLI tests for ephemeral-store and workspace-storage isolation (`npm run test:cli`)
+- Playwright WebUI tests for browser interactions (`npm run test:webui`)
+
+For more details on test layers, variants, and troubleshooting, see
+[Testing](docs/testing.md).
+
 ### Use workspace files as task inputs and outputs
 
 The `Files` section is a workspace file shelf with explicit per-message
