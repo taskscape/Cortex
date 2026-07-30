@@ -23,7 +23,11 @@ async function openPlugins(page) {
 }
 
 async function openSkills(page) {
-  await page.locator('[data-section="skills"] .sidebar-heading').click();
+  const section = page.locator('[data-section="skills"]');
+  const classes = await section.getAttribute("class");
+  if (classes?.includes("collapsed")) {
+    await section.locator(".sidebar-heading").click();
+  }
 }
 
 async function openExperts(page) {
@@ -127,6 +131,48 @@ test("loads the shell, providers, conversations, files, plugins, and skills", as
 
   await openSkills(page);
   await expect(page.locator("#skill-list")).toContainText("Panel Etiquette");
+});
+
+test("keeps only one Files, Architecture, Plugins, or Skills section expanded", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop sidebar accordion coverage");
+  await page.goto("/");
+
+  const expandedSections = page.locator(
+    '.sidebar-section:is([data-section="files"], [data-section="architecture"], [data-section="plugins"], [data-section="skills"]):not(.collapsed)'
+  );
+
+  await expect(page.locator('[data-section="files"]')).not.toHaveClass(/collapsed/);
+  await expect(expandedSections).toHaveCount(1);
+
+  await page.locator('[data-section="architecture"] .sidebar-heading').click();
+  await expect(page.locator('[data-section="architecture"]')).not.toHaveClass(/collapsed/);
+  await expect(page.locator('[data-section="files"]')).toHaveClass(/collapsed/);
+  await expect(expandedSections).toHaveCount(1);
+
+  await page.locator('[data-section="plugins"] .sidebar-heading').click();
+  await expect(page.locator('[data-section="plugins"]')).not.toHaveClass(/collapsed/);
+  await expect(page.locator('[data-section="architecture"]')).toHaveClass(/collapsed/);
+  await expect(expandedSections).toHaveCount(1);
+
+  await page.locator('[data-section="plugins"] .sidebar-heading').click();
+  await expect(expandedSections).toHaveCount(0);
+
+  await page.evaluate(() => {
+    localStorage.setItem("sidebarSections", JSON.stringify({
+      conversations: false,
+      files: false,
+      architecture: false,
+      plugins: false,
+      skills: false
+    }));
+  });
+  await page.reload();
+
+  await expect(page.locator('[data-section="files"]')).not.toHaveClass(/collapsed/);
+  await expect(page.locator('[data-section="architecture"]')).toHaveClass(/collapsed/);
+  await expect(page.locator('[data-section="plugins"]')).toHaveClass(/collapsed/);
+  await expect(page.locator('[data-section="skills"]')).toHaveClass(/collapsed/);
+  await expect(expandedSections).toHaveCount(1);
 });
 
 test("default file broker tool reads host files through the WebUI transport", async ({ page, isMobile }) => {

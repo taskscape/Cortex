@@ -10,6 +10,7 @@ const LS_FONT_SIZE      = 'fontSize';
 const LS_PROVIDER       = 'provider';
 const LS_SIDEBAR        = 'sidebarSections';
 const LS_SIDEBAR_WIDTH  = 'sidebarWidth';
+const SIDEBAR_ACCORDION_SECTIONS = new Set(['files', 'architecture', 'plugins', 'skills']);
 
 function applyBranding(value) {
   if (!value || typeof value !== 'object') return;
@@ -383,6 +384,12 @@ function loadSidebarState() {
       if (collapsed) section.classList.add('collapsed');
       else           section.classList.remove('collapsed');
     }
+    let expandedAccordionSection = null;
+    for (const section of document.querySelectorAll('.sidebar-section[data-section]')) {
+      if (!SIDEBAR_ACCORDION_SECTIONS.has(section.dataset.section) || section.classList.contains('collapsed')) continue;
+      if (expandedAccordionSection) section.classList.add('collapsed');
+      else expandedAccordionSection = section;
+    }
   } catch { /* ignore */ }
 }
 
@@ -399,6 +406,13 @@ document.getElementById('sidebar').addEventListener('click', (e) => {
   if (!heading) return;
   const section = heading.closest('.sidebar-section');
   if (!section) return;
+  if (SIDEBAR_ACCORDION_SECTIONS.has(section.dataset.section) && section.classList.contains('collapsed')) {
+    for (const other of document.querySelectorAll('.sidebar-section[data-section]')) {
+      if (other !== section && SIDEBAR_ACCORDION_SECTIONS.has(other.dataset.section)) {
+        other.classList.add('collapsed');
+      }
+    }
+  }
   section.classList.toggle('collapsed');
   saveSidebarState();
 });
