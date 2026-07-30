@@ -24,6 +24,8 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
+ * T3-E2E-033: Source registry with stable IDs and persistent storage
+ *
  * Validates that the source registry correctly stores and retrieves source identifiers
  * with stable IDs that persist across sessions and runtime restarts.
  *
@@ -40,7 +42,7 @@ const execFileAsync = promisify(execFile);
  * - The store survives runtime restarts (e.g., writes to disk or database)
  * - Success is indicated by the runtime output containing the expected success message
  */
-test("MISSING-13 source-registry runtime flow covers versions, access history, and health transitions", async () => {
+test("T3-E2E-033 source-registry runtime flow covers versions, access history, and health transitions", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

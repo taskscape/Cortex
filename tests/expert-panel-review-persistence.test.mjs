@@ -66,7 +66,25 @@ async function execute(tool, input) {
   return events.find(event => event.type === "result")?.value;
 }
 
-test("expert reviews persist structured consensus, risks, and links to durable external records", async t => {
+/**
+ * T3-E2E-041: Expert reviews persist structured consensus, risks, and links to durable external records
+ *
+ * Validates that expert reviews correctly persist structured consensus, risks,
+ * blockers, mitigations, and links to durable external records (e.g., workflows).
+ *
+ * This test ensures:
+ * - Reviews are persisted with correct metadata (targetType, targetId, workflowId, etc.)
+ * - Consensus, disagreements, blockers, and mitigations are correctly generated
+ * - Expert confidence levels and evidence IDs are recorded
+ * - Reviews can be retrieved, listed, and queried by targetType
+ * - Risk registers are populated with severity and owner expert information
+ *
+ * Assumptions:
+ * - The expert-panel plugin persists reviews to a durable store
+ * - The test creates a temporary configuration with multiple experts
+ * - Success is indicated by the review lifecycle working correctly
+ */
+test("T3-E2E-041 expert reviews persist structured consensus, risks, and links to durable external records", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-expert-review-persistence-"));
   const configPath = path.join(root, "experts.json");
   const expertIds = ["finance", "security", "legal"];

@@ -23,12 +23,14 @@ async function withConfig(body, check) {
 const expert = { id: "one", title: "One", description: "One", systemPrompt: "One", roots: ["valid"] };
 
 /**
+ * T3-E2E-025: Expert panel configuration validation
+ *
  * Validates that expert configuration correctly rejects duplicate expert IDs,
  * inaccessible knowledge roots, and malformed schema (e.g., empty roots array).
  *
  * This test ensures:
- * - Duplicate expert IDs are rejected
- * - Inaccessible knowledge roots are rejected
+ * - Duplicate expert IDs are rejected (case-sensitive)
+ * - Inaccessible knowledge roots (missing directories) are rejected
  * - Empty knowledge root arrays are rejected
  * - The configuration loader throws appropriate errors for invalid configurations
  *
@@ -38,7 +40,7 @@ const expert = { id: "one", title: "One", description: "One", systemPrompt: "One
  * - Success is indicated by the configuration loader throwing appropriate errors
  *   for each invalid configuration
  */
-test("MISSING-04 expert configuration rejects duplicate ids, missing roots, and malformed schema", async () => {
+test("T3-E2E-025 expert configuration rejects duplicate ids, missing roots, and malformed schema", async () => {
   await withConfig({ experts: [{ ...expert }, { ...expert, id: "ONE" }] }, async () => {
     await assert.rejects(loadExpertConfig(), /duplicate expert id/i);
   });

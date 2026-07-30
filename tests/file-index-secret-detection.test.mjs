@@ -79,7 +79,7 @@ test("file-index redacts credential-shaped assignments across common formats and
 });
 
 /**
- * Test 3: Secret file handling and redacted document indexing
+ * T3-E2E-036: File-index secret file handling and redacted document indexing
  *
  * Validates that the file-index can:
  * - Detect and skip files with high-confidence secrets (to prevent accidental exposure)
@@ -87,14 +87,19 @@ test("file-index redacts credential-shaped assignments across common formats and
  * - Preserve searchability of non-secret content in files that had secrets redacted
  * - Handle edge cases like files with only placeholder values
  *
- * Assumptions:
- * - Files with high-confidence secrets are skipped during indexing
+ * This test ensures:
+ * - Files with high-confidence secrets (e.g., raw API keys, private key blocks) are skipped
  * - Skipped files are logged with a reason (e.g., "possible-secret: api-key-literal")
  * - Files with some credential patterns have those patterns redacted but remain searchable
  * - The redaction preserves surrounding context for searchability
  * - The indexer can distinguish between actual secrets and safe patterns like "REPLACE_ME"
+ *
+ * Assumptions:
+ * - The indexer correctly identifies and handles secret patterns
+ * - The test creates files with various secret patterns and edge cases
+ * - Success is indicated by correct file handling and redaction behavior
  */
-test("file-index skips high-confidence secret files and keeps surrounding redacted documents searchable", async () => {
+test("T3-E2E-036 file-index skips high-confidence secret files and keeps surrounding redacted documents searchable", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cortex-file-index-secrets-"));
   const apiKey = "sk-proj-cortexSyntheticCanary_0123456789";
   const assignment = "LongAssignedSecretValue_012345";

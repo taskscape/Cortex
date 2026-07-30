@@ -1550,6 +1550,64 @@ test("mobile layout exposes workflow operations summary and run ledger", async (
   await expect(page.locator("#workflow-ops-run-detail")).toContainText("Run Ledger");
 });
 
+test("mobile layout contains narrow-phone content and provides usable primary controls", async ({ page, isMobile }) => {
+  test.skip(!isMobile, "mobile-only responsive coverage");
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.goto("/");
+
+  const primaryControlSizes = await page.locator("#main").evaluate(main => {
+    const size = selector => {
+      const rect = main.querySelector(selector).getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    };
+    return {
+      burger: size("#burger"),
+      send: size("#send-btn")
+    };
+  });
+  expect(primaryControlSizes.burger.width).toBeGreaterThanOrEqual(40);
+  expect(primaryControlSizes.burger.height).toBeGreaterThanOrEqual(40);
+  expect(primaryControlSizes.send.width).toBeGreaterThanOrEqual(36);
+  expect(primaryControlSizes.send.height).toBeGreaterThanOrEqual(36);
+
+  await page.locator("#burger").click();
+  await openArchitecturePanel(page, "sources");
+  await expect(page.locator("#architecture-source-list .architecture-badge.bad")).toHaveText("unhealthy");
+  const architectureLayout = await page.locator("#architecture-screen").evaluate(screen => {
+    const badge = screen.querySelector("#architecture-source-list .architecture-badge.bad");
+    return {
+      clientWidth: screen.clientWidth,
+      scrollWidth: screen.scrollWidth,
+      badgeWhiteSpace: badge ? getComputedStyle(badge).whiteSpace : null
+    };
+  });
+  expect(architectureLayout.scrollWidth).toBeLessThanOrEqual(architectureLayout.clientWidth + 1);
+  expect(architectureLayout.badgeWhiteSpace).toBe("normal");
+});
+
+test("mobile landscape keeps both memory browser panes usable", async ({ page, isMobile }) => {
+  test.skip(!isMobile, "mobile-only responsive coverage");
+  await page.setViewportSize({ width: 568, height: 320 });
+  await page.goto("/");
+  await page.locator("#burger").click();
+  await openSkills(page);
+  await page.locator("#memory-browser-btn").click();
+
+  const layout = await page.locator("#memory-browser").evaluate(panel => {
+    const list = panel.querySelector("#memory-browser-list-pane").getBoundingClientRect();
+    const detail = panel.querySelector("#memory-browser-detail-pane").getBoundingClientRect();
+    return {
+      sideBySide: Math.abs(list.top - detail.top) <= 1 && list.right <= detail.left + 1,
+      detailHeight: detail.height,
+      clientHeight: panel.clientHeight,
+      scrollHeight: panel.scrollHeight
+    };
+  });
+  expect(layout.sideBySide).toBeTruthy();
+  expect(layout.detailHeight).toBeGreaterThan(180);
+  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight + 1);
+});
+
 test("E2E-001 workspace switch locks mutations and a failed switch restores the active workspace", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workspace-switch failure coverage");
   await page.goto("/");

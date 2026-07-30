@@ -107,7 +107,24 @@ function createDreamServices({ facts, mergeMode = "normal" }) {
   return { services, rememberedFacts, dreamRuns, saves, calls, skill };
 }
 
-test("dream-time merges a bounded fact cluster, records provenance, and keeps workspace stores isolated", async () => {
+/**
+ * T3-E2E-037: Dream-time fact merging with provenance and workspace isolation
+ *
+ * Validates that the dream-time service correctly merges a bounded fact cluster,
+ * records provenance for merged facts, and keeps workspace stores isolated.
+ *
+ * This test ensures:
+ * - Facts are merged into a single skill (Workspace Profile) in one write operation
+ * - Provenance is recorded (merged fact IDs, contradictions, run outcome)
+ * - Workspace isolation is maintained (workspace A facts don't affect workspace B)
+ * - Completed runs are persisted for observability
+ *
+ * Assumptions:
+ * - The runDreamTimePass() function performs dream-time processing
+ * - The test creates workspace-specific services with isolated stores
+ * - Success is indicated by correct merging behavior and isolation
+ */
+test("T3-E2E-037 dream-time merges a bounded fact cluster, records provenance, and keeps workspace stores isolated", async () => {
   const workspaceA = createDreamServices({
     facts: [
       fact("alpha", "2026-01-01T00:00:00.000Z"),
@@ -140,7 +157,23 @@ test("dream-time merges a bounded fact cluster, records provenance, and keeps wo
   assert.equal(workspaceB.dreamRuns.docs.size, 0, "a run in one workspace does not create records in another workspace store");
 });
 
-test("dream-time quarantines a durable merge failure without overwriting the skill", async () => {
+/**
+ * T3-E2E-038: Dream-time error handling with quarantine for failed merges
+ *
+ * Validates that the dream-time service correctly handles merge failures by
+ * quarantining failed facts without overwriting the existing skill.
+ *
+ * This test ensures:
+ * - Merge failures result in a quarantined error state (DREAM_SKILL_ERROR)
+ * - The original skill remains untouched after a failed merge
+ * - The failed run is persisted for observability
+ *
+ * Assumptions:
+ * - The runDreamTimePass() function handles merge failures gracefully
+ * - The test simulates a merge failure by returning shorter content
+ * - Success is indicated by correct error handling and quarantine behavior
+ */
+test("T3-E2E-038 dream-time quarantines a durable merge failure without overwriting the skill", async () => {
   const workspace = createDreamServices({
     facts: [fact("bad-merge", "2026-01-01T00:00:00.000Z")],
     mergeMode: "short",

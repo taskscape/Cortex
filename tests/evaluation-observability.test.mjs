@@ -28,9 +28,11 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
- * Validates that the evaluation and observability plugin correctly captures traces,
- * supports safe replay (with credential redaction), runs regression test suites,
- * and computes model cost accounting and ROI metrics.
+ * T3-E2E-028: Evaluation and observability runtime flow with safe replay and ROI
+ *
+ * Validates the end-to-end flow of the evaluation and observability plugin, which
+ * captures traces, supports safe replay (with credential redaction), runs regression
+ * test suites, and computes model cost accounting and ROI metrics.
  *
  * This test ensures:
  * - The plugin loads correctly under the Matbot TypeScript loader
@@ -49,7 +51,7 @@ const execFileAsync = promisify(execFile);
  * - The plugin's storage backend (filesystem or database) is accessible
  * - The runtime reports success via a specific stdout message
  */
-test("MISSING-09 evaluation-observability runtime flow covers safe replay, release gates, and ROI", async () => {
+test("T3-E2E-028 evaluation-observability runtime flow covers safe replay, release gates, and ROI", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

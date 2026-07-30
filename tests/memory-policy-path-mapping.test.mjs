@@ -24,7 +24,25 @@ function translateWindowsPath(input, mapping, targetPrefix) {
 // These assets currently have no production reader in this repository. These assertions protect
 // their documented on-disk contract; runtime policy enforcement and host path access need a
 // production consumer before they can be exercised as integration behavior.
-test("memory policy declares non-overlapping durable-memory safeguards", async () => {
+/**
+ * T3-E2E-039: Memory policy declares non-overlapping durable-memory safeguards
+ *
+ * Validates that the memory policy configuration declares non-overlapping durable-memory
+ * safeguards, ensuring that secrets are explicitly excluded and promotion requires
+ * explicit user intent.
+ *
+ * This test ensures:
+ * - The memory policy has the correct structure (doNotStoreInMemory, durableMemoryKinds, promotionRequires)
+ * - doNotStoreInMemory and durableMemoryKinds are disjoint (no overlap)
+ * - Secrets are explicitly excluded from durable memory
+ * - Promotion requires explicit user intent (safeguard)
+ *
+ * Assumptions:
+ * - The memory policy is stored in memory-policy.json
+ * - The test reads and validates the policy configuration
+ * - Success is indicated by the policy passing all validation checks
+ */
+test("T3-E2E-039 memory policy declares non-overlapping durable-memory safeguards", async () => {
   const policy = await readJson("memory-policy.json");
   assert.deepEqual(Object.keys(policy).sort(), ["doNotStoreInMemory", "durableMemoryKinds", "promotionRequires"]);
   assertStringList(policy.durableMemoryKinds, "durableMemoryKinds");
@@ -39,7 +57,25 @@ test("memory policy declares non-overlapping durable-memory safeguards", async (
   assert.ok(policy.promotionRequires.includes("explicit-user-request"), "explicit user intent remains a promotion safeguard");
 });
 
-test("path mappings define complete Windows, WSL, and Docker prefixes for Cortex workspace files", async () => {
+/**
+ * T3-E2E-040: Path mappings define complete Windows, WSL, and Docker prefixes for Cortex workspace files
+ *
+ * Validates that the path mapping configuration defines complete prefixes for
+ * Windows, WSL, and Docker environments for all Cortex workspace files.
+ *
+ * This test ensures:
+ * - At least one path mapping is defined
+ * - Each mapping has windowsPrefix, wslPrefix, and dockerPrefix fields
+ * - Prefixes are properly formatted (end at directory boundaries)
+ * - No duplicate Windows prefixes exist
+ * - The C:\ Windows mapping is present and works correctly
+ *
+ * Assumptions:
+ * - The path mapping configuration is stored in path-mapping.json
+ * - The test reads and validates the path mappings
+ * - Success is indicated by all path mappings passing validation
+ */
+test("T3-E2E-040 path mappings define complete Windows, WSL, and Docker prefixes for Cortex workspace files", async () => {
   const config = await readJson("path-mapping.json");
   assert.deepEqual(Object.keys(config), ["mappings"]);
   assert.ok(Array.isArray(config.mappings) && config.mappings.length > 0, "at least one path mapping is required");

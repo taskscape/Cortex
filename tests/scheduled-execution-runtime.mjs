@@ -98,4 +98,23 @@ try {
   restore();
 }
 
-console.log("scheduled child execution preserves principal/provider identity and durable exact-once occurrence history");
+/**
+ * T3-E2E-046: Scheduled child execution preserves principal/provider identity and durable exact-once occurrence history
+ *
+ * Validates that scheduled tasks correctly record their occurrences with the correct
+ * identity and are bound to their policy.
+ *
+ * This test ensures:
+ * - Scheduled tasks execute at their configured intervals
+ * - Each occurrence is recorded with the correct policy identity
+ * - Child executions inherit the principal (user/identity) from the schedule
+ * - No unauthorized executions can occur (policy-bound enforcement)
+ * - The occurrence tracking persists across runtime restarts
+ * - The principal/provider identity is correctly propagated to child executions
+ *
+ * Assumptions:
+ * - The background plugin creates scheduled tasks with the correct identity
+ * - The test creates a scheduled task and verifies its execution
+ * - Success is indicated by the runtime output containing the expected success message
+ */
+console.log("T3-E2E-046 scheduled child execution preserves principal/provider identity and durable exact-once occurrence history");

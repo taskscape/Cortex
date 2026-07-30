@@ -65,7 +65,7 @@ async function productionMemorySnapshot() {
 }
 
 /**
- * Production memory integration test
+ * T3-E2E-043: Production memory runtime is persistent, workspace-isolated, and test-safe
  *
  * Validates the complete production memory system including:
  * - Memory capture and storage in .data/remembered_facts/
@@ -85,7 +85,7 @@ async function productionMemorySnapshot() {
  * - Success is indicated by the runtime output containing the expected success message
  * - The productionMemorySnapshot() function correctly computes file checksums
  */
-test("production memory runtime is persistent, workspace-isolated, and test-safe", { timeout: 60_000 }, async () => {
+test("T3-E2E-043 production memory runtime is persistent, workspace-isolated, and test-safe", { timeout: 60_000 }, async () => {
   const before = await productionMemorySnapshot();
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",

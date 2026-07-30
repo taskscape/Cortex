@@ -5,6 +5,8 @@ await import("../local-agent/matbot/apps/cli/register.js");
 const { pricedCost } = await import("../local-agent/matbot/packages/plugins/evaluation-observability/src/index.ts");
 
 /**
+ * T3-E2E-029: Model pricing with direct costs, catalog pricing, and cached tokens
+ *
  * Validates that the model pricing function correctly calculates costs based on
  * direct costs, catalog pricing, cached input tokens, and handles invalid configurations.
  *
@@ -21,7 +23,7 @@ const { pricedCost } = await import("../local-agent/matbot/packages/plugins/eval
  * - The test also tests invalid configurations (missing model, non-JSON, negative costs)
  * - Success is indicated by the function returning the expected costs for each case
  */
-test("MISSING-09 model pricing honours direct cost, catalog pricing, cached input, and invalid configuration", () => {
+test("T3-E2E-029 model pricing honours direct cost, catalog pricing, cached input, and invalid configuration", () => {
   const prior = process.env.CORTEX_MODEL_PRICING_JSON;
   try {
     process.env.CORTEX_MODEL_PRICING_JSON = JSON.stringify({

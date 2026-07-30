@@ -4031,11 +4031,92 @@
       #chat-header {
         padding: max(10px, env(safe-area-inset-top, 0px)) 12px 10px;
       }
+      #burger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        min-width: 40px;
+        height: 40px;
+        min-height: 40px;
+        margin-right: 4px;
+        padding: 0;
+      }
+      #chat-title {
+        max-width: calc(100vw - 68px);
+      }
       #messages {
         padding: 24px 16px 18px;
+        overflow-x: hidden;
+      }
+      .message,
+      .message .md-body {
+        min-width: 0;
+        overflow-wrap: anywhere;
       }
       .message.user {
         max-width: 92%;
+      }
+      .md-body table,
+      .architecture-table {
+        display: block;
+        max-width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      #workspace-settings-screen {
+        padding: 24px 16px;
+      }
+      .workspace-settings-page {
+        gap: 16px;
+      }
+      .workspace-config-actions {
+        flex-wrap: wrap;
+      }
+      .workspace-config-actions button {
+        min-height: 40px;
+      }
+      .architecture-page,
+      .architecture-panel,
+      .architecture-grid,
+      .architecture-list,
+      .architecture-detail,
+      .architecture-form,
+      .architecture-results,
+      .workflow-ops-section {
+        min-width: 0;
+      }
+      .architecture-tabs {
+        gap: 8px;
+      }
+      .architecture-tab,
+      .architecture-actions button,
+      .architecture-form button,
+      .workflow-ops-tab,
+      .workflow-ops-actions button {
+        min-height: 40px;
+      }
+      .architecture-item-title {
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .architecture-badge {
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-align: left;
+      }
+      .architecture-card-grid {
+        grid-template-columns: 1fr;
+      }
+      .architecture-kv {
+        grid-template-columns: minmax(84px, 32%) minmax(0, 1fr);
+      }
+      .architecture-kv dd,
+      .architecture-item-meta,
+      .architecture-muted,
+      .architecture-card p {
+        overflow-wrap: anywhere;
       }
       #input-area {
         width: calc(100% - 20px);
@@ -4045,17 +4126,92 @@
       }
       #input-meta {
         margin-bottom: 6px;
+        min-width: 0;
+      }
+      #provider-select {
+        flex: 1 1 120px;
+        min-width: 0;
+        max-width: 100%;
+        min-height: 36px;
+      }
+      #input-meta #expert-menu {
+        flex: 0 1 auto;
+        min-width: 0;
       }
       #expert-toggle-btn {
         width: auto;
-        height: 28px;
+        height: 36px;
+        min-height: 36px;
         max-width: 150px;
+      }
+      #input-row,
+      #input {
+        min-width: 0;
       }
       #send-btn,
       #stop-btn {
-        height: 21px;
-        width: 21px;
-        font-size: 0.92em;
+        height: 36px;
+        width: 36px;
+        min-width: 36px;
+        min-height: 36px;
+        font-size: 1.08em;
+      }
+      #memory-browser button {
+        min-height: 36px;
+      }
+      #memory-browser-close {
+        width: 36px;
+        min-width: 36px;
+        padding: 0;
+      }
+      #memory-browser-search,
+      #memory-browser-filter,
+      #memory-browser-new-fact,
+      #memory-browser-fact-input,
+      .memory-browser-field input {
+        min-height: 40px;
+      }
+    }
+
+    @media (max-width: 360px) {
+      #workspace-settings-screen {
+        padding: 20px 12px;
+      }
+      .architecture-kv {
+        grid-template-columns: 1fr;
+        gap: 2px;
+      }
+      .architecture-kv dt:not(:first-child) {
+        margin-top: 8px;
+      }
+      .workspace-config-actions,
+      .architecture-form-actions,
+      .architecture-card-actions {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .workspace-config-actions button,
+      .architecture-form-actions button,
+      .architecture-card-actions button {
+        width: 100%;
+      }
+      .memory-browser-control-row {
+        flex-direction: column;
+      }
+      #memory-browser-filter {
+        flex: 0 0 auto;
+        width: 100%;
+      }
+    }
+
+    @media (min-width: 480px) and (max-width: 760px) and (max-height: 500px) and (orientation: landscape) {
+      #memory-browser-body {
+        grid-template-columns: minmax(200px, 42%) minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr);
+      }
+      #memory-browser-list-pane {
+        border-right: 1px solid var(--line, #e5e7eb);
+        border-bottom: none;
       }
     }
 

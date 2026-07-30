@@ -1,4 +1,6 @@
 /**
+ * T3-E2E-049: Context graph validation with source-backed relationships and storage
+ *
  * Context graph validation ensures that relationships between entities (sources,
  * people, topics, etc.) are correctly extracted and stored.
  *
@@ -23,6 +25,8 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
+ * T3-E2E-026: Context graph multi-hop provenance and confidence bounds
+ *
  * Validates that the context graph correctly extracts relationships between entities
  * from conversation content and supports multi-hop provenance queries with confidence
  * bounds.
@@ -40,7 +44,7 @@ const execFileAsync = promisify(execFile);
  * - The plugin stores the graph in a durable backend (e.g., Neo4j)
  * - Success is indicated by the runtime output containing the expected success message
  */
-test("MISSING-07 context-graph runtime flow covers multi-hop provenance and confidence bounds", async () => {
+test("T3-E2E-026 context-graph runtime flow covers multi-hop provenance and confidence bounds", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

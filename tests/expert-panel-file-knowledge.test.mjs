@@ -17,7 +17,27 @@ function expert(id, roots) {
   };
 }
 
-test("expert knowledge loads every supported text format and ignores unsupported or oversized files", async t => {
+/**
+ * T3-E2E-023: Expert panel file knowledge format support
+ *
+ * Validates that the expert panel correctly loads knowledge files from all supported
+ * text formats (Markdown, MDX, JSON, CSV, TSV, YAML, TXT) while ignoring unsupported
+ * formats (PDF) and files that are too large or hidden.
+ *
+ * This test ensures:
+ * - All supported text formats are loaded and indexed
+ * - Unsupported formats (e.g., PDF) are ignored
+ * - Hidden files (e.g., .hidden.md) are ignored
+ * - Oversized files (beyond maxFileBytes) are ignored
+ * - The search function correctly retrieves content from all supported formats
+ *
+ * Assumptions:
+ * - The FileExpertKnowledge class loads files from the configured knowledge root
+ * - The test creates temporary files in all supported and unsupported formats
+ * - Success is indicated by only supported, non-hidden, appropriately-sized files
+ *   being loaded and searchable
+ */
+test("T3-E2E-023 expert knowledge loads every supported text format and ignores unsupported or oversized files", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-expert-knowledge-formats-"));
   t.after(() => rm(root, { recursive: true, force: true }));
 
@@ -52,7 +72,25 @@ test("expert knowledge loads every supported text format and ignores unsupported
   assert.equal(sources.find(source => source.title === "table.csv")?.content, supported.get("table.csv"));
 });
 
-test("expert knowledge keeps roots isolated and does not let a large matching file leak into results", async t => {
+/**
+ * T3-E2E-024: Expert panel knowledge root isolation
+ *
+ * Validates that the expert panel correctly isolates knowledge roots for different
+ * experts and prevents large files from polluting search results (e.g., by exceeding
+ * token limits or degrading performance).
+ *
+ * This test ensures:
+ * - Each expert's knowledge root is isolated from other experts' roots
+ * - Large files (beyond token limits) are not included in search results
+ * - Experts can only access files within their configured roots
+ *
+ * Assumptions:
+ * - The FileExpertKnowledge class implements root isolation
+ * - The test creates experts with separate knowledge roots
+ * - Success is indicated by correct root isolation and exclusion of oversized files
+ *   from search results
+ */
+test("T3-E2E-024 expert knowledge keeps roots isolated and does not let a large matching file leak into results", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-expert-knowledge-isolation-"));
   const financeRoot = path.join(root, "finance");
   const securityRoot = path.join(root, "security");

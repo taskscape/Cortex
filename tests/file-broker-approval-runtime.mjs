@@ -231,7 +231,27 @@ try {
     assert.equal(await readFile(path.join(outside, "sentinel.ps1"), "utf8"), "outside\n");
   }
 
-  console.log("file-broker rejects unapproved high-risk writes, validates low-risk/read-only policies, preserves restorable backups, and resolves junctions");
+  /**
+   * T3-E2E-047: File broker runtime with high-risk write approval and junction resolution
+   *
+   * Validates that the file broker correctly rejects unapproved high-risk writes,
+   * validates low-risk/read-only policies, preserves restorable backups, and resolves junctions.
+   *
+   * This test ensures:
+   * - High-risk writes (e.g., .ps1 files, existing files) require explicit approval
+   * - Low-risk writes (e.g., new files) don't require approval
+   * - Backups are created for high-risk writes and can be used for restoration
+   * - Concurrent high-risk writes get distinct backup filenames (no collision)
+   * - Read-only directories cannot be written to
+   * - Path traversal via junctions is blocked
+   * - Policy-denied paths (e.g., .blocked/) are rejected
+   *
+   * Assumptions:
+   * - The file broker service correctly implements write approval and security policies
+   * - The test creates a temporary environment with various file types and paths
+   * - Success is indicated by the runtime output containing the expected success message
+   */
+  console.log("T3-E2E-047 file-broker rejects unapproved high-risk writes, validates low-risk/read-only policies, preserves restorable backups, and resolves junctions");
 } finally {
   if (child && !child.killed) child.kill();
   await rm(temp, { recursive: true, force: true });

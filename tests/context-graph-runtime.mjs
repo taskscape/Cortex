@@ -305,5 +305,26 @@ async function main() {
   assert.ok(extractionList.extractionRuns.some(item => item.id === run.id && item.sourceVersionId === version.id));
 }
 
+/**
+ * T3-E2E-044: Context graph runtime with source-backed relationships and projection operations
+ *
+ * Validates that the context graph correctly extracts source-backed relationships from
+ * conversation content, deduplicates assertions, filters denied sources, retrieves graph
+ * facts, and records projection operations.
+ *
+ * This test ensures:
+ * - Source-backed relationships are extracted from conversation content
+ * - Entity deduplication works correctly (same entity with different identifiers)
+ * - Relationship deduplication works correctly (same relationship with different confidence)
+ * - Denied sources are filtered from retrieval results
+ * - Multi-hop path search works with confidence bounds
+ * - Projection operations (merge_entity, merge_relationship) are recorded
+ * - Access events are recorded for retrieval operations
+ *
+ * Assumptions:
+ * - The context-graph plugin extracts relationships from conversation content
+ * - The test creates sample data with explicit relationships and entities
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 await main();
-console.log("context-graph extracts source-backed relationships, dedupes assertions, filters denied sources, retrieves graph facts, and records projection operations");
+console.log("T3-E2E-044 context-graph extracts source-backed relationships, dedupes assertions, filters denied sources, retrieves graph facts, and records projection operations");

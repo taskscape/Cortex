@@ -65,7 +65,27 @@ async function productionMemorySnapshot() {
   return snapshot;
 }
 
-test("memory recall", { timeout: 120_000 }, async t => {
+/**
+ * T3-E2E-042: Memory recall validates fact persistence and workspace isolation
+ *
+ * Validates that facts captured in one conversation are successfully recalled
+ * in subsequent conversations within the same workspace, and that facts do not
+ * leak across different workspaces (workspace isolation).
+ *
+ * This test ensures:
+ * - A fact mentioned in conversation A is available in conversation B (recall)
+ * - Facts stored in workspace 1 do not appear in workspace 2 (isolation)
+ * - Memory persists across runtime restarts
+ * - The test never modifies production workspace memory (detected via checksums)
+ *
+ * Assumptions:
+ * - The production memory system stores facts in .data/remembered_facts/ as JSON files
+ * - The runtime script creates temporary test workspaces and manipulates their memory
+ * - The runtime reports each scenario result via ##RESULT## lines to stdout
+ * - The productionMemorySnapshot() function computes SHA-256 hashes of all remembered_facts
+ *   files before and after the test to verify no production data was modified
+ */
+test("T3-E2E-042 memory recall", { timeout: 120_000 }, async t => {
   const before = await productionMemorySnapshot();
 
   let stdout = "", stderr = "", spawnError;

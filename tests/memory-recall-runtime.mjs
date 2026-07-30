@@ -500,7 +500,16 @@ const scenarios = [
 /**
  * Scenario 15: Provenance resilience
  *
- * Tests that facts captured with minimal or
+ * Tests that facts captured with minimal or malformed provenance still remain
+ * recallable and do not prevent normally captured facts from being retrieved.
+ *
+ * Assumptions:
+ * - Recall tolerates hand-written store entries with non-standard timestamps
+ * - One malformed provenance record does not poison the remaining result set
+ */
+  {
+    name: "a fact with unusable provenance is still recalled",
+    async run(workspace) {
       const alpha = createWorkspace(workspace("alpha"));
       // The shape hand-written entries arrive in through `remembered_facts_action`.
       await seed(alpha, [

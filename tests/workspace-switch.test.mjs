@@ -27,6 +27,8 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
+ * T3-E2E-032: Workspace switch process handoff with HTTP connection draining
+ *
  * Validates that the workspace switching process correctly handles process handoff,
  * including cleaning up the outgoing process and starting a new one for the target
  * workspace.
@@ -46,7 +48,7 @@ const execFileAsync = promisify(execFile);
  *   via ##RESULT## lines to stdout
  * - Each scenario in the runtime must pass (ok: true) for the overall test to pass
  */
-test("workspace switch handoff", { timeout: 120_000 }, async t => {
+test("T3-E2E-032 workspace switch handoff", { timeout: 120_000 }, async t => {
   let stdout = "", stderr = "", spawnError;
   try {
     ({ stdout, stderr } = await execFileAsync(process.execPath, [

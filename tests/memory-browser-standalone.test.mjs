@@ -49,6 +49,8 @@ async function start(store) {
 }
 
 /**
+ * T3-E2E-030: Standalone memory browser with health, filtering, CRUD, and CAS
+ *
  * Validates that the standalone memory browser correctly provides health checks,
  * filtering, CRUD operations, and version-aware updates (CAS) for memory records.
  *
@@ -65,7 +67,7 @@ async function start(store) {
  * - The test verifies that workspace A cannot see workspace B's memories
  * - Success is indicated by all HTTP requests returning the expected responses
  */
-test("MISSING-11 standalone memory browser provides health, filtering, CRUD, and version-aware updates", async t => {
+test("T3-E2E-030 standalone memory browser provides health, filtering, CRUD, and version-aware updates", async t => {
   const store = new MemoryStore();
   const otherWorkspaceStore = new MemoryStore();
   await store.set("processed", { id: "processed", version: "v1", fact: "Processed alpha", sessionId: "s", messageId: "m", createdAt: "2026-01-01T00:00:00.000Z", dreamSkill: "Operations" });

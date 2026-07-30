@@ -25,7 +25,30 @@ import test from "node:test";
 
 import { isJsonObject, readJsonBody, sendJson, sendJsonError } from "../local-agent/http-utils/dist/index.js";
 
-test("shared HTTP JSON helpers validate content type, shape, and body size", async () => {
+/**
+ * T2-E2E-021: Shared HTTP JSON helpers for validation and error handling
+ *
+ * Validates that the shared HTTP JSON helpers correctly validate content type,
+ * shape, and body size, and send appropriate error responses.
+ *
+ * This test ensures:
+ * - isJsonObject() validates that the value is a proper JSON object (not array, null, etc.)
+ * - readJsonBody() validates Content-Type is application/json before parsing
+ * - readJsonBody() enforces maximum body size to prevent DoS
+ * - readJsonBody() validates the parsed JSON shape against a custom validator
+ * - sendJson() sends proper JSON responses with 200 status
+ * - sendJsonError() sends proper error responses with appropriate HTTP status codes
+ * - Content-Type validation returns 415 Unsupported Media Type
+ * - Invalid JSON shape returns 400 Bad Request
+ * - Oversized bodies return 413 Payload Too Large
+ *
+ * Assumptions:
+ * - The test server uses the shared HTTP utilities from http-utils
+ * - The validator function receives the parsed JSON value and returns true/false
+ * - The readJsonBody() function is async and returns the parsed body
+ * - The server correctly handles errors and sends appropriate responses
+ */
+test("T2-E2E-021 shared HTTP JSON helpers validate content type, shape, and body size", async () => {
   const server = createServer(async (request, response) => {
     try {
       const body = await readJsonBody(request, {

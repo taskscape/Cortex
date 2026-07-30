@@ -1,4 +1,6 @@
 /**
+ * T3-E2E-050: Connector fabric validation with grants and access control
+ *
  * Connector fabric validation ensures that data connector access is properly
  * controlled through grants and permissions.
  *
@@ -23,6 +25,8 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
+ * T3-E2E-027: Connector fabric runtime flow with grants and access control
+ *
  * Validates that the connector fabric runtime correctly enforces connector grants
  * and access control under the Matbot TypeScript loader.
  *
@@ -38,7 +42,7 @@ const execFileAsync = promisify(execFile);
  * - The plugin correctly enforces access control rules
  * - Success is indicated by the runtime output containing the expected success message
  */
-test("connector-fabric runtime flow passes under the Matbot TypeScript loader", async () => {
+test("T3-E2E-027 connector-fabric runtime flow passes under the Matbot TypeScript loader", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",

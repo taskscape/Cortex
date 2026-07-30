@@ -56,7 +56,27 @@ async function execute(tool, input) {
  * - Success is indicated by the panel correctly routing to each expert and
  *   generating appropriate synthesis
  */
-test("MISSING-04 custom expert configuration isolates roots and preserves all three panel modes", async t => {
+/**
+ * T3-E2E-035: Custom expert configuration with isolated roots and all panel modes
+ *
+ * Validates that custom expert configuration correctly isolates expert knowledge roots
+ * and preserves all three panel modes (parallel, review, debate).
+ *
+ * This test ensures:
+ * - Experts are correctly loaded from configuration with isolated roots
+ * - Each expert can only access files within their configured roots
+ * - All three panel modes (parallel, review, debate) work correctly
+ * - Synthesis works in review and debate modes
+ * - Individual expert selection works in parallel mode
+ *
+ * Assumptions:
+ * - The expert-panel plugin loads configuration from a JSON file
+ * - The test creates temporary expert configurations with isolated roots
+ * - Each expert has a unique knowledge root with specific content markers
+ * - Success is indicated by the panel correctly routing to each expert and
+ *   generating appropriate synthesis
+ */
+test("T3-E2E-035 custom expert configuration isolates roots and preserves all three panel modes", async t => {
   t.after(async () => { delete process.env.EXPERT_PANEL_CONFIG; await rm(root, { recursive: true, force: true }); });
   const tools = new Map();
   const calls = [];

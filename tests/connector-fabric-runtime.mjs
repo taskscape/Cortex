@@ -316,5 +316,25 @@ async function main() {
   assert.equal(audit.events.length, 2);
 }
 
+/**
+ * T3-E2E-045: Connector fabric runtime with grants, audit events, and sensitive field redaction
+ *
+ * Validates that the connector fabric correctly enforces connector grants, seeds local bindings,
+ * records audit events, and redacts sensitive fields.
+ *
+ * This test ensures:
+ * - Connector definitions are registered correctly
+ * - Tool call evaluation works with principal-based access control
+ * - Grant-based access control is enforced (denied tool calls are rejected)
+ * - Audit events are recorded for both allowed and denied operations
+ * - Sensitive fields (e.g., content) are redacted in toolresult hooks
+ * - Health test returns correct state and message
+ * - Audit events can be queried and listed
+ *
+ * Assumptions:
+ * - The connector-fabric plugin implements grant-based access control
+ * - The test creates a mock environment with various connector tools
+ * - Success is indicated by the runtime output containing the expected success message
+ */
 await main();
-console.log("connector-fabric enforces connector grants, seeds local bindings, records audit events, and redacts sensitive fields");
+console.log("T3-E2E-045 connector-fabric enforces connector grants, seeds local bindings, records audit events, and redacts sensitive fields");

@@ -24,7 +24,24 @@ async function writePlugin(projectDir, directory, name) {
   }), "utf8");
 }
 
-test("plugin add persists and activates an approved local plugin, rejects missing paths, and rolls back incompatible plugins", async t => {
+/**
+ * T3-E2E-034: Plugin add with persistence, duplicate guard, and rollback for incompatible plugins
+ *
+ * Validates that the plugin add operation correctly persists and activates approved
+ * local plugins, rejects missing paths, and rolls back incompatible plugins.
+ *
+ * This test ensures:
+ * - Approved local plugins are persisted to matbot.yaml and activated
+ * - Duplicate plugin additions are rejected before prompting for confirmation
+ * - Missing paths are rejected with appropriate error messages
+ * - Incompatible plugins (wrong runtime) are rolled back from configuration
+ *
+ * Assumptions:
+ * - The plugin add tool correctly validates and installs plugins
+ * - The test creates temporary plugins and configures the plugin system
+ * - Success is indicated by the plugin system correctly handling each scenario
+ */
+test("T3-E2E-034 plugin add persists and activates an approved local plugin, rejects missing paths, and rolls back incompatible plugins", async t => {
   const projectDir = await mkdtemp(path.join(os.tmpdir(), "cortex-plugin-runtime-"));
   const configPath = path.join(projectDir, "matbot.yaml");
   const localSpecifier = "./packages/plugins/local-test-plugin";

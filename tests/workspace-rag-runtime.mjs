@@ -334,4 +334,25 @@ async function main() {
 }
 
 await main();
-console.log("workspace-rag ingests markdown, persists the vector db, searches, and injects turn context");
+/**
+ * T3-E2E-048: Workspace RAG runtime with markdown ingestion, persistence, search, and context injection
+ *
+ * Validates that the workspace RAG system correctly ingests markdown, persists the vector DB,
+ * searches across contexts, and injects turn context with citations and health warnings.
+ *
+ * This test ensures:
+ * - Markdown files are parsed and stored with path normalization
+ * - Vectors are stored in a JSON file (for testing)
+ * - Sources are registered with correct metadata
+ * - Contexts can be created, searched, selected, and deleted
+ * - Single-file search works correctly
+ * - Health monitoring correctly reports degraded/stale sources
+ * - Screen hooks inject citations and health warnings into turn context
+ * - Path normalization (Windows backslashes) works correctly
+ *
+ * Assumptions:
+ * - The workspace-rag plugin correctly processes markdown files
+ * - The test creates a temporary workspace with sample markdown content
+ * - Success is indicated by the runtime output containing the expected success message
+ */
+console.log("T3-E2E-048 workspace-rag ingests markdown, persists the vector db, searches, and injects turn context");

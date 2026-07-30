@@ -6,6 +6,8 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 
 /**
+ * T3-E2E-031: Workspace RAG E5 embedding contract with purpose-aware requests
+ *
  * Validates that the RAG system sends purpose-aware embedding requests (with query
  * vs document prefixes) and correctly persists the embedding model signature for
  * future compatibility checks.
@@ -21,7 +23,7 @@ const execFileAsync = promisify(execFile);
  * - The CUDA service returns the correct embedding signature and model information
  * - Success is indicated by the runtime output containing the expected success message
  */
-test("workspace-rag sends purpose-aware requests and persists the embedding signature", async () => {
+test("T3-E2E-031 workspace-rag sends purpose-aware requests and persists the embedding signature", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     "--import",
     "./local-agent/matbot/apps/cli/register.js",
