@@ -233,6 +233,12 @@ metadata in the `workspace_rag` schema. The older
 `.data\workspace-rag\index.json` file is retained only as a fallback or
 diagnostic storage mode.
 
+The proposed successor architecture for million-document and multi-gigabyte
+sources is described in
+[`hybrid-retrieval-architecture.md`](hybrid-retrieval-architecture.md). It adds
+streaming ingestion, immutable versions, document/section/passage hierarchy,
+lexical plus dense retrieval, reranking, and deterministic range citations.
+
 ## `contextual_search` Retrieval
 
 Use `contextual_search` when the model needs local context before answering. It

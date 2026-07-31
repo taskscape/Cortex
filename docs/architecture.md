@@ -67,6 +67,14 @@ Persistence is deliberately split:
 | File-index data | Host service | `local-agent\file-index\data\index.json` |
 | Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
 
+The proposed scale-out design for million-document corpora and exceptional
+multi-gigabyte Markdown sources is documented in
+[`hybrid-retrieval-architecture.md`](hybrid-retrieval-architecture.md). It
+evolves Workspace RAG toward streamed versioned ingestion, document/section/
+passage retrieval, lexical and dense rank fusion, reranking, range citations,
+and tiered lazy embeddings while retaining PostgreSQL/pgvector as the initial
+search plane.
+
 ## Core Systems
 
 ### Plugin System

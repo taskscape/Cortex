@@ -269,6 +269,59 @@ unbounded graph expansion is intentional.
      -Body '{"action":"reindex_now"}'
    ```
 
+### Roll out hierarchical Workspace RAG V2
+
+V2 implements progressive document → section → passage retrieval beside the
+existing index. It is deliberately disabled by default and never turns a mode
+change into an automatic million-file reindex.
+
+1. Set `CORTEX_RAG_V2_MODE=shadow` and the V2 Postgres/object-store variables
+   in the active workspace `.env`. For production, use a non-owner application
+   database role, a separate `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL`, and
+   `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES=1`.
+2. Start Cortex, then run a read-only resumable census:
+
+   ```json
+   { "action": "corpus_census", "deep": true }
+   ```
+
+   An interrupted result supplies `checkpoint`; pass it back as `resumeAfter`.
+   Use the measured percentiles and storage forecast to set the 20 MB/250 MB
+   prototype tier thresholds appropriately for the corpus.
+3. Start one explicit side-by-side generation:
+
+   ```json
+   { "action": "ingestion_start" }
+   ```
+
+   Use `ingestion_status`, `ingestion_pause`, `ingestion_resume`,
+   `ingestion_cancel`, and `ingestion_wait` to control it. Starting again while
+   a job is active returns that job instead of queuing a duplicate scan.
+   Cancellation preserves the active generation, and publication is one atomic
+   transaction after validation.
+4. Exercise V2 explicitly with `v2_search` and run `evaluation_run`. Shadow mode
+   records comparable traces without changing V1 answers. Only set
+   `CORTEX_RAG_V2_MODE=primary` after the authorization, citation, memory,
+   relevance, latency, and degradation gates pass.
+   Repeat `evaluation_run` with `evaluationVariant` set to
+   `flat_dense_baseline`, `lexical_only`, `dense_only`, `hybrid_rrf`,
+   `hybrid_translated`, `hybrid_reranked`, `hierarchical`, and
+   `hierarchical_lazy`; each run persists its variant and metrics.
+5. To enable the optional multilingual cross-encoder, start
+   `docker compose --profile reranker up -d --build workspace-rag-reranker` and
+   set `CORTEX_RAG_V2_RERANKER_URL=http://127.0.0.1:8891`. Retrieval falls back
+   to fused lexical/dense results if this service times out or is unavailable.
+   The Compose default pins the reranker model to an immutable Hugging Face
+   revision and pins its referenced repository code separately; when changing
+   models, set matching immutable `WORKSPACE_RAG_RERANKER_MODEL_REVISION` and
+   `WORKSPACE_RAG_RERANKER_CODE_REVISION` values.
+
+Rollback changes `CORTEX_RAG_V2_MODE` to `shadow` or `off`; V1 Postgres tables
+and the JSON fallback remain untouched. V2 generations and immutable source
+versions are retained for diagnosis and a later atomic re-publication.
+See [Hybrid Retrieval Architecture](docs/hybrid-retrieval-architecture.md) for
+the data contracts, adoption gates, and completed implementation evidence.
+
 For additional storage, CUDA, and troubleshooting options, see
 [Workspace RAG configuration](docs/configuration.md#workspace-rag).
 

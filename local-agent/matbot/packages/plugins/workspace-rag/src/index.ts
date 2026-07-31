@@ -18,11 +18,35 @@ import {
   documentMatchesVectorizer,
   type RagStorage,
 } from './storage.js';
+import { ragV2ModeFromEnv } from './v2/config.js';
+import type { RagV2EvaluationCase } from './v2/evaluation.js';
+import { WorkspaceRagV2Manager, type RagV2SourceBridge } from './v2/manager.js';
+import { MemoryRagV2Repository } from './v2/memory-repository.js';
+import { PostgresRagV2Repository } from './v2/postgres-repository.js';
+import {
+  evaluateOpenSearchAdoption,
+  type OpenSearchAdoptionGateInput,
+} from './v2/search-backend.js';
+import type {
+  RagV2Mode,
+  RagV2RetrievalVariant,
+  RagV2SearchResult,
+} from './v2/types.js';
 
 const CONFIG_FILE = 'cortex-rag.json';
 const REGISTRY_FILE = 'cortex-workspaces.json';
 const LOG_FILE = 'ingestion.log';
 const MAX_INGESTION_LOG_BYTES = 25 * 1024 * 1024;
+const RAG_V2_EVALUATION_VARIANTS: readonly RagV2RetrievalVariant[] = [
+  'flat_dense_baseline',
+  'lexical_only',
+  'dense_only',
+  'hybrid_rrf',
+  'hybrid_translated',
+  'hybrid_reranked',
+  'hierarchical',
+  'hierarchical_lazy',
+];
 const VECTOR_DIMS = 384;
 const SCAN_INTERVAL_MS = 60_000;
 const MAX_CHUNK_CHARS = 1800;
@@ -285,6 +309,16 @@ interface SearchHit {
   sourceHealthState?: SourceHealthState;
   sourceStalenessState?: SourceStalenessState;
   citation?: SourceCitationLike;
+  documentId?: string;
+  documentVersionId?: string;
+  sectionId?: string;
+  startByte?: number;
+  endByte?: number;
+  startLine?: number;
+  endLine?: number;
+  language?: string;
+  retrievalReasons?: string[];
+  retrievalRunId?: string;
 }
 
 interface SourceWarning {
@@ -880,6 +914,12 @@ class WorkspaceRagManager {
   private readonly activeConfigPath: string;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
   private readonly contextGraph: ContextGraphLike | undefined;
+  private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
+  private readonly v1BackgroundScanEnabled = !['0', 'false', 'no', 'off'].includes(
+    String(process.env['CORTEX_RAG_V1_BACKGROUND_SCAN'] ?? '1').trim().toLowerCase(),
+  );
+  private v2: WorkspaceRagV2Manager | undefined;
+  private v2Message = 'Workspace RAG V2 is disabled.';
 
   constructor(activeConfigPath: string, sourceRegistry?: SourceRegistryLike, contextGraph?: ContextGraphLike) {
     this.activeConfigPath = activeConfigPath;
@@ -895,8 +935,11 @@ class WorkspaceRagManager {
     this.cudaServiceUrl = launch.cudaServiceUrl;
     this.accelerationMessage = launch.accelerationMessage;
     this.storage = await createRagStorage(this.vectorizer.info);
-    this.timer = setInterval(() => this.startBackgroundScan('interval'), SCAN_INTERVAL_MS);
-    this.startBackgroundScan('startup');
+    await this.startV2();
+    if (this.v1BackgroundScanEnabled) {
+      this.timer = setInterval(() => this.startBackgroundScan('interval'), SCAN_INTERVAL_MS);
+      this.startBackgroundScan('startup');
+    }
   }
 
   stop(): void {
@@ -904,6 +947,9 @@ class WorkspaceRagManager {
     if (this.timer) clearInterval(this.timer);
     void this.storage?.close?.().catch(error => {
       console.warn(`[workspace-rag] failed to close storage backend: ${errorMessage(error)}`);
+    });
+    void this.v2?.close().catch(error => {
+      console.warn(`[workspace-rag-v2] failed to close: ${errorMessage(error)}`);
     });
   }
 
@@ -1103,9 +1149,143 @@ class WorkspaceRagManager {
     if (!workspace || !query.trim()) return [];
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
+    if (this.v2Mode === 'primary' && this.v2 !== undefined) {
+      try {
+        const result = await this.v2.search(
+          this.v2Workspace(workspace),
+          active,
+          query,
+          { limit },
+          signal,
+        );
+        if (result.evidence.length > 0) {
+          return this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace);
+        }
+      } catch (error) {
+        console.warn(`[workspace-rag-v2] primary search fell back to V1: ${errorMessage(error)}`);
+      }
+    }
     const queryVector = (await this.embedTexts([query], 'query', signal))[0] ?? [];
     const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
-    return this.enrichSearchHits(workspace, active, hits, trace);
+    const enriched = await this.enrichSearchHits(workspace, active, hits, trace);
+    if (this.v2Mode === 'shadow' && this.v2 !== undefined) {
+      void this.v2.search(this.v2Workspace(workspace), active, query, { limit }, signal)
+        .catch(error => console.warn(`[workspace-rag-v2] shadow search failed: ${errorMessage(error)}`));
+    }
+    return enriched;
+  }
+
+  async v2StatusCurrent(): Promise<unknown> {
+    const workspace = await this.currentWorkspace();
+    const context = activeContext(await this.readConfig(workspace));
+    if (!this.v2) {
+      return {
+        mode: this.v2Mode,
+        available: false,
+        backend: 'unavailable',
+        message: this.v2Message,
+      };
+    }
+    return this.v2.status(this.v2Mode, this.v2Workspace(workspace), context);
+  }
+
+  async v2StartCurrent(): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.startIngestion(this.v2Workspace(workspace), context);
+  }
+
+  async v2WaitCurrent(): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    await manager.waitForIngestion(workspace.id, context.id);
+    return manager.status(this.v2Mode, this.v2Workspace(workspace), context);
+  }
+
+  async v2PauseCurrent(): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.pause(workspace.id, context.id);
+  }
+
+  async v2ResumeCurrent(): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.resume(workspace.id, context.id);
+  }
+
+  async v2CancelCurrent(): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.cancel(workspace.id, context.id);
+  }
+
+  async v2EvictCurrent(limit: number): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.evictColdPassageEmbeddings(
+      this.v2Workspace(workspace),
+      context,
+      limit,
+    );
+  }
+
+  async v2CensusCurrent(
+    signal?: AbortSignal,
+    options: { deep?: boolean; resumeAfter?: string } = {},
+  ): Promise<unknown> {
+    const { context, manager } = await this.v2Current();
+    return manager.census(context.paths, signal, options);
+  }
+
+  async v2SearchCurrent(
+    query: string,
+    limit: number,
+    signal: AbortSignal,
+    filters: { documentTypes?: string[]; jurisdictions?: string[]; asOfDate?: string } = {},
+  ): Promise<RagV2SearchResult> {
+    const { workspace, context, manager } = await this.v2Current();
+    const result = await manager.search(
+      this.v2Workspace(workspace), context, query, { limit, ...filters }, signal,
+    );
+    if (!this.sourceRegistry) return result;
+    return {
+      ...result,
+      evidence: await Promise.all(result.evidence.map(async evidence => {
+        if (!evidence.sourceId) return evidence;
+        const source = await this.sourceRegistry!.getSource(evidence.sourceId).catch(() => null);
+        return source ? {
+          ...evidence,
+          sourceHealth: source.healthState,
+          sourceStaleness: source.stalenessState,
+        } : evidence;
+      })),
+    };
+  }
+
+  async v2FetchRangeCurrent(documentVersionId: string, startByte: number, endByte: number): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.fetchSourceRange(
+      this.v2Workspace(workspace), context, documentVersionId, startByte, endByte,
+    );
+  }
+
+  async v2FetchLinesCurrent(documentVersionId: string, startLine: number, endLine: number): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.fetchLines(
+      this.v2Workspace(workspace), context, documentVersionId, startLine, endLine,
+    );
+  }
+
+  async v2GrepCurrent(documentVersionIds: string[], pattern: string, limit: number): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.grepDocuments(
+      this.v2Workspace(workspace), context, documentVersionIds, pattern, limit,
+    );
+  }
+
+  async v2EvaluateCurrent(
+    cases: RagV2EvaluationCase[],
+    k: number,
+    variant: RagV2RetrievalVariant,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const { workspace, context, manager } = await this.v2Current();
+    return manager.evaluate(this.v2Workspace(workspace), context, cases, k, variant, signal);
   }
 
   async indexKnowledgeEntry(workspaceId: string, entry: KnowledgeEntry): Promise<void> {
@@ -1798,6 +1978,154 @@ class WorkspaceRagManager {
     return this.storage;
   }
 
+  private async startV2(): Promise<void> {
+    if (this.v2Mode === 'off') return;
+    const storageMode = String(process.env['CORTEX_RAG_V2_STORAGE'] ?? 'postgres').trim().toLowerCase();
+    const repository = storageMode === 'memory'
+      ? new MemoryRagV2Repository()
+      : new PostgresRagV2Repository();
+    const embedder = {
+      info: {
+        backend: this.vectorizer.info.backend,
+        model: this.vectorizer.info.model,
+        dimensions: this.vectorizer.info.dimensions,
+        signature: this.vectorizer.info.signature,
+        ...(this.vectorizer.info.maxTokens !== undefined ? { maxTokens: this.vectorizer.info.maxTokens } : {}),
+      },
+      embed: (
+        texts: readonly string[],
+        purpose: EmbeddingPurpose,
+        signal?: AbortSignal,
+      ) => this.vectorizer.embed(texts, purpose, signal),
+    };
+    const manager = new WorkspaceRagV2Manager(repository, embedder, this.v2SourceBridge());
+    try {
+      await manager.initialize();
+      this.v2 = manager;
+      this.v2Message = `Workspace RAG V2 ${this.v2Mode} mode is ready with ${repository.backend}.`;
+    } catch (error) {
+      await manager.close().catch(() => undefined);
+      this.v2Message = `Workspace RAG V2 initialization failed; V1 remains active. ${errorMessage(error)}`;
+      console.warn(`[workspace-rag-v2] ${this.v2Message}`);
+    }
+  }
+
+  private v2SourceBridge(): RagV2SourceBridge | undefined {
+    if (!this.sourceRegistry) return undefined;
+    return {
+      register: async (workspace, context, normalizedPath, contentSha256, modifiedAt, summary) => {
+        const externalId = this.fileSourceExternalId(context.id, normalizedPath);
+        const source = await this.sourceRegistry!.upsertSource({
+          workspaceId: workspace.id,
+          connectorType: 'workspace-rag',
+          externalId,
+          uri: normalizedPath,
+          title: path.basename(normalizedPath),
+          sourceKind: 'document',
+          schemaOrDocumentType: 'markdown',
+          sensitivity: 'internal',
+          permissionState: 'allowed',
+          trustLevel: 'medium',
+          citationPolicy: 'cite_path',
+          healthState: 'healthy',
+          lastObservedAt: nowIso(),
+          lastSuccessfulReadAt: nowIso(),
+          knownLimitations: [
+            'Workspace RAG V2 indexes immutable document, section, and passage evidence.',
+            'Generated summaries route retrieval but are not final answer evidence.',
+          ],
+        });
+        const version = await this.sourceRegistry!.upsertVersion({
+          sourceId: source.id,
+          contentHash: contentSha256,
+          observedAt: modifiedAt,
+          provenance: { activityId: `workspace-rag-v2:${workspace.id}:${context.id}:ingest` },
+        });
+        return { sourceId: source.id, sourceVersionId: version.id };
+      },
+      enrichContextGraph: async (workspace, context, normalizedPath, registration, summary) => {
+        if (!registration.sourceId || !registration.sourceVersionId) return;
+        await this.extractContextGraphSource(
+          {
+            id: workspace.id,
+            name: workspace.name,
+            configPath: path.join(workspace.configDir, 'matbot.yaml'),
+            configDir: workspace.configDir,
+            active: workspace.id === this.currentWorkspaceId(),
+          },
+          registration.sourceId,
+          registration.sourceVersionId,
+          `${path.basename(normalizedPath)}\n${summary}`,
+          'deterministic',
+        );
+      },
+      recordFailure: async (workspace, context, normalizedPath, error) => {
+        await this.registerFileReadFailure(
+          {
+            id: workspace.id,
+            name: workspace.name,
+            configPath: path.join(workspace.configDir, 'matbot.yaml'),
+            configDir: workspace.configDir,
+            active: workspace.id === this.currentWorkspaceId(),
+          },
+          context,
+          normalizedPath,
+          error,
+        );
+      },
+    };
+  }
+
+  private async v2Current(): Promise<{
+    workspace: WorkspaceRef;
+    context: RagContextConfig;
+    manager: WorkspaceRagV2Manager;
+  }> {
+    if (!this.v2) throw new Error(this.v2Message);
+    const workspace = await this.currentWorkspace();
+    const context = activeContext(await this.readConfig(workspace));
+    return { workspace, context, manager: this.v2 };
+  }
+
+  private v2Workspace(workspace: WorkspaceRef): { id: string; name: string; configDir: string } {
+    return { id: workspace.id, name: workspace.name, configDir: workspace.configDir };
+  }
+
+  private v2SearchHits(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    result: RagV2SearchResult,
+  ): SearchHit[] {
+    return result.evidence.map(evidence => ({
+      workspaceId: workspace.id,
+      contextName: context.name,
+      path: evidence.sourceUri,
+      chunkId: evidence.passageId,
+      score: evidence.score,
+      text: evidence.text,
+      ...(evidence.sourceId ? { sourceId: evidence.sourceId } : {}),
+      ...(evidence.sourceVersionId ? { sourceVersionId: evidence.sourceVersionId } : {}),
+      documentId: evidence.documentId,
+      documentVersionId: evidence.documentVersionId,
+      sectionId: evidence.sectionId,
+      startByte: evidence.byteRange.from,
+      endByte: evidence.byteRange.to,
+      startLine: evidence.lineRange.from,
+      endLine: evidence.lineRange.to,
+      language: evidence.language,
+      retrievalReasons: evidence.retrievalReasons,
+      retrievalRunId: result.runId,
+      citation: {
+        sourceId: evidence.sourceId ?? evidence.documentId,
+        policy: 'cite_path',
+        text: `${evidence.sourceUri}:${evidence.lineRange.from}-${evidence.lineRange.to}`,
+        uri: evidence.sourceUri,
+        title: evidence.title,
+        ...(evidence.sourceVersionId ? { versionId: evidence.sourceVersionId } : {}),
+      },
+    }));
+  }
+
   private async embedTexts(
     texts: readonly string[],
     purpose: EmbeddingPurpose,
@@ -1982,12 +2310,74 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['status', 'get_config', 'configure', 'select_context', 'create_context', 'delete_context', 'search', 'reindex_now'] },
+        action: {
+          type: 'string',
+          enum: [
+            'status', 'get_config', 'configure', 'select_context', 'create_context', 'delete_context',
+            'search', 'reindex_now',
+            'ingestion_start', 'ingestion_pause', 'ingestion_resume', 'ingestion_cancel',
+            'ingestion_retry', 'ingestion_status', 'ingestion_wait', 'reconcile_now',
+            'corpus_census', 'v2_search', 'grep_documents', 'fetch_source_range', 'fetch_lines',
+            'evaluation_run', 'backend_gate_evaluate',
+            'embedding_evict',
+          ],
+        },
         contextId: { type: 'string', description: 'Workspace RAG context id for select_context, delete_context, or configure.' },
         contextName: { type: 'string', description: 'Human-facing name for this workspace RAG context.' },
         paths: { type: 'array', items: { type: 'string' }, description: 'Absolute local folder paths containing markdown files.' },
         query: { type: 'string', description: 'Search query for action=search.' },
         limit: { type: 'number', default: 5 },
+        documentVersionId: { type: 'string', description: 'Immutable V2 document version id for range retrieval.' },
+        documentVersionIds: { type: 'array', items: { type: 'string' }, description: 'Authorized immutable V2 document versions for narrowed regex.' },
+        pattern: { type: 'string', description: 'Bounded regular expression for action=grep_documents.' },
+        startByte: { type: 'number', description: 'Inclusive source byte offset.' },
+        endByte: { type: 'number', description: 'Exclusive source byte offset.' },
+        startLine: { type: 'number', description: 'Inclusive one-based source line.' },
+        endLine: { type: 'number', description: 'Inclusive one-based source line.' },
+        evaluationCases: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'V2 evaluation cases with id, category, query, judgments, and optional forbiddenPassageIds.',
+        },
+        k: { type: 'number', default: 10, description: 'Evaluation cutoff for Recall, Precision, nDCG, and MRR.' },
+        evaluationVariant: {
+          type: 'string',
+          enum: [...RAG_V2_EVALUATION_VARIANTS],
+          default: 'hierarchical_lazy',
+          description: 'Retriever ablation persisted with evaluation metrics for V1-like flat dense, lexical, dense, RRF, translation, reranking, hierarchy, and lazy-promotion comparisons.',
+        },
+        deep: {
+          type: 'boolean',
+          default: true,
+          description: 'For corpus_census, stream every file to measure structure, language, and duplicate forecasts.',
+        },
+        resumeAfter: {
+          type: 'string',
+          description: 'For corpus_census, resume after the normalized checkpoint path returned by an interrupted run.',
+        },
+        documentTypes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional V2 document-type filters, for example contract or policy.',
+        },
+        jurisdictions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional V2 jurisdiction filters, for example PL or EU.',
+        },
+        asOfDate: {
+          type: 'string',
+          description: 'Optional ISO date used to filter publication and validity ranges.',
+        },
+        backendGate: {
+          type: 'object',
+          description: 'Measured PostgreSQL/OpenSearch metrics, targets, benefit, and operational approval.',
+        },
+        evictionLimit: {
+          type: 'number',
+          default: 1000,
+          description: 'Maximum oldest passage-vector derivatives removed by embedding_evict.',
+        },
       },
     },
     executor: {
@@ -2039,6 +2429,130 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             yield { type: 'result', value: await manager.statusCurrent() };
             return;
           }
+          if (action === 'ingestion_start' || action === 'ingestion_retry' || action === 'reconcile_now') {
+            yield { type: 'result', value: await manager.v2StartCurrent() };
+            return;
+          }
+          if (action === 'ingestion_pause') {
+            yield { type: 'result', value: await manager.v2PauseCurrent() };
+            return;
+          }
+          if (action === 'ingestion_resume') {
+            yield { type: 'result', value: await manager.v2ResumeCurrent() };
+            return;
+          }
+          if (action === 'ingestion_cancel') {
+            yield { type: 'result', value: await manager.v2CancelCurrent() };
+            return;
+          }
+          if (action === 'embedding_evict') {
+            const evictionLimit = typeof value.evictionLimit === 'number'
+              ? value.evictionLimit
+              : 1_000;
+            yield { type: 'result', value: await manager.v2EvictCurrent(evictionLimit) };
+            return;
+          }
+          if (action === 'ingestion_status') {
+            yield { type: 'result', value: await manager.v2StatusCurrent() };
+            return;
+          }
+          if (action === 'ingestion_wait') {
+            yield { type: 'result', value: await manager.v2WaitCurrent() };
+            return;
+          }
+          if (action === 'corpus_census') {
+            yield {
+              type: 'result',
+              value: await manager.v2CensusCurrent(ctx.signal, {
+                ...(typeof value.deep === 'boolean' ? { deep: value.deep } : {}),
+                ...(typeof value.resumeAfter === 'string' ? { resumeAfter: value.resumeAfter } : {}),
+              }),
+            };
+            return;
+          }
+          if (action === 'v2_search') {
+            const query = typeof value.query === 'string' ? value.query : '';
+            if (!query.trim()) { yield { type: 'error', message: 'workspace_rag v2_search requires "query".' }; return; }
+            const limit = typeof value.limit === 'number' ? value.limit : 5;
+            yield {
+              type: 'result',
+              value: await manager.v2SearchCurrent(query, limit, ctx.signal, {
+                ...(Array.isArray(value.documentTypes)
+                  ? { documentTypes: value.documentTypes.map(item => String(item)).filter(Boolean) }
+                  : {}),
+                ...(Array.isArray(value.jurisdictions)
+                  ? { jurisdictions: value.jurisdictions.map(item => String(item)).filter(Boolean) }
+                  : {}),
+                ...(typeof value.asOfDate === 'string' ? { asOfDate: value.asOfDate } : {}),
+              }),
+            };
+            return;
+          }
+          if (action === 'backend_gate_evaluate') {
+            if (!value.backendGate || typeof value.backendGate !== 'object') {
+              yield { type: 'error', message: 'workspace_rag backend_gate_evaluate requires "backendGate".' };
+              return;
+            }
+            yield {
+              type: 'result',
+              value: evaluateOpenSearchAdoption(value.backendGate as OpenSearchAdoptionGateInput),
+            };
+            return;
+          }
+          if (action === 'grep_documents') {
+            const documentVersionIds = Array.isArray(value.documentVersionIds)
+              ? value.documentVersionIds.map(item => String(item)).filter(Boolean)
+              : [];
+            const pattern = typeof value.pattern === 'string' ? value.pattern : '';
+            if (documentVersionIds.length === 0 || !pattern) {
+              yield { type: 'error', message: 'workspace_rag grep_documents requires "documentVersionIds" and "pattern".' };
+              return;
+            }
+            const limit = typeof value.limit === 'number' ? value.limit : 50;
+            yield { type: 'result', value: await manager.v2GrepCurrent(documentVersionIds, pattern, limit) };
+            return;
+          }
+          if (action === 'fetch_source_range') {
+            const documentVersionId = typeof value.documentVersionId === 'string' ? value.documentVersionId : '';
+            const startByte = typeof value.startByte === 'number' ? value.startByte : Number.NaN;
+            const endByte = typeof value.endByte === 'number' ? value.endByte : Number.NaN;
+            if (!documentVersionId || !Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte)) {
+              yield { type: 'error', message: 'workspace_rag fetch_source_range requires "documentVersionId", "startByte", and "endByte".' };
+              return;
+            }
+            yield { type: 'result', value: await manager.v2FetchRangeCurrent(documentVersionId, startByte, endByte) };
+            return;
+          }
+          if (action === 'fetch_lines') {
+            const documentVersionId = typeof value.documentVersionId === 'string' ? value.documentVersionId : '';
+            const startLine = typeof value.startLine === 'number' ? value.startLine : Number.NaN;
+            const endLine = typeof value.endLine === 'number' ? value.endLine : Number.NaN;
+            if (!documentVersionId || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine)) {
+              yield { type: 'error', message: 'workspace_rag fetch_lines requires "documentVersionId", "startLine", and "endLine".' };
+              return;
+            }
+            yield { type: 'result', value: await manager.v2FetchLinesCurrent(documentVersionId, startLine, endLine) };
+            return;
+          }
+          if (action === 'evaluation_run') {
+            const cases = Array.isArray(value.evaluationCases)
+              ? value.evaluationCases.filter(item => item && typeof item === 'object') as unknown as RagV2EvaluationCase[]
+              : [];
+            if (cases.length === 0) {
+              yield { type: 'error', message: 'workspace_rag evaluation_run requires "evaluationCases".' };
+              return;
+            }
+            const k = typeof value.k === 'number' ? value.k : 10;
+            const evaluationVariant = typeof value.evaluationVariant === 'string'
+              && RAG_V2_EVALUATION_VARIANTS.includes(value.evaluationVariant as RagV2RetrievalVariant)
+              ? value.evaluationVariant as RagV2RetrievalVariant
+              : 'hierarchical_lazy';
+            yield {
+              type: 'result',
+              value: await manager.v2EvaluateCurrent(cases, k, evaluationVariant, ctx.signal),
+            };
+            return;
+          }
           if (action === 'search') {
             const query = typeof value.query === 'string' ? value.query : '';
             if (!query.trim()) { yield { type: 'error', message: 'workspace_rag search requires "query".' }; return; }
@@ -2079,6 +2593,11 @@ function renderContext(hits: SearchHit[]): string {
       ...(hit.sourceId !== undefined ? [`Source id: ${hit.sourceId}`] : []),
       ...(hit.sourceHealthState !== undefined ? [`Source health: ${hit.sourceHealthState}`] : []),
       ...(hit.sourceStalenessState !== undefined ? [`Source freshness: ${hit.sourceStalenessState}`] : []),
+      ...(hit.documentVersionId !== undefined ? [`Document version: ${hit.documentVersionId}`] : []),
+      ...(hit.sectionId !== undefined ? [`Section id: ${hit.sectionId}`] : []),
+      ...(hit.startLine !== undefined && hit.endLine !== undefined ? [`Lines: ${hit.startLine}-${hit.endLine}`] : []),
+      ...(hit.language !== undefined ? [`Language: ${hit.language}`] : []),
+      ...(hit.retrievalReasons?.length ? [`Retrieved by: ${hit.retrievalReasons.join('; ')}`] : []),
       ...sourceWarningsForHit(hit).map(warning => `Warning: ${warning.message}`),
       ...(hit.citation !== undefined ? [`Citation: ${hit.citation.text}`] : []),
       hit.text,

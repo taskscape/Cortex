@@ -39,7 +39,10 @@ test("CUDA image preloads models and mounts a persistent Hugging Face cache", as
   ]);
   assert.match(dockerfile, /HF_HOME=\/models\/huggingface/);
   assert.match(dockerfile, /SENTENCE_TRANSFORMERS_HOME=\/models\/sentence-transformers/);
-  assert.match(dockerfile, /SentenceTransformer\(model_name, device="cpu"\)/);
+  assert.match(
+    dockerfile,
+    /SentenceTransformer\([\s\S]*?model_name,[\s\S]*?device="cpu",[\s\S]*?revision=os\.environ\["EMBEDDING_MODEL_REVISION"\]/,
+  );
   assert.match(compose, /workspace-rag-cuda:[\s\S]*?volumes:\s*\r?\n\s*- workspace-rag-models:\/models/);
   assert.match(compose, /^  workspace-rag-models:\s*$/m);
 });

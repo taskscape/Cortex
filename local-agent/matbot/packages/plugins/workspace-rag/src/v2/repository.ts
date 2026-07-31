@@ -1,0 +1,205 @@
+import type {
+  RagV2DocumentRecord,
+  RagV2Evidence,
+  RagV2Job,
+  RagV2JobItem,
+  RagV2Level,
+  RagV2PassageRecord,
+  RagV2PublicationState,
+  RagV2RankedHit,
+  RagV2SectionRecord,
+  RagV2VectorizerInfo,
+} from './types.js';
+
+export interface RagV2DocumentFingerprint {
+  documentId: string;
+  documentVersionId: string;
+  path: string;
+  byteLength: number;
+  modifiedAt: string;
+  contentSha256: string;
+  embeddingSignature: string;
+}
+
+export interface RagV2Publication {
+  generationId: string;
+  workspaceId: string;
+  contextId: string;
+  state: RagV2PublicationState;
+  embeddingSignature: string;
+  active: boolean;
+  createdAt: string;
+  publishedAt?: string;
+}
+
+export interface RagV2EmbeddingRecord {
+  level: RagV2Level;
+  unitId: string;
+  documentVersionId: string;
+  workspaceId: string;
+  contextId: string;
+  signature: string;
+  contentSha256: string;
+  vector: number[];
+}
+
+export interface RagV2SearchScope {
+  workspaceId: string;
+  contextId: string;
+  generationId: string;
+  documentIds?: string[];
+  sectionIds?: string[];
+  authorizationTokens?: string[];
+  documentTypes?: string[];
+  jurisdictions?: string[];
+  asOfDate?: string;
+  lexicalLanguage?: string;
+  limit: number;
+}
+
+export interface RagV2RetrievalRunRecord {
+  id: string;
+  workspaceId: string;
+  contextId: string;
+  generationId: string;
+  questionHash: string;
+  planJson: unknown;
+  embeddingSignature: string;
+  rerankerModel?: string;
+  startedAt: string;
+  completedAt?: string;
+  status: 'running' | 'succeeded' | 'failed';
+  timingsJson?: unknown;
+}
+
+export interface RagV2StoredRetrievalHit {
+  runId: string;
+  hit: RagV2RankedHit;
+  selectedForContext: boolean;
+  exclusionReason?: string;
+}
+
+export interface RagV2RegexRunRecord {
+  id: string;
+  workspaceId: string;
+  contextId: string;
+  generationId: string;
+  patternHash: string;
+  targetVersionCount: number;
+  matchLimit: number;
+  matchCount: number;
+  resultBytes: number;
+  durationMs: number;
+  createdAt: string;
+}
+
+export interface RagV2Repository {
+  readonly backend: 'postgres-pgvector' | 'memory';
+  initialize(vectorizer: RagV2VectorizerInfo): Promise<void>;
+  close(): Promise<void>;
+
+  beginGeneration(workspaceId: string, contextId: string, generationId: string): Promise<void>;
+  activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined>;
+  publishGeneration(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+    state: Extract<RagV2PublicationState, 'active_lexical' | 'active_hybrid_partial' | 'active_hybrid_complete'>,
+  ): Promise<void>;
+  validateGeneration(workspaceId: string, contextId: string, generationId: string): Promise<{
+    valid: boolean;
+    documents: number;
+    sections: number;
+    passages: number;
+    lexicalReady: number;
+    passageEmbeddings: number;
+    errors: string[];
+  }>;
+
+  createJob(job: RagV2Job): Promise<void>;
+  updateJob(job: RagV2Job): Promise<void>;
+  currentJob(workspaceId: string, contextId: string): Promise<RagV2Job | undefined>;
+  upsertJobItem(item: RagV2JobItem): Promise<void>;
+
+  listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]>;
+  beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void>;
+  appendSections(sections: readonly RagV2SectionRecord[]): Promise<void>;
+  appendPassages(passages: readonly RagV2PassageRecord[]): Promise<void>;
+  putEmbeddings(records: readonly RagV2EmbeddingRecord[], vectorizer: RagV2VectorizerInfo): Promise<void>;
+  reuseEmbeddings(
+    records: readonly Omit<RagV2EmbeddingRecord, 'vector'>[],
+    vectorizer: RagV2VectorizerInfo,
+  ): Promise<Set<string>>;
+  evictPassageEmbeddings(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+    limit: number,
+    vectorizer: RagV2VectorizerInfo,
+  ): Promise<number>;
+  finishDocument(generationId: string, document: RagV2DocumentRecord): Promise<void>;
+  reconcileGeneration(
+    jobId: string,
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<number>;
+
+  lexicalSearch(level: RagV2Level, query: string, scope: RagV2SearchScope): Promise<RagV2RankedHit[]>;
+  exactSearch(references: readonly string[], scope: RagV2SearchScope): Promise<RagV2RankedHit[]>;
+  denseSearch(
+    level: RagV2Level,
+    queryVector: readonly number[],
+    vectorizer: RagV2VectorizerInfo,
+    scope: RagV2SearchScope,
+  ): Promise<RagV2RankedHit[]>;
+  passagesForSection(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+    sectionId: string,
+    onlyMissingEmbeddings: boolean,
+  ): Promise<RagV2PassageRecord[]>;
+  documentVersion(
+    workspaceId: string,
+    contextId: string,
+    documentVersionId: string,
+    authorizationTokens: readonly string[],
+  ): Promise<RagV2DocumentRecord | undefined>;
+  grepDocuments(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+    documentVersionIds: readonly string[],
+    pattern: string,
+    authorizationTokens: readonly string[],
+    limit: number,
+  ): Promise<RagV2RankedHit[]>;
+
+  createRetrievalRun(run: RagV2RetrievalRunRecord): Promise<void>;
+  appendRetrievalHits(
+    workspaceId: string,
+    contextId: string,
+    hits: readonly RagV2StoredRetrievalHit[],
+  ): Promise<void>;
+  appendRetrievalEvidence(
+    workspaceId: string,
+    contextId: string,
+    runId: string,
+    evidence: readonly RagV2Evidence[],
+  ): Promise<void>;
+  finishRetrievalRun(run: RagV2RetrievalRunRecord): Promise<void>;
+  saveEvaluationRun(input: {
+    id: string;
+    workspaceId: string;
+    contextId: string;
+    generationId: string;
+    embeddingSignature: string;
+    rerankerModel?: string;
+    configuration: unknown;
+    metrics: Record<string, unknown>;
+    createdAt: string;
+    completedAt: string;
+  }): Promise<void>;
+  saveRegexRun(run: RagV2RegexRunRecord): Promise<void>;
+}

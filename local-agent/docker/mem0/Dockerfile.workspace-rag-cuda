@@ -9,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_CACHE=/models/huggingface \
     SENTENCE_TRANSFORMERS_HOME=/models/sentence-transformers \
     EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2 \
+    EMBEDDING_MODEL_REVISION=46605decb5369335a3847c9f41bb0b896c07dd1a \
     EMBEDDING_BATCH_SIZE=32
 
 WORKDIR /app
@@ -25,7 +26,11 @@ RUN python - <<'PY'
 from sentence_transformers import SentenceTransformer
 import os
 model_name = os.environ["EMBEDDING_MODEL"]
-model = SentenceTransformer(model_name, device="cpu")
+model = SentenceTransformer(
+    model_name,
+    device="cpu",
+    revision=os.environ["EMBEDDING_MODEL_REVISION"],
+)
 print(f"cached {model_name} ({model.get_sentence_embedding_dimension()} dims)")
 PY
 

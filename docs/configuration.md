@@ -59,6 +59,27 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
 | `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES` | `10000` | Maximum workspace scan size that receives per-file context-graph extraction. Larger scans still get vectors and source metadata but skip graph expansion. Use `-1` only when intentionally enabling graph extraction for an unbounded scan. |
+| `CORTEX_RAG_V2_MODE` | `off` | Side-by-side hybrid mode: `off`, `shadow`, or `primary`. `primary` falls back to V1 if V2 is unavailable or produces no evidence. |
+| `CORTEX_RAG_V1_BACKGROUND_SCAN` | `1` | Set to `0` during a V2-only rebuild to prevent the legacy flat index from being repopulated. Explicit `reindex_now` remains available. |
+| `CORTEX_RAG_V2_POSTGRES_SCHEMA` | `workspace_rag_v2` | Versioned V2 catalog, lexical, vector, job, trace, evidence, and evaluation schema. |
+| `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL` | unset | Optional owner connection used only for V2 migrations and grants. When set, `CORTEX_RAG_POSTGRES_URL` must identify a distinct non-owner application role without `BYPASSRLS`. |
+| `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES` | `0` | Set to `1` in production to reject owner-bypassed V2 startup. |
+| `CORTEX_RAG_V2_OBJECT_ROOT` | workspace `.data\workspace-rag-v2` | Content-addressed immutable objects, sparse line indexes, and manifests. |
+| `CORTEX_RAG_V2_OBJECT_RETENTION` | `managed` | `managed`, `external_immutable`, or explicitly degraded `manifest_only`. |
+| `CORTEX_RAG_V2_EXTERNAL_OBJECT_ROOT` | unset | Range-readable content-addressed root required for `external_immutable`. |
+| `CORTEX_RAG_V2_EAGER_MAX_BYTES` | `20971520` | Largest source receiving eager passage vectors. Lexical coverage remains complete at every tier. |
+| `CORTEX_RAG_V2_ASYNC_MAX_BYTES` | `262144000` | Largest source eligible for capped asynchronous passage promotion. Larger sources remain lexical with query-triggered lazy promotion. |
+| `CORTEX_RAG_V2_EAGER_PASSAGE_VECTOR_CAP` | `20000` | Per-document cap for eager or planned asynchronous passage vectors. |
+| `CORTEX_RAG_V2_PARSER_MEMORY_BYTES` | `33554432` | Per-file streaming parser budget. |
+| `CORTEX_RAG_V2_RERANKER_URL` | unset | Optional multilingual reranker base URL, normally `http://127.0.0.1:8891`. |
+| `CORTEX_RAG_V2_RRF_K` | `60` | Reciprocal Rank Fusion rank constant. |
+| `CORTEX_RAG_V2_RRF_WEIGHTS` | `{}` | Measured retriever weights as a JSON object; malformed or unsafe weights are ignored. |
+| `CORTEX_RAG_V2_VECTOR_INDEX_MODE` | `full` | `full`, `half`, or `binary` HNSW candidate index. Half/binary modes over-fetch candidates and rerank them with the full vector; activate only after recall measurement. |
+| `CORTEX_RAG_V2_COLBERT_URL` | unset | Optional local ColBERT-compatible `/search` lane. Returned versions are re-authorized and source ranges rehashed; activate only after representative measurements justify it. |
+| `CORTEX_RAG_V2_STORAGE_BYTES_PER_SECOND` | `0` | Independent immutable-object write/read throttle; zero is unlimited. |
+| `CORTEX_RAG_V2_EMBEDDING_TEXTS_PER_SECOND` | `0` | Independent embedding backfill throttle; zero is unlimited. |
+| `CORTEX_RAG_V2_SOURCE_METADATA_OPS_PER_SECOND` | `0` | Independent source-registry metadata throttle. |
+| `CORTEX_RAG_V2_CONTEXT_GRAPH_OPS_PER_SECOND` | `0` | Independent context-graph enrichment throttle. |
 | `CORTEX_STRUCTURED_POSTGRES_URL` | unset | Optional Postgres connection string used by the `structured-data` plugin for approved read-only semantic SQL execution. Use a database role with read-only privileges. |
 | `CORTEX_MODEL_PRICING_JSON` | unset | Optional JSON object keyed by model id with `inputPerMillionUsd`, `cachedInputPerMillionUsd`, and `outputPerMillionUsd`; used when a provider does not report model cost directly. |
 | `CORTEX_APPROVAL_SLA_HOURS` | `24` | Hours before a pending workflow approval is considered overdue in observability and governance metrics. |
@@ -101,10 +122,20 @@ OPENAI_API_KEY=CHANGE_ME
 
 # Optional CUDA embedding service for workspace-rag.
 WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=
+WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=46605decb5369335a3847c9f41bb0b896c07dd1a
 WORKSPACE_RAG_EMBEDDING_PROFILE=auto
 WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+
+# Optional multilingual V2 reranker.
+WORKSPACE_RAG_RERANKER_MODEL=Alibaba-NLP/gte-multilingual-reranker-base
+WORKSPACE_RAG_RERANKER_MODEL_REVISION=8215cf04918ba6f7b6a62bb44238ce2953d8831c
+WORKSPACE_RAG_RERANKER_CODE_REVISION=40ced75c3017eb27626c9d4ea981bde21a2662f4
 ```
+
+Model revisions in this template are immutable repository commits. Change the
+model, model revision, and any referenced code revision together; these pins
+are part of the V2 derivative signature and prevent a moving branch from
+silently changing ranking behavior.
 
 The Postgres and Neo4j passwords are baked into their Docker volumes on first
 start. If you rotate them after the stack has already started, recreate the

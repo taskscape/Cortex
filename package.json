@@ -9,6 +9,7 @@
     "test": "node --test tests/*.test.mjs",
     "test:cli": "corepack pnpm -C local-agent/matbot --filter @matatbread/matbot-cli run test",
     "test:webui": "playwright test",
+    "test:webui:hybrid-retrieval": "playwright test tests/webui/hybrid-retrieval.spec.mjs --project=chromium",
     "test:integration:docker": "node --test tests/docker-stack.integration.mjs",
     "test:integration:cuda": "node --test --test-name-pattern=CUDA tests/docker-stack.integration.mjs",
     "test:readme-qa": "playwright test --config playwright.readme-qa.config.mjs",

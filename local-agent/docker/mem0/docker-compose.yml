@@ -40,12 +40,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.workspace-rag-cuda
-    image: matbot/workspace-rag-cuda:latest
+    image: matbot/workspace-rag-cuda:v1
     platform: linux/amd64
     gpus: all
     environment:
       EMBEDDING_MODEL: ${WORKSPACE_RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-      EMBEDDING_MODEL_REVISION: ${WORKSPACE_RAG_EMBEDDING_MODEL_REVISION:-}
+      EMBEDDING_MODEL_REVISION: ${WORKSPACE_RAG_EMBEDDING_MODEL_REVISION:-46605decb5369335a3847c9f41bb0b896c07dd1a}
       EMBEDDING_PROFILE: ${WORKSPACE_RAG_EMBEDDING_PROFILE:-auto}
       EMBEDDING_BATCH_SIZE: ${WORKSPACE_RAG_EMBEDDING_BATCH_SIZE:-32}
     volumes:
@@ -53,8 +53,29 @@ services:
     ports:
       - "8890:8000"
 
+  workspace-rag-reranker:
+    profiles: ["reranker"]
+    build:
+      context: .
+      dockerfile: Dockerfile.workspace-rag-reranker
+    image: matbot/workspace-rag-reranker:v1
+    platform: linux/amd64
+    gpus: all
+    environment:
+      RERANKER_MODEL: ${WORKSPACE_RAG_RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      RERANKER_MODEL_REVISION: ${WORKSPACE_RAG_RERANKER_MODEL_REVISION:-8215cf04918ba6f7b6a62bb44238ce2953d8831c}
+      RERANKER_CODE_REVISION: ${WORKSPACE_RAG_RERANKER_CODE_REVISION:-40ced75c3017eb27626c9d4ea981bde21a2662f4}
+      RERANKER_BATCH_SIZE: ${WORKSPACE_RAG_RERANKER_BATCH_SIZE:-16}
+      RERANKER_MAX_TEXTS: ${WORKSPACE_RAG_RERANKER_MAX_TEXTS:-100}
+      RERANKER_MAX_LENGTH: ${WORKSPACE_RAG_RERANKER_MAX_LENGTH:-1024}
+    volumes:
+      - workspace-rag-models:/models
+    ports:
+      - "8891:8000"
+
   postgres:
-    image: pgvector/pgvector:pg16
+    # PostgreSQL 16.14 + pgvector 0.8.3, pinned to the tested multi-arch image.
+    image: pgvector/pgvector:0.8.3-pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mem0}
       POSTGRES_USER: ${POSTGRES_USER:-mem0}
