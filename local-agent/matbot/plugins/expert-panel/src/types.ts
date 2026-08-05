@@ -136,6 +136,7 @@ export type ExpertReviewMode =
 export type ExpertReviewTargetType =
   | "decision_dossier"
   | "workflow"
+  | "workflow_run"
   | "alert"
   | "investigation"
   | "chat"

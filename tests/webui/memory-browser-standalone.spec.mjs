@@ -41,7 +41,10 @@ async function start(store) {
   if (!address || typeof address === "string") throw new Error("memory browser did not bind");
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
-    close: () => new Promise(resolve => server.close(resolve)),
+    close: () => new Promise(resolve => {
+      server.closeAllConnections?.();
+      server.close(resolve);
+    }),
   };
 }
 
@@ -122,6 +125,54 @@ test("MISSING-11 standalone memory browser renders and reconciles cross-tab CAS 
     await expect(page.locator(".memory-item")).toHaveCount(1);
   } finally {
     await second.close();
+    await service.close();
+  }
+});
+
+test("MBS-2/MBS-3 standalone browser uses the injected workspace store when IndexedDB and OPFS are unavailable", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "indexedDB", { configurable: true, value: undefined });
+    if (navigator.storage) {
+      Object.defineProperty(navigator.storage, "getDirectory", { configurable: true, value: undefined });
+    }
+  });
+  const store = new MemoryStore();
+  await store.set("server-backed", {
+    id: "server-backed",
+    version: "v1",
+    fact: "Injected workspace store fact",
+    sessionId: "session-store",
+    messageId: "message-store",
+    createdAt: "2026-01-03T00:00:00.000Z",
+  });
+  const service = await start(store);
+  try {
+    await page.goto(`${service.baseUrl}/`, { waitUntil: "networkidle" });
+    expect(await page.evaluate(() => ({
+      indexedDb: typeof indexedDB,
+      opfs: typeof navigator.storage?.getDirectory,
+    }))).toEqual({ indexedDb: "undefined", opfs: "undefined" });
+    await expect(page.locator(".memory-item", { hasText: "Injected workspace store fact" })).toBeVisible();
+
+    await page.locator("#new-fact").fill("Created without browser-native storage");
+    await page.locator("#add-memory-btn").click();
+    await expect(page.locator("#status")).toHaveText("Added.");
+    expect(
+      [...store.docs.values()].some(memory => memory.fact === "Created without browser-native storage"),
+      "browser mutations must reach the injected workspace store",
+    ).toBe(true);
+
+    await store.set("external-store-update", {
+      id: "external-store-update",
+      version: "v1",
+      fact: "External store update",
+      sessionId: "session-external",
+      messageId: "message-external",
+      createdAt: "2026-01-04T00:00:00.000Z",
+    });
+    await page.locator("#refresh-btn").click();
+    await expect(page.locator(".memory-item", { hasText: "External store update" })).toBeVisible();
+  } finally {
     await service.close();
   }
 });

@@ -1654,7 +1654,8 @@
       background: #fff;
     }
     .trigger-row .trigger-text {
-      flex: 1;
+      width: 100%;
+      box-sizing: border-box;
       min-width: 0;
       resize: vertical;
       font-family: inherit;
@@ -1686,6 +1687,39 @@
     .trigger-row .trigger-edit:hover,
     .trigger-row .trigger-del:hover { background: #f3f4f6; color: #111; }
     .trigger-row .trigger-edit.editing { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .trigger-body { flex: 1; min-width: 0; }
+    .trigger-action {
+      margin-top: 4px;
+      color: #6b7280;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.72em;
+    }
+    #skill-trigger-dialog {
+      width: min(520px, calc(100vw - 32px));
+      border: 0;
+      border-radius: 12px;
+      box-shadow: 0 20px 60px rgb(15 23 42 / 0.28);
+      padding: 0;
+      color: #1f2937;
+    }
+    #skill-trigger-dialog::backdrop { background: rgb(15 23 42 / 0.42); }
+    .skill-trigger-dialog-body { display: grid; gap: 14px; padding: 18px; }
+    .skill-trigger-dialog-body h2 { margin: 0; font-size: 1.05em; }
+    .skill-trigger-field { display: grid; gap: 5px; font-size: 0.84em; font-weight: 600; }
+    .skill-trigger-field select,
+    .skill-trigger-field textarea,
+    .skill-trigger-field input {
+      box-sizing: border-box;
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 7px;
+      padding: 8px;
+      font: inherit;
+      font-weight: 400;
+    }
+    .skill-trigger-field textarea { min-height: 96px; resize: vertical; }
+    #skill-trigger-dialog-error { min-height: 1.2em; color: #b91c1c; font-size: 0.82em; }
+    .skill-trigger-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
     /* ── Skill metadata pane ────────────────────────────────────── */
     /* Read-only view of the skill's derived LLM analysis (summary / entities / tags). */
@@ -4511,7 +4545,7 @@
         </div>
         <div id="skill-editor-pane-triggers" class="skill-pane">
           <div id="skill-trigger-list"></div>
-          <button id="skill-trigger-add" class="skill-editor-btn">+ Add condition</button>
+          <button id="skill-trigger-add" class="skill-editor-btn">+ Add trigger</button>
         </div>
         <div id="skill-editor-pane-metadata" class="skill-pane">
           <div id="skill-metadata"></div>
@@ -4524,6 +4558,30 @@
         <button id="skill-editor-save" class="skill-editor-btn primary">Save</button>
       </div>
     </div>
+    <dialog id="skill-trigger-dialog" aria-labelledby="skill-trigger-dialog-title">
+      <div class="skill-trigger-dialog-body">
+        <h2 id="skill-trigger-dialog-title">Add trigger</h2>
+        <label class="skill-trigger-field">Trigger behavior
+          <select id="skill-trigger-dialog-kind">
+            <option value="ephemeral">On user message — load for this turn</option>
+            <option value="contextual">On user message — retain in context</option>
+            <option value="retract">On assistant response — retract and redo</option>
+            <option value="followup">On assistant response — add follow-up</option>
+          </select>
+        </label>
+        <label class="skill-trigger-field">Classifier condition
+          <textarea id="skill-trigger-dialog-rule" placeholder="MATCH when …; DO NOT MATCH when …"></textarea>
+        </label>
+        <label class="skill-trigger-field">Action
+          <input id="skill-trigger-dialog-action" type="text" readonly>
+        </label>
+        <div id="skill-trigger-dialog-error" role="alert" aria-live="polite"></div>
+        <div class="skill-trigger-dialog-actions">
+          <button id="skill-trigger-dialog-cancel" class="skill-editor-btn" type="button">Cancel</button>
+          <button id="skill-trigger-dialog-save" class="skill-editor-btn primary" type="button">Add trigger</button>
+        </div>
+      </div>
+    </dialog>
   </div>
 
   <div id="memory-browser-overlay">
@@ -4648,10 +4706,11 @@
           <div class="architecture-tabs" role="tablist" aria-label="Architecture panels">
             <button id="architecture-tab-sources" class="architecture-tab active" data-architecture-tab="sources" type="button" role="tab" aria-selected="true" aria-controls="architecture-panel-sources">Sources</button>
             <button id="architecture-tab-sql" class="architecture-tab" data-architecture-tab="sql" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-sql" tabindex="-1">SQL Preview</button>
-            <button id="architecture-tab-workflows" class="architecture-tab" data-architecture-tab="workflows" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-workflows" tabindex="-1">Workflows</button>
-            <button id="architecture-tab-evaluation" class="architecture-tab" data-architecture-tab="evaluation" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-evaluation" tabindex="-1">Evaluation &amp; ROI</button>
-            <button id="architecture-tab-graph" class="architecture-tab" data-architecture-tab="graph" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-graph" tabindex="-1">Graph</button>
+            <button id="architecture-tab-workflows" class="architecture-tab" data-architecture-tab="workflows" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-workflows" tabindex="-1">Workflow Center</button>
+            <button id="architecture-tab-graph" class="architecture-tab" data-architecture-tab="graph" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-graph" tabindex="-1">Context Graph</button>
             <button id="architecture-tab-reviews" class="architecture-tab" data-architecture-tab="reviews" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-reviews" tabindex="-1">Reviews</button>
+            <button id="architecture-tab-evaluation" class="architecture-tab" data-architecture-tab="evaluation" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-evaluation" tabindex="-1">Evaluation &amp; ROI</button>
+            <button id="architecture-tab-plugins" class="architecture-tab" data-architecture-tab="plugins" type="button" role="tab" aria-selected="false" aria-controls="architecture-panel-plugins" tabindex="-1">Plugins</button>
           </div>
         </div>
 
@@ -4708,6 +4767,16 @@
             <div id="architecture-sql-status" class="architecture-status" role="status"></div>
           </div>
           <div id="architecture-sql-preview" class="architecture-code" aria-label="SQL preview"></div>
+          <form id="architecture-sql-validation-form" class="architecture-form architecture-sql-validation-form">
+            <label class="full">
+              SQL safety check
+              <textarea id="architecture-sql-validation-input" rows="3" spellcheck="false">SELECT o.id FROM public.orders o CROSS JOIN public.orders other LIMIT 10</textarea>
+            </label>
+            <div class="architecture-form-actions">
+              <button id="architecture-sql-validation-btn" type="submit">Validate SQL</button>
+            </div>
+          </form>
+          <div id="architecture-sql-validation-result" class="architecture-sql-validation-result" aria-live="polite"></div>
           <div id="architecture-sql-results" class="architecture-results" aria-live="polite"></div>
         </section>
 
@@ -4819,6 +4888,17 @@
               <div id="workflow-ops-shadow-detail" class="architecture-detail" aria-live="polite"></div>
             </div>
           </div>
+          <div id="architecture-high-risk-write-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-high-risk-write-title" hidden>
+            <div class="architecture-health-modal-header">
+              <h3 id="architecture-high-risk-write-title">Review high-risk write</h3>
+              <button id="architecture-high-risk-write-close" type="button">Close</button>
+            </div>
+            <div id="architecture-high-risk-write-content"></div>
+            <div class="architecture-card-actions">
+              <button id="architecture-high-risk-write-reject" class="danger" type="button">Reject write</button>
+              <button id="architecture-high-risk-write-approve" class="primary" type="button">Approve write</button>
+            </div>
+          </div>
         </section>
 
         <section id="architecture-panel-evaluation" class="architecture-panel" data-architecture-panel="evaluation" role="tabpanel" aria-labelledby="architecture-tab-evaluation" hidden>
@@ -4875,48 +4955,72 @@
         </section>
 
         <section id="architecture-panel-reviews" class="architecture-panel" data-architecture-panel="reviews" role="tabpanel" aria-labelledby="architecture-tab-reviews" hidden>
-          <form id="architecture-review-form" class="architecture-form">
-            <label class="full">
-              Question
-              <textarea id="architecture-review-question">Should this high-risk workflow be approved?</textarea>
-            </label>
-            <label>
-              Target type
-              <select id="architecture-review-target-type">
-                <option value="workflow">Workflow</option>
-                <option value="decision_dossier">Decision dossier</option>
-                <option value="investigation">Investigation</option>
-                <option value="alert">Alert</option>
-                <option value="other">Other</option>
-              </select>
-            </label>
-            <label>
-              Target ID
-              <input id="architecture-review-target-id" type="text" value="workflow:compiled-followup" autocomplete="off">
-            </label>
-            <label>
-              Workflow ID
-              <input id="architecture-review-workflow-id" type="text" value="workflow:compiled-followup" autocomplete="off">
-            </label>
-            <label>
-              Run ID
-              <input id="architecture-review-run-id" type="text" autocomplete="off">
-            </label>
-            <label class="full">
-              Experts
-              <input id="architecture-review-experts" type="text" value="finance, engineering" autocomplete="off">
-            </label>
-            <div class="architecture-form-actions">
-              <button id="architecture-review-refresh" type="button">Refresh</button>
-              <button id="architecture-review-create-btn" class="primary" type="submit">Create Review</button>
-            </div>
-          </form>
           <div class="architecture-toolbar">
             <div id="architecture-review-status" class="architecture-status" role="status"></div>
+            <div class="architecture-actions">
+              <button id="architecture-review-refresh" type="button">Refresh</button>
+              <button id="architecture-review-open-btn" class="primary" type="button">Create Review</button>
+            </div>
+          </div>
+          <div id="architecture-review-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-review-modal-title" hidden>
+            <div class="architecture-health-modal-header">
+              <h3 id="architecture-review-modal-title">Create expert review</h3>
+              <button id="architecture-review-close-btn" type="button">Close</button>
+            </div>
+            <form id="architecture-review-form" class="architecture-form">
+              <label class="full">
+                Question
+                <textarea id="architecture-review-question">Should this high-risk workflow be approved?</textarea>
+              </label>
+              <label>
+                Target type
+                <select id="architecture-review-target-type">
+                  <option value="workflow">Workflow</option>
+                  <option value="workflow_run">Workflow run</option>
+                  <option value="alert">Alert</option>
+                  <option value="investigation">Investigation</option>
+                  <option value="chat">Chat</option>
+                  <option value="decision_dossier">Decision dossier</option>
+                  <option value="other">Other</option>
+                </select>
+              </label>
+              <label>
+                Target ID
+                <input id="architecture-review-target-id" type="text" value="workflow:compiled-followup" autocomplete="off">
+              </label>
+              <label>
+                Workflow ID
+                <input id="architecture-review-workflow-id" type="text" value="workflow:compiled-followup" autocomplete="off">
+              </label>
+              <label>
+                Run ID
+                <input id="architecture-review-run-id" type="text" autocomplete="off">
+              </label>
+              <label class="full">
+                Experts
+                <select id="architecture-review-experts" multiple size="3" aria-label="Experts">
+                  <option value="design">Design Expert</option>
+                  <option value="finance" selected>Finance Expert</option>
+                  <option value="engineering" selected>Engineering Expert</option>
+                </select>
+              </label>
+              <div class="architecture-form-actions">
+                <button id="architecture-review-cancel-btn" type="button">Cancel</button>
+                <button id="architecture-review-create-btn" class="primary" type="submit">Create Review</button>
+              </div>
+            </form>
           </div>
           <div class="architecture-grid">
             <div id="architecture-review-list" class="architecture-list" aria-label="Expert review cards"></div>
             <div id="architecture-review-detail" class="architecture-detail" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section id="architecture-panel-plugins" class="architecture-panel" data-architecture-panel="plugins" role="tabpanel" aria-labelledby="architecture-tab-plugins" hidden>
+          <div class="workflow-ops-section">
+            <h3>Plugin management</h3>
+            <p>Inspect compatibility, runtime metadata, tools, activation, and removal controls in the Plugins sidebar.</p>
+            <button id="architecture-open-plugin-management" class="primary" type="button">Open plugin management</button>
           </div>
         </section>
       </div>
@@ -4972,6 +5076,19 @@
     </div>
     <button id="scroll-down-btn" style="display:none" title="Scroll to bottom" aria-label="Scroll to bottom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
   </main>
+
+  <div id="core-plugin-removal-dialog" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="core-plugin-removal-title" hidden>
+    <div class="architecture-health-modal-header">
+      <h2 id="core-plugin-removal-title">Core plugin removal</h2>
+      <button id="core-plugin-removal-close" type="button">Close</button>
+    </div>
+    <p id="core-plugin-removal-message"></p>
+    <p class="architecture-muted">Core plugins are required by the active workspace and cannot be removed while it is running.</p>
+    <div class="architecture-card-actions">
+      <button id="core-plugin-removal-cancel" type="button">Keep plugin</button>
+      <button id="core-plugin-removal-confirm" class="danger" type="button" disabled>Remove core plugin</button>
+    </div>
+  </div>
 
   <div id="workspace-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-delete-title" aria-hidden="true">
     <div class="workspace-delete-panel">

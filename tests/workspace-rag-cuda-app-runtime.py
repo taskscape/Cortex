@@ -73,6 +73,18 @@ class FakeCuda:
     def empty_cache(self) -> None:
         self.empty_cache_calls += 1
 
+    def reset_peak_memory_stats(self) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+    def memory_allocated(self) -> int:
+        return 1024
+
+    def max_memory_allocated(self) -> int:
+        return 2048
+
 
 class FakeMatrix:
     def __init__(self, vectors: list[list[float]]):
@@ -226,6 +238,9 @@ def test_e5_prefixes_revision_and_single_model_load() -> None:
     assert query["inputType"] == "query"
     assert document["inputType"] == "document"
     assert len(query["embeddings"][0]) == 768
+    assert query["durationMs"] >= 0
+    assert query["gpuMemoryAllocatedBytes"] == 1024
+    assert query["gpuMemoryPeakBytes"] == 2048
     assert recorder.encode_calls[0]["texts"] == ["query: find Aurora"]
     assert recorder.encode_calls[1]["texts"] == ["passage: Aurora is cobalt"]
     assert recorder.encode_calls[0]["batch_size"] == 3

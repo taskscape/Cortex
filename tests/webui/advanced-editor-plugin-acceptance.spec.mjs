@@ -51,7 +51,7 @@ function installTinyMdeStub(page) {
   });
 }
 
-test("inline skill trigger conditions persist after add, edit, remove, and reopen", async ({ page }) => {
+test("STE-1 through STE-8 skill trigger modal configures the shipped classifier behaviors and persists them", async ({ page }) => {
   await installTinyMdeStub(page);
   await page.goto("/");
   await openSkills(page);
@@ -64,12 +64,25 @@ test("inline skill trigger conditions persist after add, edit, remove, and reope
   const triggerRows = page.locator("#skill-trigger-list .trigger-row");
   await expect(triggerRows).toHaveCount(1);
   await expect(triggerRows.first().locator(".trigger-text")).toHaveValue(/expert panel etiquette/);
+  await expect(triggerRows.first().locator(".trigger-action")).toHaveText("Action: skill_action use Panel Etiquette");
 
   await page.locator("#skill-trigger-add").click();
+  const triggerDialog = page.getByRole("dialog", { name: "Add trigger" });
+  await expect(triggerDialog).toBeVisible();
+  const behavior = page.locator("#skill-trigger-dialog-kind");
+  await expect(behavior.locator("option")).toHaveCount(4);
+  await expect(page.locator("#skill-trigger-dialog-action")).toHaveValue("skill_action use Panel Etiquette");
+  await page.locator("#skill-trigger-dialog-save").click();
+  await expect(page.locator("#skill-trigger-dialog-error")).toContainText("Enter a classifier condition");
+  await behavior.selectOption("contextual");
+  await page.locator("#skill-trigger-dialog-rule").fill("MATCH when the acceptance canary asks for an editor trigger.");
+  await page.locator("#skill-trigger-dialog-save").click();
+  await expect(triggerDialog).not.toBeVisible();
   await expect(triggerRows).toHaveCount(2);
   const addedTrigger = triggerRows.last();
-  await addedTrigger.locator(".trigger-kind").selectOption("contextual");
-  await addedTrigger.locator(".trigger-text").fill("MATCH when the acceptance canary asks for an editor trigger.");
+  await expect(addedTrigger.locator(".trigger-kind")).toHaveValue("contextual");
+  await expect(addedTrigger.locator(".trigger-text")).toHaveValue("MATCH when the acceptance canary asks for an editor trigger.");
+  await expect(addedTrigger.locator(".trigger-action")).toHaveText("Action: skill_action use Panel Etiquette");
   await page.locator("#skill-editor-save").click();
   await expect(page.locator("#skill-editor-overlay")).not.toHaveClass(/open/);
 

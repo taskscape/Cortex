@@ -267,10 +267,19 @@ const architectureSqlExecuteBtn = document.getElementById('architecture-sql-exec
 const architectureSqlStatusEl = document.getElementById('architecture-sql-status');
 const architectureSqlPreviewEl = document.getElementById('architecture-sql-preview');
 const architectureSqlResultsEl = document.getElementById('architecture-sql-results');
+const architectureSqlValidationForm = document.getElementById('architecture-sql-validation-form');
+const architectureSqlValidationInputEl = document.getElementById('architecture-sql-validation-input');
+const architectureSqlValidationBtn = document.getElementById('architecture-sql-validation-btn');
+const architectureSqlValidationResultEl = document.getElementById('architecture-sql-validation-result');
 const architectureWorkflowStatusEl = document.getElementById('architecture-workflow-status');
 const architectureWorkflowRefreshBtn = document.getElementById('architecture-workflow-refresh');
 const architectureApprovalListEl = document.getElementById('architecture-approval-list');
 const architectureApprovalDetailEl = document.getElementById('architecture-approval-detail');
+const architectureHighRiskWriteModalEl = document.getElementById('architecture-high-risk-write-modal');
+const architectureHighRiskWriteContentEl = document.getElementById('architecture-high-risk-write-content');
+const architectureHighRiskWriteCloseBtn = document.getElementById('architecture-high-risk-write-close');
+const architectureHighRiskWriteRejectBtn = document.getElementById('architecture-high-risk-write-reject');
+const architectureHighRiskWriteApproveBtn = document.getElementById('architecture-high-risk-write-approve');
 const workflowOpsTabBtns = Array.from(document.querySelectorAll('.workflow-ops-tab'));
 const workflowOpsPanelEls = Array.from(document.querySelectorAll('.workflow-ops-view'));
 const workflowOpsSummaryBtns = Array.from(document.querySelectorAll('[data-workflow-summary-view]'));
@@ -320,6 +329,10 @@ const architectureGraphStatusEl = document.getElementById('architecture-graph-st
 const architectureGraphListEl = document.getElementById('architecture-graph-list');
 const architectureGraphDetailEl = document.getElementById('architecture-graph-detail');
 const architectureReviewForm = document.getElementById('architecture-review-form');
+const architectureReviewModalEl = document.getElementById('architecture-review-modal');
+const architectureReviewOpenBtn = document.getElementById('architecture-review-open-btn');
+const architectureReviewCloseBtn = document.getElementById('architecture-review-close-btn');
+const architectureReviewCancelBtn = document.getElementById('architecture-review-cancel-btn');
 const architectureReviewQuestionEl = document.getElementById('architecture-review-question');
 const architectureReviewTargetTypeEl = document.getElementById('architecture-review-target-type');
 const architectureReviewTargetIdEl = document.getElementById('architecture-review-target-id');
@@ -331,6 +344,7 @@ const architectureReviewCreateBtn = document.getElementById('architecture-review
 const architectureReviewStatusEl = document.getElementById('architecture-review-status');
 const architectureReviewListEl = document.getElementById('architecture-review-list');
 const architectureReviewDetailEl = document.getElementById('architecture-review-detail');
+const architectureOpenPluginManagementBtn = document.getElementById('architecture-open-plugin-management');
 let expertPanelExperts = [];
 let expertPanelBusy = false;
 let workspaceState = { active: 'default', workspaces: [] };
@@ -349,6 +363,7 @@ let architectureSourcesLoadSeq = 0;
 let architectureSqlState = { plan: null, approvalToken: '', executed: null };
 let architectureSqlBusy = '';
 let architectureSqlPlanRequest = 0;
+let architectureSqlValidationState = null;
 let architectureWorkflowState = {
   view: 'overview',
   compilations: [],
@@ -364,6 +379,7 @@ let architectureWorkflowState = {
   loaded: false,
 };
 let architectureWorkflowDecision = '';
+let architectureHighRiskWriteContext = null;
 let architectureWorkflowBusy = '';
 let architectureWorkflowLoadRequest = 0;
 let architectureWorkflowRefreshTimer = null;
@@ -928,7 +944,9 @@ const ARCHITECTURE_PANEL_TITLES = {
   evaluation: 'Evaluation, Observability & ROI',
   graph: 'Graph Entities',
   reviews: 'Expert Reviews',
+  plugins: 'Plugins',
 };
+const ARCHITECTURE_HASH_VIEWS = new Set(Object.keys(ARCHITECTURE_PANEL_TITLES));
 
 function architectureString(value, fallback = '-') {
   if (value === undefined || value === null || value === '') return fallback;
@@ -1141,6 +1159,9 @@ function activateArchitecturePanel(view) {
   if (architectureView === 'workflows') scheduleWorkflowOpsAutoRefresh();
   else stopWorkflowOpsAutoRefresh();
   if (architectureView !== 'sources' && architectureSourceHealthModalEl) architectureSourceHealthModalEl.hidden = true;
+  if (architectureScreenEl?.classList.contains('open')) {
+    history.replaceState(null, '', `${location.pathname}#${architectureView}`);
+  }
 }
 
 async function loadArchitecturePanel(view, force = false) {
@@ -1149,6 +1170,7 @@ async function loadArchitecturePanel(view, force = false) {
   if (view === 'evaluation' && (force || !architectureEvaluationState.loaded)) return loadArchitectureEvaluation();
   if (view === 'graph' && (force || !architectureGraphState.loaded)) return loadArchitectureGraph(force);
   if (view === 'reviews' && (force || !architectureReviewState.loaded)) return loadArchitectureReviews();
+  if (view === 'plugins') return loadPlugins();
   if (view === 'sql') renderArchitectureSqlResults();
   return undefined;
 }
@@ -1460,6 +1482,45 @@ function invalidateArchitectureSqlPlan() {
   renderArchitectureSqlResults();
 }
 
+function renderArchitectureSqlValidation() {
+  architectureClear(architectureSqlValidationResultEl);
+  if (!architectureSqlValidationResultEl || !architectureSqlValidationState) return;
+  const result = architectureSqlValidationState;
+  architectureSqlValidationResultEl.classList.toggle('error', !result.valid);
+  architectureSqlValidationResultEl.setAttribute('role', result.valid ? 'status' : 'alert');
+  architectureSqlValidationResultEl.appendChild(architectureHeading(4, result.valid ? 'SQL validation passed' : 'SQL validation errors'));
+  if (result.valid) {
+    architectureSqlValidationResultEl.appendChild(architectureMuted('Read-only SELECT with an explicit row limit.'));
+    return;
+  }
+  const list = document.createElement('ul');
+  for (const reason of result.reasons || []) {
+    const item = document.createElement('li');
+    item.textContent = reason;
+    list.appendChild(item);
+  }
+  architectureSqlValidationResultEl.appendChild(list);
+}
+
+async function validateArchitectureSql(event) {
+  event?.preventDefault();
+  if (!architectureSqlValidationInputEl || architectureSqlValidationBtn?.disabled) return;
+  architectureSqlValidationBtn.disabled = true;
+  architectureSqlValidationState = null;
+  renderArchitectureSqlValidation();
+  try {
+    architectureSqlValidationState = await callTool('structured_data_action', {
+      action: 'validate_sql',
+      sql: architectureSqlValidationInputEl.value,
+    });
+  } catch (err) {
+    architectureSqlValidationState = { valid: false, reasons: [String(err?.message || err)] };
+  } finally {
+    architectureSqlValidationBtn.disabled = false;
+    renderArchitectureSqlValidation();
+  }
+}
+
 function renderArchitectureSqlResults() {
   if (architectureSqlPreviewEl) {
     architectureSqlPreviewEl.textContent = architectureSqlState.plan?.queryRun?.sql || '';
@@ -1490,6 +1551,8 @@ function renderArchitectureSqlResults() {
       ['Row limit', run?.rowLimit],
       ['SQL hash', run?.sqlHash],
       ['Sources', run?.sourceIds],
+      ['Estimated cost', plan.costEstimate ? `${plan.costEstimate.complexity} (score ${plan.costEstimate.score})` : undefined],
+      ['Cost factors', plan.costEstimate?.factors],
       ['Warning', plan.rowCapWarning],
     ])
   );
@@ -2204,6 +2267,52 @@ function renderArchitectureApprovalList() {
   }
 }
 
+function highRiskWriteDetails(action) {
+  const input = action?.input || {};
+  const path = String(input.path || action?.path || '');
+  const highRiskPath = /(^|[\\/])(?:\.env(?:\.[^\\/]*)?|config\.json|credentials(?:\.[^\\/]*)?)$/i.test(path);
+  if (!highRiskPath || !['write', 'admin'].includes(action?.capability || 'write')) return null;
+  const before = input.existingContent ?? input.before;
+  const after = input.content ?? input.after;
+  const diff = input.unifiedDiff || input.diff || action.diff || (
+    before !== undefined && after !== undefined
+      ? `--- ${path}\n+++ ${path}\n-${String(before)}\n+${String(after)}`
+      : 'Unified diff unavailable; reject the write until the proposed content can be inspected.'
+  );
+  return {
+    path,
+    diff,
+    warnings: Array.isArray(input.warnings) && input.warnings.length
+      ? input.warnings
+      : ['Sensitive configuration path requires explicit approval.'],
+    backupPath: input.backupPath || action.backupPath,
+  };
+}
+
+function closeHighRiskWriteModal() {
+  if (architectureHighRiskWriteModalEl) architectureHighRiskWriteModalEl.hidden = true;
+  architectureHighRiskWriteContext = null;
+}
+
+function openHighRiskWriteModal(action, approval) {
+  const details = highRiskWriteDetails(action);
+  if (!details || !architectureHighRiskWriteModalEl || !architectureHighRiskWriteContentEl) return;
+  architectureHighRiskWriteContext = { action, approval };
+  architectureClear(architectureHighRiskWriteContentEl);
+  architectureHighRiskWriteContentEl.appendChild(architectureKeyValues([
+    ['Path', details.path],
+    ['Backup path', details.backupPath],
+    ['Warnings', details.warnings],
+  ]));
+  architectureHighRiskWriteContentEl.appendChild(architectureHeading(4, 'Unified diff'));
+  const diff = document.createElement('pre');
+  diff.className = 'architecture-code high-risk-write-diff';
+  diff.textContent = details.diff;
+  architectureHighRiskWriteContentEl.appendChild(diff);
+  architectureHighRiskWriteModalEl.hidden = false;
+  architectureHighRiskWriteRejectBtn?.focus();
+}
+
 function renderArchitectureApprovalDetail() {
   architectureClear(architectureApprovalDetailEl);
   if (!architectureApprovalDetailEl) return;
@@ -2260,7 +2369,19 @@ function renderArchitectureApprovalDetail() {
     const grid = document.createElement('div');
     grid.className = 'architecture-card-grid';
     for (const action of proposed) {
-      grid.appendChild(architectureCard(action.toolName || action.id, [action.id, `Sources: ${architectureString(action.sourceIds)}`], action.status));
+      const highRisk = highRiskWriteDetails(action);
+      if (highRisk) {
+        const item = architectureItemButton({
+          title: action.toolName || action.id,
+          meta: [action.id, highRisk.path, `Sources: ${architectureString(action.sourceIds)}`].filter(Boolean).join(' | '),
+          badge: 'high risk',
+          onClick: () => openHighRiskWriteModal(action, approval),
+        });
+        item.dataset.highRiskWrite = action.id || highRisk.path;
+        grid.appendChild(item);
+      } else {
+        grid.appendChild(architectureCard(action.toolName || action.id, [action.id, `Sources: ${architectureString(action.sourceIds)}`], action.status));
+      }
     }
     architectureApprovalDetailEl.appendChild(grid);
   }
@@ -2834,9 +2955,12 @@ function renderArchitectureReviewList() {
     return;
   }
   for (const review of reviews) {
+    const expertIds = Array.isArray(review.expertIds) && review.expertIds.length
+      ? review.expertIds
+      : (review.experts || []).map(expert => expert.expertId).filter(Boolean);
     architectureReviewListEl.appendChild(architectureItemButton({
       title: review.question || review.id,
-      meta: [review.targetType, review.targetId, review.workflowRunId].filter(Boolean).join(' | '),
+      meta: [review.targetType, review.targetId, review.workflowRunId, expertIds.length ? `Experts: ${expertIds.join(', ')}` : undefined].filter(Boolean).join(' | '),
       badge: review.status,
       active: architectureReviewState.selected?.id === review.id,
       onClick: () => selectArchitectureReview(review.id),
@@ -2943,9 +3067,8 @@ async function createArchitectureReview(event) {
     architectureStatus(architectureReviewStatusEl, 'Question is required.', true);
     return;
   }
-  const experts = [...new Set((architectureReviewExpertsEl?.value || '')
-    .split(',')
-    .map(value => value.trim())
+  const experts = [...new Set(Array.from(architectureReviewExpertsEl?.selectedOptions || [])
+    .map(option => option.value.trim())
     .filter(Boolean))];
   const targetId = architectureReviewTargetIdEl?.value.trim() || undefined;
   const workflowId = architectureReviewWorkflowIdEl?.value.trim() || undefined;
@@ -2957,6 +3080,14 @@ async function createArchitectureReview(event) {
   }
   if (targetType === 'workflow' && !workflowId) {
     architectureStatus(architectureReviewStatusEl, 'Workflow ID is required for workflow reviews.', true);
+    return;
+  }
+  if (targetType === 'workflow_run' && !workflowRunId) {
+    architectureStatus(architectureReviewStatusEl, 'Run ID is required for workflow run reviews.', true);
+    return;
+  }
+  if (!experts.length) {
+    architectureStatus(architectureReviewStatusEl, 'Select at least one expert.', true);
     return;
   }
   architectureStatus(architectureReviewStatusEl, 'Creating review...');
@@ -2987,6 +3118,7 @@ async function createArchitectureReview(event) {
       await loadArchitectureReviews();
     }
     architectureStatus(architectureReviewStatusEl, 'Review created.');
+    if (architectureReviewModalEl) architectureReviewModalEl.hidden = true;
   } catch (err) {
     architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
   } finally {
@@ -3038,6 +3170,7 @@ if (architectureScreenEl) {
   architectureSqlForm?.addEventListener('submit', planArchitectureSql);
   architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
   architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);
+  architectureSqlValidationForm?.addEventListener('submit', validateArchitectureSql);
   [
     architectureSqlMetricEl,
     architectureSqlDimensionEl,
@@ -3055,6 +3188,34 @@ if (architectureScreenEl) {
   architectureGraphForm?.addEventListener('submit', retrieveArchitectureGraph);
   architectureReviewRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('reviews', true));
   architectureReviewForm?.addEventListener('submit', createArchitectureReview);
+  architectureReviewOpenBtn?.addEventListener('click', () => {
+    if (!architectureReviewModalEl) return;
+    architectureReviewModalEl.hidden = false;
+    architectureReviewQuestionEl?.focus();
+  });
+  const closeArchitectureReviewModal = () => {
+    if (architectureReviewModalEl) architectureReviewModalEl.hidden = true;
+    architectureReviewOpenBtn?.focus();
+  };
+  architectureReviewCloseBtn?.addEventListener('click', closeArchitectureReviewModal);
+  architectureReviewCancelBtn?.addEventListener('click', closeArchitectureReviewModal);
+  architectureHighRiskWriteCloseBtn?.addEventListener('click', closeHighRiskWriteModal);
+  architectureHighRiskWriteRejectBtn?.addEventListener('click', async () => {
+    const approval = architectureHighRiskWriteContext?.approval;
+    closeHighRiskWriteModal();
+    if (approval) await decideArchitectureApproval('reject', approval);
+  });
+  architectureHighRiskWriteApproveBtn?.addEventListener('click', async () => {
+    const approval = architectureHighRiskWriteContext?.approval;
+    closeHighRiskWriteModal();
+    if (approval) await decideArchitectureApproval('approve', approval);
+  });
+  architectureOpenPluginManagementBtn?.addEventListener('click', () => {
+    setArchitectureOpen(false, architectureView, { skipWorkspace: true });
+    const section = document.querySelector('[data-section="plugins"]');
+    if (section?.classList.contains('collapsed')) section.querySelector('.sidebar-heading')?.click();
+    document.body.classList.add('sidebar-open');
+  });
 }
 
 // ── Cortex workspaces ───────────────────────────────────────────────────────
@@ -4090,6 +4251,25 @@ const CORE_PLUGIN_NAMES = new Set([
   '@matatbread/matbot-workflow-governance',
   '@matatbread/matbot-frontend',
 ]);
+const corePluginRemovalDialogEl = document.getElementById('core-plugin-removal-dialog');
+const corePluginRemovalMessageEl = document.getElementById('core-plugin-removal-message');
+const corePluginRemovalCloseBtn = document.getElementById('core-plugin-removal-close');
+const corePluginRemovalCancelBtn = document.getElementById('core-plugin-removal-cancel');
+
+function closeCorePluginRemovalDialog() {
+  if (corePluginRemovalDialogEl) corePluginRemovalDialogEl.hidden = true;
+}
+
+function openCorePluginRemovalDialog(plugin) {
+  if (!corePluginRemovalDialogEl) return;
+  if (corePluginRemovalMessageEl) corePluginRemovalMessageEl.textContent = `The core plugin ${plugin.name} (${plugin.specifier}) was selected for removal.`;
+  corePluginRemovalDialogEl.hidden = false;
+  corePluginRemovalCancelBtn?.focus();
+}
+
+corePluginRemovalCloseBtn?.addEventListener('click', closeCorePluginRemovalDialog);
+corePluginRemovalCancelBtn?.addEventListener('click', closeCorePluginRemovalDialog);
+
 function runsHere(p) {
   const rt = p && p.matbotRuntime;
   if (!Array.isArray(rt) || rt.length === 0) return true;
@@ -4127,19 +4307,28 @@ function renderPlugins(loaded, local) {
       main.appendChild(badges);
     }
     sum.appendChild(main);
-    if (p.specifier && !CORE_PLUGIN_NAMES.has(p.name)) {
+    if (p.specifier) {
       const actions = document.createElement('div');
       actions.className = 'plugin-actions';
       const removeBtn = document.createElement('button');
       removeBtn.className = 'plugin-action-btn remove';
       removeBtn.textContent = '×';
       removeBtn.title = 'Remove plugin';
-      removeBtn.onclick = (e) => {
-        e.stopPropagation();
-        closeSidebar();
-        // Direct submit so it queues during a turn instead of being blocked by the input.
-        submit(`Remove the plugin '${p.specifier}'`);
-      };
+      if (CORE_PLUGIN_NAMES.has(p.name)) {
+        removeBtn.dataset.corePlugin = p.name;
+        removeBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openCorePluginRemovalDialog(p);
+        };
+      } else {
+        removeBtn.onclick = (e) => {
+          e.stopPropagation();
+          closeSidebar();
+          // Direct submit so it queues during a turn instead of being blocked by the input.
+          submit(`Remove the plugin '${p.specifier}'`);
+        };
+      }
       actions.appendChild(removeBtn);
       sum.appendChild(actions);
     }
@@ -4307,6 +4496,11 @@ const skillEditorError   = document.getElementById('skill-editor-error');
 const skillEditorSave    = document.getElementById('skill-editor-save');
 const skillEditorRoot    = document.getElementById('skill-editor');
 const skillTriggerList   = document.getElementById('skill-trigger-list');
+const skillTriggerDialog = document.getElementById('skill-trigger-dialog');
+const skillTriggerDialogKind = document.getElementById('skill-trigger-dialog-kind');
+const skillTriggerDialogRule = document.getElementById('skill-trigger-dialog-rule');
+const skillTriggerDialogAction = document.getElementById('skill-trigger-dialog-action');
+const skillTriggerDialogError = document.getElementById('skill-trigger-dialog-error');
 const TRIGGER_KINDS = ['ephemeral', 'contextual', 'retract', 'followup'];
 let editingSkillName = null;
 let skillEditor = null;   // TinyMDE.Editor, created lazily on first open
@@ -4430,6 +4624,13 @@ function makeTriggerRow(c) {
   txt.disabled = !editable;
   txt.placeholder = '"MATCH if the message is …; DO NOT MATCH if …" — judged against the latest turn';
 
+  const body = document.createElement('div');
+  body.className = 'trigger-body';
+  const action = document.createElement('div');
+  action.className = 'trigger-action';
+  action.textContent = `Action: skill_action use ${editingSkillName ?? ''}`.trim();
+  body.append(txt, action);
+
   const editBtn = document.createElement('button');
   editBtn.className = 'trigger-edit';
   editBtn.title = 'Edit';
@@ -4448,7 +4649,7 @@ function makeTriggerRow(c) {
   delBtn.textContent = '×';
   delBtn.onclick = () => row.remove();
 
-  row.append(sel, txt, editBtn, delBtn);
+  row.append(sel, body, editBtn, delBtn);
   return row;
 }
 
@@ -4552,6 +4753,7 @@ function closeSkillEditor(force = false) {
     if (!window.confirm('Discard unsaved skill changes?')) return false;
   }
   skillEditorOverlay.classList.remove('open');
+  if (skillTriggerDialog?.open) skillTriggerDialog.close();
   editingSkillName = null;
   editingSkillSavedContent = '';
   return true;
@@ -4565,9 +4767,23 @@ if (skillEditorOverlay) {
   document.getElementById('skill-editor-cancel').onclick = () => closeSkillEditor();
   for (const btn of document.querySelectorAll('.skill-tab')) btn.onclick = () => setSkillTab(btn.dataset.tab);
   document.getElementById('skill-trigger-add').onclick = () => {
-    const row = makeTriggerRow();
-    skillTriggerList.appendChild(row);
-    row.querySelector('.trigger-text').focus();
+    skillTriggerDialogKind.value = 'ephemeral';
+    skillTriggerDialogRule.value = '';
+    skillTriggerDialogAction.value = `skill_action use ${editingSkillName ?? ''}`.trim();
+    skillTriggerDialogError.textContent = '';
+    skillTriggerDialog.showModal();
+    skillTriggerDialogKind.focus();
+  };
+  document.getElementById('skill-trigger-dialog-cancel').onclick = () => skillTriggerDialog.close();
+  document.getElementById('skill-trigger-dialog-save').onclick = () => {
+    const rule = skillTriggerDialogRule.value.trim();
+    if (!rule) {
+      skillTriggerDialogError.textContent = 'Enter a classifier condition before adding the trigger.';
+      skillTriggerDialogRule.focus();
+      return;
+    }
+    skillTriggerList.appendChild(makeTriggerRow({ kind: skillTriggerDialogKind.value, rule }));
+    skillTriggerDialog.close();
   };
   skillEditorSave.onclick = async () => {
     if (editingSkillName === null) return;
@@ -6242,10 +6458,11 @@ async function init() {
   });
 
   const rawFragment = decodeURIComponent(location.hash.slice(1));
+  const startArchitectureView = ARCHITECTURE_HASH_VIEWS.has(rawFragment) ? rawFragment : null;
   const tildeIdx    = rawFragment.indexOf('~');
   const fragmentSid = tildeIdx >= 0 ? rawFragment.slice(0, tildeIdx) : rawFragment;
   const fragmentNav = tildeIdx >= 0 ? (() => { try { return JSON.parse(rawFragment.slice(tildeIdx + 1)); } catch { return null; } })() : null;
-  const startId     = (fragmentSid && sessions.some(s => s.id === fragmentSid))
+  const startId     = (!startArchitectureView && fragmentSid && sessions.some(s => s.id === fragmentSid))
     ? fragmentSid : sessions[0]?.id;
   if (startId === 'new') {
     await handleNewSession();
@@ -6255,6 +6472,7 @@ async function init() {
     showEmpty();
     setBusyState(false);
   }
+  if (startArchitectureView) setArchitectureOpen(true, startArchitectureView);
   loadFiles();
   loadPlugins();
   loadSkills();
@@ -6292,7 +6510,9 @@ window.addEventListener('hashchange', async () => {
   const ti       = raw.indexOf('~');
   const id       = ti >= 0 ? raw.slice(0, ti) : raw;
   const nav      = ti >= 0 ? (() => { try { return JSON.parse(raw.slice(ti + 1)); } catch { return null; } })() : null;
-  if (id === 'new') {
+  if (ARCHITECTURE_HASH_VIEWS.has(id)) {
+    setArchitectureOpen(true, id);
+  } else if (id === 'new') {
     await handleNewSession();
   } else if (id && id !== currentSessionId) {
     await openSession(id, nav?.msg).catch(console.error);

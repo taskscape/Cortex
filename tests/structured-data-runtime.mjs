@@ -209,6 +209,11 @@ async function main() {
   assert.match(plan.queryRun.sql, /LIMIT 50/);
   assert.deepEqual(plan.queryRun.parameters, ["paid"]);
   assert.equal(plan.validation.valid, true);
+  assert.deepEqual(plan.costEstimate, {
+    complexity: "medium",
+    score: 3,
+    factors: ["1 dimension", "1 filter", "row limit 50"],
+  });
   assert.match(plan.rowCapWarning, /Requested limit 200 exceeds row cap 50/);
   assert.deepEqual(plan.queryRun.sourceIds, [storedTable.sourceId]);
 

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import time
 from typing import List
 
 import torch
@@ -93,6 +94,9 @@ def embed(request: EmbedRequest):
     prefix = QUERY_PREFIX if request.inputType == "query" else DOCUMENT_PREFIX
     prepared_texts = [f"{prefix}{text}" for text in request.texts]
     try:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        started_at = time.perf_counter()
         embeddings = model.encode(
             prepared_texts,
             batch_size=BATCH_SIZE,
@@ -100,6 +104,10 @@ def embed(request: EmbedRequest):
             convert_to_numpy=True,
             show_progress_bar=False,
         )
+        torch.cuda.synchronize()
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        gpu_memory_allocated_bytes = int(torch.cuda.memory_allocated())
+        gpu_memory_peak_bytes = int(torch.cuda.max_memory_allocated())
     except RuntimeError as error:
         # PyTorch reports CUDA allocation failures as RuntimeError subclasses across
         # supported releases.  Return a retryable HTTP response instead of letting
@@ -121,5 +129,8 @@ def embed(request: EmbedRequest):
         "signature": signature,
         "dimensions": dimensions,
         "inputType": request.inputType,
+        "durationMs": duration_ms,
+        "gpuMemoryAllocatedBytes": gpu_memory_allocated_bytes,
+        "gpuMemoryPeakBytes": gpu_memory_peak_bytes,
         "embeddings": embeddings.astype("float32").tolist(),
     }

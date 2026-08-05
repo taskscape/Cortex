@@ -390,9 +390,21 @@ test("architecture product panels expose sources, SQL approval, workflow approva
   await expect(page.locator("#architecture-graph-detail")).toContainText("architecture.md");
 
   await page.locator('.architecture-tab[data-architecture-tab="reviews"]').click();
+  await expect(page.locator("#architecture-review-modal")).toBeHidden();
+  await page.locator("#architecture-review-open-btn").click();
+  await expect(page.locator("#architecture-review-modal")).toBeVisible();
+  await expect(page.locator("#architecture-review-target-type option")).toHaveText([
+    "Workflow", "Workflow run", "Alert", "Investigation", "Chat", "Decision dossier", "Other",
+  ]);
+  await page.locator("#architecture-review-experts").selectOption(["finance", "engineering"]);
   await page.locator("#architecture-review-run-id").fill(workflowRunId);
   await page.locator("#architecture-review-create-btn").click();
-  await expect(page.locator("#architecture-review-list")).toContainText("Should this high-risk workflow be approved?");
+  await expect(page.locator("#architecture-review-modal")).toBeHidden();
+  const reviewCard = page.locator("#architecture-review-list .architecture-item", { hasText: "Should this high-risk workflow be approved?" });
+  await expect(reviewCard).toContainText("workflow");
+  await expect(reviewCard).toContainText("finance");
+  await expect(reviewCard).toContainText("engineering");
+  await expect(reviewCard).toContainText("under_review");
   await expect(page.locator("#architecture-review-detail")).toContainText("Finance Expert");
   await expect(page.locator("#architecture-review-detail")).toContainText("automation rollback path confirmed");
   await expect(page.locator("#architecture-review-detail")).toContainText("Risk Register");
@@ -1515,7 +1527,9 @@ test("opens skill editor, shows metadata and trigger controls, and saves", async
   await page.getByRole("button", { name: "Triggers" }).click();
   await expect(page.locator(".trigger-row").first().locator(".trigger-text")).toHaveValue(/MATCH when the user asks/);
   await page.locator("#skill-trigger-add").click();
-  await page.locator(".trigger-row").last().locator(".trigger-text").fill("MATCH when this Playwright trigger is saved.");
+  await page.locator("#skill-trigger-dialog-rule").fill("MATCH when this Playwright trigger is saved.");
+  await page.locator("#skill-trigger-dialog-save").click();
+  await expect(page.locator(".trigger-row").last().locator(".trigger-text")).toHaveValue("MATCH when this Playwright trigger is saved.");
 
   await page.locator("#skill-editor-save").click();
   await expect(page.locator("#skill-editor-overlay")).not.toHaveClass(/open/);
@@ -1901,7 +1915,7 @@ test("E2E-006 workspace RAG save failure preserves edits and ignores stale works
   await expect(page.locator("#workspace-rag-status")).not.toContainText("stale workspace status");
 });
 
-test("E2E-007 failed plugin activation is atomic and core plugins have no remove control", async ({ page, isMobile }) => {
+test("E2E-007 failed plugin activation is atomic and core plugin removal is confirmation-gated", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop plugin mutation safety coverage");
   let failSubmit = true;
   await page.route("**/sessions/*/submit", async route => {
@@ -1920,7 +1934,15 @@ test("E2E-007 failed plugin activation is atomic and core plugins have no remove
   await page.goto("/");
   await openPlugins(page);
   const coreWorkspace = page.locator("details.plugin-entry", { hasText: "@matatbread/matbot-tool-workspace" });
-  await expect(coreWorkspace.getByTitle("Remove plugin")).toHaveCount(0);
+  await coreWorkspace.hover();
+  await coreWorkspace.getByTitle("Remove plugin").click();
+  const coreDialog = page.locator("#core-plugin-removal-dialog");
+  await expect(coreDialog).toBeVisible();
+  await expect(coreDialog).toContainText("@matatbread/matbot-tool-workspace");
+  await expect(coreDialog).toContainText("cannot be removed while it is running");
+  await expect(coreDialog.getByRole("button", { name: "Remove core plugin" })).toBeDisabled();
+  await coreDialog.getByRole("button", { name: "Keep plugin" }).click();
+  await expect(coreDialog).toBeHidden();
 
   const background = page.locator(".plugin-entry-inactive", { hasText: "@matatbread/matbot-tool-background" });
   await background.hover();
@@ -2146,6 +2168,7 @@ test("E2E-019 review validation and creation failure preserve the form for retry
   test.skip(isMobile, "desktop durable-review validation coverage");
   await page.goto("/");
   await openArchitecturePanel(page, "reviews");
+  await page.locator("#architecture-review-open-btn").click();
   await page.locator("#architecture-review-question").fill("");
   await page.locator("#architecture-review-create-btn").click();
   await expect(page.locator("#architecture-review-status")).toContainText("Question is required");
@@ -2204,9 +2227,10 @@ test("E2E-022 font controls clamp at documented UI bounds and architecture tabs 
   if (await page.locator("#burger").isVisible()) await page.locator("#burger").click();
   await openArchitecturePanel(page, "sources");
   const sourcesTab = page.getByRole("tab", { name: "Sources" });
+  const pluginsTab = page.getByRole("tab", { name: "Plugins" });
   await sourcesTab.press("ArrowLeft");
-  await expect(page.getByRole("tab", { name: "Reviews" })).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("tab", { name: "Reviews" }).press("ArrowRight");
+  await expect(pluginsTab).toHaveAttribute("aria-selected", "true");
+  await pluginsTab.press("ArrowRight");
   await expect(sourcesTab).toHaveAttribute("aria-selected", "true");
 });
 
@@ -3308,6 +3332,7 @@ test("T3-E2E-019 validates review targets and deduplicates expert IDs before cre
   });
   await page.goto("/");
   await openArchitecturePanel(page, "reviews");
+  await page.locator("#architecture-review-open-btn").click();
   await page.locator("#architecture-review-target-id").fill("");
   await page.locator("#architecture-review-form").evaluate(form => form.requestSubmit());
   await expect(page.locator("#architecture-review-status")).toContainText("Target ID is required");
@@ -3315,7 +3340,7 @@ test("T3-E2E-019 validates review targets and deduplicates expert IDs before cre
 
   await page.locator("#architecture-review-target-id").fill("workflow:compiled-followup");
   await page.locator("#architecture-review-workflow-id").fill("workflow:compiled-followup");
-  await page.locator("#architecture-review-experts").fill("finance, finance, engineering");
+  await page.locator("#architecture-review-experts").selectOption(["finance", "engineering"]);
   await page.locator("#architecture-review-form").evaluate(form => form.requestSubmit());
   await expect(page.locator("#architecture-review-status")).toContainText("Review created");
   expect(reviewInput.experts).toEqual(["finance", "engineering"]);

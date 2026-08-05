@@ -171,6 +171,12 @@ export interface SqlValidationResult {
   sqlHash: string;
 }
 
+export interface QueryCostEstimate {
+  complexity: 'low' | 'medium' | 'high';
+  score: number;
+  factors: string[];
+}
+
 export interface QueryRun {
   id: string;
   version: string;
@@ -202,6 +208,7 @@ export interface QueryPlan {
   dimensions: DataColumn[];
   filters: SemanticFilter[];
   validation: SqlValidationResult;
+  costEstimate: QueryCostEstimate;
   rowCapWarning?: string;
 }
 
@@ -536,6 +543,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     const rendered = this.renderSql(metric, table, columns, dimensions, filters, dimensions.length > 0 ? cappedLimit : undefined);
     const validation = this.validateSql(rendered.sql, { requireLimit: dimensions.length > 0 });
     if (!validation.valid) throw new Error(`Generated SQL failed validation: ${validation.reasons.join('; ')}`);
+    const costScore = dimensions.length * 2 + filters.length + (cappedLimit > 500 ? 3 : cappedLimit > 100 ? 2 : 0);
+    const costEstimate: QueryCostEstimate = {
+      complexity: costScore >= 6 ? 'high' : costScore >= 3 ? 'medium' : 'low',
+      score: costScore,
+      factors: [
+        `${dimensions.length} dimension${dimensions.length === 1 ? '' : 's'}`,
+        `${filters.length} filter${filters.length === 1 ? '' : 's'}`,
+        `row limit ${dimensions.length > 0 ? cappedLimit : 'aggregate-only'}`,
+      ],
+    };
     const timestamp = nowIso();
     const run: QueryRun = {
       id: randomUUID(),
@@ -561,6 +578,7 @@ class StoreBackedSqlPlanner implements SqlPlanner {
       dimensions,
       filters,
       validation,
+      costEstimate,
       ...(rowCapWarning !== undefined ? { rowCapWarning } : {}),
     };
   }

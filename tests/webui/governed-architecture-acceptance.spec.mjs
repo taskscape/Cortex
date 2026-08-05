@@ -66,12 +66,13 @@ async function seedWorkflowRuns(page, name) {
   }, name);
 }
 
-test("AT-1/AT-2/AT-3 architecture tabs provide a visible roving keyboard focus and native activation", async ({ page, isMobile }) => {
+test("AT-1 through AT-5 architecture tabs provide roving focus, native activation, and persistent URL routing", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop architecture accessibility coverage");
   await page.goto("/");
   await openArchitecturePanel(page, "sources");
 
-  const tabOrder = ["Sources", "SQL Preview", "Workflows", "Evaluation & ROI", "Graph", "Reviews"];
+  const tabOrder = ["Sources", "SQL Preview", "Workflow Center", "Context Graph", "Reviews", "Evaluation & ROI", "Plugins"];
+  const hashOrder = ["sources", "sql", "workflows", "graph", "reviews", "evaluation", "plugins"];
   const sources = page.getByRole("tab", { name: "Sources" });
   await sources.focus();
   await expect(sources).toBeFocused();
@@ -89,19 +90,26 @@ test("AT-1/AT-2/AT-3 architecture tabs provide a visible roving keyboard focus a
     await expect(page.getByRole("tab", { name: nextName })).toBeFocused();
     await expect(page.getByRole("tab", { name: nextName })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("tabpanel", { name: nextName })).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`#${hashOrder[(index + 1) % hashOrder.length]}$`));
   }
 
-  const graph = page.getByRole("tab", { name: "Graph" });
+  const graph = page.getByRole("tab", { name: "Context Graph" });
   await graph.focus();
   await page.keyboard.press("Enter");
   await expect(graph).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByRole("tabpanel", { name: "Graph" })).toBeVisible();
+  await expect(page.getByRole("tabpanel", { name: "Context Graph" })).toBeVisible();
+  await expect(page).toHaveURL(/#graph$/);
 
   const reviews = page.getByRole("tab", { name: "Reviews" });
   await reviews.focus();
   await page.keyboard.press("Space");
   await expect(reviews).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("tabpanel", { name: "Reviews" })).toBeVisible();
+  await expect(page).toHaveURL(/#reviews$/);
+  await page.reload();
+  await expect(page.getByRole("tab", { name: "Reviews" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tabpanel", { name: "Reviews" })).toBeVisible();
+  await expect(page).toHaveURL(/#reviews$/);
 });
 
 test("SHP implemented source-health detail keeps unhealthy findings and events attached to the selected source", async ({ page, isMobile }) => {
@@ -191,7 +199,23 @@ test("GSP governed SQL keeps execution disabled until approval and renders the p
   await expect(result).toContainText("Row limit");
   await expect(result).toContainText("SQL hash");
   await expect(result).toContainText("Sources");
+  await expect(result).toContainText("Estimated cost");
+  await expect(result).toContainText("medium (score 3)");
+  await expect(result).toContainText("1 dimension");
   await expect(page.locator("#architecture-sql-execute-btn")).toBeDisabled();
+
+  const validationInput = page.locator("#architecture-sql-validation-input");
+  const validationResult = page.locator("#architecture-sql-validation-result");
+  await page.locator("#architecture-sql-validation-btn").click();
+  await expect(validationResult).toContainText("CROSS JOIN is not allowed.");
+  await expect(validationResult).toHaveAttribute("role", "alert");
+  await validationInput.fill("DROP TABLE public.orders");
+  await page.locator("#architecture-sql-validation-btn").click();
+  await expect(validationResult).toContainText("Only SELECT statements are allowed.");
+  await expect(validationResult).toContainText("disallowed write, DDL");
+  await validationInput.fill("UPDATE public.orders SET status = 'paid'");
+  await page.locator("#architecture-sql-validation-btn").click();
+  await expect(validationResult).toContainText("disallowed write, DDL");
 
   await page.locator("#architecture-sql-approve-btn").click();
   await expect(page.locator("#architecture-sql-status")).toContainText("Query approved");
@@ -285,7 +309,7 @@ test("WOC overview and run ledger expose summary metrics, typed inputs, evidence
   await expect(page.getByRole("tabpanel", { name: "Sources" })).toBeVisible();
   await expect(page.locator("#architecture-source-detail")).toContainText("source:playwright-architecture-brief");
 
-  await page.getByRole("tab", { name: "Workflows" }).click();
+  await page.getByRole("tab", { name: "Workflow Center" }).click();
   await page.getByRole("tab", { name: "Run Ledger" }).click();
 
   await page.locator("#workflow-ops-run-search").fill(seeded.approvalRunId);
@@ -343,6 +367,52 @@ test("WOC-5 failed recent runs use the critical visual treatment", async ({ page
   await expect(failedBadge).toHaveCSS("color", "rgb(153, 27, 27)");
   await expect(page.locator("#workflow-ops-attention")).toContainText("Failed runs");
   await expect(page.locator("#workflow-ops-attention")).toContainText("1");
+});
+
+test("HWA-2/HWA-3 high-risk workflow write opens an approval modal with warnings and a unified diff", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop high-risk write approval coverage");
+  await page.goto("/");
+  const runId = await page.evaluate(async () => {
+    const run = await window.matbotTransport.callTool("workflow_action", {
+      action: "start",
+      workspaceId: "default",
+      workflowId: "workflow:high-risk-write-acceptance",
+      mode: "approval_gated",
+      proposedActions: [{
+        id: "action:high-risk-env-write",
+        toolName: "file_broker_action",
+        capability: "write",
+        requiresApproval: true,
+        sourceIds: ["source:playwright-architecture-brief"],
+        input: {
+          path: "C:/Projects/Cortex/.env",
+          before: "OLD_SECRET=redacted",
+          content: "NEW_SECRET=redacted",
+          warnings: ["Environment credentials may be exposed or replaced."],
+          backupPath: "C:/Projects/Cortex/backups/proposed-env.bak",
+        },
+      }],
+    });
+    return run.id;
+  });
+  await openArchitecturePanel(page, "workflows");
+  await page.getByRole("tab", { name: "Approvals" }).click();
+  await page.locator(`#architecture-approval-list .architecture-item[data-run-id="${runId}"][data-approval-id="approval:action"]`).click();
+  await page.locator('[data-high-risk-write="action:high-risk-env-write"]').click();
+
+  const modal = page.locator("#architecture-high-risk-write-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal).toContainText("C:/Projects/Cortex/.env");
+  await expect(modal).toContainText("Environment credentials may be exposed or replaced.");
+  await expect(modal).toContainText("C:/Projects/Cortex/backups/proposed-env.bak");
+  const diff = modal.locator(".high-risk-write-diff");
+  await expect(diff).toContainText("--- C:/Projects/Cortex/.env");
+  await expect(diff).toContainText("-OLD_SECRET=redacted");
+  await expect(diff).toContainText("+NEW_SECRET=redacted");
+  await expect(modal.getByRole("button", { name: "Approve write" })).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Reject write" })).toBeVisible();
+  await modal.getByRole("button", { name: "Close" }).click();
+  await expect(modal).toBeHidden();
 });
 
 test("WCD-4 draft library displays compiler validation errors and warnings", async ({ page, isMobile }) => {

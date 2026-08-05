@@ -1048,6 +1048,8 @@ function structuredDataActionResult(input) {
     const hasExplicitLimit = /\blimit\s+\d+\b/i.test(sql);
     const reasons = [];
     if (!readOnly) reasons.push("Only SELECT statements are allowed.");
+    if (/\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|copy|call|execute|do|vacuum|analyze|set|reset|begin|commit|rollback)\b/i.test(sql)) reasons.push("SQL contains a disallowed write, DDL, session, or procedural keyword.");
+    if (/\bcross\s+join\b/i.test(sql)) reasons.push("CROSS JOIN is not allowed.");
     if (!hasExplicitLimit) reasons.push("A row-limited query must include an explicit LIMIT.");
     return { valid: reasons.length === 0, readOnly, hasExplicitLimit, reasons, sqlHash: "sql-hash:playwright" };
   }
@@ -1085,6 +1087,11 @@ function structuredDataActionResult(input) {
       dimensions: [catalog.columns[1]],
       filters: [{ columnId: "data-column:orders:status", op: "eq", value: "paid" }],
       validation: { valid: true, readOnly: true, hasExplicitLimit: true, reasons: [], sqlHash: run.sqlHash },
+      costEstimate: {
+        complexity: "medium",
+        score: 3,
+        factors: ["1 dimension", "1 filter", "row limit 50"]
+      },
       rowCapWarning: "Requested limit 200 exceeds row cap 50; using 50."
     };
   }

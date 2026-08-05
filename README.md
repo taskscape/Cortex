@@ -192,6 +192,7 @@ unbounded graph expansion is intentional.
 
    ```dotenv
    WORKSPACE_RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+   WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=d13f1b27baf31030b7fd040960d60d909913633f
    WORKSPACE_RAG_EMBEDDING_PROFILE=auto
    WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
    ```
@@ -200,6 +201,7 @@ unbounded graph expansion is intentional.
 
    ```dotenv
    WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+   WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=46605decb5369335a3847c9f41bb0b896c07dd1a
    WORKSPACE_RAG_EMBEDDING_PROFILE=auto
    WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
    ```

@@ -322,7 +322,7 @@ function createExpertPanelTool(panel: ExpertPanel): Tool {
         },
         targetType: {
           type: "string",
-          enum: ["decision_dossier", "workflow", "alert", "investigation", "chat", "other"],
+          enum: ["decision_dossier", "workflow", "workflow_run", "alert", "investigation", "chat", "other"],
           default: "chat",
           description: "Artifact type this review is linked to."
         },
@@ -499,6 +499,7 @@ function isReviewMode(value: unknown): value is ExpertReviewMode {
 function isTargetType(value: unknown): value is ExpertReviewTargetType {
   return value === "decision_dossier"
     || value === "workflow"
+    || value === "workflow_run"
     || value === "alert"
     || value === "investigation"
     || value === "chat"
