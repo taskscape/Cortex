@@ -2,7 +2,9 @@
 
 Cortex is a Windows-native local assistant built on the Matbot runtime. It combines
 local chat, provider selection, workspace isolation, durable memory, controlled file
-access, markdown RAG, and a tool-based expert panel.
+access, markdown hybrid retriever with exact and lexical reference lanes.
+
+It also provides a tool-based expert panel for orchestrating multi-expertese work.
 
 Matbot remains the underlying runtime and plugin system. Cortex is the product shell
 configured in this repository: the WebUI branding, PowerShell launch scripts, workspace
