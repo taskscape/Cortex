@@ -66,7 +66,8 @@ await plugin.setup(machine);
 try {
   const created = await collect(background, {
     prompt: "Execute typed workflow invoice-approval; do not call write tools before its approval gate.",
-    interval: "1s",
+    // Production rejects intervals below 10s; startupDelayMs=0 keeps this test immediate.
+    interval: "10s",
     name: "Governed scheduled execution",
     output: "scheduled-ledger.json",
   });

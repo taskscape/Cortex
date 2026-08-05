@@ -198,11 +198,17 @@ export class FilesystemFileStore implements FileStore {
   }
 
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
+    // Storage backends construct their FileStore eagerly but create this directory lazily. The WebUI
+    // starts watching during boot, before the first file write, so watch() must establish its own
+    // prerequisite instead of crashing a fresh workspace with ENOENT.
+    await this.ensureDir();
+
     const queue:     FileEvent[]                             = [];
     const prevMeta   = new Map<string, FileMetaData>();
     const debounces  = new Map<string, ReturnType<typeof setTimeout>>();
     let   notify:    (() => void) | undefined;
     let   done       = false;
+    let   failure:   unknown;
 
     const wake = (): void => { const fn = notify; notify = undefined; fn?.(); };
 
@@ -220,8 +226,12 @@ export class FilesystemFileStore implements FileStore {
       const id = filename.endsWith('.data') ? filename.slice(0, -'.data'.length) : filename;
       const t  = debounces.get(id);
       if (t !== undefined) clearTimeout(t);
-      debounces.set(id, setTimeout(() => { debounces.delete(id); void handleChange(id); }, 50));
+      debounces.set(id, setTimeout(() => {
+        debounces.delete(id);
+        void handleChange(id).catch(error => { failure = error; done = true; wake(); });
+      }, 50));
     });
+    watcher.on('error', error => { failure = error; done = true; wake(); });
 
     const onAbort = (): void => { done = true; watcher.close(); wake(); };
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -229,7 +239,10 @@ export class FilesystemFileStore implements FileStore {
     try {
       while (!done) {
         while (queue.length > 0) yield queue.shift()!;
-        if (done) break;
+        if (done) {
+          if (failure !== undefined) throw failure;
+          break;
+        }
         await new Promise<void>(r => { notify = r; });
       }
     } finally {

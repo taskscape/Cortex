@@ -7,6 +7,10 @@ import { chunkText, extractText, isIndexableTextFile } from "./extract.js";
 import { fileLevelSecret, redactSecrets } from "./secrets.js";
 import type { IndexedChunk, IndexStore } from "./store.js";
 
+const RECOVERABLE_FILE_ERROR_CODES = new Set([
+  "EACCES", "EBUSY", "EIO", "EMFILE", "ENFILE", "ENOENT", "EPERM",
+]);
+
 export interface IndexOptions {
   root: string;
   // Indexing-only noise filters (build output, vendor trees). Not an access-control boundary —
@@ -40,90 +44,97 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
   }
 
   for await (const filePath of walk(root, root, options.indexExcludedPatterns, skipped)) {
-    options.signal?.throwIfAborted();
-    const relative = path.relative(root, filePath);
+    try {
+      options.signal?.throwIfAborted();
+      const relative = path.relative(root, filePath);
 
-    if (isExcluded(relative, options.indexExcludedPatterns)) {
-      skipped.push({ path: filePath, reason: "excluded-pattern" });
-      continue;
+      if (isExcluded(relative, options.indexExcludedPatterns)) {
+        skipped.push({ path: filePath, reason: "excluded-pattern" });
+        continue;
+      }
+
+      const decision = evaluateAccess(filePath, "read", options.workspaces, options.policy);
+
+      if (!decision.allowed) {
+        skipped.push({ path: filePath, reason: decision.reason ?? "denied-by-security-policy" });
+        continue;
+      }
+
+      // High-risk files (.env, .pem, .key, ...) are readable through the broker only behind an explicit
+      // approval. Nothing approves an index run, and a chunk in the store is readable by anyone who can
+      // reach /search — so they are never indexed. The redaction pass below is a content backstop for
+      // ordinary files, not a substitute for this: it misses `TOKEN=...` shapes entirely.
+      if (decision.highRisk) {
+        skipped.push({ path: filePath, reason: "high-risk-file" });
+        continue;
+      }
+
+      const stats = await fs.stat(filePath);
+
+      if (!stats.isFile()) {
+        continue;
+      }
+
+      if (!isIndexableTextFile(filePath)) {
+        skipped.push({ path: filePath, reason: "unsupported-extension" });
+        continue;
+      }
+
+      if (stats.size > options.maxFileBytes) {
+        skipped.push({ path: filePath, reason: "too-large" });
+        continue;
+      }
+
+      const normalized = normalizeWindowsPath(filePath, root);
+      const previous = existingByPath.get(normalized.canonicalPath);
+      if (
+        previous !== undefined &&
+        previous.length > 0 &&
+        previous[0]!.size === stats.size &&
+        previous[0]!.modifiedTime === stats.mtime.toISOString()
+      ) {
+        nextChunks.push(...previous);
+        continue;
+      }
+
+      const content = await extractText(filePath, options.maxFileBytes);
+
+      const secret = fileLevelSecret(content);
+      if (secret !== undefined) {
+        skipped.push({ path: filePath, reason: `possible-secret: ${secret}` });
+        continue;
+      }
+
+      // Hash the original content: this drives change detection, so it must not shift when redaction
+      // rules change.
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+      const chunks = chunkText(content);
+
+      nextChunks.push(
+        ...chunks.map((chunk, chunkIndex) => {
+          const { text, redactions } = redactSecrets(chunk);
+          return {
+            id: `${normalized.canonicalPath}:${chunkIndex}`,
+            path: normalized.nativePath,
+            canonicalPath: normalized.canonicalPath,
+            ...(normalized.relativePath !== undefined ? { relativePath: normalized.relativePath } : {}),
+            ...(normalized.projectRoot !== undefined ? { projectRoot: normalized.projectRoot } : {}),
+            extension: path.extname(filePath).toLowerCase(),
+            fileHash: hash,
+            modifiedTime: stats.mtime.toISOString(),
+            size: stats.size,
+            chunkIndex,
+            content: text,
+            ...(redactions > 0 ? { redactions } : {})
+          };
+        })
+      );
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (typeof code !== "string" || !RECOVERABLE_FILE_ERROR_CODES.has(code)) throw error;
+      skipped.push({ path: filePath, reason: `unreadable-file: ${code}` });
     }
-
-    const decision = evaluateAccess(filePath, "read", options.workspaces, options.policy);
-
-    if (!decision.allowed) {
-      skipped.push({ path: filePath, reason: decision.reason ?? "denied-by-security-policy" });
-      continue;
-    }
-
-    // High-risk files (.env, .pem, .key, ...) are readable through the broker only behind an explicit
-    // approval. Nothing approves an index run, and a chunk in the store is readable by anyone who can
-    // reach /search — so they are never indexed. The redaction pass below is a content backstop for
-    // ordinary files, not a substitute for this: it misses `TOKEN=...` shapes entirely.
-    if (decision.highRisk) {
-      skipped.push({ path: filePath, reason: "high-risk-file" });
-      continue;
-    }
-
-    const stats = await fs.stat(filePath);
-
-    if (!stats.isFile()) {
-      continue;
-    }
-
-    if (!isIndexableTextFile(filePath)) {
-      skipped.push({ path: filePath, reason: "unsupported-extension" });
-      continue;
-    }
-
-    if (stats.size > options.maxFileBytes) {
-      skipped.push({ path: filePath, reason: "too-large" });
-      continue;
-    }
-
-    const normalized = normalizeWindowsPath(filePath, root);
-    const previous = existingByPath.get(normalized.canonicalPath);
-    if (
-      previous !== undefined &&
-      previous.length > 0 &&
-      previous[0]!.size === stats.size &&
-      previous[0]!.modifiedTime === stats.mtime.toISOString()
-    ) {
-      nextChunks.push(...previous);
-      continue;
-    }
-
-    const content = await extractText(filePath, options.maxFileBytes);
-
-    const secret = fileLevelSecret(content);
-    if (secret !== undefined) {
-      skipped.push({ path: filePath, reason: `possible-secret: ${secret}` });
-      continue;
-    }
-
-    // Hash the original content: this drives change detection, so it must not shift when redaction
-    // rules change.
-    const hash = crypto.createHash("sha256").update(content).digest("hex");
-    const chunks = chunkText(content);
-
-    nextChunks.push(
-      ...chunks.map((chunk, chunkIndex) => {
-        const { text, redactions } = redactSecrets(chunk);
-        return {
-          id: `${normalized.canonicalPath}:${chunkIndex}`,
-          path: normalized.nativePath,
-          canonicalPath: normalized.canonicalPath,
-          ...(normalized.relativePath !== undefined ? { relativePath: normalized.relativePath } : {}),
-          ...(normalized.projectRoot !== undefined ? { projectRoot: normalized.projectRoot } : {}),
-          extension: path.extname(filePath).toLowerCase(),
-          fileHash: hash,
-          modifiedTime: stats.mtime.toISOString(),
-          size: stats.size,
-          chunkIndex,
-          content: text,
-          ...(redactions > 0 ? { redactions } : {})
-        };
-      })
-    );
   }
 
   const outsideRoot = existing.chunks.filter(chunk => {

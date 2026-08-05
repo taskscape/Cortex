@@ -17,6 +17,7 @@ interface RememberedFact {
 const HOST = process.env['MATBOT_MEMORY_BROWSER_HOST'] ?? '127.0.0.1';
 const PORT = Number(process.env['MATBOT_MEMORY_BROWSER_PORT'] ?? 19779);
 const BASE_URL = `http://${HOST}:${PORT}`;
+const CLOSE_GRACE_MS = 1_000;
 
 let activeServer: ReturnType<typeof createServer> | undefined;
 let activeUrl: string | undefined;
@@ -223,6 +224,29 @@ export function createMemoryBrowserServer(store: Store<RememberedFact>, principa
   });
 }
 
+export async function closeMemoryBrowserServer(
+  server: ReturnType<typeof createServer>,
+  graceMs = CLOSE_GRACE_MS,
+): Promise<void> {
+  // server.close() waits for active requests, including a half-sent request body or a store call that
+  // never settles. Release idle keep-alive sockets now and bound the remaining wait so plugin unload
+  // and process shutdown cannot hang indefinitely.
+  server.closeIdleConnections();
+  const graceTimer = setTimeout(() => server.closeAllConnections(), Math.max(0, graceMs));
+  try {
+    await new Promise<void>(resolve => {
+      server.close(error => {
+        if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
+          console.warn('[memory-browser] Error closing server:', String(error));
+        }
+        resolve();
+      });
+    });
+  } finally {
+    clearTimeout(graceTimer);
+  }
+}
+
 function openMemoryBrowserTool(): Tool {
   return {
     name: 'open_memory_browser',
@@ -286,7 +310,7 @@ export const plugin: MatbotPluginSpec = {
     activeServer = undefined;
     activeUrl = undefined;
     if (server) {
-      await new Promise<void>(resolve => server.close(() => resolve()));
+      await closeMemoryBrowserServer(server);
     }
   },
 };

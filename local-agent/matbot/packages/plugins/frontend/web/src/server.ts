@@ -443,6 +443,12 @@ export function createWebServer(deps: WebServerDeps) {
   const fileEventListeners = new Map<string, Set<ServerResponse>>();
   const watchAc            = new AbortController();
 
+  const reportWatchFailure = (name: string, error: unknown): void => {
+    if (!watchAc.signal.aborted) {
+      console.warn(`[frontend-web] ${name} watch stopped:`, error instanceof Error ? error.message : String(error));
+    }
+  };
+
   if (deps.files?.watch) {
     void (async () => {
       for await (const event of deps.files!.watch!(watchAc.signal)) {
@@ -451,13 +457,13 @@ export function createWebServer(deps: WebServerDeps) {
         const subs = fileEventListeners.get(`${event.namespace ?? ''}/${event.name}`);
         if (subs) for (const res of subs) { if (res.writable) res.write(msg); else subs.delete(res); }
       }
-    })();
+    })().catch(error => reportWatchFailure('file', error));
   }
 
   if (deps.tools) {
     void (async () => {
       for await (const event of deps.tools!.watch(watchAc.signal)) broadcast(sseEvent('tool-changed', event));
-    })();
+    })().catch(error => reportWatchFailure('tool', error));
   }
 
   // Skill content CRUD (save/delete), including saves the LLM makes mid-turn via skill_action. The
@@ -470,7 +476,7 @@ export function createWebServer(deps: WebServerDeps) {
     skillWatchStarted = true;
     void (async () => {
       for await (const event of skills.watch(watchAc.signal)) broadcast(sseEvent('skill-changed', event));
-    })();
+    })().catch(error => reportWatchFailure('skill', error));
   }
 
   // Plugin load/unload. Covers tool-less plugins (pure provider/hook/storage — e.g. the storage backend
@@ -478,7 +484,7 @@ export function createWebServer(deps: WebServerDeps) {
   if (deps.watchPlugins) {
     void (async () => {
       for await (const event of deps.watchPlugins!(watchAc.signal)) broadcast(sseEvent('plugin-changed', event));
-    })();
+    })().catch(error => reportWatchFailure('plugin', error));
   }
 
   function sendToSession(sessionId: string, msg: string): void {

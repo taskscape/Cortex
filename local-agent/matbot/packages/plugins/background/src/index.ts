@@ -34,11 +34,16 @@ function mimeFromName(name: string): string {
 const DURATION_FACTORS: Record<string, number> = {
   ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000,
 };
+const MIN_SCHEDULE_INTERVAL_MS = 10_000;
 
 function parseDuration(s: string): number {
   const m = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/.exec(s.trim());
   if (!m) throw new Error(`Invalid duration "${s}". Use e.g. "30s", "5m", "1h", "24h".`);
-  return parseFloat(m[1]!) * (DURATION_FACTORS[m[2]!] ?? 1);
+  const durationMs = parseFloat(m[1]!) * (DURATION_FACTORS[m[2]!] ?? 1);
+  if (!Number.isFinite(durationMs) || durationMs < MIN_SCHEDULE_INTERVAL_MS) {
+    throw new Error(`Recurring background intervals must be at least 10s; received "${s}".`);
+  }
+  return durationMs;
 }
 
 function formatDuration(ms: number): string {

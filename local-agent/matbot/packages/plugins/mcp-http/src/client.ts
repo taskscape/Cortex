@@ -2,6 +2,8 @@ import type { MCPClient, MCPRemoteConfig, MCPToolDef, MCPToolResult } from './ty
 
 const PROTOCOL_VERSION = '2024-11-05';
 const CLIENT_INFO = { name: 'matbot', version: '0.1.0' };
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_SSE_BUFFER_CHARS = 1_048_576;
 
 interface JsonRpcRequest  { jsonrpc: '2.0'; id: number; method: string; params: unknown }
 interface JsonRpcResponse { jsonrpc: string; id?: unknown; result?: unknown; error?: { code: number; message: string } }
@@ -16,10 +18,14 @@ export class HttpMCPClient implements MCPClient {
   private nextId = 1;
   private readonly endpoint: string;
   private readonly extraHeaders: Record<string, string> | undefined;
+  private readonly requestTimeoutMs: number;
 
-  constructor(endpoint: string, extraHeaders?: Record<string, string>) {
+  constructor(endpoint: string, extraHeaders?: Record<string, string>, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.endpoint = endpoint;
     this.extraHeaders = extraHeaders;
+    this.requestTimeoutMs = Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0
+      ? requestTimeoutMs
+      : DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   // Best-effort: stateless HTTP MCP servers serve tools/call without an init handshake, so a server
@@ -45,35 +51,79 @@ export class HttpMCPClient implements MCPClient {
       ...this.extraHeaders,
     };
 
-    const resp = await fetch(this.endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      ...(signal !== undefined ? { signal } : {}),
-    });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      throw new Error(`HTTP ${resp.status}: ${text || resp.statusText}`);
-    }
+    const requestAc = new AbortController();
+    const forwardAbort = (): void => requestAc.abort(signal?.reason);
+    if (signal?.aborted) forwardAbort();
+    else signal?.addEventListener('abort', forwardAbort, { once: true });
+    const timer = setTimeout(() => {
+      requestAc.abort(new Error(`MCP request "${method}" timed out after ${this.requestTimeoutMs}ms`));
+    }, this.requestTimeoutMs);
 
-    const ct = resp.headers.get('content-type') ?? '';
-    if (ct.includes('text/event-stream')) {
-      const text = await resp.text();
-      for (const line of text.split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        let msg: JsonRpcResponse;
-        try { msg = JSON.parse(line.slice(6)) as JsonRpcResponse; } catch { continue; }
-        if (msg.id === id) {
-          if (msg.error) throw new Error(msg.error.message);
-          return msg.result;
+    try {
+      const resp = await fetch(this.endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: requestAc.signal,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${text || resp.statusText}`);
+      }
+
+      const ct = resp.headers.get('content-type') ?? '';
+      if (ct.includes('text/event-stream')) return await this.readSseResponse(resp, id);
+
+      const data = await resp.json() as JsonRpcResponse;
+      if (data.error) throw new Error(data.error.message);
+      return data.result;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', forwardAbort);
+    }
+  }
+
+  private async readSseResponse(resp: Response, id: number): Promise<unknown> {
+    if (!resp.body) throw new Error('MCP SSE response has no body');
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const acceptLine = (line: string): { matched: boolean; result?: unknown } => {
+      const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+      if (!normalized.startsWith('data:')) return { matched: false };
+      const payload = normalized.slice(5).trimStart();
+      let msg: JsonRpcResponse;
+      try { msg = JSON.parse(payload) as JsonRpcResponse; } catch { return { matched: false }; }
+      if (msg.id !== id) return { matched: false };
+      if (msg.error) throw new Error(msg.error.message);
+      return { matched: true, result: msg.result };
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const accepted = acceptLine(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+          if (accepted.matched) return accepted.result;
+        }
+        if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+          throw new Error(`MCP SSE response exceeded ${MAX_SSE_BUFFER_CHARS} buffered characters without a matching response`);
         }
       }
-      throw new Error('No matching response found in SSE stream');
-    }
 
-    const data = await resp.json() as JsonRpcResponse;
-    if (data.error) throw new Error(data.error.message);
-    return data.result;
+      const tail = acceptLine(buffer + decoder.decode());
+      if (tail.matched) return tail.result;
+      throw new Error('No matching response found in SSE stream');
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
   }
 
   async listTools(): Promise<MCPToolDef[]> {

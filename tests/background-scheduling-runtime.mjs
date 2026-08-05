@@ -54,6 +54,10 @@ try {
   const invalid = await collect(background, { prompt: "invalid", interval: "tomorrow" });
   assert.match(invalid.error, /Invalid duration/);
 
+  const tooFast = await collect(background, { prompt: "too fast", interval: "0ms" });
+  assert.match(tooFast.error, /at least 10s/);
+  assert.equal(workspaceAStore.docs.size, 0, "an unsafe interval must not be persisted or armed");
+
   const created = await collect(background, {
     prompt: "Run the typed workflow with the minimum required tools.",
     interval: "1d",

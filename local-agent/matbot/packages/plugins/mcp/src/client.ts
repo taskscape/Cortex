@@ -39,6 +39,14 @@ export class StdioMCPClient implements MCPClient {
     const args  = [...parts.slice(1), ...extraArgs];
     this.child = spawn(exe, args, { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
 
+    // A failed spawn (missing executable, denied access, invalid working environment) is reported as
+    // an `error` event after spawn() returns. Without a listener Node treats it as an uncaught error
+    // and terminates the whole host before createStdioClient() can reject normally.
+    this.child.on('error', error => this.fail(error));
+    // A server can also disappear between the liveness check and a write. Consume the stream error and
+    // reject the same pending requests instead of allowing an EPIPE event to crash the process.
+    this.child.stdin?.on('error', error => this.fail(error));
+
     this.child.stdout?.on('data', (chunk: Buffer) => {
       this.buf += chunk.toString('utf8');
       let nl: number;
@@ -48,11 +56,16 @@ export class StdioMCPClient implements MCPClient {
         if (line) this.onLine(line);
       }
     });
-    this.child.on('close', () => {
-      this.dead = true;
-      for (const { reject, timer } of this.pending.values()) { clearTimeout(timer); reject(new Error('MCP server process exited unexpectedly')); }
-      this.pending.clear();
-    });
+    this.child.on('close', () => this.fail(new Error('MCP server process exited unexpectedly')));
+  }
+
+  private fail(error: Error): void {
+    this.dead = true;
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    this.pending.clear();
   }
 
   private onLine(line: string): void {
@@ -99,7 +112,7 @@ export class StdioMCPClient implements MCPClient {
 
   close(): void {
     if (this.dead) return;
-    this.dead = true;
+    this.fail(new Error('MCP client is closed'));
     this.child.kill('SIGTERM');
   }
 }
