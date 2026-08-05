@@ -7,7 +7,7 @@ import test from "node:test";
 
 await import("../local-agent/matbot/apps/cli/register.js");
 
-const { ragV2PolicyFromEnv } = await import(
+const { ragV2ModeFromEnv, ragV2PolicyFromEnv } = await import(
   "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/config.ts"
 );
 const { RagV2ObjectStore } = await import(
@@ -20,6 +20,21 @@ const { parseMarkdownStream } = await import(
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
+
+test("workspace RAG V2 defaults to primary and preserves explicit rollback modes", () => {
+  const previous = process.env.CORTEX_RAG_V2_MODE;
+  try {
+    delete process.env.CORTEX_RAG_V2_MODE;
+    assert.equal(ragV2ModeFromEnv(), "primary");
+    process.env.CORTEX_RAG_V2_MODE = "shadow";
+    assert.equal(ragV2ModeFromEnv(), "shadow");
+    process.env.CORTEX_RAG_V2_MODE = "off";
+    assert.equal(ragV2ModeFromEnv(), "off");
+  } finally {
+    if (previous === undefined) delete process.env.CORTEX_RAG_V2_MODE;
+    else process.env.CORTEX_RAG_V2_MODE = previous;
+  }
+});
 
 test("workspace RAG V2 streams hierarchy with immutable byte and line citations", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-parser-"));

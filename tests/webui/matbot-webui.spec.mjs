@@ -949,6 +949,39 @@ test("MISSING-03/MISSING-12 workspace RAG configuration panel saves paths and sh
   await expect(page.locator("#workspace-rag-current-file")).toHaveAttribute("title", "");
 });
 
+test("workspace settings discard unsaved edits when navigating to another conversation or dialog", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workspace settings coverage");
+  await page.goto("/");
+
+  const settings = page.locator("#workspace-settings-screen");
+  const contextName = page.locator("#workspace-context-name");
+  const openSettings = async () => {
+    await page.locator("#workspace-config-btn").click();
+    await expect(settings).toHaveClass(/open/);
+  };
+
+  await openSettings();
+  await contextName.fill("New conversation discard");
+  await page.locator("#new-btn").click();
+  await expect(settings).not.toHaveClass(/open/);
+
+  await openSettings();
+  await expect(contextName).toHaveValue("Default");
+  await contextName.fill("Conversation switch discard");
+  await page.locator(".session-item:not(.active) .session-label").first().click();
+  await expect(settings).not.toHaveClass(/open/);
+
+  await openSettings();
+  await expect(contextName).toHaveValue("Default");
+  await contextName.fill("Dialog discard");
+  await page.locator("#expert-toggle-btn").evaluate(button => button.click());
+  await expect(page.locator("#expert-popover")).toHaveClass(/open/);
+  await expect(settings).not.toHaveClass(/open/);
+
+  await openSettings();
+  await expect(contextName).toHaveValue("Default");
+});
+
 test("remembered facts persist across conversations and are used in later answers", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop memory coverage");
   await page.goto("/");

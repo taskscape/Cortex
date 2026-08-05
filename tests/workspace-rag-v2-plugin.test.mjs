@@ -8,7 +8,7 @@ await import("../local-agent/matbot/apps/cli/register.js");
 
 process.env.CORTEX_RAG_STORAGE = "json";
 process.env.CORTEX_RAG_DISABLE_CUDA = "true";
-process.env.CORTEX_RAG_V2_MODE = "primary";
+delete process.env.CORTEX_RAG_V2_MODE;
 process.env.CORTEX_RAG_V2_STORAGE = "memory";
 
 const { plugin } = await import(
@@ -27,7 +27,7 @@ async function execute(tool, value) {
   return events.find(event => event.type === "result")?.value;
 }
 
-test("workspace_rag exposes side-by-side V2 ingestion and primary hybrid search", async t => {
+test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-plugin-"));
   t.after(async () => {
     await plugin.teardown?.();

@@ -59,7 +59,7 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
 | `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES` | `10000` | Maximum workspace scan size that receives per-file context-graph extraction. Larger scans still get vectors and source metadata but skip graph expansion. Use `-1` only when intentionally enabling graph extraction for an unbounded scan. |
-| `CORTEX_RAG_V2_MODE` | `off` | Side-by-side hybrid mode: `off`, `shadow`, or `primary`. `primary` falls back to V1 if V2 is unavailable or produces no evidence. |
+| `CORTEX_RAG_V2_MODE` | `primary` | Hybrid retrieval mode: `primary`, `shadow`, or `off`. `primary` uses an active V2 publication and falls back to V1 if V2 is unavailable or produces no evidence. |
 | `CORTEX_RAG_V1_BACKGROUND_SCAN` | `1` | Set to `0` during a V2-only rebuild to prevent the legacy flat index from being repopulated. Explicit `reindex_now` remains available. |
 | `CORTEX_RAG_V2_POSTGRES_SCHEMA` | `workspace_rag_v2` | Versioned V2 catalog, lexical, vector, job, trace, evidence, and evaluation schema. |
 | `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL` | unset | Optional owner connection used only for V2 migrations and grants. When set, `CORTEX_RAG_POSTGRES_URL` must identify a distinct non-owner application role without `BYPASSRLS`. |

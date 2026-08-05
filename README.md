@@ -272,12 +272,15 @@ unbounded graph expansion is intentional.
 ### Roll out hierarchical Workspace RAG V2
 
 V2 implements progressive document → section → passage retrieval beside the
-existing index. It is deliberately disabled by default and never turns a mode
-change into an automatic million-file reindex.
+existing index. Hybrid retrieval is initialized in `primary` mode by default,
+but startup never turns that mode into an automatic million-file reindex. Until
+an active V2 generation is published, searches continue through the V1 fallback.
 
-1. Set `CORTEX_RAG_V2_MODE=shadow` and the V2 Postgres/object-store variables
-   in the active workspace `.env`. For production, use a non-owner application
-   database role, a separate `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL`, and
+1. Keep the default `CORTEX_RAG_V2_MODE=primary`, or set it to `shadow` while
+   evaluating a new publication without changing answers. Configure the V2
+   Postgres/object-store variables in the active workspace `.env`. For
+   production, use a non-owner application database role, a separate
+   `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL`, and
    `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES=1`.
 2. Start Cortex, then run a read-only resumable census:
 
@@ -300,8 +303,8 @@ change into an automatic million-file reindex.
    Cancellation preserves the active generation, and publication is one atomic
    transaction after validation.
 4. Exercise V2 explicitly with `v2_search` and run `evaluation_run`. Shadow mode
-   records comparable traces without changing V1 answers. Only set
-   `CORTEX_RAG_V2_MODE=primary` after the authorization, citation, memory,
+   records comparable traces without changing V1 answers. Keep or restore
+   `CORTEX_RAG_V2_MODE=primary` only after the authorization, citation, memory,
    relevance, latency, and degradation gates pass.
    Repeat `evaluation_run` with `evaluationVariant` set to
    `flat_dense_baseline`, `lexical_only`, `dense_only`, `hybrid_rrf`,

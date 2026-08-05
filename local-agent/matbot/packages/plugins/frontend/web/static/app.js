@@ -850,6 +850,7 @@ async function addMemoryBrowserMemory() {
 
 async function openMemoryBrowser() {
   if (!memoryBrowserOverlay) return;
+  setWorkspaceSettingsOpen(false);
   setMemoryBrowserLauncherStatus('');
   memoryBrowserOverlay.classList.add('open');
   closeSidebar();
@@ -3360,6 +3361,7 @@ function updateExpertControlsState() {
 
 function setExpertPopoverOpen(open) {
   if (!expertPopoverEl) return;
+  if (open) setWorkspaceSettingsOpen(false);
   expertPopoverEl.classList.toggle('open', open);
   updateExpertControlsState();
 }
@@ -4263,6 +4265,7 @@ function ensureSkillEditor() {
 }
 
 async function openSkillEditor(name) {
+  setWorkspaceSettingsOpen(false);
   editingSkillName = name;
   skillEditorError.textContent = '';
   skillEditorTitle.textContent = name;
@@ -5066,6 +5069,7 @@ function renderSession(session, startIdx, scrollTarget) {
 async function openSession(id, scrollTarget) {
   closeSidebar();
   setArchitectureOpen(false);
+  setWorkspaceSettingsOpen(false);
   currentSessionId = id;
   unreadSessions.delete(id);
   sessionListEl.querySelector('[data-sid="' + id + '"]')?.classList.remove('unread');
@@ -5095,6 +5099,7 @@ function handleNewSession() {
 
   closeSidebar();
   setArchitectureOpen(false);
+  setWorkspaceSettingsOpen(false);
   const pending = (async () => {
     try {
       const { id } = await apiNewSession();

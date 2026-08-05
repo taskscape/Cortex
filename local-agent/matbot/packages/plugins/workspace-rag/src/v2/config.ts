@@ -13,7 +13,7 @@ function nonNegativeInteger(value: string | undefined, fallback: number): number
 }
 
 export function ragV2ModeFromEnv(): RagV2Mode {
-  const value = String(process.env['CORTEX_RAG_V2_MODE'] ?? 'off').trim().toLowerCase();
+  const value = String(process.env['CORTEX_RAG_V2_MODE'] ?? 'primary').trim().toLowerCase();
   return value === 'shadow' || value === 'primary' ? value : 'off';
 }
 
