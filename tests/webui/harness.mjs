@@ -834,12 +834,22 @@ function sourceActionResult(input) {
         id: "source-access:playwright",
         version: "source-access-version",
         sourceId: input.sourceId ?? architectureSource.id,
+        sourceVersionId: architectureSourceVersion.id,
+        workspaceId: "default",
         action: "retrieve",
         allowed: true,
+        principalId: "principal:playwright",
+        toolCallId: "tool-call:workspace-rag",
         timestamp: now(),
         message: "Harness retrieval access event."
       }],
-      health: sourceActionResult({ action: "health", sourceId: input.sourceId }).events
+      health: sourceActionResult({ action: "health", sourceId: input.sourceId }).events.map(event => ({
+        ...event,
+        workspaceId: "default",
+        sourceVersionId: architectureSourceVersion.id,
+        details: { toolName: "source_health_action" }
+      })),
+      versions: [{ ...architectureSourceVersion, workspaceId: "default" }]
     };
   }
   return { error: `Unknown source_action "${input.action}".` };
@@ -1143,6 +1153,17 @@ function workflowActionResult(input) {
         ? [{ id: "structured-expert-review", type: "expert_review", requiredRiskLevel: "high" }]
         : [])
     ];
+    const validation = approvalGates
+      .map((gate, index) => ({ gate, index }))
+      .filter(({ gate }) => !["action", "stale_source", "low_confidence", "cost", "risk", "expert_review"].includes(gate.type))
+      .map(({ index }) => ({ path: `$.approvalGates[${index}].type`, message: "Unsupported approval gate type." }));
+    const warnings = [
+      ...(toolCalls.length === 0 ? ["No tool calls were supplied; compiled workflow will only validate inputs and evidence."] : []),
+      ...(sourceIds.length === 0 ? ["No source ids were supplied; compiled workflow has no required evidence yet."] : []),
+      ...((input.inputHints ?? input.compile?.inputHints ?? []).length === 0
+        ? ["No input hints or {{placeholders}} were found; compiled workflow accepts an empty input object."]
+        : []),
+    ];
     const proposedActions = toolCalls.map((call, index) => ({
       id: `action:compiled-${sequence}-${index + 1}`,
       toolName: call.toolName,
@@ -1172,8 +1193,9 @@ function workflowActionResult(input) {
     };
     const publish = input.publish ?? input.compile?.publish ?? false;
     const runDry = input.dryRun ?? input.compile?.dryRun ?? false;
+    if (runDry && !publish) warnings.push("dryRun was requested without publish=true; no run was created.");
     let dryRun;
-    if (runDry) {
+    if (runDry && publish && validation.length === 0) {
       const runId = `workflow-run:compiled-${workflowRunSeq++}`;
       dryRun = {
         id: runId,
@@ -1199,11 +1221,11 @@ function workflowActionResult(input) {
       id: compilationId,
       version: "compilation-version-1",
       workspaceId,
-      status: runDry ? "dry_run_completed" : (publish ? "published" : "draft"),
+      status: dryRun ? "dry_run_completed" : (publish && validation.length === 0 ? "published" : "drafted"),
       compilerVersion: "deterministic-workflow-compiler-v1",
       inputHash: `input-hash-${sequence}`,
       definition,
-      validation: [],
+      validation,
       sourceIds,
       toolNames,
       proposedActions,
@@ -1212,14 +1234,14 @@ function workflowActionResult(input) {
       updatedAt: timestamp,
       ...(publish ? { workflowId, workflowVersion } : {}),
       ...(dryRun ? { dryRunId: dryRun.id } : {}),
-      warnings: []
+      warnings
     };
     workflowCompilations.set(compilationId, compilation);
     return {
       compilation,
       definition,
-      validation: [],
-      ...(publish ? { published: { definition, version: { id: workflowVersion, workflowId, version: workflowVersion } } } : {}),
+      validation,
+      ...(publish && validation.length === 0 ? { published: { definition, version: { id: workflowVersion, workflowId, version: workflowVersion } } } : {}),
       ...(dryRun ? { dryRun } : {})
     };
   }

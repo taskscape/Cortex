@@ -181,13 +181,15 @@ class ExpertPanel {
       prompt,
       signal: ctx.signal
     });
+    const formatted = formatExpertModeAnswer(mode, response.text.trim());
 
     return {
       expertId: expert.config.id,
       title: expert.config.title,
-      answer: response.text.trim(),
+      answer: formatted.answer,
       providerResolution,
       warnings: knowledge.warnings,
+      modeFormat: formatted.modeFormat,
       citations: sources.map(source => ({
         id: source.id,
         path: source.path,
@@ -434,11 +436,42 @@ function expertPrompt(question: string, mode: string, sources: ExpertSource[]): 
   return [
     `Question:\n${question}`,
     `Panel mode: ${mode}`,
+    expertModeInstruction(mode),
     "Use your domain expertise and the grounded sources below. If the sources do not cover part of the question, say so explicitly instead of inventing evidence.",
     "Return sections: answer, evidence, assumptions, risks, blockers, mitigations, approval checklist, confidence.",
     "Grounded sources:",
     sources.length === 0 ? "(No matching knowledge files were found for this expert.)" : sources.map(formatSource).join("\n\n")
   ].join("\n\n");
+}
+
+function expertModeInstruction(mode: string): string {
+  if (mode === "review") {
+    return "Required review sections: Strengths, Risks, Omissions, Practical concerns.";
+  }
+  if (mode === "debate") {
+    return "Required debate sections: Position, Disagreements, Tradeoffs.";
+  }
+  return "Answer independently; do not assume access to another expert's answer.";
+}
+
+function formatExpertModeAnswer(mode: string, answer: string): {
+  answer: string;
+  modeFormat: ExpertOpinion["modeFormat"];
+} {
+  const schema = mode === "review" ? "review-v1" : mode === "debate" ? "debate-v1" : "parallel-v1";
+  const requiredSections = mode === "review"
+    ? ["Strengths", "Risks", "Omissions", "Practical concerns"]
+    : mode === "debate"
+      ? ["Position", "Disagreements", "Tradeoffs"]
+      : [];
+  const missing = requiredSections.filter(section => !new RegExp(
+    `^#{1,6}\\s+${section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`,
+    "im",
+  ).test(answer));
+  const completed = missing.length === 0
+    ? answer
+    : [answer, ...missing.map(section => `## ${section}\nNot explicitly identified in the provider response.`)].join("\n\n");
+  return { answer: completed, modeFormat: { schema, requiredSections } };
 }
 
 function formatSource(source: ExpertSource, index: number): string {

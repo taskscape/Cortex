@@ -251,6 +251,10 @@ const architectureSourceStatusEl = document.getElementById('architecture-source-
 const architectureSourceRefreshBtn = document.getElementById('architecture-source-refresh');
 const architectureSourceListEl = document.getElementById('architecture-source-list');
 const architectureSourceDetailEl = document.getElementById('architecture-source-detail');
+const architectureSourceHealthSummaryEl = document.getElementById('architecture-source-health-summary');
+const architectureSourceHealthModalEl = document.getElementById('architecture-source-health-modal');
+const architectureSourceHealthModalContentEl = document.getElementById('architecture-source-health-modal-content');
+const architectureSourceHealthModalCloseBtn = document.getElementById('architecture-source-health-modal-close');
 const architectureSqlForm = document.getElementById('architecture-sql-form');
 const architectureSqlMetricEl = document.getElementById('architecture-sql-metric');
 const architectureSqlDimensionEl = document.getElementById('architecture-sql-dimension');
@@ -269,10 +273,12 @@ const architectureApprovalListEl = document.getElementById('architecture-approva
 const architectureApprovalDetailEl = document.getElementById('architecture-approval-detail');
 const workflowOpsTabBtns = Array.from(document.querySelectorAll('.workflow-ops-tab'));
 const workflowOpsPanelEls = Array.from(document.querySelectorAll('.workflow-ops-view'));
+const workflowOpsSummaryBtns = Array.from(document.querySelectorAll('[data-workflow-summary-view]'));
 const workflowOpsWorkflowCountEl = document.getElementById('workflow-ops-workflow-count');
 const workflowOpsRunCountEl = document.getElementById('workflow-ops-run-count');
 const workflowOpsPendingCountEl = document.getElementById('workflow-ops-pending-count');
 const workflowOpsAcceptanceRateEl = document.getElementById('workflow-ops-acceptance-rate');
+const workflowOpsAcceptanceTrendEl = document.getElementById('workflow-ops-acceptance-trend');
 const workflowOpsAttentionEl = document.getElementById('workflow-ops-attention');
 const workflowOpsRecentRunsEl = document.getElementById('workflow-ops-recent-runs');
 const workflowOpsShadowReadinessEl = document.getElementById('workflow-ops-shadow-readiness');
@@ -338,7 +344,7 @@ const WORKSPACE_RESTART_TIMEOUT_MS = 120000;
 const WORKSPACE_RESTART_STATUS_INTERVAL_MS = 5000;
 let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
 let architectureView = 'sources';
-let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, healthReport: null, loaded: false };
+let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, selectedEvent: null, healthReport: null, loaded: false };
 let architectureSourcesLoadSeq = 0;
 let architectureSqlState = { plan: null, approvalToken: '', executed: null };
 let architectureSqlBusy = '';
@@ -360,6 +366,8 @@ let architectureWorkflowState = {
 let architectureWorkflowDecision = '';
 let architectureWorkflowBusy = '';
 let architectureWorkflowLoadRequest = 0;
+let architectureWorkflowRefreshTimer = null;
+const WORKFLOW_OPS_REFRESH_MS = 30000;
 let architectureEvaluationState = { metrics: null, roi: null, traces: [], suites: [], runs: [], selectedTrace: null, traceDetail: null, selectedSuite: null, loaded: false };
 let architectureEvaluationLoadRequest = 0;
 let architectureGraphState = { entities: [], relationships: [], retrieve: null, selected: null, loaded: false };
@@ -1088,7 +1096,10 @@ function setArchitectureOpen(open, view = architectureView, options = {}) {
   if (open) closeMemoryBrowser();
   architectureScreenEl.classList.toggle('open', Boolean(open));
   document.body.classList.toggle('architecture-open', Boolean(open));
-  if (!open) return;
+  if (!open) {
+    stopWorkflowOpsAutoRefresh();
+    return;
+  }
   activateArchitecturePanel(view);
   closeSidebar();
   loadArchitecturePanel(view).catch(err => {
@@ -1127,6 +1138,9 @@ function activateArchitecturePanel(view) {
     panel.classList.toggle('active', active);
     panel.hidden = !active;
   }
+  if (architectureView === 'workflows') scheduleWorkflowOpsAutoRefresh();
+  else stopWorkflowOpsAutoRefresh();
+  if (architectureView !== 'sources' && architectureSourceHealthModalEl) architectureSourceHealthModalEl.hidden = true;
 }
 
 async function loadArchitecturePanel(view, force = false) {
@@ -1146,8 +1160,58 @@ function sourceHealthFindings(sourceId) {
   return findings.filter(finding => finding.sourceId === sourceId);
 }
 
+function sourceHealthSeverity(sourceId) {
+  const severities = sourceHealthFindings(sourceId).map(finding => String(finding.severity || '').toLowerCase());
+  if (severities.includes('critical') || severities.includes('error')) return 'critical';
+  if (severities.includes('warning') || severities.includes('warn')) return 'warning';
+  return 'healthy';
+}
+
+function renderArchitectureSourceHealthSummary() {
+  architectureClear(architectureSourceHealthSummaryEl);
+  if (!architectureSourceHealthSummaryEl) return;
+  const report = architectureSourcesState.healthReport;
+  const counts = [
+    ['Healthy', report?.healthySources ?? architectureSourcesState.sources.filter(source => sourceHealthSeverity(source.id) === 'healthy').length, 'good'],
+    ['Warnings', report?.warningCount ?? 0, 'warn'],
+    ['Critical', report?.criticalCount ?? 0, 'bad'],
+  ];
+  for (const [label, value, tone] of counts) {
+    const card = document.createElement('div');
+    card.className = `source-health-count ${tone}`;
+    card.dataset.healthCount = label.toLowerCase();
+    const count = document.createElement('strong');
+    count.textContent = String(value);
+    const text = document.createElement('span');
+    text.textContent = label;
+    card.append(count, text);
+    architectureSourceHealthSummaryEl.appendChild(card);
+  }
+}
+
+function openArchitectureSourceHealthModal(sourceId) {
+  const source = architectureSourcesState.sources.find(item => item.id === sourceId);
+  if (!source || !architectureSourceHealthModalEl || !architectureSourceHealthModalContentEl) return;
+  const report = architectureSourcesState.healthReport || {};
+  const connector = (report.connectorHealth || []).find(item => item.connectorInstanceId === source.connectorInstanceId);
+  architectureClear(architectureSourceHealthModalContentEl);
+  architectureSourceHealthModalContentEl.append(
+    architectureKeyValues([
+      ['Source ID', source.id],
+      ['Version ID', sourceHealthFindings(source.id).find(finding => finding.sourceVersionId)?.sourceVersionId],
+      ['Connector health snapshot', connector ? `${connector.displayName || connector.connectorInstanceId}: ${connector.healthState}` : source.connectorInstanceId],
+      ['Warning count', report.warningCount ?? 0],
+      ['Critical count', report.criticalCount ?? 0],
+      ['Health', source.healthState],
+      ['Freshness', source.stalenessState],
+    ]),
+  );
+  architectureSourceHealthModalEl.hidden = false;
+}
+
 function renderArchitectureSourceList() {
   architectureClear(architectureSourceListEl);
+  renderArchitectureSourceHealthSummary();
   const sources = architectureSourcesState.sources;
   if (!architectureSourceListEl) return;
   if (!sources.length) {
@@ -1156,13 +1220,35 @@ function renderArchitectureSourceList() {
   }
   for (const source of sources) {
     const status = source.healthState || source.stalenessState || source.sourceKind;
-    architectureSourceListEl.appendChild(architectureItemButton({
+    const severity = sourceHealthSeverity(source.id);
+    const findings = sourceHealthFindings(source.id);
+    const item = architectureItemButton({
       title: source.title || source.id,
       meta: [source.sourceKind, source.uri].filter(Boolean).join(' | '),
       badge: status,
       active: architectureSourcesState.selected?.id === source.id,
-      onClick: () => selectArchitectureSource(source.id),
-    }));
+      onClick: async () => {
+        await selectArchitectureSource(source.id);
+        openArchitectureSourceHealthModal(source.id);
+      },
+    });
+    item.classList.add('architecture-source-item', `health-${severity}`);
+    item.dataset.sourceId = source.id;
+    if (severity !== 'healthy') {
+      const indicator = document.createElement('span');
+      indicator.className = `source-health-indicator ${severity === 'critical' ? 'bad' : 'warn'}`;
+      indicator.setAttribute('aria-label', `${severity} source`);
+      indicator.textContent = '\u26a0';
+      item.querySelector('.architecture-item-title')?.appendChild(indicator);
+    }
+    const tooltip = document.createElement('span');
+    tooltip.className = 'source-health-tooltip';
+    tooltip.role = 'tooltip';
+    tooltip.textContent = findings.length
+      ? findings.map(finding => finding.issueType || finding.message).join(', ')
+      : `${source.healthState || 'healthy'} / ${source.stalenessState || 'current'}`;
+    item.appendChild(tooltip);
+    architectureSourceListEl.appendChild(item);
   }
 }
 
@@ -1217,16 +1303,62 @@ function renderArchitectureSourceDetail() {
   const events = architectureSourcesState.events || {};
   const access = Array.isArray(events.access) ? events.access : [];
   const health = Array.isArray(events.health) ? events.health : [];
+  const versions = Array.isArray(events.versions) ? events.versions : [];
+  const timeline = [
+    ...access.map(event => ({ kind: 'access', event, timestamp: event.timestamp })),
+    ...health.map(event => ({ kind: 'health', event, timestamp: event.checkedAt })),
+    ...versions.map(event => ({ kind: 'version', event, timestamp: event.observedAt })),
+  ].sort((left, right) => String(right.timestamp || '').localeCompare(String(left.timestamp || '')));
   architectureSourceDetailEl.append(architectureHeading(4, 'Events'));
-  if (access.length || health.length) {
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const event of [...access, ...health].slice(0, 8)) {
-      grid.appendChild(architectureCard(event.action || event.state || event.eventType || event.id, [event.message, architectureDate(event.timestamp || event.checkedAt)], event.allowed === false ? 'denied' : event.state));
+  if (timeline.length) {
+    const list = document.createElement('div');
+    list.className = 'architecture-list architecture-source-events';
+    for (const entry of timeline.slice(0, 12)) {
+      const event = entry.event;
+      const item = architectureItemButton({
+        title: event.action || event.state || (entry.kind === 'version' ? 'version observed' : event.eventType) || event.id,
+        meta: [event.sourceId || source.id, event.workspaceId || source.workspaceId, architectureDate(entry.timestamp)].filter(Boolean).join(' | '),
+        badge: entry.kind,
+        active: architectureSourcesState.selectedEvent?.event?.id === event.id,
+        onClick: () => {
+          architectureSourcesState.selectedEvent = entry;
+          renderArchitectureSourceDetail();
+        },
+      });
+      item.dataset.sourceEventId = event.id;
+      item.dataset.sourceEventType = entry.kind;
+      list.appendChild(item);
     }
-    architectureSourceDetailEl.appendChild(grid);
+    architectureSourceDetailEl.appendChild(list);
   } else {
     architectureSourceDetailEl.appendChild(architectureEmpty('No events'));
+  }
+
+  const selectedEvent = architectureSourcesState.selectedEvent;
+  if (selectedEvent) {
+    const event = selectedEvent.event;
+    const detail = document.createElement('div');
+    detail.id = 'architecture-source-event-detail';
+    detail.className = 'architecture-detail-card';
+    detail.append(
+      architectureHeading(4, 'Event details'),
+      architectureKeyValues([
+        ['Event type', selectedEvent.kind],
+        ['Event ID', event.id],
+        ['Timestamp', architectureDate(selectedEvent.timestamp)],
+        ['Source', event.sourceId || source.id],
+        ['Source version', event.sourceVersionId || (selectedEvent.kind === 'version' ? event.id : undefined)],
+        ['Workspace', event.workspaceId || source.workspaceId],
+        ['User', event.principalId || event.effectiveUserId],
+        ['Tool', event.toolName || event.toolCallId],
+        ['Action', event.action || event.state || (selectedEvent.kind === 'version' ? 'observed' : undefined)],
+        ['Allowed', event.allowed],
+        ['Message', event.message],
+        ['Provenance', event.provenance ? JSON.stringify(event.provenance) : undefined],
+        ['Metadata', event.details ? JSON.stringify(event.details) : undefined],
+      ]),
+    );
+    architectureSourceDetailEl.appendChild(detail);
   }
 }
 
@@ -1234,6 +1366,7 @@ async function selectArchitectureSource(sourceId) {
   const source = architectureSourcesState.sources.find(item => item.id === sourceId);
   if (!source) return;
   architectureSourcesState.selected = source;
+  architectureSourcesState.selectedEvent = null;
   renderArchitectureSourceList();
   renderArchitectureSourceDetail();
   architectureStatus(architectureSourceStatusEl, 'Loading source details...');
@@ -1278,12 +1411,17 @@ async function loadArchitectureSources() {
     architectureSourcesState.selected = next;
     architectureSourcesState.citation = null;
     architectureSourcesState.events = null;
+    architectureSourcesState.selectedEvent = null;
     renderArchitectureSourceList();
     renderArchitectureSourceDetail();
     void healthResultPromise.then(healthResult => {
       if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
       architectureSourcesState.healthReport = healthResult.status === 'fulfilled' ? healthResult.value : null;
+      renderArchitectureSourceList();
       renderArchitectureSourceDetail();
+      if (architectureSourceHealthModalEl && !architectureSourceHealthModalEl.hidden && architectureSourcesState.selected) {
+        openArchitectureSourceHealthModal(architectureSourcesState.selected.id);
+      }
     });
     if (next) await selectArchitectureSource(next.id);
     else architectureStatus(architectureSourceStatusEl, 'No sources');
@@ -1461,6 +1599,35 @@ function workflowOpsAcceptanceText(value) {
   return `${Math.round(numeric * 100)}%`;
 }
 
+function workflowOpsAcceptanceTrend() {
+  const comparisons = [...architectureWorkflowState.comparisons].sort((left, right) =>
+    String(left.comparedAt || left.createdAt || '').localeCompare(String(right.comparedAt || right.createdAt || ''))
+  );
+  if (!comparisons.length) return 'Trend: no labels';
+  if (comparisons.length === 1) return 'Trend: new baseline';
+  const recentSize = Math.ceil(comparisons.length / 2);
+  const previous = comparisons.slice(0, comparisons.length - recentSize);
+  const recent = comparisons.slice(comparisons.length - recentSize);
+  const rate = records => records.filter(record => record.outcome === 'accepted').length / records.length;
+  const delta = Math.round((rate(recent) - rate(previous)) * 100);
+  return `Trend: ${delta > 0 ? '+' : ''}${delta} pp vs prior`;
+}
+
+function stopWorkflowOpsAutoRefresh() {
+  if (architectureWorkflowRefreshTimer !== null) clearTimeout(architectureWorkflowRefreshTimer);
+  architectureWorkflowRefreshTimer = null;
+}
+
+function scheduleWorkflowOpsAutoRefresh() {
+  stopWorkflowOpsAutoRefresh();
+  architectureWorkflowRefreshTimer = setTimeout(async () => {
+    architectureWorkflowRefreshTimer = null;
+    if (!architectureScreenEl?.classList.contains('open') || architectureView !== 'workflows') return;
+    await loadArchitectureWorkflowApprovals();
+    if (architectureScreenEl?.classList.contains('open') && architectureView === 'workflows') scheduleWorkflowOpsAutoRefresh();
+  }, WORKFLOW_OPS_REFRESH_MS);
+}
+
 function activateWorkflowOpsView(view) {
   const allowed = new Set(['overview', 'library', 'runs', 'approvals', 'shadow']);
   architectureWorkflowState.view = allowed.has(view) ? view : 'overview';
@@ -1483,6 +1650,7 @@ function renderWorkflowOpsSummary() {
   const pending = architectureWorkflowState.approvals.filter(approval => approval.status === 'pending').length;
   if (workflowOpsPendingCountEl) workflowOpsPendingCountEl.textContent = String(pending);
   if (workflowOpsAcceptanceRateEl) workflowOpsAcceptanceRateEl.textContent = workflowOpsAcceptanceText(architectureWorkflowState.shadowSummary?.acceptanceRate);
+  if (workflowOpsAcceptanceTrendEl) workflowOpsAcceptanceTrendEl.textContent = workflowOpsAcceptanceTrend();
 }
 
 function workflowOpsSortedRuns() {
@@ -1513,9 +1681,13 @@ function renderWorkflowOpsOverview() {
     if (!recent.length) workflowOpsRecentRunsEl.appendChild(architectureEmpty('No workflow runs yet'));
     else {
       for (const run of recent) {
+        const compilation = architectureWorkflowState.compilations.find(record =>
+          record.workflowId === run.workflowId || record.definition?.id === run.workflowId
+        );
+        const workflowName = run.workflowName || compilation?.definition?.name || run.workflowId;
         const item = architectureItemButton({
-          title: run.workflowId,
-          meta: `${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
+          title: workflowName,
+          meta: `${run.workflowId} | ${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
           badge: run.status,
           onClick: () => {
             activateWorkflowOpsView('runs');
@@ -1612,6 +1784,7 @@ function renderWorkflowOpsLibraryDetail() {
   workflowOpsLibraryDetailEl.appendChild(architectureHeading(4, 'Release checks'));
   workflowOpsLibraryDetailEl.appendChild(architectureInlineBadges([
     validation.length ? `${validation.length} validation error(s)` : 'validated',
+    ...validation.map(error => [error?.path, error?.message].filter(Boolean).join(': ')),
     ...warnings,
   ]));
 
@@ -1751,6 +1924,52 @@ function renderWorkflowOpsRunList() {
   }
 }
 
+function workflowOpsDisclosure(label, content, open = false) {
+  const details = document.createElement('details');
+  details.className = 'workflow-ops-disclosure';
+  details.open = open;
+  const summary = document.createElement('summary');
+  summary.textContent = label;
+  details.append(summary, content);
+  return details;
+}
+
+async function openWorkflowEvidenceSource(sourceId) {
+  if (!sourceId) return;
+  setArchitectureOpen(true, 'sources');
+  if (!architectureSourcesState.loaded) await loadArchitectureSources();
+  await selectArchitectureSource(sourceId);
+}
+
+function workflowOpsEvidenceLinks(current) {
+  const wrap = document.createElement('div');
+  wrap.className = 'architecture-key-values';
+  const appendLinks = (label, references) => {
+    const row = document.createElement('div');
+    const key = document.createElement('strong');
+    key.textContent = label;
+    const values = document.createElement('span');
+    values.className = 'architecture-inline-list';
+    for (const reference of references) {
+      const sourceId = typeof reference === 'string' ? reference : reference.sourceId;
+      const value = typeof reference === 'string' ? reference : (reference.sourceVersionId || reference.sourceId);
+      const link = document.createElement('button');
+      link.type = 'button';
+      link.className = 'architecture-link-button';
+      link.dataset.sourceId = sourceId || '';
+      link.textContent = value;
+      link.addEventListener('click', () => void openWorkflowEvidenceSource(sourceId));
+      values.appendChild(link);
+    }
+    if (!values.childElementCount) values.appendChild(architectureMuted('-'));
+    row.append(key, values);
+    wrap.appendChild(row);
+  };
+  appendLinks('Source IDs', current.evidenceSourceIds || []);
+  appendLinks('Source versions', current.evidenceSourceVersions || []);
+  return wrap;
+}
+
 function workflowOpsActionCards(actions, emptyText) {
   const wrap = document.createElement('div');
   if (!actions.length) {
@@ -1759,12 +1978,27 @@ function workflowOpsActionCards(actions, emptyText) {
   }
   wrap.className = 'architecture-card-grid';
   for (const action of actions) {
-    wrap.appendChild(architectureCard(action.toolName || action.id, [
-      action.id,
-      action.reason,
-      action.error,
-      `Sources: ${architectureString(action.sourceIds)}`,
-    ].filter(Boolean), action.status));
+    const body = document.createElement('div');
+    body.appendChild(architectureKeyValues([
+      ['Action ID', action.id],
+      ['Tool', action.toolName],
+      ['Status', action.status],
+      ['Approval required', action.requiresApproval === undefined ? undefined : (action.requiresApproval ? 'Yes' : 'No')],
+      ['Reason', action.reason],
+      ['Sources', action.sourceIds],
+      ['Duration', action.durationMs === undefined ? undefined : `${action.durationMs} ms`],
+      ['Error', action.error],
+    ]));
+    body.appendChild(architectureHeading(5, 'Inputs'));
+    body.appendChild(architectureJsonBlock(action.input || {}));
+    if (action.output !== undefined) {
+      body.appendChild(architectureHeading(5, 'Output'));
+      body.appendChild(architectureJsonBlock(action.output));
+    }
+    const disclosure = workflowOpsDisclosure(`${action.toolName || action.id} - ${action.status || 'unknown'}`, body);
+    disclosure.classList.add('workflow-ops-action');
+    disclosure.dataset.actionId = action.id || '';
+    wrap.appendChild(disclosure);
   }
   return wrap;
 }
@@ -1791,13 +2025,9 @@ function renderWorkflowOpsRunDetail() {
       ['Updated', architectureDate(current.updatedAt)],
       ['Error', current.error],
     ]),
-    architectureHeading(4, 'Typed inputs'),
-    architectureJsonBlock(current.inputs || {}),
+    workflowOpsDisclosure('Typed inputs', architectureJsonBlock(current.inputs || {})),
     architectureHeading(4, 'Evidence'),
-    architectureKeyValues([
-      ['Source IDs', current.evidenceSourceIds],
-      ['Source versions', (current.evidenceSourceVersions || []).map(reference => reference.sourceVersionId || reference.sourceId)],
-    ]),
+    workflowOpsEvidenceLinks(current),
     architectureHeading(4, 'Proposed Actions'),
     workflowOpsActionCards(current.proposedActions || [], 'No proposed actions'),
     architectureHeading(4, 'Executed Actions'),
@@ -1843,7 +2073,9 @@ function workflowOpsComparisonForRun(runId) {
 }
 
 function workflowOpsShadowRuns() {
-  return workflowOpsSortedRuns().filter(run => run.mode === 'shadow');
+  return workflowOpsSortedRuns().filter(run => (
+    run.mode === 'shadow' && !workflowOpsComparisonForRun(run.id)
+  ));
 }
 
 function renderWorkflowOpsShadowList() {
@@ -1851,15 +2083,14 @@ function renderWorkflowOpsShadowList() {
   if (!workflowOpsShadowListEl) return;
   const runs = workflowOpsShadowRuns();
   if (!runs.length) {
-    workflowOpsShadowListEl.appendChild(architectureEmpty('No shadow runs'));
+    workflowOpsShadowListEl.appendChild(architectureEmpty('No unlabeled shadow runs'));
     return;
   }
   for (const run of runs) {
-    const comparison = workflowOpsComparisonForRun(run.id);
     const item = architectureItemButton({
       title: run.workflowId,
       meta: `${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
-      badge: comparison?.outcome || 'unlabeled',
+      badge: 'unlabeled',
       active: architectureWorkflowState.selectedShadowRun?.id === run.id,
       onClick: () => selectWorkflowOpsShadowRun(run.id),
     });
@@ -2797,7 +3028,13 @@ if (architectureScreenEl) {
       workflowOpsTabBtns[next].click();
     });
   }
+  for (const btn of workflowOpsSummaryBtns) {
+    btn.addEventListener('click', () => activateWorkflowOpsView(btn.dataset.workflowSummaryView || 'overview'));
+  }
   architectureSourceRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('sources', true));
+  architectureSourceHealthModalCloseBtn?.addEventListener('click', () => {
+    if (architectureSourceHealthModalEl) architectureSourceHealthModalEl.hidden = true;
+  });
   architectureSqlForm?.addEventListener('submit', planArchitectureSql);
   architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
   architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);

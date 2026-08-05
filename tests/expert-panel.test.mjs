@@ -95,11 +95,49 @@ test("expert panel runs selected experts with isolated knowledge and synthesis",
   assert.ok(design.citations.some(citation => citation.title === "panel-probe.md"));
   assert.ok(finance.citations.some(citation => citation.title === "panel-probe.md"));
   assert.ok(engineering.citations.some(citation => citation.title === "panel-probe.md"));
+  for (const opinion of resultEvent.value.experts) {
+    assert.deepEqual(opinion.modeFormat, {
+      schema: "review-v1",
+      requiredSections: ["Strengths", "Risks", "Omissions", "Practical concerns"]
+    });
+    assert.match(opinion.answer, /^## Strengths$/m);
+    assert.match(opinion.answer, /^## Risks$/m);
+    assert.match(opinion.answer, /^## Omissions$/m);
+    assert.match(opinion.answer, /^## Practical concerns$/m);
+  }
 
   assert.match(calls[0].prompt, /PanelProbeDesign/);
   assert.match(calls[1].prompt, /PanelProbeFinance/);
   assert.match(calls[2].prompt, /PanelProbeEngineering/);
   assert.match(calls[3].system, /orchestrating agent/i);
+
+  const debateResults = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const debateEvents = [];
+    for await (const event of registeredTool.executor.execute({
+      question: "Debate the operational tradeoffs.",
+      experts: ["engineering"],
+      mode: "debate",
+      synthesize: false
+    }, context)) {
+      debateEvents.push(event);
+    }
+    debateResults.push(debateEvents.find(event => event.type === "result")?.value);
+  }
+  for (const debate of debateResults) {
+    assert.equal(debate.mode, "debate");
+    assert.deepEqual(debate.experts[0].modeFormat, {
+      schema: "debate-v1",
+      requiredSections: ["Position", "Disagreements", "Tradeoffs"]
+    });
+    assert.match(debate.experts[0].answer, /^## Position$/m);
+    assert.match(debate.experts[0].answer, /^## Disagreements$/m);
+    assert.match(debate.experts[0].answer, /^## Tradeoffs$/m);
+  }
+  assert.deepEqual(
+    debateResults.map(result => result.experts[0].modeFormat.requiredSections),
+    [["Position", "Disagreements", "Tradeoffs"], ["Position", "Disagreements", "Tradeoffs"]],
+  );
 
   const reviewEvents = [];
   for await (const event of registeredTool.executor.execute({

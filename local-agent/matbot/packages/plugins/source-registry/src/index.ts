@@ -785,7 +785,11 @@ function createSourceActionTool(registry: SourceRegistry): Tool {
               return;
             }
             case 'events':
-              yield { type: 'result', value: { access: await registry.accessEvents(parsed.sourceId), health: await registry.healthEvents(parsed.sourceId) } };
+              yield { type: 'result', value: {
+                access: await registry.accessEvents(parsed.sourceId),
+                health: await registry.healthEvents(parsed.sourceId),
+                versions: await registry.sourceVersions(parsed.sourceId),
+              } };
               return;
             default:
               yield { type: 'error', message: `Unknown source_action "${String(parsed.action)}". Expected: list, get, health, stale, citation, events.` };

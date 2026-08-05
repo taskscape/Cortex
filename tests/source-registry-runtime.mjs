@@ -214,9 +214,11 @@ async function main() {
   assert.equal(stale.sources.length, 1);
   assert.equal(stale.sources[0].id, sourceId);
 
+  const versionStore = stores.get("source_versions");
   const events = await collectTool(sourceTool, { action: "events", sourceId });
   assert.equal(events.access.length, 6);
   assert.equal(events.health.length, 3);
+  assert.deepEqual(events.versions.map(version => version.id), [versionA.id, versionC.id]);
   assert.deepEqual(events.health.map(event => event.state), ["healthy", "degraded", "down"]);
   assert.equal((await registry.accessEvents(sourceId)).find(event => event.action === "cite")?.sourceVersionId, versionC.id);
   const accessAudit = await registry.accessEvents(sourceId);
@@ -225,9 +227,9 @@ async function main() {
   assert.ok(accessAudit.every(event => event.principalId === "source-auditor"));
   assert.ok(accessAudit.every(event => event.sourceVersionId === versionC.id || event.action === "write" || event.action === "delete" || event.action === "health_check"));
   assert.doesNotMatch(JSON.stringify(accessAudit), /source-secret/);
+  const versionQueriesAfterEvents = versionStore.queryCount;
 
   const healthTool = tools.get("source_health_action");
-  const versionStore = stores.get("source_versions");
   const report = await collectTool(healthTool, { action: "report", workspaceId: "default" });
   assert.equal(report.totalSources, 2);
   assert.equal(report.healthySources, 1);
@@ -240,13 +242,13 @@ async function main() {
   assert.equal(report.findings.find(finding => finding.sourceId === sourceId)?.sourceVersionId, versionC.id);
   assert.equal(report.connectorHealth.length, 1);
   assert.equal(report.connectorHealth[0].healthState, "degraded");
-  assert.equal(versionStore.queryCount, 1, "health evaluation should query source versions once");
+  assert.equal(versionStore.queryCount, versionQueriesAfterEvents + 1, "health evaluation should query source versions once");
 
   const warnings = await collectTool(healthTool, { action: "warnings", workspaceId: "default" });
   assert.equal(warnings.warningCount, 1);
   assert.equal(warnings.findings.length, 2);
   assert.equal(warnings.connectorHealth.length, 1);
-  assert.equal(versionStore.queryCount, 2, "each health evaluation should use one source-version query");
+  assert.equal(versionStore.queryCount, versionQueriesAfterEvents + 2, "each health evaluation should use one source-version query");
 
   const reports = await collectTool(healthTool, { action: "reports", workspaceId: "default" });
   assert.equal(reports.reports.length, 1);

@@ -109,9 +109,25 @@ test("SHP implemented source-health detail keeps unhealthy findings and events a
   await page.goto("/");
   await openArchitecturePanel(page, "sources");
 
+  await expect(page.locator('[data-health-count="healthy"] strong')).toHaveText("0");
+  await expect(page.locator('[data-health-count="warnings"] strong')).toHaveText("2");
+  await expect(page.locator('[data-health-count="critical"] strong')).toHaveText("0");
   const source = page.locator("#architecture-source-list .architecture-item", { hasText: "architecture.md" });
   await expect(source.locator(".architecture-badge.bad")).toHaveText("unhealthy");
+  await expect(source).toHaveClass(/health-warning/);
+  await expect(source.locator('.source-health-indicator[aria-label="warning source"]')).toBeVisible();
+  await source.hover();
+  await expect(source.getByRole("tooltip")).toContainText("stale");
+  await expect(source.getByRole("tooltip")).toContainText("degraded");
   await source.click();
+
+  const modal = page.locator("#architecture-source-health-modal");
+  await expect(modal).toBeVisible();
+  for (const value of ["Source ID", "source:playwright-architecture-brief", "Version ID", "source-version:playwright-architecture-brief-v1", "Connector health snapshot", "Warning count", "Critical count"]) {
+    await expect(modal).toContainText(value);
+  }
+  await modal.getByRole("button", { name: "Close" }).click();
+  await expect(modal).toBeHidden();
 
   const detail = page.locator("#architecture-source-detail");
   await expect(detail).toContainText("source:playwright-architecture-brief");
@@ -124,6 +140,35 @@ test("SHP implemented source-health detail keeps unhealthy findings and events a
   await expect(detail.locator(".architecture-card-grid").first().locator(".architecture-badge.warn")).toHaveCount(2);
   await expect(detail).toContainText("Events");
   await expect(detail).toContainText("retrieve");
+  const accessEvent = detail.locator('.architecture-item[data-source-event-id="source-access:playwright"]');
+  await accessEvent.click();
+  const eventDetail = page.locator("#architecture-source-event-detail");
+  await expect(eventDetail).toContainText("Event details");
+  await expect(eventDetail).toContainText("access");
+  await expect(eventDetail).toContainText("source-version:playwright-architecture-brief-v1");
+  await expect(eventDetail).toContainText("principal:playwright");
+  await expect(eventDetail).toContainText("tool-call:workspace-rag");
+  await expect(detail.locator('.architecture-item[data-source-event-type="version"]')).toHaveCount(1);
+});
+
+test("SHP-3 critical source findings use the critical list and count treatment", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop source-health critical-state coverage");
+  await page.goto("/");
+  await page.route("**/tools/source_health_action", async route => {
+    const response = await route.fetch();
+    const report = await response.json();
+    report.findings[0].severity = "critical";
+    report.warningCount = 1;
+    report.criticalCount = 1;
+    await route.fulfill({ response, json: report });
+  });
+  await openArchitecturePanel(page, "sources");
+
+  await expect(page.locator('[data-health-count="warnings"] strong')).toHaveText("1");
+  await expect(page.locator('[data-health-count="critical"] strong')).toHaveText("1");
+  const source = page.locator('#architecture-source-list .architecture-source-item[data-source-id="source:playwright-architecture-brief"]');
+  await expect(source).toHaveClass(/health-critical/);
+  await expect(source.locator('.source-health-indicator[aria-label="critical source"]')).toBeVisible();
 });
 
 test("GSP governed SQL keeps execution disabled until approval and renders the planned query record", async ({ page, isMobile }) => {
@@ -160,15 +205,48 @@ test("GSP governed SQL keeps execution disabled until approval and renders the p
 test("WOC overview and run ledger expose summary metrics, typed inputs, evidence, events, and filters", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workflow operations coverage");
   await page.goto("/");
-  const seeded = await seedWorkflowRuns(page, "Ledger Acceptance Workflow");
+  const workflowName = "Ledger Acceptance Workflow";
+  const seeded = await seedWorkflowRuns(page, workflowName);
+  await page.route("**/tools/workflow_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action !== "inspect_run" || input.runId !== seeded.shadowRunIds[0]) {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    body.run.executedActions = [{
+      id: "action:playwright-executed-acceptance",
+      toolName: "file_broker_action",
+      capability: "write",
+      status: "succeeded",
+      requiresApproval: false,
+      sourceIds: ["source:playwright-architecture-brief"],
+      input: { path: "reports/acceptance.md" },
+      output: { written: true, bytes: 128 },
+      durationMs: 42,
+    }];
+    await route.fulfill({ response, json: body });
+  });
   await openArchitecturePanel(page, "workflows");
 
-  await expect(page.locator("#architecture-panel-workflows .workflow-ops-summary .workflow-ops-metric")).toHaveCount(4);
+  const summary = page.locator("#architecture-panel-workflows .workflow-ops-summary");
+  await expect(summary.locator(".workflow-ops-metric")).toHaveCount(4);
   await expect(page.locator("#workflow-ops-workflow-count")).toHaveText("1");
   await expect(page.locator("#workflow-ops-run-count")).toHaveText("4");
   await expect(page.locator("#workflow-ops-pending-count")).toHaveText("2");
   await expect(page.locator("#workflow-ops-acceptance-rate")).toHaveText("0%");
-  await expect(page.locator(`#workflow-ops-recent-runs .architecture-item[data-run-id="${seeded.approvalRunId}"]`)).toBeVisible();
+  await expect(page.locator("#workflow-ops-acceptance-trend")).toHaveText("Trend: no labels");
+  const recentRun = page.locator(`#workflow-ops-recent-runs .architecture-item[data-run-id="${seeded.approvalRunId}"]`);
+  await expect(recentRun).toContainText(workflowName);
+  await expect(recentRun).toContainText(seeded.approvalRunId);
+  await expect(recentRun).toContainText("waiting_for_approval");
+  await expect(recentRun).toContainText(/\d{1,2}\/\d{1,2}\/\d{4}|\d{4}-\d{2}-\d{2}/);
+
+  for (const [label, panel] of [["Workflows", "library"], ["Runs", "runs"], ["Pending approvals", "approvals"], ["Shadow acceptance", "shadow"]]) {
+    await summary.getByRole("button", { name: new RegExp(`^${label}`) }).click();
+    await expect(page.locator(`[data-workflow-ops-panel="${panel}"]`)).toBeVisible();
+  }
 
   await page.getByRole("tab", { name: "Run Ledger" }).click();
   await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${seeded.approvalRunId}"]`).click();
@@ -180,6 +258,35 @@ test("WOC overview and run ledger expose summary metrics, typed inputs, evidence
   await expect(detail).toContainText("source:playwright-architecture-brief");
   await expect(detail).toContainText("source-version:playwright-architecture-brief-v1");
   await expect(detail).toContainText("approval_requested");
+  const typedInputs = detail.locator("details", { hasText: "Typed inputs" });
+  await expect(typedInputs).not.toHaveAttribute("open", "");
+  await typedInputs.locator("summary").click();
+  await expect(typedInputs.locator("pre")).toContainText("INV-42");
+
+  const sourceLink = detail.locator('.architecture-link-button[data-source-id="source:playwright-architecture-brief"]').first();
+  await expect(sourceLink).toHaveText("source:playwright-architecture-brief");
+  const proposedAction = detail.locator('.workflow-ops-action[data-action-id="action:playwright-write"]');
+  await proposedAction.locator("summary").click();
+  await expect(proposedAction).toContainText("file_broker_action");
+  await expect(proposedAction).toContainText("Approval required");
+  await expect(proposedAction).toContainText("Yes");
+  await expect(proposedAction).toContainText("Inputs");
+
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${seeded.shadowRunIds[0]}"]`).click();
+  const executedAction = detail.locator(".workflow-ops-action", { hasText: "succeeded" }).last();
+  await executedAction.locator("summary").click();
+  await expect(executedAction).toContainText("Output");
+  await expect(executedAction).toContainText('"written": true');
+  await expect(executedAction).toContainText("42 ms");
+
+  await page.getByRole("tab", { name: "Run Ledger" }).click();
+  await page.locator(`#workflow-ops-run-list .architecture-item[data-run-id="${seeded.approvalRunId}"]`).click();
+  await detail.locator('.architecture-link-button[data-source-id="source:playwright-architecture-brief"]').first().click();
+  await expect(page.getByRole("tabpanel", { name: "Sources" })).toBeVisible();
+  await expect(page.locator("#architecture-source-detail")).toContainText("source:playwright-architecture-brief");
+
+  await page.getByRole("tab", { name: "Workflows" }).click();
+  await page.getByRole("tab", { name: "Run Ledger" }).click();
 
   await page.locator("#workflow-ops-run-search").fill(seeded.approvalRunId);
   await expect(page.locator("#workflow-ops-run-list .architecture-item")).toHaveCount(1);
@@ -188,6 +295,23 @@ test("WOC overview and run ledger expose summary metrics, typed inputs, evidence
   await page.locator("#workflow-ops-run-search").fill("");
   await page.locator("#workflow-ops-run-status").selectOption("succeeded");
   await expect(page.locator("#workflow-ops-run-list .architecture-item")).toHaveCount(3);
+});
+
+test("WOC-8 workflow overview refreshes automatically every 30 seconds while visible", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow auto-refresh coverage");
+  await page.goto("/");
+  await seedWorkflowRuns(page, "Auto Refresh Acceptance Workflow");
+  await page.clock.install();
+  let listRunRequests = 0;
+  page.on("request", request => {
+    if (!request.url().includes("/tools/workflow_action")) return;
+    if (request.postDataJSON()?.action === "list_runs") listRunRequests += 1;
+  });
+
+  await openArchitecturePanel(page, "workflows");
+  await expect.poll(() => listRunRequests).toBe(1);
+  await page.clock.runFor(30_000);
+  await expect.poll(() => listRunRequests).toBeGreaterThanOrEqual(2);
 });
 
 test("WOC-5 failed recent runs use the critical visual treatment", async ({ page, isMobile }) => {
@@ -221,6 +345,34 @@ test("WOC-5 failed recent runs use the critical visual treatment", async ({ page
   await expect(page.locator("#workflow-ops-attention")).toContainText("1");
 });
 
+test("WCD-4 draft library displays compiler validation errors and warnings", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop workflow draft validation coverage");
+  await page.goto("/");
+  const seeded = await page.evaluate(() => window.matbotTransport.callTool("workflow_action", {
+    action: "compile",
+    workspaceId: "default",
+    name: "Draft Validation Acceptance",
+    sourceIds: [],
+    toolCalls: [],
+    approvalGates: [{ id: "invalid-gate", type: "unsupported-gate" }],
+    publish: false,
+    dryRun: true,
+  }));
+  expect(seeded.compilation.validation.length).toBeGreaterThan(0);
+  expect(seeded.compilation.warnings.length).toBeGreaterThan(0);
+
+  await openArchitecturePanel(page, "workflows");
+  await page.getByRole("tab", { name: "Library" }).click();
+  await page.locator(`#workflow-ops-library-list .architecture-item[data-compilation-id="${seeded.compilation.id}"]`).click();
+  const detail = page.locator("#workflow-ops-library-detail");
+  await expect(detail).toContainText("Release checks");
+  await expect(detail).toContainText("1 validation error(s)");
+  await expect(detail).toContainText("$.approvalGates[0].type");
+  await expect(detail).toContainText("Unsupported approval gate type");
+  await expect(detail).toContainText("No tool calls were supplied");
+  await expect(detail).toContainText("dryRun was requested without publish=true");
+});
+
 test("WSL shadow outcome controls record accept, reject, and mixed labels and recalculate readiness", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop workflow shadow coverage");
   await page.goto("/");
@@ -241,8 +393,13 @@ test("WSL shadow outcome controls record accept, reject, and mixed labels and re
     await expect(detail).toContainText("Evidence");
     await expect(detail).toContainText("Proposed recommendation");
     await detail.getByRole("button", { name: buttonName }).click();
-    await expect(detail).toContainText(outcome);
+    await expect(page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${runId}"]`)).toHaveCount(0);
+    await expect(page.locator("#architecture-workflow-status")).toContainText(`recorded as ${outcome}`);
   }
+
+  await expect(page.locator("#workflow-ops-shadow-list .architecture-item")).toHaveCount(0);
+  await expect(page.locator("#workflow-ops-shadow-list")).toContainText("No unlabeled shadow runs");
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("Select a shadow run");
 
   const report = await page.evaluate(() => window.matbotTransport.callTool("workflow_action", { action: "shadow_report" }));
   expect(report.summary).toEqual(expect.objectContaining({ total: 3, accepted: 1, rejected: 1, mixed: 1 }));

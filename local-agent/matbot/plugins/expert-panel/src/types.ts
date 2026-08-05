@@ -113,6 +113,10 @@ export interface ExpertOpinion {
   answer: string;
   providerResolution: ExpertProviderResolution;
   warnings: string[];
+  modeFormat: {
+    schema: "parallel-v1" | "review-v1" | "debate-v1";
+    requiredSections: string[];
+  };
   citations: Array<{
     id: string;
     path: string;

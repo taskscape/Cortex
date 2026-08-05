@@ -177,3 +177,31 @@ test("WCD-1/2/3/5/6/7/8 draft-only compilation persists deterministically and ca
   assert.deepEqual(await registry.getDefinition(workflowId), published.published.definition);
   assert.deepEqual(await registry.getVersion(published.published.version.id), published.published.version);
 });
+
+test("WCD-4 draft compilation persists validation errors and compiler warnings for inspection", async () => {
+  const { services, tools } = createWorkflowFixture();
+  await plugin.setup(services);
+
+  const drafted = await collectTool(tools.get("workflow_action"), {
+    action: "compile",
+    workspaceId: "draft-validation-workspace",
+    name: "Draft validation probe",
+    approvalGates: [{ id: "invalid-gate", type: "unsupported-gate" }],
+    publish: false,
+    dryRun: true,
+  });
+
+  assert.equal(drafted.compilation.status, "drafted");
+  assert.ok(drafted.compilation.validation.some(error => (
+    error.path === "$.approvalGates[0].type" && /Unsupported approval gate type/.test(error.message)
+  )));
+  assert.ok(drafted.compilation.warnings.includes(
+    "No tool calls were supplied; compiled workflow will only validate inputs and evidence.",
+  ));
+  assert.ok(drafted.compilation.warnings.includes(
+    "No source ids were supplied; compiled workflow has no required evidence yet.",
+  ));
+  assert.ok(drafted.compilation.warnings.includes(
+    "dryRun was requested without publish=true; no run was created.",
+  ));
+});

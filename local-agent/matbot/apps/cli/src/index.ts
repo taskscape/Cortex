@@ -29,7 +29,7 @@ import { FilesystemFileStore }             from '@matatbread/matbot-files-node';
 import { createBuiltinTools, createProviderTool, classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
 import { LookupKnowledgeIndex }               from '@matatbread/matbot-knowledge';
 import { appendFileSync, closeSync, mkdirSync, openSync } from 'node:fs';
-import { access, copyFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createInterface }                 from 'node:readline/promises';
 import { createRequire }                   from 'node:module';
 import { fileURLToPath, pathToFileURL }     from 'node:url';
@@ -315,6 +315,24 @@ interface CortexWorkspaceManager {
   switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
+export interface WorkspaceDeletionHooks {
+  beforeRegistryCommit?(workspaceId: string): void | Promise<void>;
+  beforePurge?(workspaceId: string, stagedPath: string): void | Promise<void>;
+}
+
+export interface WorkspaceDeletionResult {
+  id: string;
+  deleted: true;
+  cleanupLog: string[];
+  cleanupPending?: true;
+  pendingCleanupPath?: string;
+}
+
+export interface FileWorkspaceManagerOptions {
+  deletionHooks?: WorkspaceDeletionHooks;
+  deletionLogger?: (message: string) => void;
+}
+
 function yamlSingleQuoted(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
@@ -407,13 +425,18 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
   private restarter: ((id: string) => Promise<void>) | undefined;
   private readonly registryPath: string;
   private readonly rootConfigPath: string;
+  private readonly deletionHooks: WorkspaceDeletionHooks;
+  private readonly deletionLogger: (message: string) => void;
 
   constructor(
     registryPath: string,
     rootConfigPath: string,
+    options: FileWorkspaceManagerOptions = {},
   ) {
     this.registryPath = registryPath;
     this.rootConfigPath = rootConfigPath;
+    this.deletionHooks = options.deletionHooks ?? {};
+    this.deletionLogger = options.deletionLogger ?? (message => console.info(message));
   }
 
   setRestarter(restarter: (id: string) => Promise<void>): void {
@@ -484,7 +507,7 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return this.summarize(record, record.id === registry.active);
   }
 
-  async delete(id: string): Promise<{ id: string; deleted: true }> {
+  async delete(id: string): Promise<WorkspaceDeletionResult> {
     const registry = await this.load();
     const record = registry.workspaces.find(w => w.id === id);
     if (record === undefined) throw new Error(`Unknown workspace "${id}".`);
@@ -495,10 +518,49 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
       throw new Error('Cannot delete the only workspace.');
     }
 
-    await this.deleteWorkspaceDirectoryIfOwned(record);
-    registry.workspaces = registry.workspaces.filter(w => w.id !== id);
-    await this.save(registry);
-    return { id, deleted: true };
+    const cleanupLog: string[] = [];
+    const audit = (operation: string): void => {
+      const message = `[workspace-delete] workspace=${id} ${operation}`;
+      cleanupLog.push(message);
+      this.deletionLogger(message);
+    };
+    const workspaceDir = this.ownedWorkspaceDirectory(record);
+    const stagedPath = workspaceDir !== undefined && await exists(workspaceDir)
+      ? `${workspaceDir}.deleting-${crypto.randomUUID()}`
+      : undefined;
+
+    if (stagedPath !== undefined && workspaceDir !== undefined) {
+      await rename(workspaceDir, stagedPath);
+      audit(`staged path=${stagedPath}`);
+    } else {
+      audit('no owned workspace directory to stage');
+    }
+
+    try {
+      await this.deletionHooks.beforeRegistryCommit?.(id);
+      registry.workspaces = registry.workspaces.filter(w => w.id !== id);
+      await this.save(registry);
+      audit('registry commit complete');
+    } catch (error) {
+      if (stagedPath !== undefined && workspaceDir !== undefined && await exists(stagedPath)) {
+        await rename(stagedPath, workspaceDir);
+        audit(`rolled back path=${workspaceDir}`);
+      }
+      audit(`aborted before commit error=${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+
+    if (stagedPath !== undefined) {
+      try {
+        await this.deletionHooks.beforePurge?.(id, stagedPath);
+        await rm(stagedPath, { recursive: true, force: true });
+        audit(`purged path=${stagedPath}`);
+      } catch (error) {
+        audit(`cleanup pending path=${stagedPath} error=${error instanceof Error ? error.message : String(error)}`);
+        return { id, deleted: true, cleanupLog, cleanupPending: true, pendingCleanupPath: stagedPath };
+      }
+    }
+    return { id, deleted: true, cleanupLog };
   }
 
   async switch(id: string): Promise<{ active: string; restarting: boolean }> {
@@ -544,16 +606,16 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return { ...record, active };
   }
 
-  private async deleteWorkspaceDirectoryIfOwned(record: CortexWorkspaceRecord): Promise<void> {
+  private ownedWorkspaceDirectory(record: CortexWorkspaceRecord): string | undefined {
     const rootDir = path.dirname(this.rootConfigPath);
     const workspacesDir = path.resolve(rootDir, 'workspaces');
     const expectedWorkspaceDir = path.resolve(workspacesDir, record.id);
     const configPath = path.resolve(path.dirname(this.registryPath), record.configPath);
     const configDir = path.dirname(configPath);
 
-    if (!pathIsInsideOrEqual(expectedWorkspaceDir, workspacesDir)) return;
-    if (!pathIsInsideOrEqual(configDir, expectedWorkspaceDir)) return;
-    await rm(expectedWorkspaceDir, { recursive: true, force: true });
+    if (!pathIsInsideOrEqual(expectedWorkspaceDir, workspacesDir)) return undefined;
+    if (!pathIsInsideOrEqual(configDir, expectedWorkspaceDir)) return undefined;
+    return expectedWorkspaceDir;
   }
 
   private async load(): Promise<CortexWorkspaceRegistry> {

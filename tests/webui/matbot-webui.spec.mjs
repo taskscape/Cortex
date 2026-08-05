@@ -633,9 +633,10 @@ test("workflow operations center summarizes library, runs, approvals, and shadow
   await expect(page.locator(`#architecture-approval-list .architecture-item[data-run-id="${seeded.approvalRunId}"]`)).toHaveCount(2);
 
   await page.locator('.workflow-ops-tab[data-workflow-ops-view="shadow"]').click();
-  await page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${seeded.shadowRunId}"]`).click();
-  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("accepted");
-  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("shadow-recommendation-hash");
+  await expect(page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${seeded.shadowRunId}"]`)).toHaveCount(0);
+  await expect(page.locator("#workflow-ops-shadow-list")).toContainText("No unlabeled shadow runs");
+  await expect(page.locator("#workflow-ops-shadow-readiness")).toContainText("Accepted");
+  await expect(page.locator("#workflow-ops-shadow-readiness")).toContainText("1");
 });
 
 test("E2E-016 workflow compiler publishes a library entry and starts an approval-gated run", async ({ page, isMobile }) => {
@@ -704,7 +705,9 @@ test("MISSING-08 workflow shadow lab records a human outcome and refreshes readi
   await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("unlabeled");
   await page.locator("#workflow-ops-shadow-detail").getByRole("button", { name: "Accept" }).click();
   await expect(page.locator("#architecture-workflow-status")).toContainText("recorded as accepted");
-  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("accepted");
+  await expect(page.locator(`#workflow-ops-shadow-list .architecture-item[data-run-id="${shadowRunId}"]`)).toHaveCount(0);
+  await expect(page.locator("#workflow-ops-shadow-list")).toContainText("No unlabeled shadow runs");
+  await expect(page.locator("#workflow-ops-shadow-detail")).toContainText("Select a shadow run");
   await expect(page.locator("#workflow-ops-acceptance-rate")).toHaveText("100%");
 });
 

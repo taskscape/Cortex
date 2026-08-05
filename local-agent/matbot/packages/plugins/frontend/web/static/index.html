@@ -735,6 +735,61 @@
     .architecture-badge.good { background: #dcfce7; color: #166534; }
     .architecture-badge.warn { background: #fef3c7; color: #92400e; }
     .architecture-badge.bad { background: #fee2e2; color: #991b1b; }
+    .source-health-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .source-health-count {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px 10px;
+    }
+    .source-health-count.warn { border-color: #f59e0b; background: #fffbeb; }
+    .source-health-count.bad { border-color: #ef4444; background: #fef2f2; }
+    .source-health-count strong { display: block; font-size: 1.25em; }
+    .architecture-source-item { position: relative; }
+    .architecture-source-item.health-warning { border-left: 4px solid #f59e0b; }
+    .architecture-source-item.health-critical { border-left: 4px solid #dc2626; }
+    .source-health-indicator { margin-left: auto; }
+    .source-health-indicator.warn { color: #b45309; }
+    .source-health-indicator.bad { color: #b91c1c; }
+    .source-health-tooltip {
+      display: none;
+      position: absolute;
+      z-index: 15;
+      left: 8px;
+      top: calc(100% - 2px);
+      max-width: 280px;
+      border-radius: 6px;
+      background: #111827;
+      color: #fff;
+      font-size: 0.76em;
+      padding: 6px 8px;
+      pointer-events: none;
+    }
+    .architecture-source-item:hover .source-health-tooltip,
+    .architecture-source-item:focus-visible .source-health-tooltip { display: block; }
+    .architecture-health-modal {
+      position: fixed;
+      z-index: 90;
+      inset: 10vh max(20px, 18vw) auto;
+      max-height: 78vh;
+      overflow: auto;
+      border: 1px solid #cbd5e1;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.35);
+      padding: 18px;
+    }
+    .architecture-health-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
     .architecture-kv {
       display: grid;
       grid-template-columns: minmax(110px, 180px) minmax(0, 1fr);
@@ -867,7 +922,17 @@
       border: 1px solid #e5e7eb;
       border-radius: 10px;
       background: linear-gradient(145deg, #ffffff, #f8fbff);
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
       padding: 12px;
+      text-align: left;
+      width: 100%;
+    }
+    .workflow-ops-metric:hover,
+    .workflow-ops-metric:focus-visible {
+      border-color: #93c5fd;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
     }
     .workflow-ops-metric-label {
       color: #667085;
@@ -881,6 +946,33 @@
       color: #111827;
       font-size: 1.5em;
       font-weight: 750;
+    }
+    .workflow-ops-metric-trend {
+      color: #667085;
+      font-size: 0.72em;
+      margin-top: 2px;
+    }
+    .workflow-ops-disclosure {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px 10px;
+    }
+    .workflow-ops-disclosure > summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .workflow-ops-disclosure[open] > summary {
+      margin-bottom: 8px;
+    }
+    .architecture-link-button {
+      border: 0;
+      background: transparent;
+      color: #1d4ed8;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+      text-decoration: underline;
     }
     .workflow-ops-nav {
       display: flex;
@@ -4570,9 +4662,17 @@
               <button id="architecture-source-refresh" type="button">Refresh</button>
             </div>
           </div>
+          <div id="architecture-source-health-summary" class="source-health-summary" aria-label="Source health counts"></div>
           <div class="architecture-grid">
             <div id="architecture-source-list" class="architecture-list" aria-label="Sources"></div>
             <div id="architecture-source-detail" class="architecture-detail" aria-live="polite"></div>
+          </div>
+          <div id="architecture-source-health-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-source-health-modal-title" hidden>
+            <div class="architecture-health-modal-header">
+              <h3 id="architecture-source-health-modal-title">Source health report</h3>
+              <button id="architecture-source-health-modal-close" type="button">Close</button>
+            </div>
+            <div id="architecture-source-health-modal-content"></div>
           </div>
         </section>
 
@@ -4620,10 +4720,10 @@
           </div>
 
           <div class="workflow-ops-summary" aria-label="Workflow operations summary">
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Workflows</div><div id="workflow-ops-workflow-count" class="workflow-ops-metric-value">0</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Runs</div><div id="workflow-ops-run-count" class="workflow-ops-metric-value">0</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Pending approvals</div><div id="workflow-ops-pending-count" class="workflow-ops-metric-value">0</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Shadow acceptance</div><div id="workflow-ops-acceptance-rate" class="workflow-ops-metric-value">-</div></div>
+            <button class="workflow-ops-metric" data-workflow-summary-view="library" type="button"><div class="workflow-ops-metric-label">Workflows</div><div id="workflow-ops-workflow-count" class="workflow-ops-metric-value">0</div></button>
+            <button class="workflow-ops-metric" data-workflow-summary-view="runs" type="button"><div class="workflow-ops-metric-label">Runs</div><div id="workflow-ops-run-count" class="workflow-ops-metric-value">0</div></button>
+            <button class="workflow-ops-metric" data-workflow-summary-view="approvals" type="button"><div class="workflow-ops-metric-label">Pending approvals</div><div id="workflow-ops-pending-count" class="workflow-ops-metric-value">0</div></button>
+            <button class="workflow-ops-metric" data-workflow-summary-view="shadow" type="button"><div class="workflow-ops-metric-label">Shadow acceptance</div><div id="workflow-ops-acceptance-rate" class="workflow-ops-metric-value">-</div><div id="workflow-ops-acceptance-trend" class="workflow-ops-metric-trend">Trend: no labels</div></button>
           </div>
 
           <div class="workflow-ops-nav" role="tablist" aria-label="Workflow Operations Center">
