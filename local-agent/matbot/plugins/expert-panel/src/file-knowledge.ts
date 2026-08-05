@@ -29,10 +29,16 @@ interface CachedExpertFile extends ExpertFileMetadata {
   haystack: string;
 }
 
+export interface ExpertKnowledgeSearchResult {
+  sources: ExpertSource[];
+  warnings: string[];
+}
+
 export class FileExpertKnowledge {
   private readonly expert: ExpertConfig;
   private readonly cache = new Map<string, CachedExpertFile>();
   private manifest: ExpertFileMetadata[] = [];
+  private manifestWarnings: string[] = [];
   private manifestExpiresAt = 0;
 
   constructor(expert: ExpertConfig) {
@@ -40,12 +46,17 @@ export class FileExpertKnowledge {
   }
 
   async search(query: string, limit: number, signal: AbortSignal): Promise<ExpertSource[]> {
-    const files = await this.listFiles(signal);
+    return (await this.searchWithDiagnostics(query, limit, signal)).sources;
+  }
+
+  async searchWithDiagnostics(query: string, limit: number, signal: AbortSignal): Promise<ExpertKnowledgeSearchResult> {
+    const { files, warnings } = await this.listFiles(signal);
     const terms = tokenize(query);
     const sources = await mapWithConcurrency(files, FILE_READ_CONCURRENCY, async file => {
       signal.throwIfAborted();
       const cached = await this.readCached(file, signal).catch(error => {
         signal.throwIfAborted();
+        warnings.push(`Expert "${this.expert.id}" could not read knowledge file: ${file.path}`);
         return undefined;
       });
       if (cached === undefined) return undefined;
@@ -64,22 +75,36 @@ export class FileExpertKnowledge {
       } satisfies ExpertSource;
     });
 
-    return sources
+    return {
+      sources: sources
       .filter((source): source is ExpertSource => source !== undefined)
       .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-      .slice(0, limit);
+      .slice(0, limit),
+      warnings: unique(warnings)
+    };
   }
 
-  private async listFiles(signal: AbortSignal): Promise<ExpertFileMetadata[]> {
-    if (Date.now() < this.manifestExpiresAt) return this.manifest;
-    const files = await listTextFiles(this.expert.roots, signal);
+  private async listFiles(signal: AbortSignal): Promise<{ files: ExpertFileMetadata[]; warnings: string[] }> {
+    if (Date.now() < this.manifestExpiresAt) {
+      const rootWarnings = await inaccessibleRootWarnings(this.expert, signal);
+      if (rootWarnings.length === 0) {
+        return { files: this.manifest, warnings: this.manifestWarnings };
+      }
+      this.cache.clear();
+      this.manifest = [];
+      this.manifestWarnings = rootWarnings;
+      this.manifestExpiresAt = 0;
+      return { files: [], warnings: rootWarnings };
+    }
+    const { files, warnings } = await listTextFiles(this.expert, signal);
     const livePaths = new Set(files.map(file => file.path));
     for (const cachedPath of this.cache.keys()) {
       if (!livePaths.has(cachedPath)) this.cache.delete(cachedPath);
     }
     this.manifest = files;
+    this.manifestWarnings = warnings;
     this.manifestExpiresAt = Date.now() + MANIFEST_TTL_MS;
-    return files;
+    return { files, warnings };
   }
 
   private async readCached(file: ExpertFileMetadata, signal: AbortSignal): Promise<CachedExpertFile> {
@@ -96,29 +121,54 @@ export class FileExpertKnowledge {
   }
 }
 
-async function listTextFiles(roots: string[], signal: AbortSignal): Promise<ExpertFileMetadata[]> {
+async function listTextFiles(expert: ExpertConfig, signal: AbortSignal): Promise<{
+  files: ExpertFileMetadata[];
+  warnings: string[];
+}> {
   const files: ExpertFileMetadata[] = [];
+  const warnings: string[] = [];
 
-  for (const root of roots) {
-    await walk(root, files, signal);
+  for (const root of expert.roots) {
+    await walk(root, files, warnings, signal, expert.id, true);
   }
 
-  return files;
+  return { files, warnings };
 }
 
-async function walk(target: string, files: ExpertFileMetadata[], signal: AbortSignal): Promise<void> {
+async function inaccessibleRootWarnings(expert: ExpertConfig, signal: AbortSignal): Promise<string[]> {
+  const warnings: string[] = [];
+  for (const root of expert.roots) {
+    signal.throwIfAborted();
+    await stat(root).catch(() => {
+      warnings.push(`Expert "${expert.id}" knowledge root is inaccessible: ${root}`);
+    });
+  }
+  return warnings;
+}
+
+async function walk(
+  target: string,
+  files: ExpertFileMetadata[],
+  warnings: string[],
+  signal: AbortSignal,
+  expertId: string,
+  root = false,
+): Promise<void> {
   signal.throwIfAborted();
 
   let info;
   try {
     info = await stat(target);
   } catch {
+    if (root) warnings.push(`Expert "${expertId}" knowledge root is inaccessible: ${target}`);
     return;
   }
 
   if (info.isFile()) {
     if (isTextFile(target) && info.size <= MAX_FILE_BYTES) {
       files.push({ path: target, size: info.size, mtimeMs: info.mtimeMs });
+    } else if (isTextFile(target)) {
+      warnings.push(`Expert "${expertId}" skipped oversized knowledge file (${info.size} bytes): ${target}`);
     }
     return;
   }
@@ -132,7 +182,7 @@ async function walk(target: string, files: ExpertFileMetadata[], signal: AbortSi
     if (entry.name.startsWith(".") || entry.name === "node_modules") {
       continue;
     }
-    await walk(path.join(target, entry.name), files, signal);
+    await walk(path.join(target, entry.name), files, warnings, signal, expertId);
   }
 }
 
@@ -187,4 +237,8 @@ function trimForContext(content: string): string {
 
 function stableId(input: string): string {
   return createHash("sha256").update(input).digest("hex").slice(0, 16);
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
 }

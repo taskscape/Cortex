@@ -73,3 +73,40 @@ test("every test file referenced by TEST-GAPS exists", async () => {
     );
   }
 });
+
+test("fully covered TEST-GAPS areas are marked Fixed and only fully covered areas are Fixed", async () => {
+  const document = await readFile(documentPath, "utf8");
+  const statusStart = document.indexOf("## Implementation Status");
+  const dispositionStart = document.indexOf("### Criterion-Level Disposition");
+  const dispositionEnd = document.indexOf("\n---", dispositionStart);
+
+  const statusRows = document
+    .slice(statusStart, dispositionStart)
+    .split(/\r?\n/)
+    .filter(line => /^\|\s*\d+\./.test(line))
+    .map(line => {
+      const columns = line.slice(1, -1).split("|").map(column => column.trim());
+      return { area: columns[0], status: columns[1].replaceAll("**", "") };
+    });
+  const dispositionRows = document
+    .slice(dispositionStart, dispositionEnd)
+    .split(/\r?\n/)
+    .filter(line => /^\|[^-].*\|$/.test(line) && !line.startsWith("| Area |"))
+    .map(line => {
+      const columns = line.slice(1, -1).split("|").map(column => column.trim());
+      return { area: columns[0], commentedIds: idsIn(columns[2]) };
+    });
+
+  assert.equal(statusRows.length, dispositionRows.length, "status and disposition tables must stay aligned");
+  for (let index = 0; index < statusRows.length; index += 1) {
+    const status = statusRows[index];
+    const disposition = dispositionRows[index];
+    const fixed = /^Fixed(?: \(.+\))?$/.test(status.status);
+    const fullyCovered = disposition.commentedIds.length === 0;
+    assert.equal(
+      fixed,
+      fullyCovered,
+      `${status.area} must be Fixed exactly when it has no commented acceptance criteria (${disposition.area})`,
+    );
+  }
+});

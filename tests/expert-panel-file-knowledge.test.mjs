@@ -6,6 +6,7 @@ import test from "node:test";
 
 await import("../local-agent/matbot/apps/cli/register.js");
 const { FileExpertKnowledge } = await import("../local-agent/matbot/plugins/expert-panel/src/file-knowledge.ts");
+const { default: expertPanelPlugin } = await import("../local-agent/matbot/plugins/expert-panel/src/index.ts");
 
 function expert(id, roots) {
   return {
@@ -57,7 +58,8 @@ test("T3-E2E-023 expert knowledge loads every supported text format and ignores 
   await writeFile(path.join(root, "too-large.md"), `FORMAT_CANARY${"x".repeat(1_000_001)}`, "utf8");
 
   const knowledge = new FileExpertKnowledge(expert("formats", [root]));
-  const sources = await knowledge.search("FORMAT_CANARY", 20, new AbortController().signal);
+  const search = await knowledge.searchWithDiagnostics("FORMAT_CANARY", 20, new AbortController().signal);
+  const sources = search.sources;
 
   assert.deepEqual(
     sources.map(source => source.title).sort(),
@@ -68,6 +70,7 @@ test("T3-E2E-023 expert knowledge loads every supported text format and ignores 
   assert.equal(sources.some(source => source.title === "unsupported.pdf"), false);
   assert.equal(sources.some(source => source.title === ".hidden.md"), false);
   assert.equal(sources.some(source => source.title === "too-large.md"), false);
+  assert.ok(search.warnings.some(warning => /skipped oversized knowledge file/.test(warning) && /too-large\.md/.test(warning)));
   assert.equal(sources.find(source => source.title === "record.json")?.content, supported.get("record.json"));
   assert.equal(sources.find(source => source.title === "table.csv")?.content, supported.get("table.csv"));
 });
@@ -114,4 +117,74 @@ test("T3-E2E-024 expert knowledge keeps roots isolated and does not let a large 
   assert.deepEqual(securitySources.map(source => source.title), ["security.md"]);
   assert.ok(securitySources.every(source => source.path.startsWith(securityRoot)));
   assert.equal(securitySources.some(source => source.path.startsWith(financeRoot)), false);
+});
+
+test("EKI-6 expert panel response warns when a configured knowledge root becomes inaccessible", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-expert-missing-root-"));
+  const knowledgeRoot = path.join(root, "knowledge");
+  const configPath = path.join(root, "experts.json");
+  const priorConfig = process.env.EXPERT_PANEL_CONFIG;
+  await mkdir(knowledgeRoot);
+  await writeFile(path.join(knowledgeRoot, "brief.md"), "MISSING_ROOT_CANARY", "utf8");
+  await writeFile(configPath, JSON.stringify({
+    defaultProvider: "test",
+    experts: [expert("runtime-root", [knowledgeRoot])]
+  }), "utf8");
+  process.env.EXPERT_PANEL_CONFIG = configPath;
+  t.after(async () => {
+    if (priorConfig === undefined) delete process.env.EXPERT_PANEL_CONFIG;
+    else process.env.EXPERT_PANEL_CONFIG = priorConfig;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const tools = new Map();
+  const stores = new Map();
+  await expertPanelPlugin.setup({
+    providers: new Map([["test", {}]]),
+    tools: { register(tool) { tools.set(tool.name, tool); } },
+    createStore(name) {
+      if (!stores.has(name)) {
+        const docs = new Map();
+        stores.set(name, {
+          async get(id) { return docs.get(id) ?? null; },
+          async set(id, value) { docs.set(id, value); },
+          async query() { return { items: [...docs.values()], total: docs.size }; }
+        });
+      }
+      return stores.get(name);
+    },
+    async singleTurn() {
+      return { text: "The configured knowledge root could not be read.", usage: { inputTokens: 1, outputTokens: 1 } };
+    }
+  });
+
+  const tool = tools.get("expert_panel");
+  const input = {
+    question: "MISSING_ROOT_CANARY",
+    experts: ["runtime-root"],
+    synthesize: false
+  };
+  const initialEvents = [];
+  for await (const event of tool.executor.execute(input, {
+    provider: "test",
+    signal: new AbortController().signal
+  })) {
+    initialEvents.push(event);
+  }
+  assert.equal(initialEvents.find(event => event.type === "result")?.value.experts[0].citations.length, 1);
+
+  await rm(knowledgeRoot, { recursive: true, force: true });
+  const events = [];
+  for await (const event of tool.executor.execute(input, {
+    provider: "test",
+    signal: new AbortController().signal
+  })) {
+    events.push(event);
+  }
+  const result = events.find(event => event.type === "result")?.value;
+  assert.ok(result);
+  assert.deepEqual(result.experts[0].citations, []);
+  assert.ok(result.experts[0].warnings.some(warning => (
+    /knowledge root is inaccessible/.test(warning) && warning.includes(knowledgeRoot)
+  )));
 });

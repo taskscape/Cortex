@@ -92,10 +92,27 @@ export interface ExpertSource {
   score: number;
 }
 
+export type ExpertProviderSource = "expert" | "turn" | "panel_default" | "first_available";
+
+export interface ExpertProviderCandidate {
+  source: Exclude<ExpertProviderSource, "first_available">;
+  provider: string | undefined;
+  available: boolean;
+}
+
+export interface ExpertProviderResolution {
+  selectedProvider: string;
+  source: ExpertProviderSource;
+  fallback: boolean;
+  chain: ExpertProviderCandidate[];
+}
+
 export interface ExpertOpinion {
   expertId: string;
   title: string;
   answer: string;
+  providerResolution: ExpertProviderResolution;
+  warnings: string[];
   citations: Array<{
     id: string;
     path: string;

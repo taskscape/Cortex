@@ -51,6 +51,8 @@ async function execute(tool, input, provider) {
  * - Panel default provider is used when both expert pin and turn provider are null
  * - Synthesis correctly inherits from the turn provider when available
  * - Synthesis falls back to panel default when turn provider is unavailable
+ * - Unavailable configured providers continue through the documented chain
+ * - Fallbacks emit an audit log and return provider-resolution metadata
  *
  * Assumptions:
  * - The expert-panel plugin implements a provider resolution chain
@@ -92,6 +94,14 @@ test("T3-E2E-022 EPF provider resolution prefers expert pins and falls back thro
         provider: null,
         roots: [knowledgeRoot],
         systemPrompt: "Panel default expert system prompt."
+      },
+      {
+        id: "unavailable-pin",
+        title: "Unavailable provider expert",
+        description: "Continues to the turn provider when its configured provider is unavailable.",
+        provider: "missing-provider",
+        roots: [knowledgeRoot],
+        systemPrompt: "Unavailable provider expert system prompt."
       }
     ]
   }), "utf8");
@@ -133,22 +143,59 @@ test("T3-E2E-022 EPF provider resolution prefers expert pins and falls back thro
   const tool = tools.get("expert_panel");
   assert.ok(tool);
 
-  await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: false }, "turn-provider");
+  const logs = [];
+  const originalConsoleInfo = console.info;
+  console.info = (...args) => logs.push(args.join(" "));
+  t.after(() => { console.info = originalConsoleInfo; });
+
+  const pinned = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: false }, "turn-provider");
   assert.deepEqual(calls.map(call => call.provider), ["expert-provider"]);
+  assert.deepEqual(pinned.experts[0].providerResolution, {
+    selectedProvider: "expert-provider",
+    source: "expert",
+    fallback: false,
+    chain: [
+      { source: "expert", provider: "expert-provider", available: true },
+      { source: "turn", provider: "turn-provider", available: true },
+      { source: "panel_default", provider: "panel-default", available: true }
+    ]
+  });
 
   calls.length = 0;
-  await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["turn-fallback"], synthesize: false }, "turn-provider");
+  const turnFallback = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["turn-fallback"], synthesize: false }, "turn-provider");
   assert.deepEqual(calls.map(call => call.provider), ["turn-provider"]);
+  assert.equal(turnFallback.experts[0].providerResolution.source, "turn");
+  assert.equal(turnFallback.experts[0].providerResolution.fallback, true);
 
   calls.length = 0;
-  await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["default-fallback"], synthesize: false });
+  const defaultFallback = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["default-fallback"], synthesize: false });
   assert.deepEqual(calls.map(call => call.provider), ["panel-default"]);
+  assert.equal(defaultFallback.experts[0].providerResolution.source, "panel_default");
+  assert.equal(defaultFallback.experts[0].providerResolution.fallback, true);
 
   calls.length = 0;
-  await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: true }, "turn-provider");
+  const unavailablePin = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["unavailable-pin"], synthesize: false }, "turn-provider");
+  assert.deepEqual(calls.map(call => call.provider), ["turn-provider"]);
+  assert.equal(unavailablePin.experts[0].providerResolution.source, "turn");
+  assert.deepEqual(unavailablePin.experts[0].providerResolution.chain.slice(0, 2), [
+    { source: "expert", provider: "missing-provider", available: false },
+    { source: "turn", provider: "turn-provider", available: true }
+  ]);
+
+  calls.length = 0;
+  const turnSynthesis = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: true }, "turn-provider");
   assert.deepEqual(calls.map(call => call.provider), ["expert-provider", "turn-provider"]);
+  assert.equal(turnSynthesis.synthesisProviderResolution.source, "turn");
+  assert.equal(turnSynthesis.synthesisProviderResolution.fallback, false);
 
   calls.length = 0;
-  await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: true });
+  const defaultSynthesis = await execute(tool, { question: "PROVIDER_FALLBACK_CANARY", experts: ["pinned"], synthesize: true });
   assert.deepEqual(calls.map(call => call.provider), ["expert-provider", "panel-default"]);
+  assert.equal(defaultSynthesis.synthesisProviderResolution.source, "panel_default");
+  assert.equal(defaultSynthesis.synthesisProviderResolution.fallback, true);
+
+  assert.ok(logs.some(log => /scope=expert:turn-fallback selected=turn-provider source=turn/.test(log)));
+  assert.ok(logs.some(log => /scope=expert:default-fallback selected=panel-default source=panel_default/.test(log)));
+  assert.ok(logs.some(log => /scope=expert:unavailable-pin.*expert=missing-provider \(unavailable\)/.test(log)));
+  assert.ok(logs.some(log => /scope=synthesis selected=panel-default source=panel_default/.test(log)));
 });

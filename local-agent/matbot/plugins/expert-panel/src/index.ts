@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   ExpertConfig,
   ExpertOpinion,
+  ExpertProviderResolution,
+  ExpertProviderSource,
   ExpertRecommendation,
   ExpertReviewMode,
   ExpertReviewRecord,
@@ -44,6 +46,19 @@ interface ExpertRuntime {
   knowledge: FileExpertKnowledge;
 }
 
+interface ExpertPanelResult {
+  question: string;
+  mode: string;
+  experts: ExpertOpinion[];
+  synthesis?: string;
+  synthesisProviderResolution?: ExpertProviderResolution;
+}
+
+interface ProviderCandidate {
+  source: Exclude<ExpertProviderSource, "first_available">;
+  provider: string | undefined;
+}
+
 class ExpertPanel {
   private readonly services: MatbotMachine;
   private readonly experts: ExpertRuntime[];
@@ -66,12 +81,7 @@ class ExpertPanel {
     return this.experts.map(expert => expert.config);
   }
 
-  async askPanel(input: Required<Pick<ExpertPanelInput, "question" | "mode" | "synthesize">> & ExpertPanelInput, ctx: ToolContext): Promise<{
-    question: string;
-    mode: string;
-    experts: ExpertOpinion[];
-    synthesis?: string;
-  }> {
+  async askPanel(input: Required<Pick<ExpertPanelInput, "question" | "mode" | "synthesize">> & ExpertPanelInput, ctx: ToolContext): Promise<ExpertPanelResult> {
     const selected = this.selectExperts(input.experts);
     const citationLimit = clamp(input.maxCitationsPerExpert ?? 5, 1, 12);
 
@@ -79,19 +89,16 @@ class ExpertPanel {
       this.askExpert(expert, input.question, input.mode, citationLimit, ctx)
     ));
 
-    const result: {
-      question: string;
-      mode: string;
-      experts: ExpertOpinion[];
-      synthesis?: string;
-    } = {
+    const result: ExpertPanelResult = {
       question: input.question,
       mode: input.mode,
       experts: opinions
     };
 
     if (input.synthesize) {
-      result.synthesis = await this.synthesize(input.question, input.mode, opinions, ctx);
+      const synthesis = await this.synthesize(input.question, input.mode, opinions, ctx);
+      result.synthesis = synthesis.text;
+      result.synthesisProviderResolution = synthesis.providerResolution;
     }
 
     return result;
@@ -99,12 +106,7 @@ class ExpertPanel {
 
   async createReview(input: Required<Pick<ExpertPanelInput, "question" | "mode" | "synthesize" | "reviewMode" | "targetType">> & ExpertPanelInput, ctx: ToolContext): Promise<{
     review: ExpertReviewRecord;
-    panel: {
-      question: string;
-      mode: string;
-      experts: ExpertOpinion[];
-      synthesis?: string;
-    };
+    panel: ExpertPanelResult;
   }> {
     const panel = await this.askPanel(input, ctx);
     const experts = panel.experts.map(opinion => structureOpinion(opinion, input.reviewMode));
@@ -165,11 +167,16 @@ class ExpertPanel {
   }
 
   private async askExpert(expert: ExpertRuntime, question: string, mode: string, citationLimit: number, ctx: ToolContext): Promise<ExpertOpinion> {
-    const provider = this.resolveProvider(expert.config.provider ?? ctx.provider ?? this.defaultProvider);
-    const sources = await expert.knowledge.search(question, citationLimit, ctx.signal);
+    const providerResolution = this.resolveProvider([
+      { source: "expert", provider: expert.config.provider },
+      { source: "turn", provider: ctx.provider },
+      { source: "panel_default", provider: this.defaultProvider }
+    ], `expert:${expert.config.id}`);
+    const knowledge = await expert.knowledge.searchWithDiagnostics(question, citationLimit, ctx.signal);
+    const sources = knowledge.sources;
     const prompt = expertPrompt(question, mode, sources);
     const response = await this.services.singleTurn({
-      provider,
+      provider: providerResolution.selectedProvider,
       system: expert.config.systemPrompt,
       prompt,
       signal: ctx.signal
@@ -179,6 +186,8 @@ class ExpertPanel {
       expertId: expert.config.id,
       title: expert.config.title,
       answer: response.text.trim(),
+      providerResolution,
+      warnings: knowledge.warnings,
       citations: sources.map(source => ({
         id: source.id,
         path: source.path,
@@ -189,8 +198,14 @@ class ExpertPanel {
     };
   }
 
-  private async synthesize(question: string, mode: string, opinions: ExpertOpinion[], ctx: ToolContext): Promise<string> {
-    const provider = this.resolveProvider(ctx.provider ?? this.defaultProvider);
+  private async synthesize(question: string, mode: string, opinions: ExpertOpinion[], ctx: ToolContext): Promise<{
+    text: string;
+    providerResolution: ExpertProviderResolution;
+  }> {
+    const providerResolution = this.resolveProvider([
+      { source: "turn", provider: ctx.provider },
+      { source: "panel_default", provider: this.defaultProvider }
+    ], "synthesis");
     const prompt = [
       `Question:\n${question}`,
       `Mode: ${mode}`,
@@ -204,26 +219,47 @@ class ExpertPanel {
     ].join("\n\n");
 
     const response = await this.services.singleTurn({
-      provider,
+      provider: providerResolution.selectedProvider,
       system: "You are an orchestrating agent. Collate expert opinions faithfully, preserve disagreements, and make a final decision only after weighing the evidence.",
       prompt,
       signal: ctx.signal
     });
 
-    return response.text.trim();
+    return { text: response.text.trim(), providerResolution };
   }
 
-  private resolveProvider(candidate?: string): string {
-    if (candidate && this.services.providers.has(candidate)) {
-      return candidate;
+  private resolveProvider(candidates: ProviderCandidate[], scope: string): ExpertProviderResolution {
+    const chain = candidates.map(candidate => ({
+      ...candidate,
+      available: candidate.provider !== undefined && this.services.providers.has(candidate.provider)
+    }));
+    const selected = chain.find(candidate => candidate.available);
+    let selectedProvider: string;
+    let source: ExpertProviderSource;
+
+    if (selected?.provider) {
+      selectedProvider = selected.provider;
+      source = selected.source;
+    } else {
+      const first = this.services.providers.keys().next().value as string | undefined;
+      if (!first) {
+        throw new Error("No provider is configured for expert_panel.");
+      }
+      selectedProvider = first;
+      source = "first_available";
     }
 
-    const first = this.services.providers.keys().next().value as string | undefined;
-    if (!first) {
-      throw new Error("No provider is configured for expert_panel.");
+    const fallback = source !== candidates[0]?.source;
+    if (fallback) {
+      const attempted = chain
+        .map(candidate => `${candidate.source}=${candidate.provider ?? "unset"}${candidate.available ? "" : " (unavailable)"}`)
+        .join(", ");
+      console.info(
+        `[expert-panel] provider fallback scope=${scope} selected=${selectedProvider} source=${source}; chain: ${attempted}`
+      );
     }
 
-    return first;
+    return { selectedProvider, source, fallback, chain };
   }
 }
 
