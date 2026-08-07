@@ -81,6 +81,7 @@ test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", asyn
   assert.equal(started.state, "discovered");
   const status = await execute(tool, { action: "ingestion_wait" });
   assert.equal(status.activeState, "active_hybrid_complete");
+  assert.equal(status.summaries.enabled, false);
 
   const explicit = await execute(tool, {
     action: "v2_search",
@@ -88,7 +89,17 @@ test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", asyn
     limit: 3,
   });
   assert.ok(explicit.evidence.length >= 1);
+  assert.equal(explicit.answerability.status, "sufficient");
   assert.match(explicit.evidence[0].text, /sixty days written notice/i);
+
+  const missing = await execute(tool, {
+    action: "v2_search",
+    query: "What does ZXQ-NOT-PRESENT-991 require?",
+    limit: 3,
+  });
+  assert.equal(missing.answerability.status, "insufficient");
+  assert.equal(missing.answerability.abstained, true);
+  assert.deepEqual(missing.evidence, []);
 
   const primary = await execute(tool, {
     action: "search",

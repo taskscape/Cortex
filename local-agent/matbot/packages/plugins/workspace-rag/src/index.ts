@@ -23,12 +23,14 @@ import type { RagV2EvaluationCase } from './v2/evaluation.js';
 import { WorkspaceRagV2Manager, type RagV2SourceBridge } from './v2/manager.js';
 import { MemoryRagV2Repository } from './v2/memory-repository.js';
 import { PostgresRagV2Repository } from './v2/postgres-repository.js';
+import type { RagV2SemanticServices } from './v2/semantic.js';
 import {
   evaluateOpenSearchAdoption,
   type OpenSearchAdoptionGateInput,
 } from './v2/search-backend.js';
 import type {
   RagV2Mode,
+  RagV2ConversationTurn,
   RagV2RetrievalVariant,
   RagV2SearchResult,
 } from './v2/types.js';
@@ -335,6 +337,16 @@ interface RetrievalTraceContext {
   sessionId?: string;
   parentSpanId?: string;
   toolCallId?: string;
+}
+
+interface RetrievalConversationContext {
+  turns: RagV2ConversationTurn[];
+  provider?: string;
+}
+
+interface WorkspaceSearchOutcome {
+  hits: SearchHit[];
+  v2Result?: RagV2SearchResult;
 }
 
 function nowIso(): string {
@@ -914,6 +926,7 @@ class WorkspaceRagManager {
   private readonly activeConfigPath: string;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
   private readonly contextGraph: ContextGraphLike | undefined;
+  private readonly services: MatbotMachine;
   private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
   private readonly v1BackgroundScanEnabled = !['0', 'false', 'no', 'off'].includes(
     String(process.env['CORTEX_RAG_V1_BACKGROUND_SCAN'] ?? '1').trim().toLowerCase(),
@@ -921,10 +934,16 @@ class WorkspaceRagManager {
   private v2: WorkspaceRagV2Manager | undefined;
   private v2Message = 'Workspace RAG V2 is disabled.';
 
-  constructor(activeConfigPath: string, sourceRegistry?: SourceRegistryLike, contextGraph?: ContextGraphLike) {
+  constructor(
+    activeConfigPath: string,
+    sourceRegistry: SourceRegistryLike | undefined,
+    contextGraph: ContextGraphLike | undefined,
+    services: MatbotMachine,
+  ) {
     this.activeConfigPath = activeConfigPath;
     this.sourceRegistry = sourceRegistry;
     this.contextGraph = contextGraph;
+    this.services = services;
   }
 
   async start(): Promise<void> {
@@ -1139,14 +1158,41 @@ class WorkspaceRagManager {
     return configView(await this.readConfig(await this.currentWorkspace()));
   }
 
-  async searchCurrent(query: string, limit: number, signal: AbortSignal, trace?: RetrievalTraceContext): Promise<SearchHit[]> {
-    return this.search(this.currentWorkspaceId(), query, limit, signal, trace);
+  async searchCurrent(
+    query: string,
+    limit: number,
+    signal: AbortSignal,
+    trace?: RetrievalTraceContext,
+    conversation?: RetrievalConversationContext,
+  ): Promise<SearchHit[]> {
+    return (await this.searchDetailed(this.currentWorkspaceId(), query, limit, signal, trace, conversation)).hits;
   }
 
   async search(workspaceId: string, query: string, limit: number, signal: AbortSignal, trace?: RetrievalTraceContext): Promise<SearchHit[]> {
-    if (signal.aborted) return [];
+    return (await this.searchDetailed(workspaceId, query, limit, signal, trace)).hits;
+  }
+
+  async searchCurrentDetailed(
+    query: string,
+    limit: number,
+    signal: AbortSignal,
+    trace?: RetrievalTraceContext,
+    conversation?: RetrievalConversationContext,
+  ): Promise<WorkspaceSearchOutcome> {
+    return this.searchDetailed(this.currentWorkspaceId(), query, limit, signal, trace, conversation);
+  }
+
+  private async searchDetailed(
+    workspaceId: string,
+    query: string,
+    limit: number,
+    signal: AbortSignal,
+    trace?: RetrievalTraceContext,
+    conversation?: RetrievalConversationContext,
+  ): Promise<WorkspaceSearchOutcome> {
+    if (signal.aborted) return { hits: [] };
     const workspace = (await this.listWorkspaces()).find(item => item.id === workspaceId);
-    if (!workspace || !query.trim()) return [];
+    if (!workspace || !query.trim()) return { hits: [] };
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
     if (this.v2Mode === 'primary' && this.v2 !== undefined) {
@@ -1155,12 +1201,20 @@ class WorkspaceRagManager {
           this.v2Workspace(workspace),
           active,
           query,
-          { limit },
+          {
+            limit,
+            ...(conversation?.turns.length ? { conversation: conversation.turns } : {}),
+            ...(conversation?.provider ? { rewriteProvider: conversation.provider } : {}),
+          },
           signal,
         );
         if (result.evidence.length > 0) {
-          return this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace);
+          return {
+            hits: await this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace),
+            v2Result: result,
+          };
         }
+        if (result.answerability.abstained) return { hits: [], v2Result: result };
       } catch (error) {
         console.warn(`[workspace-rag-v2] primary search fell back to V1: ${errorMessage(error)}`);
       }
@@ -1169,10 +1223,14 @@ class WorkspaceRagManager {
     const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
     const enriched = await this.enrichSearchHits(workspace, active, hits, trace);
     if (this.v2Mode === 'shadow' && this.v2 !== undefined) {
-      void this.v2.search(this.v2Workspace(workspace), active, query, { limit }, signal)
+      void this.v2.search(this.v2Workspace(workspace), active, query, {
+        limit,
+        ...(conversation?.turns.length ? { conversation: conversation.turns } : {}),
+        ...(conversation?.provider ? { rewriteProvider: conversation.provider } : {}),
+      }, signal)
         .catch(error => console.warn(`[workspace-rag-v2] shadow search failed: ${errorMessage(error)}`));
     }
-    return enriched;
+    return { hits: enriched };
   }
 
   async v2StatusCurrent(): Promise<unknown> {
@@ -1236,7 +1294,14 @@ class WorkspaceRagManager {
     query: string,
     limit: number,
     signal: AbortSignal,
-    filters: { documentTypes?: string[]; jurisdictions?: string[]; asOfDate?: string } = {},
+    filters: {
+      documentTypes?: string[];
+      jurisdictions?: string[];
+      asOfDate?: string;
+      conversation?: RagV2ConversationTurn[];
+      rewriteProvider?: string;
+      iterative?: boolean;
+    } = {},
   ): Promise<RagV2SearchResult> {
     const { workspace, context, manager } = await this.v2Current();
     const result = await manager.search(
@@ -1998,7 +2063,12 @@ class WorkspaceRagManager {
         signal?: AbortSignal,
       ) => this.vectorizer.embed(texts, purpose, signal),
     };
-    const manager = new WorkspaceRagV2Manager(repository, embedder, this.v2SourceBridge());
+    const manager = new WorkspaceRagV2Manager(
+      repository,
+      embedder,
+      this.v2SourceBridge(),
+      this.v2SemanticServices(),
+    );
     try {
       await manager.initialize();
       this.v2 = manager;
@@ -2073,6 +2143,64 @@ class WorkspaceRagManager {
           error,
         );
       },
+    };
+  }
+
+  private v2SemanticServices(): RagV2SemanticServices {
+    const services = this.services;
+    const summaryProvider = process.env['CORTEX_RAG_V2_SUMMARY_PROVIDER']?.trim();
+    const summaryModel = summaryProvider ? services.providers.get(summaryProvider)?.model : undefined;
+    const parseJsonString = (text: string, key: string): string | undefined => {
+      const match = /\{[\s\S]*\}/u.exec(text);
+      if (match) {
+        try {
+          const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+          if (typeof parsed[key] === 'string' && parsed[key].trim()) return parsed[key].trim();
+        } catch {
+          // Fall through to a bounded plain-text response.
+        }
+      }
+      const value = text.replace(/^```(?:json)?|```$/gimu, '').trim();
+      return value || undefined;
+    };
+    return {
+      rewriteQuery: async input => {
+        if (!input.provider || !services.providers.has(input.provider)) return undefined;
+        const result = await services.singleTurn({
+          provider: input.provider,
+          system: [
+            'Rewrite a conversational follow-up as one standalone knowledge-retrieval query.',
+            'Resolve pronouns, ellipsis, relative versions, people, and dates only from the supplied conversation.',
+            'Preserve exact identifiers and quoted strings. Do not answer the question.',
+            'Return JSON only: {"standaloneQuery":"..."}.',
+          ].join(' '),
+          prompt: `Conversation:\n${input.compactConversation}\n\nLatest question:\n${input.latestQuestion}`,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        return parseJsonString(result.text, 'standaloneQuery');
+      },
+      ...(summaryProvider && services.providers.has(summaryProvider) ? {
+        summarizerSignature: `${summaryProvider}:${summaryModel ?? 'unknown'}:rag-routing-summary-v1`,
+        summarize: async (input, signal) => {
+          const result = await services.singleTurn({
+            provider: summaryProvider,
+            system: [
+              'Create a concise semantic routing summary for retrieval.',
+              'Include distinctive topics, entities, terminology, version cues, and relationships.',
+              'Do not invent facts. The output is a routing derivative and will never be cited as evidence.',
+              'Use at most 180 words. Return JSON only: {"summary":"..."}.',
+            ].join(' '),
+            prompt: [
+              `Level: ${input.level}`,
+              `Title: ${input.title}`,
+              `Breadcrumb: ${input.breadcrumb.join(' > ')}`,
+              `Source material:\n${input.text.slice(0, 12_000)}`,
+            ].join('\n\n'),
+            ...(signal ? { signal } : {}),
+          });
+          return parseJsonString(result.text, 'summary');
+        },
+      } : {}),
     };
   }
 
@@ -2369,6 +2497,11 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
           type: 'string',
           description: 'Optional ISO date used to filter publication and validity ranges.',
         },
+        iterative: {
+          type: 'boolean',
+          default: true,
+          description: 'Enable the bounded follow-up retrieval pass. The final evidence-sufficiency gate and explicit abstention always remain enabled.',
+        },
         backendGate: {
           type: 'object',
           description: 'Measured PostgreSQL/OpenSearch metrics, targets, benefit, and operational approval.',
@@ -2484,6 +2617,9 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
                   ? { jurisdictions: value.jurisdictions.map(item => String(item)).filter(Boolean) }
                   : {}),
                 ...(typeof value.asOfDate === 'string' ? { asOfDate: value.asOfDate } : {}),
+                conversation: conversationBeforeLatestUser(ctx.session),
+                ...(ctx.provider ? { rewriteProvider: ctx.provider } : {}),
+                ...(typeof value.iterative === 'boolean' ? { iterative: value.iterative } : {}),
               }),
             };
             return;
@@ -2560,7 +2696,10 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             const trace = { ...(ctx.traceId !== undefined ? { traceId: ctx.traceId } : {}), ...(ctx.rootTraceId !== undefined ? { rootTraceId: ctx.rootTraceId } : {}), ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}), ...(ctx.session?.id !== undefined ? { sessionId: ctx.session.id } : {}), ...(ctx.callId !== undefined ? { toolCallId: ctx.callId } : {}) };
             const startedAt = Date.now();
             const spanId = randomUUID();
-            const hits = await manager.searchCurrent(query, limit, ctx.signal, trace);
+            const hits = await manager.searchCurrent(query, limit, ctx.signal, trace, {
+              turns: conversationBeforeLatestUser(ctx.session),
+              ...(ctx.provider ? { provider: ctx.provider } : {}),
+            });
             await observeRetrieval(services, trace, query, hits, startedAt, spanId);
             yield { type: 'result', value: { hits } };
             return;
@@ -2583,10 +2722,44 @@ function latestUserText(session: { messages: Array<{ role: string; content: Mess
     .join('\n');
 }
 
-function renderContext(hits: SearchHit[]): string {
+function conversationBeforeLatestUser(
+  session: { messages: Array<{ role: string; content: MessageContent[] }> } | undefined,
+): RagV2ConversationTurn[] {
+  if (!session) return [];
+  const latestUserIndex = session.messages.findLastIndex(message => message.role === 'user');
+  if (latestUserIndex <= 0) return [];
+  return session.messages.slice(0, latestUserIndex)
+    .filter(message => message.role === 'user' || message.role === 'assistant')
+    .map(message => ({
+      role: message.role as RagV2ConversationTurn['role'],
+      text: message.content
+        .filter((part): part is Extract<MessageContent, { type: 'text' }> =>
+          part.type === 'text' && (!('origin' in part) || part.origin !== 'robo'))
+        .map(part => part.text)
+        .join('\n'),
+    }))
+    .filter(turn => turn.text.trim().length > 0)
+    .slice(-8);
+}
+
+function renderAbstention(result: RagV2SearchResult): string {
+  return [
+    '[Workspace RAG retrieval result]',
+    'The indexed corpus does not contain enough verified evidence to answer this request.',
+    `Standalone retrieval query: ${result.plan.standaloneQuery}`,
+    `Reason: ${result.answerability.reasons.join('; ')}`,
+    'Do not imply that the corpus supports a factual answer. State the evidence limitation explicitly.',
+    '[End workspace RAG retrieval result.]',
+  ].join('\n');
+}
+
+function renderContext(hits: SearchHit[], answerability?: RagV2SearchResult['answerability']): string {
   if (hits.length === 0) return '';
   return [
     `[Workspace RAG context — ${hits[0]!.contextName}. Use this as grounded local context when relevant; cite file paths when relying on it.]`,
+    ...(answerability?.status === 'conflicting'
+      ? [`[Warning: retrieved sources conflict. Describe the disagreement and cite each side; do not silently choose one.]`]
+      : []),
     ...hits.map((hit, index) => [
       `## Source ${index + 1}: ${hit.path}`,
       `Score: ${hit.score.toFixed(3)}`,
@@ -2658,7 +2831,7 @@ export const plugin: MatbotPluginSpec = {
 
     const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
     const contextGraph = services.get('ContextGraph' as never) as ContextGraphLike | undefined;
-    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry, contextGraph);
+    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry, contextGraph, services);
     activeManager = manager;
     await manager.start();
     await services.register('WorkspaceRagManager' as never, manager as never);
@@ -2676,9 +2849,27 @@ export const plugin: MatbotPluginSpec = {
         const trace = { ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}), ...(ctx.config.rootTraceId !== undefined ? { rootTraceId: ctx.config.rootTraceId } : {}), sessionId: ctx.session.id };
         const startedAt = Date.now();
         const spanId = randomUUID();
-        const hits = await manager.searchCurrent(query, MAX_CONTEXT_CHUNKS, ctx.signal, trace);
+        const outcome = await manager.searchCurrentDetailed(query, MAX_CONTEXT_CHUNKS, ctx.signal, trace, {
+          turns: conversationBeforeLatestUser(ctx.session),
+          provider: ctx.config.provider,
+        });
+        const hits = outcome.hits;
         await observeRetrieval(services, trace, query, hits, startedAt, spanId);
-        const text = renderContext(hits);
+        if (outcome.v2Result?.answerability.abstained) {
+          return {
+            ephemeral: [{ type: 'text', text: renderAbstention(outcome.v2Result) }],
+            markers: [{
+              type: 'marker',
+              creator: 'workspace-rag',
+              data: {
+                state: 'insufficient_evidence',
+                standaloneQuery: outcome.v2Result.plan.standaloneQuery,
+                reasons: outcome.v2Result.answerability.reasons,
+              },
+            }],
+          };
+        }
+        const text = renderContext(hits, outcome.v2Result?.answerability);
         if (!text) return;
         const sourceWarnings = hits.flatMap(sourceWarningsForHit);
         return {

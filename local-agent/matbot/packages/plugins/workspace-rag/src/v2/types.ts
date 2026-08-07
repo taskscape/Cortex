@@ -1,5 +1,5 @@
 export type RagV2Mode = 'off' | 'shadow' | 'primary';
-export type RagV2Level = 'document' | 'section' | 'passage';
+export type RagV2Level = 'collection' | 'document' | 'section' | 'passage';
 export type RagV2EmbeddingPurpose = 'query' | 'document';
 export type RagV2RetrievalVariant =
   | 'flat_dense_baseline'
@@ -97,6 +97,8 @@ export interface RagV2DocumentRecord {
   aclTokens: string[];
   path: string;
   title: string;
+  collectionId?: string;
+  collectionTitle?: string;
   documentType: string;
   jurisdiction?: string;
   governingLaw?: string;
@@ -115,6 +117,53 @@ export interface RagV2DocumentRecord {
   lineIndexPath: string;
   modifiedAt: string;
   embeddingState: RagV2EmbeddingState;
+}
+
+export interface RagV2CollectionRecord {
+  collectionId: string;
+  collectionVersionId: string;
+  generationId: string;
+  workspaceId: string;
+  contextId: string;
+  title: string;
+  documentCount: number;
+  contentSha256: string;
+  routingSummary: string;
+  embeddingState: RagV2EmbeddingState;
+  createdAt: string;
+}
+
+export type RagV2SummaryLevel = 'collection' | 'document' | 'section';
+
+/**
+ * A generated routing derivative. It is versioned by source content and model
+ * signature, but can never be returned as answer evidence.
+ */
+export interface RagV2RoutingSummaryRecord {
+  summaryId: string;
+  workspaceId: string;
+  contextId: string;
+  generationId: string;
+  level: RagV2SummaryLevel;
+  unitId: string;
+  documentVersionId?: string;
+  sourceContentSha256: string;
+  summarizerSignature: string;
+  summary: string;
+  createdAt: string;
+}
+
+export interface RagV2ConversationTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface RagV2QueryRewrite {
+  latestQuestion: string;
+  standaloneQuery: string;
+  method: 'identity' | 'deterministic' | 'model';
+  conversationTurnsUsed: number;
+  contextHash?: string;
 }
 
 export interface RagV2SectionRecord {
@@ -255,9 +304,14 @@ export interface RagV2QueryVariant {
 
 export interface RagV2RetrievalPlan {
   originalQuery: string;
+  latestQuestion: string;
+  standaloneQuery: string;
+  rewriteMethod: RagV2QueryRewrite['method'];
+  conversationTurnsUsed: number;
+  conversationContextHash?: string;
   queryLanguage: string | 'und';
   answerLanguage: string;
-  intent: 'exact_reference' | 'fact_lookup' | 'comparison' | 'as_of' | 'broad_synthesis';
+  intent: 'exact_reference' | 'fact_lookup' | 'comparison' | 'diagnostic' | 'as_of' | 'broad_synthesis';
   exactReferences: string[];
   quotedPhrases: string[];
   entities: string[];
@@ -266,6 +320,7 @@ export interface RagV2RetrievalPlan {
   asOfDate?: string;
   corpusLanguages: string[];
   lexicalVariants: Array<{ language: string; query: string; reason: string }>;
+  iterativeQueries: Array<{ query: string; reason: string }>;
   embeddingInstruction: string;
   authorization: {
     workspaceId: string;
@@ -336,9 +391,22 @@ export interface RagV2SearchResult {
   plan: RagV2RetrievalPlan;
   generationId: string;
   evidence: RagV2Evidence[];
+  answerability: {
+    status: 'sufficient' | 'insufficient' | 'conflicting';
+    score: number;
+    abstained: boolean;
+    reasons: string[];
+    iterations: number;
+    firstPass: {
+      status: 'sufficient' | 'insufficient' | 'conflicting';
+      candidateCount: number;
+      reasons: string[];
+    };
+  };
   degraded: string[];
   timings: Record<string, number>;
   diagnostics: {
+    routedCollectionIds: string[];
     routedDocumentIds: string[];
     routedSectionIds: string[];
     candidateCounts: Record<string, number>;
@@ -353,5 +421,13 @@ export interface RagV2Status {
   activeState?: RagV2PublicationState;
   embeddingSignature?: string;
   job?: RagV2Job;
+  summaries: {
+    enabled: boolean;
+    queued: number;
+    active: number;
+    completed: number;
+    failed: number;
+    signature?: string;
+  };
   message: string;
 }

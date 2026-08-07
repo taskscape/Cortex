@@ -39,6 +39,10 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   const docs = path.join(root, "docs");
   await mkdir(docs, { recursive: true });
   await writeFile(path.join(docs, "supply.md"), [
+    "---",
+    "collection_id: supply-contracts",
+    "collection_title: Supply Contracts",
+    "---",
     "# Supply Agreement",
     "",
     "## Delivery",
@@ -64,6 +68,11 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   const manager = new WorkspaceRagV2Manager(repository, {
     info: { backend: "test", model: "test", dimensions: 32, signature: "test-pg-v1" },
     async embed(texts) { return texts.map(text => embedding(text)); },
+  }, undefined, {
+    summarizerSignature: "test-pg-summary-v1",
+    async summarize(input) {
+      return `Semantic ${input.level} routing summary for ${input.title}: ${input.text}`;
+    },
   });
   t.after(async () => {
     await manager.close().catch(() => undefined);
@@ -76,6 +85,11 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   const context = { id: "agreements", name: "Agreements", paths: [docs] };
   const job = manager.startIngestion(workspace, context);
   await manager.waitForIngestion(workspace.id, context.id);
+  await manager.waitForSummaries();
+  assert.equal(
+    (await repository.listFingerprints(workspace.id, context.id))[0].summarySignature,
+    "test-pg-summary-v1",
+  );
   const status = await manager.status("primary", workspace, context);
   assert.equal(status.job.state, "active_hybrid_complete");
   assert.equal(status.activeGenerationId, job.generationId);
@@ -126,6 +140,8 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   const counts = await cleanup.query(`
     SELECT
       (SELECT COUNT(*) FROM "${schema}".documents) AS documents,
+      (SELECT COUNT(*) FROM "${schema}".collections) AS collections,
+      (SELECT COUNT(*) FROM "${schema}".routing_summaries) AS routing_summaries,
       (SELECT COUNT(*) FROM "${schema}".sections) AS sections,
       (SELECT COUNT(*) FROM "${schema}".passages) AS passages,
       (SELECT COUNT(*) FROM "${schema}".unit_embeddings_32) AS embeddings,
@@ -134,12 +150,14 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
       (SELECT MAX(version) FROM "${schema}".schema_migrations) AS schema_version
   `);
   assert.equal(Number(counts.rows[0].documents), 1);
+  assert.equal(Number(counts.rows[0].collections), 1);
+  assert.ok(Number(counts.rows[0].routing_summaries) >= 4);
   assert.ok(Number(counts.rows[0].sections) >= 2);
   assert.ok(Number(counts.rows[0].passages) >= 2);
   assert.ok(Number(counts.rows[0].embeddings) >= 3);
   assert.ok(Number(counts.rows[0].retrieval_evidence) >= 1);
   assert.equal(Number(counts.rows[0].evaluation_runs), 1);
-  assert.equal(Number(counts.rows[0].schema_version), 5);
+  assert.equal(Number(counts.rows[0].schema_version), 6);
 });
 
 integration("workspace RAG V2 enforces RLS through a separate non-owner application role", async t => {

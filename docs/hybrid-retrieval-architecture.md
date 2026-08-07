@@ -148,9 +148,9 @@ flowchart TD
 | `RagDiscoveryService` | Stream paths, stat sources, detect changes, checkpoint progress | Replaces array-returning recursive discovery |
 | `RagObjectStore` | Put/open immutable content by hash; read byte ranges | Local Docker volume first; interface permits external object stores later |
 | `MarkdownStructureScanner` | Incremental UTF-8 decoding and structural events | Replaces whole-file `readFile` and `chunkMarkdown` |
-| `RagCatalog` | Documents, versions, sections, passages, ACLs, jobs, publications | PostgreSQL schema `workspace_rag_v2` |
+| `RagCatalog` | Collections, documents, versions, sections, passages, routing-summary versions, ACLs, jobs, publications | PostgreSQL schema `workspace_rag_v2` |
 | `LexicalRetriever` | Full-text, phrase, identifier, prefix, proximity, and narrowed regex search | PostgreSQL GIN/trigram baseline |
-| `DenseRetriever` | Document, section, and selected passage ANN/exact search | pgvector, partitioned by embedding signature and level |
+| `DenseRetriever` | Collection, document, section, and selected passage ANN/exact search | pgvector, partitioned by embedding signature and level |
 | `QueryPlanner` | Deterministic extraction plus optional structured model analysis | New internal service used by tool and per-turn hook |
 | `RankFusion` | Inspectable application-side Reciprocal Rank Fusion | New pure TypeScript module |
 | `RerankerClient` | Cross-encoder scoring for a bounded candidate set | Optional local service; retrieval still works when degraded |
@@ -161,6 +161,20 @@ flowchart TD
 | existing evaluation service | Retriever spans, judgments, replay, metrics | Stores V2 stage timings and ranked hits |
 
 ## Retrieval Hierarchy And Records
+
+### Collection Level
+
+A collection groups files that form one logical work, such as chapters of a
+book or volumes of a manual. Markdown declares the stable grouping with
+`collection_id` and optional `collection_title`; `book_id`/`book_title` and
+`series_id`/`series` are accepted aliases. Collection versions are derived from
+the ordered active document-version set, so membership or source changes create
+a new routing version without changing the underlying citations.
+
+Collection lexical and dense retrieval runs before document routing. It narrows
+large split works while retaining the global passage safety lane. A collection
+record and its summaries are routing derivatives only; evidence must still be
+rehydrated and hash-verified from a passage in an immutable document version.
 
 ### Document Level
 
@@ -199,9 +213,23 @@ interface RagDocumentRecord {
 }
 ```
 
-Document summaries answer “which sources might contain the answer?” They must
-not be selected as final evidence unless the user explicitly asks about
-document-level metadata.
+Document summaries answer “which sources might contain the answer?” They are
+never selected as final evidence.
+
+### Versioned Semantic Routing Summaries
+
+When `CORTEX_RAG_V2_SUMMARY_PROVIDER` selects a configured provider, ingestion
+queues bounded asynchronous summaries for every section, document, and
+collection. Each derivative is keyed by level, unit version, source-content
+hash, and summarizer signature (provider, model, prompt revision). Completed
+content/signature matches are reused across duplicate or repeated ingestion;
+source or model changes create a new immutable summary record.
+
+The queue has configurable concurrency and capacity and applies backpressure to
+ingestion rather than growing without bound. The initial extractive routing text
+keeps the index searchable before model summaries finish. Successful semantic
+summaries replace only the unit's routing text/vector. They do not have passage
+IDs or source ranges, cannot enter evidence assembly, and are never citations.
 
 ### Section Level
 
@@ -211,7 +239,10 @@ A section is a meaningful structural range:
 - legal article, chapter, numbered clause, or annex;
 - dated log entry;
 - table with its title and headers;
-- front matter or another typed logical block.
+- another typed content block.
+
+Front matter is parsed into routing/filter metadata and is deliberately not
+emitted as a citeable passage.
 
 Each section stores its heading path, original range, language distribution,
 entities, structural type, content hash, token estimate, and optional routing
@@ -599,12 +630,18 @@ The query planner produces an inspectable request:
 ```ts
 interface RetrievalPlan {
   originalQuery: string;
+  latestQuestion: string;
+  standaloneQuery: string;
+  rewriteMethod: "identity" | "deterministic" | "model";
+  conversationTurnsUsed: number;
+  conversationContextHash?: string;
   queryLanguage: string | "und";
   answerLanguage: string;
   intent:
     | "exact_reference"
     | "fact_lookup"
     | "comparison"
+    | "diagnostic"
     | "as_of"
     | "broad_synthesis";
   exactReferences: string[];
@@ -615,6 +652,7 @@ interface RetrievalPlan {
   asOfDate?: string;
   corpusLanguages: string[];
   lexicalVariants: Array<{ language: string; query: string; reason: string }>;
+  iterativeQueries: Array<{ query: string; reason: string }>;
   embeddingInstruction: string;
   authorization: {
     workspaceId: string;
@@ -625,25 +663,35 @@ interface RetrievalPlan {
 }
 ```
 
+Before planning, Cortex compacts recent human/assistant turns and rewrites a
+context-dependent latest question into a standalone retrieval query. The active
+turn provider performs the rewrite when available; a bounded deterministic
+rewrite preserves the conversation context when the provider fails. Retrieved
+context, tool output, and generated routing summaries are excluded from the
+conversation state. The original question, rewrite method, turn count, and a
+hash of the compact state remain in the trace.
+
 Deterministic code extracts quoted phrases, paths, document identifiers, clause
 numbers, statutory references, case references, dates, amounts, currencies,
 emails, and company/tax identifiers before an optional language model enriches
 the plan. If model analysis fails, the original lexical and dense query still
 runs.
 
-The original query is always preserved and embedded directly. Controlled
-lexical translations may improve cross-language exact matching, but a
+The original question is always preserved; retrieval embeds the standalone
+query. Controlled lexical translations may improve cross-language exact matching, but a
 translation never replaces original source evidence.
 
 ## Query Execution
 
-### Stage 1: Document And Section Routing
+### Stage 1: Collection, Document, And Section Routing
 
 Run in parallel, with authorization and version filters applied inside every
 query:
 
 - lexical document retrieval;
 - dense document retrieval;
+- lexical collection retrieval;
+- dense collection retrieval;
 - lexical section retrieval;
 - dense section retrieval;
 - exact-reference retrieval;
@@ -653,7 +701,8 @@ Prototype candidate budgets:
 
 - up to 50 document candidates per retriever;
 - up to 100 section candidates per retriever;
-- RRF fusion into approximately 30 routed documents and 50 routed sections.
+- RRF fusion into approximately 10 routed collections, 30 routed documents,
+  and 50 routed sections.
 
 Routing is a recall optimization, not a hard gate. Always retain a small global
 leaf safety lane so a weak summary cannot make original evidence unreachable.
@@ -719,7 +768,24 @@ Apply deterministic selection constraints:
   evidence;
 - preserve a configurable source-diversity floor for broad synthesis.
 
-### Stage 6: Evidence Construction
+### Stage 6: Iterative Retrieval And Answerability
+
+After the first candidate pass, comparison and diagnostic intents, sparse
+results, or materially conflicting polarity trigger one bounded follow-up pass.
+The planner decomposes comparison subjects, searches diagnostic causes and
+remediation independently, and adds an authoritative/current-version query for
+conflicts. At most four labeled follow-up queries run through lexical and dense
+passage lanes and are fused with the original candidates.
+
+After authoritative ranges are fetched and hash-verified, an answerability gate
+requires enough distinct evidence for the intent. Comparison and diagnostic
+questions require at least two verified passages; comparisons must cover two
+sections or documents; exact-reference queries require an exact-reference lane.
+Failure returns an explicit `insufficient` result with no evidence exposed to
+answer generation. Materially conflicting but adequate sources return
+`conflicting` with a warning rather than silently choosing one.
+
+### Stage 7: Evidence Construction
 
 Fetch authoritative ranges and verify their hashes before constructing context:
 
@@ -1030,9 +1096,9 @@ as required by this design.
 | --- | --- |
 | 0 | Streaming fixed-memory census, approximate duplicate cardinality, forecasts, deterministic sample, and resume checkpoint in `v2/census.ts` and `WorkspaceRagV2Manager.census`; exercised by `workspace-rag-v2-manager.test.mjs`. |
 | 1 | Versioned PostgreSQL migrations, non-owner RLS, durable jobs, immutable retention adapters, streaming manifests, atomic publication, and 2 GiB fixture in `v2/postgres-repository.ts`, `v2/object-store.ts`, and `v2/parser.ts`; exercised by parser and live PostgreSQL integration tests. |
-| 2 | Document/section/passage lexical+dense routing, all eight persisted evaluation ablations, language fields, exact filters, RRF, diversity, evidence verification/faithfulness metrics, V1 dual-read/shadow fallback, and traces in `v2/retrieval.ts` and `index.ts`; exercised by manager, plugin, evaluation, and PostgreSQL tests. |
+| 2 | Collection/document/section/passage lexical+dense routing, conversation-aware standalone-query rewriting, bounded iterative comparison/diagnostic retrieval, explicit answerability/abstention, all eight persisted evaluation ablations, language fields, exact filters, RRF, diversity, evidence verification/faithfulness metrics, V1 dual-read/shadow fallback, and traces in `v2/retrieval.ts`, `v2/semantic.ts`, and `index.ts`; exercised by manager, plugin, evaluation, and PostgreSQL tests. |
 | 3 | Optional multilingual reranker service, timeout/OOM degradation, explicit V2 search, primary mode, V1 fallback, and atomic rollback publication; exercised by reranker runtime and plugin tests. |
-| 4 | Authority/current/archive priority passes, complete lexical coverage, capped tiered embeddings, independent throttles, stage counters/ETA, duplicate-job suppression, pause/resume/cancel, and reconciliation in `v2/manager.ts`; exercised by manager tests. |
+| 4 | Authority/current/archive priority passes, complete lexical coverage, capped tiered embeddings, bounded asynchronous versioned semantic summaries, collection rebuilding, independent throttles, stage counters/ETA, duplicate-job suppression, pause/resume/cancel, and reconciliation in `v2/manager.ts`; exercised by manager tests. |
 | 5 | Lazy promotion and eviction, signature-isolated alternative-model generations, full/half/binary pgvector candidate indexes with full-vector reranking, controlled translation, configurable measured RRF weights, optional ColBERT and OpenSearch adapters, and explicit OpenSearch promotion gates; exercised by manager, live PostgreSQL, and adapter tests. |
 
 ### Playwright Generated-Corpus Acceptance
@@ -1047,7 +1113,7 @@ exact references. No workspace-local repository or live backfill is read or
 modified.
 
 - [x] Verify atomic publication, complete lexical coverage, and
-  document-to-section-to-passage hierarchy counts.
+  collection-to-document-to-section-to-passage hierarchy behavior.
 - [x] Verify streaming census measurements, structural counts, duplicates,
   tier sizing, forecasts, and the PostgreSQL/pgvector partition plan.
 - [x] Verify exact, lexical, dense, translated, and hierarchical candidate
@@ -1104,12 +1170,14 @@ budget, cancelled, resumed, and cited by range.
 
 ### Phase 2: Hybrid Baseline
 
-- [x] Add document/section summaries and E5-compatible signature-aware
-  embeddings.
+- [x] Add asynchronous versioned collection/document/section routing summaries
+  and E5-compatible signature-aware embeddings.
 - [x] Add selected passage embeddings.
 - [x] Add PostgreSQL lexical retriever.
 - [x] Implement query analysis, exact-reference extraction, RRF, diversity,
   and evidence objects.
+- [x] Rewrite conversational follow-ups, run one bounded evidence-driven
+  follow-up pass, and abstain explicitly when verified evidence is insufficient.
 - [x] Dual-read V1 and V2 behind a feature flag.
 - [x] Write retrieval traces and compare shadow results without changing
   answers.

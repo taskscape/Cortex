@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { Pool as PgPool, PoolClient, PoolConfig } from 'pg';
 import type {
+  RagV2CollectionRecord,
   RagV2DocumentRecord,
   RagV2EmbeddingState,
   RagV2Evidence,
@@ -11,6 +12,7 @@ import type {
   RagV2PassageRecord,
   RagV2PublicationState,
   RagV2RankedHit,
+  RagV2RoutingSummaryRecord,
   RagV2SectionRecord,
   RagV2VectorizerInfo,
 } from './types.js';
@@ -298,12 +300,37 @@ export class PostgresRagV2Repository implements RagV2Repository {
       modified_at: string;
       content_sha256: string;
       embedding_signature: string;
+      summary_signature: string | null;
     }>(`
       SELECT d.document_id, d.document_version_id, d.path, d.byte_length,
-        d.modified_at, d.content_sha256, p.embedding_signature
+        d.modified_at, d.content_sha256, p.embedding_signature,
+        summary.summarizer_signature AS summary_signature
       FROM ${this.table('publications')} p
       JOIN ${this.table('publication_documents')} pd ON pd.generation_id = p.generation_id
       JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+      LEFT JOIN LATERAL (
+        SELECT rs.summarizer_signature
+        FROM ${this.table('routing_summaries')} rs
+        WHERE rs.workspace_id = d.workspace_id AND rs.context_id = d.context_id
+          AND rs.level = 'document' AND rs.unit_id = d.document_version_id
+          AND NOT EXISTS (
+            SELECT 1
+            FROM ${this.table('sections')} section
+            WHERE section.workspace_id = d.workspace_id AND section.context_id = d.context_id
+              AND section.document_version_id = d.document_version_id
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ${this.table('routing_summaries')} section_summary
+                WHERE section_summary.workspace_id = section.workspace_id
+                  AND section_summary.context_id = section.context_id
+                  AND section_summary.level = 'section'
+                  AND section_summary.unit_id = section.section_id
+                  AND section_summary.summarizer_signature = rs.summarizer_signature
+              )
+          )
+        ORDER BY rs.created_at DESC
+        LIMIT 1
+      ) summary ON TRUE
       WHERE p.workspace_id = $1 AND p.context_id = $2 AND p.active = TRUE
     `, [workspaceId, contextId]));
     return result.rows.map(row => ({
@@ -314,6 +341,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
       modifiedAt: row.modified_at,
       contentSha256: row.content_sha256,
       embeddingSignature: row.embedding_signature,
+      ...(row.summary_signature ? { summarySignature: row.summary_signature } : {}),
     }));
   }
 
@@ -442,6 +470,12 @@ export class PostgresRagV2Repository implements RagV2Repository {
       values.push(record.unitId);
       byLevel.set(record.level, values);
     }
+    if (byLevel.get('collection')?.length) {
+      await this.withWorkspace(records[0]!.workspaceId, client => client.query(`
+        UPDATE ${this.table('collections')} SET embedding_state = 'ready'
+        WHERE collection_version_id = ANY($1::text[])
+      `, [byLevel.get('collection')]).then(() => undefined));
+    }
     if (byLevel.get('document')?.length) {
       await this.withWorkspace(records[0]!.workspaceId, client => client.query(`
         UPDATE ${this.table('documents')} SET embedding_state = 'ready'
@@ -493,6 +527,9 @@ export class PostgresRagV2Repository implements RagV2Repository {
         const ids = byLevel.get(record.level) ?? [];
         ids.push(record.unitId);
         byLevel.set(record.level, ids);
+      }
+      if (byLevel.get('collection')?.length) {
+        await this.withWorkspace(records[0]!.workspaceId, client => client.query(`UPDATE ${this.table('collections')} SET embedding_state = 'ready' WHERE collection_version_id = ANY($1::text[])`, [byLevel.get('collection')]).then(() => undefined));
       }
       if (byLevel.get('document')?.length) {
         await this.withWorkspace(records[0]!.workspaceId, client => client.query(`UPDATE ${this.table('documents')} SET embedding_state = 'ready' WHERE document_version_id = ANY($1::text[])`, [byLevel.get('document')]).then(() => undefined));
@@ -550,6 +587,132 @@ export class PostgresRagV2Repository implements RagV2Repository {
     await this.withWorkspace(document.workspaceId, client => this.upsertDocument(client, document));
   }
 
+  async rebuildCollections(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<RagV2CollectionRecord[]> {
+    return this.withWorkspace(workspaceId, async client => {
+      const grouped = await client.query<{
+        collection_id: string;
+        title: string;
+        document_count: string;
+        content_fingerprint: string;
+        routing_summary: string;
+      }>(`
+        SELECT d.collection_id,
+          COALESCE(MAX(d.collection_title), d.collection_id) AS title,
+          COUNT(*)::text AS document_count,
+          md5(string_agg(d.content_sha256, '' ORDER BY d.content_sha256)) AS content_fingerprint,
+          COALESCE((
+            SELECT string_agg(sample.title || ': ' || sample.routing_summary, E'\n' ORDER BY sample.title)
+            FROM (
+              SELECT member.title, member.routing_summary
+              FROM ${this.table('publication_documents')} member_pd
+              JOIN ${this.table('documents')} member ON member.document_version_id = member_pd.document_version_id
+              WHERE member_pd.generation_id = $3 AND member.collection_id = d.collection_id
+              ORDER BY member.title
+              LIMIT 50
+            ) sample
+          ), '') AS routing_summary
+        FROM ${this.table('publication_documents')} pd
+        JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+        WHERE pd.generation_id = $3 AND d.workspace_id = $1 AND d.context_id = $2
+          AND d.collection_id IS NOT NULL
+        GROUP BY d.collection_id
+      `, [workspaceId, contextId, generationId]);
+      await client.query(`DELETE FROM ${this.table('collections')} WHERE generation_id = $1`, [generationId]);
+      const records: RagV2CollectionRecord[] = [];
+      for (const row of grouped.rows) {
+        const contentSha256 = createHash('sha256').update(row.content_fingerprint).digest('hex');
+        const collectionVersionId = createHash('sha256')
+          .update(`${generationId}\0${row.collection_id}\0${contentSha256}`)
+          .digest('hex');
+        const record: RagV2CollectionRecord = {
+          collectionId: row.collection_id,
+          collectionVersionId,
+          generationId,
+          workspaceId,
+          contextId,
+          title: row.title,
+          documentCount: Number(row.document_count),
+          contentSha256,
+          routingSummary: row.routing_summary.slice(0, 12_000),
+          embeddingState: 'queued',
+          createdAt: now(),
+        };
+        await client.query(`
+          INSERT INTO ${this.table('collections')} (
+            collection_version_id, collection_id, generation_id, workspace_id, context_id,
+            title, document_count, content_sha256, routing_summary, embedding_state, created_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        `, [
+          record.collectionVersionId, record.collectionId, record.generationId,
+          record.workspaceId, record.contextId, record.title, record.documentCount,
+          record.contentSha256, record.routingSummary, record.embeddingState, record.createdAt,
+        ]);
+        records.push(record);
+      }
+      return records;
+    });
+  }
+
+  async findRoutingSummary(
+    workspaceId: string,
+    contextId: string,
+    level: RagV2RoutingSummaryRecord['level'],
+    sourceContentSha256: string,
+    summarizerSignature: string,
+  ): Promise<RagV2RoutingSummaryRecord | undefined> {
+    const result = await this.withWorkspace(workspaceId, client => client.query<{
+      summary_id: string; workspace_id: string; context_id: string; generation_id: string;
+      level: RagV2RoutingSummaryRecord['level']; unit_id: string; document_version_id: string | null;
+      source_content_sha256: string; summarizer_signature: string; summary: string; created_at: Date;
+    }>(`
+      SELECT * FROM ${this.table('routing_summaries')}
+      WHERE workspace_id = $1 AND context_id = $2 AND level = $3
+        AND source_content_sha256 = $4 AND summarizer_signature = $5
+      ORDER BY created_at DESC LIMIT 1
+    `, [workspaceId, contextId, level, sourceContentSha256, summarizerSignature]));
+    const row = result.rows[0];
+    return row ? {
+      summaryId: row.summary_id,
+      workspaceId: row.workspace_id,
+      contextId: row.context_id,
+      generationId: row.generation_id,
+      level: row.level,
+      unitId: row.unit_id,
+      ...(row.document_version_id ? { documentVersionId: row.document_version_id } : {}),
+      sourceContentSha256: row.source_content_sha256,
+      summarizerSignature: row.summarizer_signature,
+      summary: row.summary,
+      createdAt: row.created_at.toISOString(),
+    } : undefined;
+  }
+
+  async putRoutingSummary(summary: RagV2RoutingSummaryRecord): Promise<void> {
+    await this.withWorkspace(summary.workspaceId, async client => {
+      await client.query(`
+        INSERT INTO ${this.table('routing_summaries')} (
+          summary_id, workspace_id, context_id, generation_id, level, unit_id,
+          document_version_id, source_content_sha256, summarizer_signature, summary, created_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (summary_id) DO UPDATE SET summary = EXCLUDED.summary, created_at = EXCLUDED.created_at
+      `, [
+        summary.summaryId, summary.workspaceId, summary.contextId, summary.generationId,
+        summary.level, summary.unitId, summary.documentVersionId ?? null,
+        summary.sourceContentSha256, summary.summarizerSignature, summary.summary, summary.createdAt,
+      ]);
+      if (summary.level === 'collection') {
+        await client.query(`UPDATE ${this.table('collections')} SET routing_summary = $1 WHERE collection_version_id = $2`, [summary.summary, summary.unitId]);
+      } else if (summary.level === 'document') {
+        await client.query(`UPDATE ${this.table('documents')} SET routing_summary = $1 WHERE document_version_id = $2`, [summary.summary, summary.unitId]);
+      } else {
+        await client.query(`UPDATE ${this.table('sections')} SET routing_summary = $1 WHERE section_id = $2`, [summary.summary, summary.unitId]);
+      }
+    });
+  }
+
   async reconcileGeneration(
     jobId: string,
     workspaceId: string,
@@ -593,6 +756,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
           AND (d.valid_from IS NULL OR d.valid_from <= $11::date)
           AND (d.valid_to IS NULL OR d.valid_to >= $11::date)
         ))
+        AND ($12::text[] IS NULL OR d.collection_id = ANY($12::text[]))
       ORDER BY p.ordinal
       LIMIT $8
     `, [
@@ -602,6 +766,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
       scope.documentTypes?.map(value => value.toLocaleLowerCase()) ?? null,
       scope.jurisdictions?.map(value => value.toLocaleLowerCase()) ?? null,
       scope.asOfDate ?? null,
+      scope.collectionIds ?? null,
     ]));
     return result.rows.map((row, index) => this.rowToHit(row, 'exact_reference', index + 1));
   }
@@ -710,6 +875,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
         'aclTokens', to_jsonb(d.acl_tokens),
         'path', d.path,
         'title', d.title,
+        'collectionId', d.collection_id,
+        'collectionTitle', d.collection_title,
         'documentType', d.document_type,
         'jurisdiction', d.jurisdiction,
         'governingLaw', d.governing_law,
@@ -943,6 +1110,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
         acl_tokens TEXT[] NOT NULL,
         path TEXT NOT NULL,
         title TEXT NOT NULL,
+        collection_id TEXT,
+        collection_title TEXT,
         document_type TEXT NOT NULL,
         jurisdiction TEXT,
         governing_law TEXT,
@@ -973,6 +1142,32 @@ export class PostgresRagV2Repository implements RagV2Repository {
           setweight(to_tsvector('german'::regconfig, coalesce(title, '')), 'A') ||
           setweight(to_tsvector('german'::regconfig, coalesce(routing_summary, '')), 'B')
         ) STORED
+      );
+      CREATE TABLE IF NOT EXISTS ${this.table('collections')} (
+        collection_version_id TEXT PRIMARY KEY,
+        collection_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL REFERENCES ${this.table('publications')}(generation_id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL,
+        context_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        document_count BIGINT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        routing_summary TEXT NOT NULL,
+        embedding_state TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        search_vector TSVECTOR GENERATED ALWAYS AS (
+          setweight(to_tsvector('simple'::regconfig, coalesce(title, '')), 'A') ||
+          setweight(to_tsvector('simple'::regconfig, coalesce(routing_summary, '')), 'B')
+        ) STORED,
+        search_vector_en TSVECTOR GENERATED ALWAYS AS (
+          setweight(to_tsvector('english'::regconfig, coalesce(title, '')), 'A') ||
+          setweight(to_tsvector('english'::regconfig, coalesce(routing_summary, '')), 'B')
+        ) STORED,
+        search_vector_de TSVECTOR GENERATED ALWAYS AS (
+          setweight(to_tsvector('german'::regconfig, coalesce(title, '')), 'A') ||
+          setweight(to_tsvector('german'::regconfig, coalesce(routing_summary, '')), 'B')
+        ) STORED,
+        UNIQUE (generation_id, collection_id)
       );
       CREATE TABLE IF NOT EXISTS ${this.table('publication_documents')} (
         generation_id TEXT NOT NULL REFERENCES ${this.table('publications')}(generation_id) ON DELETE CASCADE,
@@ -1092,6 +1287,19 @@ export class PostgresRagV2Repository implements RagV2Repository {
         payload JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ${this.table('routing_summaries')} (
+        summary_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        context_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        level TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        document_version_id TEXT,
+        source_content_sha256 TEXT NOT NULL,
+        summarizer_signature TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
       );
       CREATE TABLE IF NOT EXISTS ${this.table('retrieval_runs')} (
         id TEXT PRIMARY KEY,
@@ -1231,6 +1439,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ON ${this.table('publication_documents')} (generation_id, document_version_id);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_path')}
         ON ${this.table('documents')} (workspace_id, context_id, path);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_collection')}
+        ON ${this.table('documents')} (workspace_id, context_id, collection_id);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_collections_generation')}
+        ON ${this.table('collections')} (workspace_id, context_id, generation_id, collection_id);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_collections_lexical')}
+        ON ${this.table('collections')} USING GIN (search_vector);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_collections_lexical_en')}
+        ON ${this.table('collections')} USING GIN (search_vector_en);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_collections_lexical_de')}
+        ON ${this.table('collections')} USING GIN (search_vector_de);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_lexical')}
         ON ${this.table('documents')} USING GIN (search_vector);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_lexical_en')}
@@ -1257,6 +1475,10 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ON ${this.table('ingestion_jobs')} (workspace_id, context_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_retrieval_runs_context')}
         ON ${this.table('retrieval_runs')} (workspace_id, context_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_routing_summary_reuse')}
+        ON ${this.table('routing_summaries')} (workspace_id, context_id, level, summarizer_signature, source_content_sha256);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_routing_summary_unit')}
+        ON ${this.table('routing_summaries')} (workspace_id, context_id, level, unit_id, created_at DESC);
     `);
     await this.ddlPool().query(`
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_title_trgm')}
@@ -1272,7 +1494,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
         }`,
       );
     });
-    for (const level of ['document', 'section', 'passage'] as const) {
+    for (const level of ['collection', 'document', 'section', 'passage'] as const) {
       const indexName = quoteIdentifier(
         `idx_rag_v2_${vectorizer.dimensions}_${level}_${this.vectorIndexMode}_hnsw`,
       );
@@ -1503,6 +1725,21 @@ export class PostgresRagV2Repository implements RagV2Repository {
           VALUES (5, 'signature_scoped_derivative_generations', $1)
         `, [now()]);
       }
+      const migrationSix = await client.query<{ exists: boolean }>(`
+        SELECT EXISTS (
+          SELECT 1 FROM ${this.table('schema_migrations')} WHERE version = 6
+        ) AS exists
+      `);
+      if (!migrationSix.rows[0]?.exists) {
+        await client.query(`
+          ALTER TABLE ${this.table('documents')} ADD COLUMN IF NOT EXISTS collection_id TEXT;
+          ALTER TABLE ${this.table('documents')} ADD COLUMN IF NOT EXISTS collection_title TEXT
+        `);
+        await client.query(`
+          INSERT INTO ${this.table('schema_migrations')} (version, name, applied_at)
+          VALUES (6, 'versioned_semantic_summaries_and_collections', $1)
+        `, [now()]);
+      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -1514,8 +1751,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
 
   private async enableRowSecurity(): Promise<void> {
     for (const name of [
-      'publications', 'documents', 'publication_documents', 'sections', 'passages',
-      'ingestion_jobs', 'ingestion_job_items', 'derivative_jobs',
+      'publications', 'collections', 'documents', 'publication_documents', 'sections', 'passages',
+      'ingestion_jobs', 'ingestion_job_items', 'derivative_jobs', 'routing_summaries',
       'retrieval_runs', 'retrieval_hits', 'retrieval_query_variants', 'retrieval_evidence',
       'evaluation_queries', 'relevance_judgments', 'evaluation_runs', 'evaluation_metrics',
       'regex_runs',
@@ -1584,8 +1821,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
     const role = quoteRole(app.name);
     const tables = [
-      'publications', 'documents', 'publication_documents', 'sections', 'passages',
-      'ingestion_jobs', 'ingestion_job_items', 'derivative_jobs',
+      'publications', 'collections', 'documents', 'publication_documents', 'sections', 'passages',
+      'ingestion_jobs', 'ingestion_job_items', 'derivative_jobs', 'routing_summaries',
       'retrieval_runs', 'retrieval_hits', 'retrieval_query_variants', 'retrieval_evidence',
       'evaluation_queries', 'relevance_judgments', 'evaluation_runs', 'evaluation_metrics',
       'regex_runs',
@@ -1688,24 +1925,27 @@ export class PostgresRagV2Repository implements RagV2Repository {
     await client.query(`
       INSERT INTO ${this.table('documents')} (
         document_version_id, document_id, source_id, source_version_id, workspace_id, context_id,
-        acl_tokens, path, title, document_type, jurisdiction, governing_law, parties,
+        acl_tokens, path, title, collection_id, collection_title, document_type, jurisdiction, governing_law, parties,
         publication_date, valid_from, valid_to, language_distribution, byte_length, line_count,
         content_sha256, table_of_contents, routing_summary, publication_state, object_path,
         line_index_path, modified_at, embedding_state
       ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17::jsonb,$18,$19,
-        $20,$21::jsonb,$22,$23,$24,$25,$26,$27
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19::jsonb,$20,$21,
+        $22,$23::jsonb,$24,$25,$26,$27,$28,$29
       )
       ON CONFLICT (document_version_id) DO UPDATE SET
         source_id = COALESCE(EXCLUDED.source_id, ${this.table('documents')}.source_id),
         source_version_id = COALESCE(EXCLUDED.source_version_id, ${this.table('documents')}.source_version_id),
-        title = EXCLUDED.title, language_distribution = EXCLUDED.language_distribution,
+        title = EXCLUDED.title, collection_id = EXCLUDED.collection_id,
+        collection_title = EXCLUDED.collection_title,
+        language_distribution = EXCLUDED.language_distribution,
         line_count = EXCLUDED.line_count, table_of_contents = EXCLUDED.table_of_contents,
         routing_summary = EXCLUDED.routing_summary, publication_state = EXCLUDED.publication_state,
         embedding_state = EXCLUDED.embedding_state
     `, [
       document.documentVersionId, document.documentId, document.sourceId ?? null, document.sourceVersionId ?? null,
       document.workspaceId, document.contextId, document.aclTokens, document.path, document.title,
+      document.collectionId ?? null, document.collectionTitle ?? null,
       document.documentType, document.jurisdiction ?? null, document.governingLaw ?? null,
       json(document.parties), document.publicationDate ?? null, document.validFrom ?? null,
       document.validTo ?? null, json(document.languageDistribution), document.byteLength, document.lineCount,
@@ -1735,6 +1975,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
       scope.documentTypes?.map(value => value.toLocaleLowerCase()) ?? null,
       scope.jurisdictions?.map(value => value.toLocaleLowerCase()) ?? null,
       scope.asOfDate ?? null,
+      scope.collectionIds ?? null,
     ];
     return values;
   }
@@ -1744,6 +1985,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
     kind: 'lexical' | 'dense',
     lexicalLanguage?: string,
   ): string {
+    if (level === 'collection') return this.collectionSearchSql(kind, lexicalLanguage);
     if (kind === 'lexical') {
       const configuration = lexicalLanguage === 'en'
         ? 'english'
@@ -1785,6 +2027,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
             AND (d.valid_from IS NULL OR d.valid_from <= $12::date)
             AND (d.valid_to IS NULL OR d.valid_to >= $12::date)
           ))
+          AND ($13::text[] IS NULL OR d.collection_id = ANY($13::text[]))
         ORDER BY score DESC
         LIMIT $8
       `;
@@ -1823,8 +2066,85 @@ export class PostgresRagV2Repository implements RagV2Repository {
           AND (d.valid_from IS NULL OR d.valid_from <= $12::date)
           AND (d.valid_to IS NULL OR d.valid_to >= $12::date)
         ))
+        AND ($13::text[] IS NULL OR d.collection_id = ANY($13::text[]))
       ORDER BY ${approximateOrder}
       LIMIT $8
+    `;
+  }
+
+  private collectionSearchSql(kind: 'lexical' | 'dense', lexicalLanguage?: string): string {
+    const authorization = `
+      EXISTS (
+        SELECT 1
+        FROM ${this.table('publication_documents')} pd
+        JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+        WHERE pd.generation_id = c.generation_id
+          AND d.collection_id = c.collection_id
+          AND d.acl_tokens && $7::text[]
+          AND ($5::text[] IS NULL OR d.document_id = ANY($5::text[]))
+          AND ($10::text[] IS NULL OR lower(d.document_type) = ANY($10::text[]))
+          AND ($11::text[] IS NULL OR lower(d.jurisdiction) = ANY($11::text[]))
+          AND ($12::date IS NULL OR (
+            (d.publication_date IS NULL OR d.publication_date <= $12::date)
+            AND (d.valid_from IS NULL OR d.valid_from <= $12::date)
+            AND (d.valid_to IS NULL OR d.valid_to >= $12::date)
+          ))
+      )
+      AND $6::text[] IS NOT DISTINCT FROM $6::text[]
+    `;
+    if (kind === 'lexical') {
+      const configuration = lexicalLanguage === 'en'
+        ? 'english'
+        : lexicalLanguage === 'de'
+          ? 'german'
+          : 'simple';
+      const vectorColumn = lexicalLanguage === 'en'
+        ? 'search_vector_en'
+        : lexicalLanguage === 'de'
+          ? 'search_vector_de'
+          : 'search_vector';
+      const score = `ts_rank_cd(c.${vectorColumn}, websearch_to_tsquery('${configuration}'::regconfig, $4), 32)`;
+      return `
+        ${this.commonCollectionSelect(score)}
+        WHERE c.generation_id = $3 AND c.workspace_id = $1 AND c.context_id = $2
+          AND c.${vectorColumn} @@ websearch_to_tsquery('${configuration}'::regconfig, $4)
+          AND $9::text IS NOT DISTINCT FROM $9::text
+          AND ($13::text[] IS NULL OR c.collection_id = ANY($13::text[]))
+          AND ${authorization}
+        ORDER BY score DESC
+        LIMIT $8
+      `;
+    }
+    const score = `GREATEST(0, 1 - (e.embedding <=> $4::vector))::float8`;
+    const approximateOrder = this.vectorIndexMode === 'half'
+      ? `(e.embedding::halfvec(${this.vectorizer?.dimensions ?? 1})) <=> (($4::vector)::halfvec(${this.vectorizer?.dimensions ?? 1}))`
+      : this.vectorIndexMode === 'binary'
+        ? `(binary_quantize(e.embedding)::bit(${this.vectorizer?.dimensions ?? 1})) <~> (binary_quantize($4::vector)::bit(${this.vectorizer?.dimensions ?? 1}))`
+        : `e.embedding <=> $4::vector`;
+    return `
+      ${this.commonCollectionSelect(score)}
+      JOIN ${this.getEmbeddingsTable()} e
+        ON e.level = 'collection' AND e.unit_id = c.collection_version_id AND e.embedding_signature = $9
+      WHERE c.generation_id = $3 AND c.workspace_id = $1 AND c.context_id = $2
+        AND ($13::text[] IS NULL OR c.collection_id = ANY($13::text[]))
+        AND ${authorization}
+      ORDER BY ${approximateOrder}
+      LIMIT $8
+    `;
+  }
+
+  private commonCollectionSelect(score: string): string {
+    return `
+      SELECT 'collection'::text AS level, c.collection_version_id AS id,
+        c.collection_id AS document_id, c.collection_version_id AS document_version_id,
+        NULL::text AS section_id, NULL::text AS passage_id,
+        'collection:' || c.collection_id AS path, c.title, ARRAY[]::text[] AS heading_path,
+        NULL::bigint AS start_byte, NULL::bigint AS end_byte, NULL::bigint AS start_line, NULL::bigint AS end_line,
+        'und'::text AS language, c.title || E'\n' || c.routing_summary AS text,
+        c.content_sha256, NULL::text AS source_id, NULL::text AS source_version_id,
+        NULL::text AS object_path, NULL::text AS line_index_path, c.embedding_state,
+        ${score} AS score
+      FROM ${this.table('collections')} c
     `;
   }
 

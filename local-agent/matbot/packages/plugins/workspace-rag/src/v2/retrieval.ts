@@ -3,10 +3,17 @@ import { detectPassageLanguage } from './language.js';
 import { RagV2ColbertAdapter } from './late-interaction.js';
 import { RagV2ObjectStore } from './object-store.js';
 import type { RagV2Repository, RagV2RetrievalRunRecord, RagV2SearchScope } from './repository.js';
+import {
+  decomposeRagV2Query,
+  rewriteRagV2ConversationQuery,
+  type RagV2SemanticServices,
+} from './semantic.js';
 import type {
+  RagV2ConversationTurn,
   RagV2Embedder,
   RagV2Evidence,
   RagV2PassageRecord,
+  RagV2QueryRewrite,
   RagV2RankedHit,
   RagV2RetrievalPlan,
   RagV2RetrievalVariant,
@@ -22,6 +29,9 @@ export interface RetrievalOptions {
   jurisdictions?: string[];
   asOfDate?: string;
   variant?: RagV2RetrievalVariant;
+  conversation?: RagV2ConversationTurn[];
+  rewriteProvider?: string;
+  iterative?: boolean;
 }
 
 interface RerankResponse {
@@ -37,6 +47,7 @@ interface RetrievalDependencies {
   rrfK?: number;
   rrfWeights?: Record<string, number>;
   colbertUrl?: string;
+  semanticServices?: RagV2SemanticServices;
   onLazySection?: (
     workspaceId: string,
     contextId: string,
@@ -110,9 +121,10 @@ function identifyLane(hits: readonly RagV2RankedHit[], retriever: string): RagV2
 }
 
 function inferIntent(query: string, exactReferences: readonly string[]): RagV2RetrievalPlan['intent'] {
-  if (exactReferences.length > 0 || /["“”„].+["“”]/u.test(query)) return 'exact_reference';
   if (/\b(?:as of|on \d{4}-\d{2}-\d{2}|na dzień|według stanu na|zum stand)\b/iu.test(query)) return 'as_of';
   if (/\b(?:compare|difference|versus|vs\.?|porównaj|różnic|vergleich)\b/iu.test(query)) return 'comparison';
+  if (/\b(?:diagnose|diagnosis|debug|root cause|why (?:does|did|is|was)|fail(?:s|ed|ure)?|error|exception|retry|workaround|napraw|błąd|awari|fehler|ursache)\b/iu.test(query)) return 'diagnostic';
+  if (exactReferences.length > 0 || /["“”„].+["“”]/u.test(query)) return 'exact_reference';
   if (/\b(?:summarize|overview|across|all documents|podsumuj|przegląd|wszystkich dokument)\b/iu.test(query)) {
     return 'broad_synthesis';
   }
@@ -137,6 +149,12 @@ export function planRagV2Query(
   workspaceId: string,
   contextId: string,
   options: RetrievalOptions = {},
+  rewrite: RagV2QueryRewrite = {
+    latestQuestion: query,
+    standaloneQuery: query,
+    method: 'identity' as const,
+    conversationTurnsUsed: 0,
+  },
 ): RagV2RetrievalPlan {
   const language = detectPassageLanguage(query);
   const exactReferences = unique(EXACT_REFERENCE_PATTERNS.flatMap(pattern => [...query.matchAll(pattern)].map(match => match[0]!)));
@@ -161,7 +179,12 @@ export function planRagV2Query(
   const explicitJurisdictions = options.jurisdictions ?? extractFilterValues(query, 'jurisdiction');
   const asOfDate = options.asOfDate ?? extractAsOfDate(query);
   return {
-    originalQuery: query,
+    originalQuery: rewrite.latestQuestion,
+    latestQuestion: rewrite.latestQuestion,
+    standaloneQuery: rewrite.standaloneQuery,
+    rewriteMethod: rewrite.method,
+    conversationTurnsUsed: rewrite.conversationTurnsUsed,
+    ...(rewrite.contextHash ? { conversationContextHash: rewrite.contextHash } : {}),
     queryLanguage: language.primary,
     answerLanguage: options.answerLanguage ?? (language.primary === 'und' ? 'en' : language.primary),
     intent: inferIntent(query, exactReferences),
@@ -173,6 +196,7 @@ export function planRagV2Query(
     ...(asOfDate ? { asOfDate } : {}),
     corpusLanguages: unique([language.primary, ...lexicalVariants.map(value => value.language)]).filter(value => value !== 'und'),
     lexicalVariants,
+    iterativeQueries: [],
     embeddingInstruction: 'Retrieve original evidence passages that answer the question.',
     authorization: {
       workspaceId,
@@ -350,6 +374,76 @@ function hitFromNeighbour(source: RagV2RankedHit, passage: RagV2PassageRecord): 
   };
 }
 
+function hasEvidenceConflict(values: readonly Pick<RagV2RankedHit, 'text' | 'documentId'>[]): boolean {
+  if (new Set(values.map(value => value.documentId)).size < 2) return false;
+  let positive = false;
+  let negative = false;
+  for (const value of values.slice(0, 30)) {
+    const text = value.text.toLocaleLowerCase();
+    positive ||= /\b(?:must|required|supported|enabled|allowed|applies|shall|yes|wymaga|dozwolon|obowiązuje|aktiviert|zulässig)\b/u.test(text);
+    negative ||= /\b(?:must not|not required|unsupported|disabled|prohibited|does not apply|shall not|no|nie wolno|zabronion|nie obowiązuje|deaktiviert|unzulässig)\b/u.test(text);
+  }
+  return positive && negative;
+}
+
+function assessFirstPassCandidates(
+  plan: RagV2RetrievalPlan,
+  candidates: readonly RagV2RankedHit[],
+): RagV2SearchResult['answerability']['firstPass'] {
+  const reasons: string[] = [];
+  const required = plan.intent === 'comparison' || plan.intent === 'diagnostic' ? 2 : 1;
+  if (candidates.length < required) {
+    reasons.push(`first pass produced ${candidates.length} passage candidate(s); ${required} required for ${plan.intent}`);
+  }
+  if (plan.intent === 'exact_reference' && candidates.length > 0
+    && !candidates.some(value => value.retrievalReasons.some(reason => /exact_reference|exact-reference/iu.test(reason)))) {
+    reasons.push('first pass did not recover the requested exact reference');
+  }
+  if (plan.intent === 'comparison' && new Set(candidates.map(value => value.documentId)).size < 2
+    && new Set(candidates.map(value => value.sectionId).filter(Boolean)).size < 2) {
+    reasons.push('first pass did not cover two comparison sources or sections');
+  }
+  const insufficient = reasons.length > 0;
+  const conflicting = hasEvidenceConflict(candidates);
+  if (conflicting) reasons.push('first-pass sources contain materially conflicting polarity');
+  return {
+    status: insufficient ? 'insufficient' : conflicting ? 'conflicting' : 'sufficient',
+    candidateCount: candidates.length,
+    reasons: reasons.length > 0 ? reasons : ['first-pass candidates satisfy the retrieval intent'],
+  };
+}
+
+function assessAnswerability(
+  plan: RagV2RetrievalPlan,
+  evidence: readonly RagV2Evidence[],
+  iterations: number,
+  conflicting: boolean,
+  firstPass: RagV2SearchResult['answerability']['firstPass'],
+): RagV2SearchResult['answerability'] {
+  const reasons: string[] = [];
+  const required = plan.intent === 'comparison' || plan.intent === 'diagnostic' ? 2 : 1;
+  if (evidence.length < required) reasons.push(`retrieval produced ${evidence.length} verified passage(s); ${required} required for ${plan.intent}`);
+  if (plan.intent === 'exact_reference' && evidence.length > 0
+    && !evidence.some(value => value.retrievalReasons.some(reason => /exact_reference|exact-reference/iu.test(reason)))) {
+    reasons.push('the requested exact reference was not found in a verified evidence range');
+  }
+  if (plan.intent === 'comparison' && new Set(evidence.map(value => value.documentId)).size < 2
+    && new Set(evidence.map(value => value.sectionId)).size < 2) {
+    reasons.push('comparison evidence does not cover two distinct sources or sections');
+  }
+  const insufficient = reasons.length > 0;
+  if (conflicting && !insufficient) reasons.push('independent retrieved sources contain materially conflicting polarity');
+  const target = Math.max(1, required);
+  return {
+    status: insufficient ? 'insufficient' : conflicting ? 'conflicting' : 'sufficient',
+    score: insufficient ? Math.min(0.49, evidence.length / target * 0.49) : conflicting ? 0.65 : Math.min(1, 0.75 + evidence.length * 0.05),
+    abstained: insufficient,
+    reasons: reasons.length > 0 ? reasons : ['verified evidence satisfies the retrieval intent'],
+    iterations,
+    firstPass,
+  };
+}
+
 export class RagV2RetrievalEngine {
   private readonly repository: RagV2Repository;
   private readonly objectStore: RagV2ObjectStore;
@@ -359,6 +453,7 @@ export class RagV2RetrievalEngine {
   private readonly rrfK: number;
   private readonly rrfWeights: Record<string, number>;
   private readonly colbert: RagV2ColbertAdapter | undefined;
+  private readonly semanticServices: RagV2SemanticServices | undefined;
 
   constructor(dependencies: RetrievalDependencies) {
     this.repository = dependencies.repository;
@@ -371,6 +466,7 @@ export class RagV2RetrievalEngine {
     this.colbert = dependencies.colbertUrl
       ? new RagV2ColbertAdapter(dependencies.colbertUrl)
       : undefined;
+    this.semanticServices = dependencies.semanticServices;
   }
 
   async search(
@@ -382,6 +478,14 @@ export class RagV2RetrievalEngine {
   ): Promise<RagV2SearchResult> {
     const publication = await this.repository.activePublication(workspaceId, contextId);
     if (!publication) throw new Error('Workspace RAG V2 has no active publication for this context.');
+    const rewrite = await rewriteRagV2ConversationQuery(
+      query,
+      options.conversation,
+      this.semanticServices,
+      options.rewriteProvider,
+      signal,
+    );
+    const retrievalQuery = rewrite.standaloneQuery;
     const timings: Record<string, number> = {};
     const degraded: string[] = [];
     const variant = options.variant ?? 'hierarchical_lazy';
@@ -407,7 +511,7 @@ export class RagV2RetrievalEngine {
     }
     const runId = randomUUID();
     const startedAtIso = new Date().toISOString();
-    const plan = planRagV2Query(query, workspaceId, contextId, options);
+    const plan = planRagV2Query(retrievalQuery, workspaceId, contextId, options, rewrite);
     const authorizationTokens = unique([
       `workspace:${workspaceId}`,
       `user:${plan.authorization.principalId}`,
@@ -428,7 +532,7 @@ export class RagV2RetrievalEngine {
       workspaceId,
       contextId,
       generationId: publication.generationId,
-      questionHash: sha256(query),
+      questionHash: sha256(rewrite.latestQuestion),
       planJson: persistedPlan,
       embeddingSignature: this.embedder.info.signature,
       status: 'running',
@@ -439,7 +543,7 @@ export class RagV2RetrievalEngine {
       let queryVector: number[] = [];
       if (useDense) {
         const embeddingStarted = Date.now();
-        queryVector = (await this.embedder.embed([query], 'query', signal))[0] ?? [];
+        queryVector = (await this.embedder.embed([retrievalQuery], 'query', signal))[0] ?? [];
         timings['query_embedding_ms'] = elapsed(embeddingStarted);
       }
       const routingScope: RagV2SearchScope = {
@@ -457,8 +561,9 @@ export class RagV2RetrievalEngine {
       const routingPromises: Array<Promise<RagV2RankedHit[]>> = [];
       if (useHierarchy && useLexical) {
         routingPromises.push(
-          this.repository.lexicalSearch('document', query, { ...routingScope, limit: 50 }),
-          this.repository.lexicalSearch('section', query, routingScope),
+          this.repository.lexicalSearch('collection', retrievalQuery, { ...routingScope, limit: 20 }),
+          this.repository.lexicalSearch('document', retrievalQuery, { ...routingScope, limit: 50 }),
+          this.repository.lexicalSearch('section', retrievalQuery, routingScope),
           this.repository.exactSearch(
             [...plan.exactReferences, ...plan.quotedPhrases],
             { ...routingScope, limit: 50 },
@@ -467,6 +572,12 @@ export class RagV2RetrievalEngine {
       }
       if (useHierarchy && useDense) {
         routingPromises.push(
+          this.repository.denseSearch(
+            'collection',
+            queryVector,
+            this.embedder.info,
+            { ...routingScope, limit: 20 },
+          ),
           this.repository.denseSearch(
             'document',
             queryVector,
@@ -477,13 +588,34 @@ export class RagV2RetrievalEngine {
         );
       }
       const routingSets = await Promise.all(routingPromises);
-      const routed = reciprocalRankFusion(routingSets, this.rrfWeights, this.rrfK);
-      const routedDocumentIds = unique(routed.slice(0, 30).map(hit => hit.documentId));
+      let routed = reciprocalRankFusion(routingSets, this.rrfWeights, this.rrfK);
+      const routedCollectionIds = unique(routed.filter(hit => hit.level === 'collection').slice(0, 10).map(hit => hit.documentId));
+      if (useHierarchy && routedCollectionIds.length > 0) {
+        const collectionScope = { ...routingScope, collectionIds: routedCollectionIds };
+        const collectionExpansionPromises: Array<Promise<RagV2RankedHit[]>> = [];
+        if (useLexical) {
+          collectionExpansionPromises.push(
+            this.repository.lexicalSearch('document', retrievalQuery, { ...collectionScope, limit: 50 }),
+            this.repository.lexicalSearch('section', retrievalQuery, collectionScope),
+          );
+        }
+        if (useDense) {
+          collectionExpansionPromises.push(
+            this.repository.denseSearch('document', queryVector, this.embedder.info, { ...collectionScope, limit: 50 }),
+            this.repository.denseSearch('section', queryVector, this.embedder.info, collectionScope),
+          );
+        }
+        const collectionExpansionSets = await Promise.all(collectionExpansionPromises);
+        routingSets.push(...collectionExpansionSets.map(values => identifyLane(values, 'collection_member_route')));
+        routed = reciprocalRankFusion(routingSets, this.rrfWeights, this.rrfK);
+      }
+      const routedDocumentIds = unique(routed.filter(hit => hit.level === 'document' || hit.level === 'section').slice(0, 30).map(hit => hit.documentId));
       const routedSectionIds = unique(routed.filter(hit => hit.sectionId).slice(0, 50).map(hit => hit.sectionId!));
       timings['routing_ms'] = elapsed(routingStarted);
       const candidateCounts: Record<string, number> = {
         routedInput: routingSets.reduce((sum, values) => sum + values.length, 0),
         routedFused: routed.length,
+        routedCollections: routedCollectionIds.length,
         routedDocuments: routedDocumentIds.length,
         routedSections: routedSectionIds.length,
       };
@@ -497,15 +629,24 @@ export class RagV2RetrievalEngine {
             limit: 150,
           }
         : { ...routingScope, limit: 150 };
+      const collectionScoped: RagV2SearchScope | undefined = useHierarchy && routedCollectionIds.length > 0
+        ? { ...routingScope, collectionIds: routedCollectionIds, limit: 150 }
+        : undefined;
       const candidatePromises: Array<Promise<RagV2RankedHit[]>> = [];
       if (useLexical) {
         candidatePromises.push(
-          this.repository.lexicalSearch('passage', query, scoped),
+          this.repository.lexicalSearch('passage', retrievalQuery, scoped),
           this.repository.exactSearch(
             [...plan.exactReferences, ...plan.quotedPhrases],
-            { ...scoped, limit: 50 },
+            { ...routingScope, limit: 50 },
           ),
         );
+        if (collectionScoped) {
+          candidatePromises.push(
+            this.repository.lexicalSearch('passage', retrievalQuery, collectionScoped)
+              .then(hits => identifyLane(hits, 'passage_lexical_collection')),
+          );
+        }
       }
       if (useDense) {
         if (useHierarchy) {
@@ -517,6 +658,16 @@ export class RagV2RetrievalEngine {
               { ...scoped, limit: 100 },
             ).then(hits => identifyLane(hits, 'passage_dense_scoped')),
           );
+          if (collectionScoped) {
+            candidatePromises.push(
+              this.repository.denseSearch(
+                'passage',
+                queryVector,
+                this.embedder.info,
+                { ...collectionScoped, limit: 100 },
+              ).then(hits => identifyLane(hits, 'passage_dense_collection')),
+            );
+          }
         }
         candidatePromises.push(
           this.repository.denseSearch(
@@ -538,7 +689,7 @@ export class RagV2RetrievalEngine {
       }
       if (this.colbert && variant === 'hierarchical_lazy') {
         candidatePromises.push(
-          this.colbert.search(query, scoped, signal)
+          this.colbert.search(retrievalQuery, scoped, signal)
             .then(result => result.hits)
             .catch(error => {
               degraded.push(
@@ -552,11 +703,69 @@ export class RagV2RetrievalEngine {
       candidateSets.forEach((values, index) => {
         candidateCounts[`passageLane${index + 1}`] = values.length;
       });
-      const fused = reciprocalRankFusion(candidateSets, {
+      let fused = reciprocalRankFusion(candidateSets, {
         ...this.rrfWeights,
         exact_reference: 2,
         passage_dense_global: 0.8,
       }, this.rrfK).slice(0, 100);
+      let iterations = 1;
+      const firstPass = assessFirstPassCandidates(plan, fused);
+      const firstPassConflicting = firstPass.status === 'conflicting';
+      if (options.iterative !== false && (
+        plan.intent === 'comparison'
+        || plan.intent === 'diagnostic'
+        || firstPass.status !== 'sufficient'
+        || firstPassConflicting
+      )) {
+        const iterativeStarted = Date.now();
+        const iterativeQueries = decomposeRagV2Query(
+          retrievalQuery,
+          plan.intent,
+          plan.exactReferences,
+          plan.entities,
+        );
+        if (firstPassConflicting) {
+          iterativeQueries.push({
+            query: `${retrievalQuery} current authoritative version effective date`,
+            reason: 'conflict resolution across current authoritative sources',
+          });
+        }
+        if (iterativeQueries.length === 0 && fused.length < 3) {
+          iterativeQueries.push({
+            query: `${retrievalQuery} supporting evidence explanation`,
+            reason: 'low-evidence recovery search',
+          });
+        }
+        plan.iterativeQueries = iterativeQueries.slice(0, 4);
+        const iterativeResults = await Promise.all(plan.iterativeQueries.map(async (item, index) => {
+          const resultSets: RagV2RankedHit[][] = [];
+          if (useLexical) {
+            resultSets.push(identifyLane(
+              await this.repository.lexicalSearch('passage', item.query, { ...routingScope, limit: 100 }),
+              `iterative_lexical_${index + 1}`,
+            ));
+          }
+          if (useDense) {
+            const vector = (await this.embedder.embed([item.query], 'query', signal))[0] ?? [];
+            resultSets.push(identifyLane(
+              await this.repository.denseSearch('passage', vector, this.embedder.info, { ...routingScope, limit: 100 }),
+              `iterative_dense_${index + 1}`,
+            ));
+          }
+          return resultSets;
+        }));
+        const followUpSets = iterativeResults.flat();
+        if (followUpSets.length > 0) {
+          fused = reciprocalRankFusion([
+            identifyLane(fused, 'first_pass_fused'),
+            ...followUpSets,
+          ], this.rrfWeights, this.rrfK).slice(0, 100);
+          iterations++;
+        }
+        candidateCounts['iterativeQueries'] = plan.iterativeQueries.length;
+        candidateCounts['iterativeCandidates'] = followUpSets.reduce((sum, values) => sum + values.length, 0);
+        timings['iterative_retrieval_ms'] = elapsed(iterativeStarted);
+      }
       candidateCounts['passageFused'] = fused.length;
       timings['candidate_retrieval_ms'] = elapsed(candidateStarted);
 
@@ -564,13 +773,13 @@ export class RagV2RetrievalEngine {
       if (useReranker && this.rerankerUrl && fused.length > 0) {
         const rerankStarted = Date.now();
         try {
-          const result = await rerank(this.rerankerUrl, query, fused.slice(0, 100), signal);
+          const result = await rerank(this.rerankerUrl, retrievalQuery, fused.slice(0, 100), signal);
           run.rerankerModel = result.model ?? this.rerankerUrl;
           ranked = fused
             .map((hit, index) => ({
               ...hit,
               rerankerScore: result.scores[index] ?? 0,
-              rerankerInputHash: sha256(`${query}\0${hit.text}`),
+              rerankerInputHash: sha256(`${retrievalQuery}\0${hit.text}`),
             }))
             .sort((left, right) => (right.rerankerScore ?? 0) - (left.rerankerScore ?? 0))
             .map((hit, index) => ({
@@ -665,7 +874,16 @@ export class RagV2RetrievalEngine {
         }
       }
       timings['evidence_assembly_ms'] = elapsed(evidenceStarted);
-      candidateCounts['evidenceDelivered'] = evidence.length;
+      const answerability = assessAnswerability(
+        plan,
+        evidence,
+        iterations,
+        hasEvidenceConflict(evidence),
+        firstPass,
+      );
+      const deliveredEvidence = answerability.abstained ? [] : evidence;
+      candidateCounts['evidenceConsidered'] = evidence.length;
+      candidateCounts['evidenceDelivered'] = deliveredEvidence.length;
       timings['total_ms'] = new Date().getTime() - new Date(startedAtIso).getTime();
 
       const selectedIds = new Set(expanded.map(hit => hit.id));
@@ -680,17 +898,27 @@ export class RagV2RetrievalEngine {
         ...run,
         status: 'succeeded',
         completedAt: new Date().toISOString(),
-        timingsJson: { timings, candidateCounts },
+        planJson: {
+          ...plan,
+          authorization: {
+            workspaceId,
+            contextId,
+            principalId: sha256(plan.authorization.principalId),
+            groupIds: [],
+          },
+        },
+        timingsJson: { timings, candidateCounts, answerability },
       };
       await this.repository.finishRetrievalRun(completed);
       return {
         runId,
         plan,
         generationId: publication.generationId,
-        evidence,
+        evidence: deliveredEvidence,
+        answerability,
         degraded,
         timings,
-        diagnostics: { routedDocumentIds, routedSectionIds, candidateCounts },
+        diagnostics: { routedCollectionIds, routedDocumentIds, routedSectionIds, candidateCounts },
       };
     } catch (error) {
       await this.repository.finishRetrievalRun({

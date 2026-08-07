@@ -16,6 +16,9 @@ const { MemoryRagV2Repository } = await import(
 const { reciprocalRankFusion } = await import(
   "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/retrieval.ts"
 );
+const { rewriteRagV2ConversationQuery, decomposeRagV2Query } = await import(
+  "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/semantic.ts"
+);
 
 function embedding(text, dimensions = 32) {
   const vector = new Array(dimensions).fill(0);
@@ -547,6 +550,52 @@ test("workspace RAG V2 builds an unchanged corpus as a side-by-side derivative g
   assert.equal(validation.passageEmbeddings, validation.passages);
 });
 
+test("workspace RAG V2 regenerates unchanged semantic derivatives when the summarizer signature changes", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-summary-signature-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "chapter.md"), [
+    "---",
+    "book_id: resilient-operations",
+    "book_title: Resilient Operations",
+    "---",
+    "# Retry chapter",
+    "",
+    "RETRY-771 uses an expiring lease and a bounded delay.",
+  ].join("\n"));
+  const repository = new MemoryRagV2Repository();
+  const { workspace, context } = refs(root, docs);
+
+  const first = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
+    summarizerSignature: "summary-model-v1",
+    async summarize(input) { return `V1 ${input.level}: ${input.text}`; },
+  });
+  first.startIngestion(workspace, context);
+  await first.waitForIngestion(workspace.id, context.id);
+  await first.waitForSummaries();
+  assert.equal((await repository.listFingerprints(workspace.id, context.id))[0].summarySignature, "summary-model-v1");
+  await first.close();
+
+  const regenerated = [];
+  const second = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
+    summarizerSignature: "summary-model-v2",
+    async summarize(input) {
+      regenerated.push(input.level);
+      return `V2 ${input.level}: ${input.text}`;
+    },
+  });
+  t.after(() => second.close());
+  second.startIngestion(workspace, context);
+  await second.waitForIngestion(workspace.id, context.id);
+  await second.waitForSummaries();
+
+  assert.ok(regenerated.includes("section"));
+  assert.ok(regenerated.includes("document"));
+  assert.ok(regenerated.includes("collection"));
+  assert.equal((await repository.listFingerprints(workspace.id, context.id))[0].summarySignature, "summary-model-v2");
+});
+
 test("workspace RAG V2 reciprocal rank fusion preserves retriever reasons", () => {
   const base = {
     level: "passage",
@@ -575,4 +624,204 @@ test("workspace RAG V2 reciprocal rank fusion preserves retriever reasons", () =
     fused[0].retrievalReasons.filter(reason => /RRF contribution/.test(reason)).length,
     2,
   );
+});
+
+test("workspace RAG V2 rewrites conversational follow-ups and decomposes comparison and diagnostic searches", async () => {
+  const turns = [
+    { role: "user", text: "What did the 2024 operations handbook say about retries?" },
+    { role: "assistant", text: "It says service RETRY-441 waits thirty seconds before another attempt." },
+  ];
+  const modelRewrite = await rewriteRagV2ConversationQuery(
+    "Does the older edition say the same thing?",
+    turns,
+    {
+      async rewriteQuery({ latestQuestion, compactConversation }) {
+        assert.match(compactConversation, /RETRY-441/);
+        return `${latestQuestion} Compare the pre-2024 operations handbook rule for RETRY-441 with the 2024 rule.`;
+      },
+    },
+  );
+  assert.equal(modelRewrite.method, "model");
+  assert.equal(modelRewrite.conversationTurnsUsed, 2);
+  assert.match(modelRewrite.standaloneQuery, /pre-2024 operations handbook/);
+  assert.match(modelRewrite.contextHash, /^[a-f0-9]{64}$/);
+
+  const deterministicRewrite = await rewriteRagV2ConversationQuery(
+    "What did she reply after that?",
+    [
+      { role: "user", text: "Did Alice approve incident INC-882?" },
+      { role: "assistant", text: "Alice replied in the incident thread." },
+    ],
+  );
+  assert.equal(deterministicRewrite.method, "deterministic");
+  assert.match(deterministicRewrite.standaloneQuery, /Alice/);
+  assert.match(deterministicRewrite.standaloneQuery, /INC-882/);
+
+  assert.ok(decomposeRagV2Query(
+    "Compare the 2023 handbook and the 2024 handbook",
+    "comparison",
+    [],
+    ["2023 handbook", "2024 handbook"],
+  ).length >= 2);
+  assert.deepEqual(
+    decomposeRagV2Query("Why did RETRY-441 fail?", "diagnostic", ["RETRY-441"], []),
+    [
+      { query: "RETRY-441", reason: "diagnostic exact symptom" },
+      { query: "Why did RETRY-441 fail? root cause", reason: "diagnostic cause search" },
+      { query: "Why did RETRY-441 fail? fix workaround resolution", reason: "diagnostic remediation search" },
+    ],
+  );
+});
+
+test("workspace RAG V2 performs iterative retrieval and explicitly abstains without evidence", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-iterative-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "incident.md"), [
+    "# Incident INC-882",
+    "",
+    "Alice replied that RETRY-441 failed because the upstream lease had expired.",
+  ].join("\n"));
+  await writeFile(path.join(docs, "runbook.md"), [
+    "# Retry runbook",
+    "",
+    "The RETRY-441 resolution is to renew the upstream lease before retrying after thirty seconds.",
+  ].join("\n"));
+
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
+    async rewriteQuery({ latestQuestion, compactConversation }) {
+      assert.match(compactConversation, /Alice/);
+      return `${latestQuestion} Alice reply about incident INC-882 and RETRY-441`;
+    },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const followUp = await manager.search(workspace, context, "What did she reply after that?", {
+    conversation: [
+      { role: "user", text: "Who handled incident INC-882?" },
+      { role: "assistant", text: "Alice handled it." },
+    ],
+  });
+  assert.equal(followUp.plan.rewriteMethod, "model");
+  assert.match(followUp.plan.standaloneQuery, /Alice reply/);
+  assert.match(followUp.evidence[0].text, /Alice replied/);
+
+  const diagnostic = await manager.search(workspace, context, "Why did RETRY-441 fail?", { limit: 4 });
+  assert.equal(diagnostic.plan.intent, "diagnostic");
+  assert.equal(diagnostic.answerability.iterations, 2);
+  assert.ok(["sufficient", "conflicting"].includes(diagnostic.answerability.firstPass.status));
+  assert.ok(diagnostic.answerability.firstPass.candidateCount >= 2);
+  assert.ok(diagnostic.plan.iterativeQueries.some(item => item.reason === "diagnostic cause search"));
+  assert.ok(diagnostic.evidence.length >= 2);
+  assert.notEqual(diagnostic.answerability.status, "insufficient");
+
+  const missing = await manager.search(workspace, context, "ZXQ-NOT-PRESENT-991", {
+    limit: 4,
+    variant: "lexical_only",
+  });
+  assert.equal(missing.answerability.status, "insufficient");
+  assert.equal(missing.answerability.firstPass.status, "insufficient");
+  assert.equal(missing.answerability.abstained, true);
+  assert.deepEqual(missing.evidence, []);
+  assert.ok(missing.answerability.reasons.length > 0);
+});
+
+test("workspace RAG V2 creates versioned semantic routing summaries and routes a split book through its collection", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-collections-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "books");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "chapter-1.md"), [
+    "---",
+    "document_type: book_chapter",
+    "book_id: distributed-systems-handbook",
+    "book_title: Distributed Systems Handbook",
+    "---",
+    "# Recovery",
+    "",
+    "## Repair protocol",
+    "",
+    "Quorum repair uses the MERKLE-SENTINEL token to identify divergent replicas.",
+  ].join("\n"));
+  await writeFile(path.join(docs, "chapter-2.md"), [
+    "---",
+    "document_type: book_chapter",
+    "book_id: distributed-systems-handbook",
+    "book_title: Distributed Systems Handbook",
+    "---",
+    "# Fencing",
+    "",
+    "## Lease protocol",
+    "",
+    "Lease fencing rejects a stale writer by comparing its EPOCH-TOKEN with the current epoch.",
+  ].join("\n"));
+
+  const summaryCalls = [];
+  const repository = new MemoryRagV2Repository();
+  const originalLexicalSearch = repository.lexicalSearch.bind(repository);
+  let collectionScopedPassageSearches = 0;
+  repository.lexicalSearch = async (level, query, scope) => {
+    if (level === "passage" && scope.collectionIds?.length) collectionScopedPassageSearches++;
+    return originalLexicalSearch(level, query, scope);
+  };
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
+    summarizerSignature: "test-semantic-summary-v1",
+    async summarize(input) {
+      summaryCalls.push({ level: input.level, title: input.title });
+      return `Semantic ${input.level} routing summary for ${input.title}: ${input.text}`;
+    },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  await manager.waitForSummaries();
+
+  assert.ok(summaryCalls.some(call => call.level === "section"));
+  assert.equal(summaryCalls.filter(call => call.level === "document").length, 2);
+  assert.equal(summaryCalls.filter(call => call.level === "collection").length, 1);
+  const status = await manager.status("primary", workspace, context);
+  assert.equal(status.summaries.failed, 0);
+  assert.ok(status.summaries.completed >= 5);
+  const publication = await repository.activePublication(workspace.id, context.id);
+  const collectionRoutes = await repository.lexicalSearch("collection", "Distributed Systems Handbook", {
+    workspaceId: workspace.id,
+    contextId: context.id,
+    generationId: publication.generationId,
+    authorizationTokens: [`workspace:${workspace.id}`],
+    limit: 3,
+  });
+  assert.equal(collectionRoutes.length, 1);
+  assert.deepEqual(await repository.lexicalSearch("collection", "Distributed Systems Handbook", {
+    workspaceId: workspace.id,
+    contextId: context.id,
+    generationId: publication.generationId,
+    authorizationTokens: ["user:not-authorized"],
+    limit: 3,
+  }), []);
+  const storedCollectionSummary = await repository.findRoutingSummary(
+    workspace.id,
+    context.id,
+    "collection",
+    collectionRoutes[0].contentSha256,
+    "test-semantic-summary-v1",
+  );
+  assert.match(storedCollectionSummary.summary, /^Semantic collection routing summary/);
+
+  const result = await manager.search(
+    workspace,
+    context,
+    "In the Distributed Systems Handbook, how is the EPOCH-TOKEN checked?",
+    { limit: 3 },
+  );
+  assert.equal(result.diagnostics.routedCollectionIds.length, 1);
+  assert.ok(collectionScopedPassageSearches > 0, "collection routing expands into a dedicated passage lane");
+  assert.match(result.evidence[0].text, /EPOCH-TOKEN/);
+  assert.ok(result.evidence.every(item => item.passageId && item.sectionId));
+  assert.ok(result.evidence.every(item => !item.retrievalReasons.some(reason => /summary/iu.test(reason))));
 });

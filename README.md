@@ -275,8 +275,8 @@ unbounded graph expansion is intentional.
 
 ### Roll out hierarchical Workspace RAG V2
 
-V2 implements progressive document → section → passage retrieval beside the
-existing index. Hybrid retrieval is initialized in `primary` mode by default,
+V2 implements progressive collection → document → section → passage retrieval
+beside the existing index. Hybrid retrieval is initialized in `primary` mode by default,
 but startup never turns that mode into an automatic million-file reindex. Until
 an active V2 generation is published, searches continue through the V1 fallback.
 
@@ -322,6 +322,13 @@ an active V2 generation is published, searches continue through the V1 fallback.
    revision and pins its referenced repository code separately; when changing
    models, set matching immutable `WORKSPACE_RAG_RERANKER_MODEL_REVISION` and
    `WORKSPACE_RAG_RERANKER_CODE_REVISION` values.
+6. For semantic routing summaries, set `CORTEX_RAG_V2_SUMMARY_PROVIDER` to the
+   name of a configured Matbot provider. Section, document, and collection
+   summaries are generated asynchronously, versioned by source content and
+   provider/model signature, and embedded only for routing. They can never be
+   emitted as citation evidence. Split books can declare `book_id` and
+   `book_title` (or `collection_id` and `collection_title`) in front matter to
+   add collection routing above their chapter files.
 
 Rollback changes `CORTEX_RAG_V2_MODE` to `shadow` or `off`; V1 Postgres tables
 and the JSON fallback remain untouched. V2 generations and immutable source

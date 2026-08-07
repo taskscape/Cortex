@@ -179,6 +179,8 @@ test("workspace RAG V2 promotes front matter, preserves fenced blocks, and repea
     "parties: [Acme, Example Sp. z o.o.]",
     "publication_date: 2026-07-31",
     "valid_from: 2026-08-01",
+    "book_id: commercial-contracts-handbook",
+    "book_title: Commercial Contracts Handbook",
     "---",
     "# Structured agreement",
     "",
@@ -223,7 +225,10 @@ test("workspace RAG V2 promotes front matter, preserves fenced blocks, and repea
     parties: ["Acme", "Example Sp. z o.o."],
     publicationDate: "2026-07-31",
     validFrom: "2026-08-01",
+    collectionId: "commercial-contracts-handbook",
+    collectionTitle: "Commercial Contracts Handbook",
   });
+  assert.ok(passages.every(passage => !/book_id:/u.test(passage.text)), "front matter is routing metadata, not citation evidence");
   assert.equal(
     parsed.tableOfContents.some(item => /This is code/.test(item.text)),
     false,

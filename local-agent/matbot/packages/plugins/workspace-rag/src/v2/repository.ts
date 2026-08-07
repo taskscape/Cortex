@@ -1,4 +1,5 @@
 import type {
+  RagV2CollectionRecord,
   RagV2DocumentRecord,
   RagV2Evidence,
   RagV2Job,
@@ -7,6 +8,7 @@ import type {
   RagV2PassageRecord,
   RagV2PublicationState,
   RagV2RankedHit,
+  RagV2RoutingSummaryRecord,
   RagV2SectionRecord,
   RagV2VectorizerInfo,
 } from './types.js';
@@ -19,6 +21,7 @@ export interface RagV2DocumentFingerprint {
   modifiedAt: string;
   contentSha256: string;
   embeddingSignature: string;
+  summarySignature?: string;
 }
 
 export interface RagV2Publication {
@@ -48,6 +51,7 @@ export interface RagV2SearchScope {
   contextId: string;
   generationId: string;
   documentIds?: string[];
+  collectionIds?: string[];
   sectionIds?: string[];
   authorizationTokens?: string[];
   documentTypes?: string[];
@@ -138,6 +142,19 @@ export interface RagV2Repository {
     vectorizer: RagV2VectorizerInfo,
   ): Promise<number>;
   finishDocument(generationId: string, document: RagV2DocumentRecord): Promise<void>;
+  rebuildCollections(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<RagV2CollectionRecord[]>;
+  findRoutingSummary(
+    workspaceId: string,
+    contextId: string,
+    level: RagV2RoutingSummaryRecord['level'],
+    sourceContentSha256: string,
+    summarizerSignature: string,
+  ): Promise<RagV2RoutingSummaryRecord | undefined>;
+  putRoutingSummary(summary: RagV2RoutingSummaryRecord): Promise<void>;
   reconcileGeneration(
     jobId: string,
     workspaceId: string,

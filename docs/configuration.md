@@ -59,7 +59,7 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
 | `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
 | `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES` | `10000` | Maximum workspace scan size that receives per-file context-graph extraction. Larger scans still get vectors and source metadata but skip graph expansion. Use `-1` only when intentionally enabling graph extraction for an unbounded scan. |
-| `CORTEX_RAG_V2_MODE` | `primary` | Hybrid retrieval mode: `primary`, `shadow`, or `off`. `primary` uses an active V2 publication and falls back to V1 if V2 is unavailable or produces no evidence. |
+| `CORTEX_RAG_V2_MODE` | `primary` | Hybrid retrieval mode: `primary`, `shadow`, or `off`. `primary` uses an active V2 publication and falls back to V1 only when V2 is unavailable or fails. A completed V2 search that explicitly abstains does not fall through to the legacy index. |
 | `CORTEX_RAG_V1_BACKGROUND_SCAN` | `1` | Set to `0` during a V2-only rebuild to prevent the legacy flat index from being repopulated. Explicit `reindex_now` remains available. |
 | `CORTEX_RAG_V2_POSTGRES_SCHEMA` | `workspace_rag_v2` | Versioned V2 catalog, lexical, vector, job, trace, evidence, and evaluation schema. |
 | `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL` | unset | Optional owner connection used only for V2 migrations and grants. When set, `CORTEX_RAG_POSTGRES_URL` must identify a distinct non-owner application role without `BYPASSRLS`. |
@@ -71,6 +71,9 @@ Additional runtime environment variables:
 | `CORTEX_RAG_V2_ASYNC_MAX_BYTES` | `262144000` | Largest source eligible for capped asynchronous passage promotion. Larger sources remain lexical with query-triggered lazy promotion. |
 | `CORTEX_RAG_V2_EAGER_PASSAGE_VECTOR_CAP` | `20000` | Per-document cap for eager or planned asynchronous passage vectors. |
 | `CORTEX_RAG_V2_PARSER_MEMORY_BYTES` | `33554432` | Per-file streaming parser budget. |
+| `CORTEX_RAG_V2_SUMMARY_PROVIDER` | unset | Configured Matbot provider used for asynchronous semantic section, document, and collection routing summaries. When unset, deterministic extractive routing text remains available and no model summary calls are made. Generated summaries are versioned derivatives and never citation evidence. |
+| `CORTEX_RAG_V2_SUMMARY_CONCURRENCY` | `2` | Concurrent semantic-summary requests, bounded to 1-8. |
+| `CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT` | `256` | In-process semantic-summary queue capacity, bounded to 16-4096. Ingestion applies backpressure when full. Completed summaries are content/signature reusable; interrupted unfinished work is regenerated on the next ingestion. |
 | `CORTEX_RAG_V2_RERANKER_URL` | unset | Optional multilingual reranker base URL, normally `http://127.0.0.1:8891`. |
 | `CORTEX_RAG_V2_RRF_K` | `60` | Reciprocal Rank Fusion rank constant. |
 | `CORTEX_RAG_V2_RRF_WEIGHTS` | `{}` | Measured retriever weights as a JSON object; malformed or unsafe weights are ignored. |

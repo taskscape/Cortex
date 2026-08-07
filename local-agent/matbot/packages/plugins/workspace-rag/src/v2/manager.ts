@@ -19,7 +19,9 @@ import { parseMarkdownStream } from './parser.js';
 import { RagV2RateLimiter } from './rate-limiter.js';
 import type { RagV2EmbeddingRecord, RagV2Repository } from './repository.js';
 import { RagV2RetrievalEngine } from './retrieval.js';
+import type { RagV2SemanticServices, RagV2SummaryInput } from './semantic.js';
 import type {
+  RagV2ConversationTurn,
   RagV2ContextRef,
   RagV2DocumentRecord,
   RagV2Embedder,
@@ -27,11 +29,21 @@ import type {
   RagV2JobState,
   RagV2PassageRecord,
   RagV2RetrievalVariant,
+  RagV2RoutingSummaryRecord,
   RagV2SearchResult,
   RagV2SectionRecord,
   RagV2Status,
   RagV2WorkspaceRef,
 } from './types.js';
+
+interface SummaryTask extends RagV2SummaryInput {
+  workspaceId: string;
+  contextId: string;
+  generationId: string;
+  unitId: string;
+  documentVersionId?: string;
+  sourceContentSha256: string;
+}
 
 interface SourceRegistration {
   sourceId?: string;
@@ -217,6 +229,7 @@ export class WorkspaceRagV2Manager {
   private readonly repository: RagV2Repository;
   private readonly embedder: RagV2Embedder;
   private readonly sourceBridge: RagV2SourceBridge | undefined;
+  private readonly semanticServices: RagV2SemanticServices | undefined;
   private readonly objectStores = new Map<string, RagV2ObjectStore>();
   private readonly runs = new Map<string, ActiveRun>();
   private readonly lazySections = new Map<string, {
@@ -237,12 +250,27 @@ export class WorkspaceRagV2Manager {
   private readonly embeddingLimiter = new RagV2RateLimiter(this.policy.embeddingTextsPerSecond);
   private readonly sourceMetadataLimiter = new RagV2RateLimiter(this.policy.sourceMetadataOpsPerSecond);
   private readonly contextGraphLimiter = new RagV2RateLimiter(this.policy.contextGraphOpsPerSecond);
+  private readonly summaryQueue: SummaryTask[] = [];
+  private readonly summarySpaceWaiters: Array<() => void> = [];
+  private readonly summaryIdleWaiters: Array<() => void> = [];
+  private readonly summaryController = new AbortController();
+  private readonly summaryConcurrency = Math.max(1, Math.min(8, Number(process.env['CORTEX_RAG_V2_SUMMARY_CONCURRENCY'] ?? 2) || 2));
+  private readonly summaryQueueLimit = Math.max(16, Math.min(4_096, Number(process.env['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT'] ?? 256) || 256));
+  private summaryActive = 0;
+  private summaryCompleted = 0;
+  private summaryFailed = 0;
   private initialized = false;
 
-  constructor(repository: RagV2Repository, embedder: RagV2Embedder, sourceBridge?: RagV2SourceBridge) {
+  constructor(
+    repository: RagV2Repository,
+    embedder: RagV2Embedder,
+    sourceBridge?: RagV2SourceBridge,
+    semanticServices?: RagV2SemanticServices,
+  ) {
     this.repository = repository;
     this.embedder = embedder;
     this.sourceBridge = sourceBridge;
+    this.semanticServices = semanticServices;
   }
 
   async initialize(): Promise<void> {
@@ -254,6 +282,9 @@ export class WorkspaceRagV2Manager {
   async close(): Promise<void> {
     for (const run of this.runs.values()) run.controller.abort(new Error('Workspace RAG V2 manager is closing.'));
     await Promise.allSettled([...this.runs.values()].map(run => run.promise));
+    this.summaryController.abort(new Error('Workspace RAG V2 manager is closing.'));
+    this.summaryQueue.splice(0);
+    await this.waitForSummaries();
     await this.repository.close();
   }
 
@@ -275,6 +306,16 @@ export class WorkspaceRagV2Manager {
         embeddingSignature: publication.embeddingSignature,
       } : {}),
       ...(job ? { job } : {}),
+      summaries: {
+        enabled: Boolean(this.semanticServices?.summarize && this.semanticServices.summarizerSignature),
+        queued: this.summaryQueue.length,
+        active: this.summaryActive,
+        completed: this.summaryCompleted,
+        failed: this.summaryFailed,
+        ...(this.semanticServices?.summarizerSignature
+          ? { signature: this.semanticServices.summarizerSignature }
+          : {}),
+      },
       message: publication
         ? `Workspace RAG V2 publication ${publication.generationId} is ${publication.state}.`
         : 'Workspace RAG V2 has no active publication; V1 remains the fallback.',
@@ -372,11 +413,108 @@ export class WorkspaceRagV2Manager {
       jurisdictions?: string[];
       asOfDate?: string;
       variant?: RagV2RetrievalVariant;
+      conversation?: RagV2ConversationTurn[];
+      rewriteProvider?: string;
+      iterative?: boolean;
     } = {},
     signal?: AbortSignal,
   ): Promise<RagV2SearchResult> {
     const engine = this.retrievalEngine(workspace);
     return engine.search(workspace.id, context.id, query, options, signal);
+  }
+
+  async waitForSummaries(): Promise<void> {
+    if (this.summaryQueue.length === 0 && this.summaryActive === 0) return;
+    await new Promise<void>(resolve => this.summaryIdleWaiters.push(resolve));
+  }
+
+  private async enqueueSummary(task: SummaryTask): Promise<void> {
+    if (!this.semanticServices?.summarize || !this.semanticServices.summarizerSignature) return;
+    while (this.summaryQueue.length >= this.summaryQueueLimit && !this.summaryController.signal.aborted) {
+      await new Promise<void>(resolve => this.summarySpaceWaiters.push(resolve));
+    }
+    if (this.summaryController.signal.aborted) return;
+    this.summaryQueue.push(task);
+    this.pumpSummaryQueue();
+  }
+
+  private pumpSummaryQueue(): void {
+    while (
+      this.summaryActive < this.summaryConcurrency
+      && this.summaryQueue.length > 0
+      && !this.summaryController.signal.aborted
+    ) {
+      const task = this.summaryQueue.shift()!;
+      this.summarySpaceWaiters.shift()?.();
+      this.summaryActive++;
+      void this.runSummaryTask(task, this.summaryController.signal)
+        .then(() => { this.summaryCompleted++; })
+        .catch(error => {
+          if (!this.summaryController.signal.aborted) {
+            this.summaryFailed++;
+            console.warn(`[workspace-rag-v2] ${task.level} summary failed for ${task.unitId}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        })
+        .finally(() => {
+          this.summaryActive--;
+          if (this.summaryQueue.length === 0 && this.summaryActive === 0) {
+            for (const resolve of this.summaryIdleWaiters.splice(0)) resolve();
+          } else {
+            this.pumpSummaryQueue();
+          }
+        });
+    }
+    if (this.summaryController.signal.aborted && this.summaryActive === 0) {
+      for (const resolve of this.summaryIdleWaiters.splice(0)) resolve();
+      for (const resolve of this.summarySpaceWaiters.splice(0)) resolve();
+    }
+  }
+
+  private async runSummaryTask(task: SummaryTask, signal: AbortSignal): Promise<void> {
+    const signature = this.semanticServices?.summarizerSignature;
+    const summarize = this.semanticServices?.summarize;
+    if (!signature || !summarize || signal.aborted) return;
+    const reusable = await this.repository.findRoutingSummary(
+      task.workspaceId,
+      task.contextId,
+      task.level,
+      task.sourceContentSha256,
+      signature,
+    );
+    const generated = reusable?.summary ?? await summarize({
+      level: task.level,
+      title: task.title,
+      breadcrumb: task.breadcrumb,
+      text: task.text,
+    }, signal);
+    const summaryText = generated?.replace(/\s+/gu, ' ').trim().slice(0, 2_000);
+    if (!summaryText) throw new Error('semantic summarizer returned no usable text');
+    const record: RagV2RoutingSummaryRecord = {
+      summaryId: sha256(`${task.level}\0${task.unitId}\0${task.sourceContentSha256}\0${signature}`),
+      workspaceId: task.workspaceId,
+      contextId: task.contextId,
+      generationId: task.generationId,
+      level: task.level,
+      unitId: task.unitId,
+      ...(task.documentVersionId ? { documentVersionId: task.documentVersionId } : {}),
+      sourceContentSha256: task.sourceContentSha256,
+      summarizerSignature: signature,
+      summary: summaryText,
+      createdAt: now(),
+    };
+    await this.repository.putRoutingSummary(record);
+    const vector = (await this.embedder.embed([`${task.title}\n${summaryText}`], 'document', signal))[0];
+    if (vector?.length !== this.embedder.info.dimensions) return;
+    await this.repository.putEmbeddings([{
+      level: task.level,
+      unitId: task.unitId,
+      documentVersionId: task.documentVersionId ?? task.unitId,
+      workspaceId: task.workspaceId,
+      contextId: task.contextId,
+      signature: this.embedder.info.signature,
+      contentSha256: sha256(summaryText),
+      vector,
+    }], this.embedder.info);
   }
 
   async fetchSourceRange(
@@ -821,11 +959,13 @@ export class WorkspaceRagV2Manager {
           state: 'discovered',
         });
         const existing = fingerprints.get(file.path);
+        const summarySignature = this.semanticServices?.summarizerSignature;
         if (
           existing
           && existing.byteLength === file.size
           && existing.modifiedAt === file.modifiedAt
           && existing.embeddingSignature === this.embedder.info.signature
+          && (!summarySignature || existing.summarySignature === summarySignature)
         ) {
           job.processedFiles++;
           job.processedBytes += file.size;
@@ -884,6 +1024,42 @@ export class WorkspaceRagV2Manager {
       job.message = 'Validating the Workspace RAG V2 staging generation.';
       await this.repository.updateJob(job);
       await this.repository.reconcileGeneration(job.id, workspace.id, context.id, job.generationId);
+      const collections = await this.repository.rebuildCollections(
+        workspace.id,
+        context.id,
+        job.generationId,
+      );
+      for (let start = 0; start < collections.length; start += 32) {
+        const batch = collections.slice(start, start + 32);
+        const vectors = await this.embedder.embed(
+          batch.map(collection => `${collection.title}\n${collection.routingSummary}`),
+          'document',
+          signal,
+        );
+        await this.repository.putEmbeddings(batch.map((collection, index) => ({
+          level: 'collection' as const,
+          unitId: collection.collectionVersionId,
+          documentVersionId: collection.collectionVersionId,
+          workspaceId: collection.workspaceId,
+          contextId: collection.contextId,
+          signature: this.embedder.info.signature,
+          contentSha256: collection.contentSha256,
+          vector: vectors[index] ?? [],
+        })).filter(record => record.vector.length === this.embedder.info.dimensions), this.embedder.info);
+        for (const collection of batch) {
+          await this.enqueueSummary({
+            level: 'collection',
+            workspaceId: collection.workspaceId,
+            contextId: collection.contextId,
+            generationId: collection.generationId,
+            unitId: collection.collectionVersionId,
+            sourceContentSha256: collection.contentSha256,
+            title: collection.title,
+            breadcrumb: [collection.title],
+            text: collection.routingSummary,
+          });
+        }
+      }
       const validation = await this.repository.validateGeneration(workspace.id, context.id, job.generationId);
       if (!validation.valid) throw new Error(`Workspace RAG V2 generation is invalid: ${validation.errors.join(' ')}`);
       const publicationState = validation.passageEmbeddings === 0
@@ -986,29 +1162,44 @@ export class WorkspaceRagV2Manager {
         const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
         const pending = batch.filter(section => !reused.has(section.sectionId));
         job.readyEmbeddings += reused.size;
-        if (pending.length === 0) return;
-        await this.embeddingLimiter.consume(pending.length, signal);
-        const vectors = await this.embedder.embed(
-          pending.map(section => `${section.headingPath.join(' > ')}\n${section.routingSummary}`),
-          'document',
-          signal,
-        );
-        const records: RagV2EmbeddingRecord[] = pending.map((section, index) => ({
-          level: 'section' as const,
-          unitId: section.sectionId,
-          documentVersionId: section.documentVersionId,
-          workspaceId: section.workspaceId,
-          contextId: section.contextId,
-          signature: this.embedder.info.signature,
-          contentSha256: section.contentSha256,
-          vector: vectors[index] ?? [],
-        })).filter(record => record.vector.length === this.embedder.info.dimensions);
-        await this.repository.putEmbeddings(records, this.embedder.info);
-        job.readyEmbeddings += records.length;
+        if (pending.length > 0) {
+          await this.embeddingLimiter.consume(pending.length, signal);
+          const vectors = await this.embedder.embed(
+            pending.map(section => `${section.headingPath.join(' > ')}\n${section.routingSummary}`),
+            'document',
+            signal,
+          );
+          const records: RagV2EmbeddingRecord[] = pending.map((section, index) => ({
+            level: 'section' as const,
+            unitId: section.sectionId,
+            documentVersionId: section.documentVersionId,
+            workspaceId: section.workspaceId,
+            contextId: section.contextId,
+            signature: this.embedder.info.signature,
+            contentSha256: section.contentSha256,
+            vector: vectors[index] ?? [],
+          })).filter(record => record.vector.length === this.embedder.info.dimensions);
+          await this.repository.putEmbeddings(records, this.embedder.info);
+          job.readyEmbeddings += records.length;
+        }
       } catch (error) {
         if (signal.aborted) throw error;
         for (const section of batch) section.embeddingState = 'failed';
         await this.repository.appendSections(batch);
+      }
+      for (const section of batch) {
+        await this.enqueueSummary({
+          level: 'section',
+          workspaceId: section.workspaceId,
+          contextId: section.contextId,
+          generationId: job.generationId,
+          unitId: section.sectionId,
+          documentVersionId: section.documentVersionId,
+          sourceContentSha256: section.contentSha256,
+          title: section.headingText,
+          breadcrumb: section.headingPath,
+          text: section.routingSummary,
+        });
       }
     };
     const flushPassages = async (): Promise<void> => {
@@ -1129,6 +1320,13 @@ export class WorkspaceRagV2Manager {
         ...(source?.sourceId ? { sourceId: source.sourceId } : {}),
         ...(source?.sourceVersionId ? { sourceVersionId: source.sourceVersionId } : {}),
         title: parsed.title,
+        ...(parsed.metadata.collectionId ? {
+          collectionId: stableId(
+            `${workspace.id}:${context.id}:collection`,
+            parsed.metadata.collectionId.toLocaleLowerCase(),
+          ),
+          collectionTitle: parsed.metadata.collectionTitle ?? parsed.metadata.collectionId,
+        } : {}),
         documentType: parsed.metadata.documentType ?? 'markdown',
         ...(parsed.metadata.jurisdiction ? { jurisdiction: parsed.metadata.jurisdiction } : {}),
         ...(parsed.metadata.governingLaw ? { governingLaw: parsed.metadata.governingLaw } : {}),
@@ -1182,6 +1380,18 @@ export class WorkspaceRagV2Manager {
         document.embeddingState = 'failed';
       }
       await this.repository.finishDocument(job.generationId, document);
+      await this.enqueueSummary({
+        level: 'document',
+        workspaceId: document.workspaceId,
+        contextId: document.contextId,
+        generationId: job.generationId,
+        unitId: document.documentVersionId,
+        documentVersionId: document.documentVersionId,
+        sourceContentSha256: document.contentSha256,
+        title: document.title,
+        breadcrumb: document.tableOfContents.slice(0, 100).map(item => item.text),
+        text: `${document.routingSummary}\nTable of contents:\n${document.tableOfContents.slice(0, 100).map(item => item.text).join('\n')}`,
+      });
       await this.repository.upsertJobItem({
         jobId: job.id,
         workspaceId: workspace.id,
@@ -1259,6 +1469,7 @@ export class WorkspaceRagV2Manager {
         rrfK: this.rrf.k,
         rrfWeights: this.rrf.weights,
         ...(this.colbertUrl ? { colbertUrl: this.colbertUrl } : {}),
+        ...(this.semanticServices ? { semanticServices: this.semanticServices } : {}),
         onLazySection: (workspaceId, contextId, generationId, sectionId, passageId) => {
           this.enqueueSelectedLazySection(
             workspaceId, contextId, generationId, sectionId, passageId,

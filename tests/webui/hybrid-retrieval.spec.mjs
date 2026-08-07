@@ -167,6 +167,32 @@ async function createGeneratedCorpus(root) {
       "- Escalate after the first missed target.",
       "- Preserve the incident identifier in every follow-up.",
     ].join("\n"),
+    "books/operations-2023.md": [
+      "---",
+      "document_type: book_chapter",
+      "book_id: operations-handbook",
+      "book_title: Operations Handbook",
+      "publication_date: 2023-01-01",
+      "---",
+      "# Operations Handbook — 2023 edition",
+      "",
+      "## Retry policy",
+      "",
+      "The older RETRY-441 rule waits sixty seconds before another attempt.",
+    ].join("\n"),
+    "books/operations-2024.md": [
+      "---",
+      "document_type: book_chapter",
+      "book_id: operations-handbook",
+      "book_title: Operations Handbook",
+      "publication_date: 2024-01-01",
+      "---",
+      "# Operations Handbook — 2024 edition",
+      "",
+      "## Retry policy",
+      "",
+      "Alice replied that the current RETRY-441 rule waits thirty seconds after renewing the upstream lease.",
+    ].join("\n"),
     "duplicate-a.md": [
       "# Operational duplicate",
       "",
@@ -291,8 +317,20 @@ test.describe("Workspace RAG V2 generated-corpus acceptance", () => {
     workspace = { id: "playwright-workspace", name: "Playwright", configDir: root };
     context = { id: "generated-corpus", name: "Generated corpus", paths: [docs] };
     repository = new MemoryRagV2Repository();
-    manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+    manager = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
+      summarizerSignature: "playwright-summary-v1",
+      async rewriteQuery({ latestQuestion }) {
+        if (/older edition/iu.test(latestQuestion)) {
+          return "Compare the RETRY-441 rule in the 2023 and 2024 editions of the Operations Handbook";
+        }
+        return latestQuestion;
+      },
+      async summarize(input) {
+        return `Semantic ${input.level} routing summary for ${input.title}: ${input.text}`;
+      },
+    });
     ingestionJob = await ingest(manager, workspace, context);
+    await manager.waitForSummaries();
     initialValidation = await repository.validateGeneration(
       workspace.id,
       context.id,
@@ -447,7 +485,7 @@ test.describe("Workspace RAG V2 generated-corpus acceptance", () => {
     return pending;
   }
 
-  test("publishes complete lexical coverage and a three-level bounded index", async ({ page, isMobile }) => {
+  test("publishes complete lexical coverage and a bounded hierarchical index", async ({ page, isMobile }) => {
     test.skip(Boolean(isMobile), "Backend-heavy generated-corpus acceptance runs once in desktop Chromium.");
     const result = await run(page, "/api/status");
 
@@ -457,8 +495,10 @@ test.describe("Workspace RAG V2 generated-corpus acceptance", () => {
       result.data.status.activeState,
     );
     expect(result.data.status.embeddingSignature).toBe("playwright-e5-v1");
-    expect(result.data.status.job.processedFiles).toBe(8);
-    expect(result.data.initialValidation.documents).toBe(8);
+    expect(result.data.status.job.processedFiles).toBe(10);
+    expect(result.data.status.summaries.enabled).toBe(true);
+    expect(result.data.status.summaries.completed).toBeGreaterThan(0);
+    expect(result.data.initialValidation.documents).toBe(10);
     expect(result.data.initialValidation.sections).toBeGreaterThan(40);
     expect(result.data.initialValidation.passages).toBeGreaterThan(
       result.data.initialValidation.sections,
@@ -478,7 +518,7 @@ test.describe("Workspace RAG V2 generated-corpus acceptance", () => {
 
     expect(result.ok).toBe(true);
     expect(result.data.complete).toBe(true);
-    expect(result.data.files).toBe(8);
+    expect(result.data.files).toBe(10);
     expect(result.data.structures.headings).toBeGreaterThan(40);
     expect(result.data.structures.tables).toBeGreaterThan(0);
     expect(result.data.exactDuplicateRate).toBeGreaterThan(0);
@@ -507,6 +547,46 @@ test.describe("Workspace RAG V2 generated-corpus acceptance", () => {
     expect(result.data.evidence[0].retrievalReasons.join(" ")).toMatch(
       /RRF contribution|exact_reference/,
     );
+  });
+
+  test("rewrites a conversational comparison, expands its book collection, and performs a follow-up pass", async ({ page, isMobile }) => {
+    test.skip(Boolean(isMobile), "Backend-heavy generated-corpus acceptance runs once in desktop Chromium.");
+    const result = await run(page, "/api/search", {
+      query: "Does the older edition say the same thing?",
+      options: {
+        limit: 5,
+        conversation: [
+          { role: "user", text: "What does the 2024 Operations Handbook say about RETRY-441?" },
+          { role: "assistant", text: "Alice says it waits thirty seconds after renewing the lease." },
+        ],
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data.plan.originalQuery).toBe("Does the older edition say the same thing?");
+    expect(result.data.plan.rewriteMethod).toBe("model");
+    expect(result.data.plan.standaloneQuery).toContain("2023 and 2024 editions");
+    expect(result.data.plan.intent).toBe("comparison");
+    expect(result.data.plan.iterativeQueries.length).toBeGreaterThan(0);
+    expect(result.data.answerability.iterations).toBe(2);
+    expect(result.data.answerability.abstained).toBe(false);
+    expect(new Set(result.data.evidence.map(item => item.documentId)).size).toBeGreaterThanOrEqual(2);
+    expect(result.data.diagnostics.routedCollectionIds).toHaveLength(1);
+    expect(result.data.evidence.every(item => !item.retrievalReasons.join(" ").match(/summary/iu))).toBe(true);
+  });
+
+  test("returns an explicit insufficient-evidence result instead of unrelated dense evidence", async ({ page, isMobile }) => {
+    test.skip(Boolean(isMobile), "Backend-heavy generated-corpus acceptance runs once in desktop Chromium.");
+    const result = await run(page, "/api/search", {
+      query: "What does ZXQ-NOT-PRESENT-991 require?",
+      options: { limit: 5 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data.answerability.firstPass.status).toBe("insufficient");
+    expect(result.data.answerability.status).toBe("insufficient");
+    expect(result.data.answerability.abstained).toBe(true);
+    expect(result.data.evidence).toEqual([]);
   });
 
   test("returns immutable byte and line citations that reproduce the evidence", async ({ page, isMobile }) => {

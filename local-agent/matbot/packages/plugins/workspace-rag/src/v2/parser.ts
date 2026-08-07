@@ -31,6 +31,8 @@ interface RawUnit {
 
 export interface RagV2ParsedMetadata {
   documentType?: string;
+  collectionId?: string;
+  collectionTitle?: string;
   jurisdiction?: string;
   governingLaw?: string;
   parties: string[];
@@ -149,6 +151,18 @@ function parseFrontMatter(text: string): RagV2ParsedMetadata {
     ?? scalar.get('parties')?.split(/[;,]/u).map(value => value.trim()).filter(Boolean)
     ?? [];
   const documentType = scalar.get('document_type') ?? scalar.get('type');
+  const collectionId = scalar.get('collection_id')
+    ?? scalar.get('book_id')
+    ?? scalar.get('series_id')
+    ?? scalar.get('collection')
+    ?? scalar.get('book')
+    ?? scalar.get('series');
+  const collectionTitle = scalar.get('collection_title')
+    ?? scalar.get('book_title')
+    ?? scalar.get('series_title')
+    ?? scalar.get('collection')
+    ?? scalar.get('book')
+    ?? scalar.get('series');
   const jurisdiction = scalar.get('jurisdiction');
   const governingLaw = scalar.get('governing_law') ?? scalar.get('governinglaw');
   const publicationDate = parseDate(
@@ -158,6 +172,8 @@ function parseFrontMatter(text: string): RagV2ParsedMetadata {
   const validTo = parseDate(scalar.get('valid_to') ?? scalar.get('expiry_date'));
   return {
     ...(documentType ? { documentType } : {}),
+    ...(collectionId ? { collectionId } : {}),
+    ...(collectionTitle ? { collectionTitle } : {}),
     ...(jurisdiction ? { jurisdiction } : {}),
     ...(governingLaw ? { governingLaw } : {}),
     parties,
@@ -532,6 +548,9 @@ export async function parseMarkdownStream(
     const heading = headingMatch(sourceUnit.text.trimEnd());
     if (sourceUnit.type === 'front_matter') {
       metadata = parseFrontMatter(sourceUnit.text);
+      // Front matter controls routing and filtering. It is not source prose and
+      // must not become a passage that can be returned as citation evidence.
+      continue;
     }
     if (heading) {
       await closeSection();

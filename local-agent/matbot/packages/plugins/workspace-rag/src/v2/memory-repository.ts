@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import type {
+  RagV2CollectionRecord,
   RagV2DocumentRecord,
   RagV2Evidence,
   RagV2Job,
@@ -7,6 +9,7 @@ import type {
   RagV2PassageRecord,
   RagV2PublicationState,
   RagV2RankedHit,
+  RagV2RoutingSummaryRecord,
   RagV2SectionRecord,
   RagV2VectorizerInfo,
 } from './types.js';
@@ -53,6 +56,8 @@ export class MemoryRagV2Repository implements RagV2Repository {
   private readonly jobs = new Map<string, RagV2Job>();
   private readonly jobItems = new Map<string, RagV2JobItem>();
   private readonly documents = new Map<string, RagV2DocumentRecord>();
+  private readonly collections = new Map<string, RagV2CollectionRecord>();
+  private readonly routingSummaries = new Map<string, RagV2RoutingSummaryRecord>();
   private readonly generationDocuments = new Map<string, Map<string, string>>();
   private readonly sections = new Map<string, RagV2SectionRecord>();
   private readonly passages = new Map<string, RagV2PassageRecord>();
@@ -156,6 +161,20 @@ export class MemoryRagV2Repository implements RagV2Repository {
     const active = await this.activePublication(workspaceId, contextId);
     if (!active) return [];
     const versions = new Set(this.generationDocuments.get(active.generationId)?.values() ?? []);
+    const documentSummarySignatures = new Map<string, string>();
+    const sectionSummarySignatures = new Map<string, string>();
+    for (const summary of this.routingSummaries.values()) {
+      if (summary.workspaceId !== workspaceId || summary.contextId !== contextId) continue;
+      if (summary.level === 'document') documentSummarySignatures.set(summary.unitId, summary.summarizerSignature);
+      if (summary.level === 'section') sectionSummarySignatures.set(summary.unitId, summary.summarizerSignature);
+    }
+    const sectionSignaturesByDocument = new Map<string, Set<string>>();
+    for (const section of this.sections.values()) {
+      if (!versions.has(section.documentVersionId)) continue;
+      const signatures = sectionSignaturesByDocument.get(section.documentVersionId) ?? new Set<string>();
+      signatures.add(sectionSummarySignatures.get(section.sectionId) ?? '');
+      sectionSignaturesByDocument.set(section.documentVersionId, signatures);
+    }
     return [...this.documents.values()]
       .filter(document => versions.has(document.documentVersionId))
       .map(document => ({
@@ -166,6 +185,16 @@ export class MemoryRagV2Repository implements RagV2Repository {
         modifiedAt: document.modifiedAt,
         contentSha256: document.contentSha256,
         embeddingSignature: active.embeddingSignature,
+        ...(documentSummarySignatures.get(document.documentVersionId)
+          && (
+            !sectionSignaturesByDocument.has(document.documentVersionId)
+            || (
+              sectionSignaturesByDocument.get(document.documentVersionId)?.size === 1
+              && sectionSignaturesByDocument.get(document.documentVersionId)?.has(documentSummarySignatures.get(document.documentVersionId)!)
+            )
+          )
+          ? { summarySignature: documentSummarySignatures.get(document.documentVersionId)! }
+          : {}),
       }));
   }
 
@@ -185,7 +214,10 @@ export class MemoryRagV2Repository implements RagV2Repository {
   async putEmbeddings(records: readonly RagV2EmbeddingRecord[], _vectorizer: RagV2VectorizerInfo): Promise<void> {
     for (const record of records) {
       this.embeddings.set(`${record.signature}\0${record.level}\0${record.unitId}`, structuredClone(record));
-      if (record.level === 'passage') {
+      if (record.level === 'collection') {
+        const collection = this.collections.get(record.unitId);
+        if (collection) collection.embeddingState = 'ready';
+      } else if (record.level === 'passage') {
         const passage = this.passages.get(record.unitId);
         if (passage) passage.embeddingState = 'ready';
       } else if (record.level === 'section') {
@@ -241,6 +273,79 @@ export class MemoryRagV2Repository implements RagV2Repository {
   async finishDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
     this.documents.set(document.documentVersionId, structuredClone(document));
     this.generationDocuments.get(generationId)?.set(document.documentId, document.documentVersionId);
+  }
+
+  async rebuildCollections(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<RagV2CollectionRecord[]> {
+    for (const [key, collection] of this.collections) {
+      if (collection.generationId === generationId) this.collections.delete(key);
+    }
+    const versions = new Set(this.generationDocuments.get(generationId)?.values() ?? []);
+    const grouped = new Map<string, RagV2DocumentRecord[]>();
+    for (const document of this.documents.values()) {
+      if (!versions.has(document.documentVersionId) || !document.collectionId) continue;
+      const values = grouped.get(document.collectionId) ?? [];
+      values.push(document);
+      grouped.set(document.collectionId, values);
+    }
+    const result: RagV2CollectionRecord[] = [];
+    for (const [collectionId, documents] of grouped) {
+      const contentSha256 = createHash('sha256')
+        .update(documents.map(value => value.contentSha256).sort().join('\0'))
+        .digest('hex');
+      const collectionVersionId = createHash('sha256')
+        .update(`${generationId}\0${collectionId}\0${contentSha256}`)
+        .digest('hex');
+      const record: RagV2CollectionRecord = {
+        collectionId,
+        collectionVersionId,
+        generationId,
+        workspaceId,
+        contextId,
+        title: documents.find(value => value.collectionTitle)?.collectionTitle ?? collectionId,
+        documentCount: documents.length,
+        contentSha256,
+        routingSummary: documents.slice(0, 50).map(value => `${value.title}: ${value.routingSummary}`).join('\n').slice(0, 12_000),
+        embeddingState: 'queued',
+        createdAt: new Date().toISOString(),
+      };
+      this.collections.set(collectionVersionId, structuredClone(record));
+      result.push(record);
+    }
+    return result;
+  }
+
+  async findRoutingSummary(
+    workspaceId: string,
+    contextId: string,
+    level: RagV2RoutingSummaryRecord['level'],
+    sourceContentSha256: string,
+    summarizerSignature: string,
+  ): Promise<RagV2RoutingSummaryRecord | undefined> {
+    const found = [...this.routingSummaries.values()].find(value =>
+      value.workspaceId === workspaceId
+      && value.contextId === contextId
+      && value.level === level
+      && value.sourceContentSha256 === sourceContentSha256
+      && value.summarizerSignature === summarizerSignature);
+    return found ? structuredClone(found) : undefined;
+  }
+
+  async putRoutingSummary(summary: RagV2RoutingSummaryRecord): Promise<void> {
+    this.routingSummaries.set(summary.summaryId, structuredClone(summary));
+    if (summary.level === 'collection') {
+      const collection = this.collections.get(summary.unitId);
+      if (collection) collection.routingSummary = summary.summary;
+    } else if (summary.level === 'document') {
+      const document = this.documents.get(summary.unitId);
+      if (document) document.routingSummary = summary.summary;
+    } else {
+      const section = this.sections.get(summary.unitId);
+      if (section) section.routingSummary = summary.summary;
+    }
   }
 
   async reconcileGeneration(
@@ -433,6 +538,40 @@ export class MemoryRagV2Repository implements RagV2Repository {
   }> {
     const activeVersions = new Set(this.generationDocuments.get(scope.generationId)?.values() ?? []);
     const documentsByVersion = this.documents;
+    if (level === 'collection') {
+      const collectionHasAuthorizedMember = (collectionId: string): boolean => [...documentsByVersion.values()].some(document =>
+        activeVersions.has(document.documentVersionId)
+        && document.workspaceId === scope.workspaceId
+        && document.contextId === scope.contextId
+        && document.collectionId === collectionId
+        && (!scope.authorizationTokens || document.aclTokens.some(token => scope.authorizationTokens!.includes(token)))
+        && (!scope.documentIds || scope.documentIds.includes(document.documentId))
+        && (!scope.documentTypes || scope.documentTypes.includes(document.documentType.toLocaleLowerCase()))
+        && (!scope.jurisdictions || Boolean(document.jurisdiction && scope.jurisdictions.includes(document.jurisdiction.toLocaleLowerCase())))
+        && (!scope.asOfDate || (
+          (!document.publicationDate || document.publicationDate <= scope.asOfDate)
+          && (!document.validFrom || document.validFrom <= scope.asOfDate)
+          && (!document.validTo || document.validTo >= scope.asOfDate)
+        )));
+      return [...this.collections.values()]
+        .filter(collection => collection.generationId === scope.generationId
+          && collection.workspaceId === scope.workspaceId
+          && collection.contextId === scope.contextId
+          && collectionHasAuthorizedMember(collection.collectionId)
+          && (!scope.collectionIds || scope.collectionIds.includes(collection.collectionId)))
+        .map(collection => ({
+          id: collection.collectionVersionId,
+          level,
+          documentId: collection.collectionId,
+          documentVersionId: collection.collectionVersionId,
+          path: `collection:${collection.collectionId}`,
+          title: collection.title,
+          headingPath: [],
+          language: 'und',
+          text: `${collection.title}\n${collection.routingSummary}`,
+          contentSha256: collection.contentSha256,
+        }));
+    }
     if (level === 'document') {
       return [...this.documents.values()]
         .filter(document =>
@@ -447,6 +586,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
             && (!document.validFrom || document.validFrom <= scope.asOfDate)
             && (!document.validTo || document.validTo >= scope.asOfDate)
           ))
+          && (!scope.collectionIds || Boolean(document.collectionId && scope.collectionIds.includes(document.collectionId)))
           && (!scope.documentIds || scope.documentIds.includes(document.documentId)))
         .map(document => ({
           id: document.documentVersionId,
@@ -480,6 +620,8 @@ export class MemoryRagV2Repository implements RagV2Repository {
               && (!document.validFrom || document.validFrom <= scope.asOfDate!)
               && (!document.validTo || document.validTo >= scope.asOfDate!);
           })())
+          && (!scope.collectionIds || Boolean(documentsByVersion.get(section.documentVersionId)!.collectionId
+            && scope.collectionIds.includes(documentsByVersion.get(section.documentVersionId)!.collectionId!)))
           && (!scope.documentIds || scope.documentIds.includes(section.documentId))
           && (!scope.sectionIds || scope.sectionIds.includes(section.sectionId)))
         .map(section => {
@@ -521,6 +663,8 @@ export class MemoryRagV2Repository implements RagV2Repository {
             && (!document.validFrom || document.validFrom <= scope.asOfDate!)
             && (!document.validTo || document.validTo >= scope.asOfDate!);
         })())
+        && (!scope.collectionIds || Boolean(documentsByVersion.get(passage.documentVersionId)!.collectionId
+          && scope.collectionIds.includes(documentsByVersion.get(passage.documentVersionId)!.collectionId!)))
         && (!scope.documentIds || scope.documentIds.includes(passage.documentId))
         && (!scope.sectionIds || scope.sectionIds.includes(passage.sectionId)))
       .map(passage => {
