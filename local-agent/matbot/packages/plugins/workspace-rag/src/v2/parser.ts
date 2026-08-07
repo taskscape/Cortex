@@ -46,6 +46,7 @@ export interface RagV2ParserIdentity {
   contextId: string;
   documentId: string;
   documentVersionId: string;
+  sourcePath?: string;
 }
 
 export interface RagV2ParserSink {
@@ -387,7 +388,8 @@ export async function parseMarkdownStream(
   const tableOfContents: RagV2HeadingRef[] = [];
   const documentSummary: string[] = [];
   const documentLanguages: Record<string, number> = {};
-  let title = path.basename(filePath);
+  const fallbackTitle = path.basename(identity.sourcePath ?? filePath);
+  let title = fallbackTitle;
   let sectionCount = 0;
   let passageCount = 0;
   let lineCount = 0;
@@ -556,7 +558,7 @@ export async function parseMarkdownStream(
       await closeSection();
       headingPath.length = Math.min(headingPath.length, Math.max(0, heading.level - 1));
       headingPath.push(heading.text);
-      if (title === path.basename(filePath)) title = heading.text;
+      if (title === fallbackTitle) title = heading.text;
       if (tableOfContents.length < TABLE_OF_CONTENTS_LIMIT) {
         tableOfContents.push({
           level: heading.level,

@@ -241,7 +241,7 @@ test("DCU-1/DCU-2/DCU-3/DCU-4/DCU-6/DCU-7 guarded CUDA sidecar validates hardwar
   assert.equal(e5Cache.stdout.trim(), "True", "the cold fixture volume must contain the downloaded E5 model cache");
 });
 
-test("WRS-4/WRS-5/WRS-8 PostgreSQL keeps MiniLM and E5 dimension tables side by side", { skip: !enabled && "set CORTEX_DOCKER_INTEGRATION=1 on a disposable Docker host" }, async t => {
+test("WRS-4/WRS-5/WRS-8 V2 PostgreSQL keeps MiniLM and E5 dimension tables side by side", { skip: !enabled && "set CORTEX_DOCKER_INTEGRATION=1 on a disposable Docker host" }, async t => {
   if (!await dockerAvailable()) t.skip("Docker Compose is unavailable");
   const fixture = await createDockerComposeFixture();
   const envPath = path.join(fixture.root, "rag-postgres.env");
@@ -250,13 +250,12 @@ test("WRS-4/WRS-5/WRS-8 PostgreSQL keeps MiniLM and E5 dimension tables side by 
   const schema = `rag_switch_${process.pid}`;
   const files = [composePath, overridePath];
   const previous = new Map([
-    ["CORTEX_RAG_STORAGE", process.env.CORTEX_RAG_STORAGE],
     ["CORTEX_RAG_POSTGRES_HOST", process.env.CORTEX_RAG_POSTGRES_HOST],
     ["CORTEX_RAG_POSTGRES_PORT", process.env.CORTEX_RAG_POSTGRES_PORT],
     ["CORTEX_RAG_POSTGRES_DB", process.env.CORTEX_RAG_POSTGRES_DB],
     ["CORTEX_RAG_POSTGRES_USER", process.env.CORTEX_RAG_POSTGRES_USER],
     ["CORTEX_RAG_POSTGRES_PASSWORD", process.env.CORTEX_RAG_POSTGRES_PASSWORD],
-    ["CORTEX_RAG_POSTGRES_SCHEMA", process.env.CORTEX_RAG_POSTGRES_SCHEMA],
+    ["CORTEX_RAG_V2_POSTGRES_SCHEMA", process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA],
   ]);
   let miniLm;
   let e5;
@@ -282,30 +281,29 @@ test("WRS-4/WRS-5/WRS-8 PostgreSQL keeps MiniLM and E5 dimension tables side by 
   const port = stdout.trim().split(":").at(-1);
   assert.match(port ?? "", /^\d+$/);
 
-  process.env.CORTEX_RAG_STORAGE = "postgres";
   process.env.CORTEX_RAG_POSTGRES_HOST = "127.0.0.1";
   process.env.CORTEX_RAG_POSTGRES_PORT = port;
   process.env.CORTEX_RAG_POSTGRES_DB = "mem0";
   process.env.CORTEX_RAG_POSTGRES_USER = "mem0";
   process.env.CORTEX_RAG_POSTGRES_PASSWORD = password;
-  process.env.CORTEX_RAG_POSTGRES_SCHEMA = schema;
-  const { createRagStorage } = await import(
-    "../local-agent/matbot/packages/plugins/workspace-rag/src/storage.ts"
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
   );
-  miniLm = await createRagStorage({
+  miniLm = new PostgresRagV2Repository();
+  await miniLm.initialize({
     backend: "cuda",
     model: "sentence-transformers/all-MiniLM-L6-v2",
     dimensions: 384,
     signature: "minilm-384-test",
   });
-  e5 = await createRagStorage({
+  e5 = new PostgresRagV2Repository();
+  await e5.initialize({
     backend: "cuda",
     model: "intfloat/multilingual-e5-base",
     dimensions: 768,
     signature: "e5-768-test",
   });
-  assert.deepEqual(miniLm.describe().postgresTables, ["documents_384", "chunks_384"]);
-  assert.deepEqual(e5.describe().postgresTables, ["documents_768", "chunks_768"]);
   await miniLm.close();
   miniLm = undefined;
   await e5.close();
@@ -313,7 +311,7 @@ test("WRS-4/WRS-5/WRS-8 PostgreSQL keeps MiniLM and E5 dimension tables side by 
 
   const tableQuery = [
     `SELECT tablename FROM pg_tables WHERE schemaname = '${schema}'`,
-    "AND tablename IN ('documents_384','chunks_384','documents_768','chunks_768')",
+    "AND tablename IN ('unit_embeddings_384','unit_embeddings_768')",
     "ORDER BY tablename;",
   ].join(" ");
   const tables = await fixture.run(composeArgs(envPath, files, [
@@ -321,7 +319,7 @@ test("WRS-4/WRS-5/WRS-8 PostgreSQL keeps MiniLM and E5 dimension tables side by 
   ]));
   assert.deepEqual(
     tables.stdout.trim().split(/\r?\n/).filter(Boolean),
-    ["chunks_384", "chunks_768", "documents_384", "documents_768"],
+    ["unit_embeddings_384", "unit_embeddings_768"],
     "switching dimensions must create the selected tables without deleting the other model's tables",
   );
 });

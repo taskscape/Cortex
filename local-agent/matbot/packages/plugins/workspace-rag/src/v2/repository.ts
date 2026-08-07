@@ -42,7 +42,7 @@ export interface RagV2EmbeddingRecord {
   workspaceId: string;
   contextId: string;
   signature: string;
-  contentSha256: string;
+  inputSha256: string;
   vector: number[];
 }
 

@@ -1,4 +1,4 @@
-export type RagV2Mode = 'off' | 'shadow' | 'primary';
+export type RagV2Mode = 'off' | 'primary';
 export type RagV2Level = 'collection' | 'document' | 'section' | 'passage';
 export type RagV2EmbeddingPurpose = 'query' | 'document';
 export type RagV2RetrievalVariant =
@@ -266,6 +266,13 @@ export interface RagV2Job {
   throughputBytesPerSecond?: number;
   estimatedRemainingSeconds?: number;
   failedFiles: number;
+  addedFiles: number;
+  changedFiles: number;
+  unchangedFiles: number;
+  removedFiles: number;
+  discoveryComplete: boolean;
+  deletionsDeferred: boolean;
+  trigger: 'startup' | 'watch' | 'interval' | 'configuration' | 'manual' | 'retry';
   currentPath?: string;
   checkpoint?: string;
   message?: string;
@@ -421,6 +428,7 @@ export interface RagV2Status {
   activeState?: RagV2PublicationState;
   embeddingSignature?: string;
   job?: RagV2Job;
+  lastSuccessfulReconcileAt?: string;
   summaries: {
     enabled: boolean;
     queued: number;

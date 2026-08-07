@@ -64,18 +64,18 @@ its contracts do not support the target corpus:
 | Stores chunk text without byte/line ranges or hierarchy | Citations resolve to a path, not deterministic original evidence | Version, heading path, byte range, and line range on every passage |
 | Has no cancellation endpoint or durable per-file job state | A million-file reindex is difficult to pause, resume, or inspect | Cancellable, checkpointed ingestion jobs |
 
-Relevant current code:
+The V2 implementation that replaced these constraints is concentrated in:
 
-- flat character chunking:
-  [`workspace-rag/src/index.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts);
-- whole-file reads and all-passage embedding:
-  [`workspace-rag/src/index.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts);
-- dimension-specific document/chunk tables and vector-only search:
-  [`workspace-rag/src/storage.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/storage.ts).
+- streaming structural parsing:
+  [`workspace-rag/src/v2/parser.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/v2/parser.ts);
+- discovery, reconciliation, tiered embeddings, and publication:
+  [`workspace-rag/src/v2/manager.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts);
+- V2 PostgreSQL/pgvector persistence:
+  [`workspace-rag/src/v2/postgres-repository.ts`](../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts).
 
-The redesign should preserve the current `workspace_rag` and `KnowledgeIndex`
-integration during migration. It changes the retrieval implementation and
-evidence schema, not the user-facing concept of a workspace RAG context.
+The redesign preserves the `workspace_rag` and `KnowledgeIndex` integration and
+the user-facing concept of a workspace RAG context. V2 is now the only retrieval
+implementation and evidence schema.
 
 ## Architectural Principles
 
@@ -502,8 +502,8 @@ eager vectors while keeping all of its original text lexically searchable.
 
 ## PostgreSQL Data Model
 
-Use a new schema, `workspace_rag_v2`, rather than mutating the current
-dimension-specific V1 tables in place.
+Use the dedicated schema `workspace_rag_v2`; obsolete flat-index tables are not
+read or written by the runtime.
 
 Principal tables:
 
@@ -1085,7 +1085,7 @@ ambiguous.
 
 ### Implementation Status
 
-Implementation status as of 2026-07-31: all migration activities below are
+Implementation status as of 2026-08-07: all migration activities below are
 implemented and executable. A checked activity means the Cortex code path,
 operator action, persistence contract, and automated verification exist. It
 does **not** mean a million-file production corpus was reindexed: that remains
@@ -1096,9 +1096,9 @@ as required by this design.
 | --- | --- |
 | 0 | Streaming fixed-memory census, approximate duplicate cardinality, forecasts, deterministic sample, and resume checkpoint in `v2/census.ts` and `WorkspaceRagV2Manager.census`; exercised by `workspace-rag-v2-manager.test.mjs`. |
 | 1 | Versioned PostgreSQL migrations, non-owner RLS, durable jobs, immutable retention adapters, streaming manifests, atomic publication, and 2 GiB fixture in `v2/postgres-repository.ts`, `v2/object-store.ts`, and `v2/parser.ts`; exercised by parser and live PostgreSQL integration tests. |
-| 2 | Collection/document/section/passage lexical+dense routing, conversation-aware standalone-query rewriting, bounded iterative comparison/diagnostic retrieval, explicit answerability/abstention, all eight persisted evaluation ablations, language fields, exact filters, RRF, diversity, evidence verification/faithfulness metrics, V1 dual-read/shadow fallback, and traces in `v2/retrieval.ts`, `v2/semantic.ts`, and `index.ts`; exercised by manager, plugin, evaluation, and PostgreSQL tests. |
-| 3 | Optional multilingual reranker service, timeout/OOM degradation, explicit V2 search, primary mode, V1 fallback, and atomic rollback publication; exercised by reranker runtime and plugin tests. |
-| 4 | Authority/current/archive priority passes, complete lexical coverage, capped tiered embeddings, bounded asynchronous versioned semantic summaries, collection rebuilding, independent throttles, stage counters/ETA, duplicate-job suppression, pause/resume/cancel, and reconciliation in `v2/manager.ts`; exercised by manager tests. |
+| 2 | Collection/document/section/passage lexical+dense routing, conversation-aware standalone-query rewriting, bounded iterative comparison/diagnostic retrieval, explicit answerability/abstention, all eight persisted evaluation ablations, language fields, exact filters, RRF, diversity, evidence verification/faithfulness metrics, V2-only reads, and traces in `v2/retrieval.ts`, `v2/semantic.ts`, and `index.ts`; exercised by manager, plugin, evaluation, and PostgreSQL tests. |
+| 3 | Optional multilingual reranker service, timeout/OOM degradation, explicit V2 search, primary mode, and atomic rollback publication; exercised by reranker runtime and plugin tests. |
+| 4 | Authority/current/archive priority passes, complete lexical coverage, capped tiered embeddings, bounded asynchronous versioned semantic summaries, collection rebuilding, independent throttles, stage counters/ETA, duplicate-job suppression, pause/resume/cancel, filesystem watchers, periodic reconciliation, path-based rename identity, safe deletion gates, exact derivative reuse keys, and source-registry reconciliation in `v2/manager.ts` and `index.ts`; exercised by manager, coordinator, and plugin tests. |
 | 5 | Lazy promotion and eviction, signature-isolated alternative-model generations, full/half/binary pgvector candidate indexes with full-vector reranking, controlled translation, configurable measured RRF weights, optional ColBERT and OpenSearch adapters, and explicit OpenSearch promotion gates; exercised by manager, live PostgreSQL, and adapter tests. |
 
 ### Playwright Generated-Corpus Acceptance
@@ -1178,12 +1178,11 @@ budget, cancelled, resumed, and cited by range.
   and evidence objects.
 - [x] Rewrite conversational follow-ups, run one bounded evidence-driven
   follow-up pass, and abstain explicitly when verified evidence is insufficient.
-- [x] Dual-read V1 and V2 behind a feature flag.
-- [x] Write retrieval traces and compare shadow results without changing
-  answers.
+- [x] Route all `workspace_rag` and automatic-context reads through V2.
+- [x] Persist retrieval traces for every V2 query and evaluation variant.
 
 Deliverable: [x] representative-sample evaluation contracts, graded judgments,
-variant configuration, persisted metrics, and V1/V2 shadow traces.
+variant configuration, persisted metrics, and V2 retrieval traces.
 
 ### Phase 3: Reranking And Controlled Rollout
 
@@ -1193,7 +1192,7 @@ variant configuration, persisted metrics, and V1/V2 shadow traces.
 - [x] Enable V2 for explicit `workspace_rag` `v2_search`.
 - [x] Enable V2 automatic per-turn context for selected workspace processes
   through `CORTEX_RAG_V2_MODE=primary`.
-- [x] Retain V1 fallback and rollback publication.
+- [x] Retain atomic V2 publication rollback while removing flat-index fallback.
 
 Deliverable: [x] executable release-gate metrics and
 mobile/desktop-independent backend tests. Production-load measurements remain
@@ -1230,15 +1229,15 @@ Only after measured gaps:
 
 ## Compatibility And Rollback
 
-- keep the current V1 tables and JSON fallback read-only during rollout;
-- do not rewrite `cortex-rag.json` to enable V2;
+- keep the `cortex-rag.json` context and path configuration contract;
 - select backend/generation through tracked runtime defaults and explicit
   feature flags, not machine-local workspace files;
-- build V2 side by side;
-- rollback changes the active read generation, not source/version data;
-- V1 automatic context remains available until V2 passes the release gates;
-- `workspace_rag.search` response can add V2 metadata while preserving path,
-  score, and text fields during a deprecation window.
+- keep `workspace_rag.search` path, score, and text fields while adding V2
+  document/version/range metadata;
+- rollback switches to the prior validated V2 publication, never a partially
+  discovered staging generation;
+- `CORTEX_RAG_V2_MODE=off` disables Workspace RAG when the V2 service must be
+  taken out of rotation; there is no flat-index fallback.
 
 ## Risks And Mitigations
 

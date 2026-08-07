@@ -158,7 +158,7 @@ function Wait-PostgresReady($HostName, $Port, $TimeoutSec) {
         Start-Sleep -Seconds 2
     }
 
-    Write-Warning "postgres unavailable after $TimeoutSec seconds ($lastError). Workspace RAG will fall back to JSON unless CORTEX_RAG_STORAGE forces Postgres."
+    Write-Warning "postgres unavailable after $TimeoutSec seconds ($lastError). Workspace RAG V2 requires Postgres and will be unavailable until it recovers."
     return $false
 }
 

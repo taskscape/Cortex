@@ -3557,21 +3557,37 @@ function setWorkspaceRagStatus(text, isError = false) {
 function renderWorkspaceRagStatus(status) {
   if (!status) return;
   if (status.workspaceId && status.workspaceId !== activeWorkspaceId()) return;
-  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = Math.max(0, Math.min(100, status.percent ?? 0)) + '%';
+  const job = status.job && typeof status.job === 'object' ? status.job : null;
+  const totalFiles = Number(job?.totalFiles ?? 0);
+  const processedFiles = Number(job?.processedFiles ?? 0);
+  const terminal = typeof job?.state === 'string' && (job.state.startsWith('active_') || ['cancelled', 'retryable_failure', 'permanent_failure'].includes(job.state));
+  const percent = totalFiles > 0
+    ? Math.max(0, Math.min(100, Math.round(processedFiles / totalFiles * 100)))
+    : (terminal && job?.discoveryComplete ? 100 : 0);
+  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = percent + '%';
   const accel = status.accelerated
     ? `CUDA · ${status.embeddingModel || 'GPU embeddings'}`
     : (status.nvidiaAvailable ? 'CPU (NVIDIA detected)' : 'CPU');
-  const state = status.state || 'idle';
-  const percent = Math.max(0, Math.min(100, status.percent ?? 0));
-  const storage = status.storageBackend === 'postgres-pgvector'
+  const state = !status.available
+    ? 'unavailable'
+    : (job?.state || status.activeState || 'pending');
+  const backend = status.backend === 'postgres-pgvector'
     ? ' · Postgres/pgvector'
-    : (status.storageBackend === 'json' ? ' · JSON' : '');
+    : (status.backend === 'memory' ? ' · Memory (test)' : '');
+  const progress = job ? ` · ${processedFiles}/${totalFiles} files · ${percent}%` : '';
+  const changes = job
+    ? ` · ${job.addedFiles ?? 0} added, ${job.changedFiles ?? 0} changed, ${job.unchangedFiles ?? 0} unchanged, ${job.removedFiles ?? 0} removed`
+    : '';
+  const watcher = status.watcher
+    ? ` · watcher ${status.watcher.state}${status.watcher.pendingChanges ? ' (pending)' : ''}${status.watcher.reconcileQueued ? ' (queued)' : ''}`
+    : '';
   const message = status.message ? ' · ' + status.message : '';
   const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
-  setWorkspaceRagStatus(`${state} · ${percent}% · ${accel}${storage}${message}${accelerationMessage}`, state === 'error');
+  const isError = !status.available || ['retryable_failure', 'permanent_failure'].includes(state) || status.watcher?.state === 'degraded';
+  setWorkspaceRagStatus(`${state}${progress}${changes} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
   if (workspaceRagCurrentFileEl) {
-    const currentFile = typeof status.currentFile === 'string' && status.currentFile.trim()
-      ? status.currentFile.trim()
+    const currentFile = typeof job?.currentPath === 'string' && job.currentPath.trim()
+      ? job.currentPath.trim()
       : '';
     workspaceRagCurrentFileEl.textContent = currentFile ? `Current file: ${currentFile}` : '';
     workspaceRagCurrentFileEl.title = currentFile;

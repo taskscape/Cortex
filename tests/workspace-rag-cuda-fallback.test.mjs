@@ -12,7 +12,8 @@ const CUDA_ENV = [
   "CORTEX_RAG_CUDA_EMBEDDING_URL",
   "CORTEX_RAG_EMBEDDING_URL",
   "CORTEX_RAG_DISABLE_CUDA",
-  "CORTEX_RAG_STORAGE",
+  "CORTEX_RAG_V2_MODE",
+  "CORTEX_RAG_V2_STORAGE",
   "CORTEX_WORKSPACES_FILE",
 ];
 
@@ -48,7 +49,8 @@ async function statusForHealth(healthResponse) {
     await writeFile(path.join(workspace, "matbot.yaml"), "plugins:\n  - ./packages/plugins/workspace-rag\n", "utf8");
 
     process.env.CORTEX_RAG_CUDA_EMBEDDING_URL = sidecar.url;
-    process.env.CORTEX_RAG_STORAGE = "json";
+    process.env.CORTEX_RAG_V2_MODE = "primary";
+    process.env.CORTEX_RAG_V2_STORAGE = "memory";
     delete process.env.CORTEX_RAG_EMBEDDING_URL;
     delete process.env.CORTEX_RAG_DISABLE_CUDA;
     delete process.env.CORTEX_WORKSPACES_FILE;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -65,7 +65,8 @@ const address = server.address();
 if (!address || typeof address === "string") throw new Error("Mock embedding server did not bind to a TCP port.");
 
 process.env.CORTEX_RAG_CUDA_EMBEDDING_URL = `http://127.0.0.1:${address.port}`;
-process.env.CORTEX_RAG_STORAGE = "json";
+process.env.CORTEX_RAG_V2_MODE = "primary";
+process.env.CORTEX_RAG_V2_STORAGE = "memory";
 delete process.env.CORTEX_RAG_DISABLE_CUDA;
 
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
@@ -119,7 +120,14 @@ async function main() {
     }, toolCtx)) {
       configureEvents.push(event);
     }
-    const status = configureEvents.find(event => event.type === "result")?.value.status;
+    const configuredStatus = configureEvents.find(event => event.type === "result")?.value.status;
+    assert.equal(configuredStatus.mode, "primary");
+    const waitEvents = [];
+    for await (const event of tool.executor.execute({ action: "ingestion_wait" }, toolCtx)) {
+      waitEvents.push(event);
+    }
+    const status = waitEvents.find(event => event.type === "result")?.value;
+    assert.equal(status.activeState, "active_hybrid_complete");
     assert.equal(status.embeddingBackend, "cuda-http");
     assert.equal(status.embeddingModel, model);
     assert.equal(status.embeddingDimensions, dimensions);
@@ -144,11 +152,8 @@ async function main() {
     assert.ok(requests.some(request => request.inputType === "query"));
     assert.ok(requests.filter(request => request.inputType === "document").every(request => request.texts.length > 0));
 
-    const index = JSON.parse(await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8"));
-    assert.ok(index.documents.length > 0);
-    assert.equal(index.documents[0].vectorizer.model, model);
-    assert.equal(index.documents[0].vectorizer.dimensions, dimensions);
-    assert.equal(index.documents[0].vectorizer.signature, signature);
+    assert.equal(status.backend, "memory");
+    assert.equal(status.embeddingSignature, signature, "the active V2 publication persists the vectorizer signature");
 
     await plugin.teardown?.();
   } finally {

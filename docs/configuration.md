@@ -56,11 +56,9 @@ Additional runtime environment variables:
 | `CORTEX_RAG_POSTGRES_DB` | `mem0` | Postgres database used by workspace RAG. |
 | `CORTEX_RAG_POSTGRES_USER` | `mem0` | Postgres user used by workspace RAG. |
 | `CORTEX_RAG_POSTGRES_PASSWORD` | `POSTGRES_PASSWORD` or Docker `.env` | Postgres password used by workspace RAG. |
-| `CORTEX_RAG_POSTGRES_SCHEMA` | `workspace_rag` | Postgres schema used for workspace RAG tables. |
-| `CORTEX_RAG_STORAGE` | `auto` | Workspace RAG storage mode: `auto` prefers Postgres/pgvector and falls back to JSON; `postgres-pgvector` forces Postgres; `json` forces legacy JSON. |
-| `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES` | `10000` | Maximum workspace scan size that receives per-file context-graph extraction. Larger scans still get vectors and source metadata but skip graph expansion. Use `-1` only when intentionally enabling graph extraction for an unbounded scan. |
-| `CORTEX_RAG_V2_MODE` | `primary` | Hybrid retrieval mode: `primary`, `shadow`, or `off`. `primary` uses an active V2 publication and falls back to V1 only when V2 is unavailable or fails. A completed V2 search that explicitly abstains does not fall through to the legacy index. |
-| `CORTEX_RAG_V1_BACKGROUND_SCAN` | `1` | Set to `0` during a V2-only rebuild to prevent the legacy flat index from being repopulated. Explicit `reindex_now` remains available. |
+| `CORTEX_RAG_V2_MODE` | `primary` | Workspace RAG mode: `primary` or `off`. V2 is the only index; `off` disables ingestion and search without a fallback. |
+| `CORTEX_RAG_V2_STORAGE` | `postgres` | V2 repository backend. Production uses `postgres`; `memory` is available only for isolated tests and loses all publications on restart. |
+| `CORTEX_RAG_RECONCILE_INTERVAL_MS` | `60000` | Periodic safety-reconciliation interval. Values below 10000 are raised to 10000 ms. Filesystem watcher events normally trigger earlier reconciliation. |
 | `CORTEX_RAG_V2_POSTGRES_SCHEMA` | `workspace_rag_v2` | Versioned V2 catalog, lexical, vector, job, trace, evidence, and evaluation schema. |
 | `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL` | unset | Optional owner connection used only for V2 migrations and grants. When set, `CORTEX_RAG_POSTGRES_URL` must identify a distinct non-owner application role without `BYPASSRLS`. |
 | `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES` | `0` | Set to `1` in production to reject owner-bypassed V2 startup. |
@@ -429,28 +427,25 @@ Concepts:
 
 | Element | Meaning |
 | --- | --- |
-| Context | A named set of local markdown folders inside one Cortex workspace. |
+| Context | A named set of local Markdown roots inside one Cortex workspace. |
 | Active context | The context injected into conversations and edited by the WebUI settings page. |
-| Paths | Absolute local folders. Only files with the `.md` extension are indexed. |
-| Vector and metadata DB | Postgres/pgvector tables in the `workspace_rag` schema by default. Dimension-specific tables such as `documents_384` and `chunks_384` hold document hashes, chunk text, metadata, and vectors. |
-| JSON fallback | Legacy local index at `.data\workspace-rag\index.json`, used only when `CORTEX_RAG_STORAGE=json` or Postgres/pgvector is unavailable in `auto` mode. |
+| Paths | Absolute local folders or individual `.md` files. Only Markdown files are indexed. |
+| Hybrid catalog | V2 Postgres/pgvector tables in the `workspace_rag_v2` schema by default. The catalog stores atomic publications, immutable document/section/passage metadata, lexical text, jobs, traces, and evidence. |
+| Derivative tables | Dimension-specific tables such as `unit_embeddings_384` and `unit_embeddings_768` retain exact-input-keyed embeddings side by side. |
 
 The ingestion manager:
 
-- scans the active workspace first, then scans inactive workspaces from `cortex-workspaces.json` serially in the background;
-- indexes markdown files under configured paths;
-- chunks markdown, hashes document content, and stores chunk text, metadata, and vectors in Postgres/pgvector;
-- batches chunks across up to 32 files per embedding request and advances progress only after that batch completes;
-- skips source and graph writes for unchanged files;
-- writes source records and versions through a bounded enrichment queue while vector ingestion continues;
-- invokes `ContextGraph.ingestSource` when the context graph plugin is loaded and the scan does not exceed `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES`;
-- re-indexes changed files when the markdown hash changes;
-- removes deleted markdown files from the index;
-- writes changed documents incrementally, so ingestion does not serialize one giant JSON file at the end;
-- rotates `ingestion.log` at 25 MiB, retaining one `.1` archive;
-- continues in the background while the WebUI is open;
-- rescans configured folders every minute after the initial pass, coalescing overlapping timer scans instead of running them concurrently;
-- restarts ingestion for the current workspace immediately when saved paths change.
+- reconciles the active workspace first, then inactive configured workspaces serially;
+- watches configured folders and standalone Markdown files, debounces filesystem events, and carries changed paths into V2 so same-size edits with preserved timestamps are rehashed;
+- performs periodic discovery as a safety net and coalesces overlapping watcher, timer, configuration, and manual requests;
+- streams Markdown into immutable document, section, and passage records within the configured parser budget;
+- skips unchanged fingerprints during incremental reconciliation, while `reindex_now` deliberately rebuilds every discovered file;
+- treats path as document identity: a rename creates a new document/source identity and retires the old path;
+- publishes additions, changes, renames, and removals in one validated generation;
+- never reconciles deletions after incomplete root or nested-directory discovery, and defers deletion reconciliation when any discovered file failed;
+- keys reusable embeddings by the exact level-specific model input, embedding signature, and level;
+- marks removed source-registry entries down after publication and restores reappearing paths to healthy during registration;
+- rate-limits source-registry and context-graph enrichment while vector ingestion continues.
 
 The WebUI exposes the active context through the workspace settings page:
 
@@ -459,13 +454,13 @@ The WebUI exposes the active context through the workspace settings page:
 3. Enter one absolute markdown folder path per line.
 4. Click `Save` to persist changes in place, or `Close` to discard changes and return to chat. `Save` is active only when the current form differs from the persisted settings.
 
-The status line displays state, percentage, CPU/CUDA status, storage backend, a
-human message, and the currently processed file name when indexing is active.
+The status line displays the active V2 publication/job, CPU/CUDA status,
+repository backend, watcher state, and the currently processed path when active.
 Open the workspace gear in the WebUI to see this line; it reads `CUDA` only when
 the current ingestion backend is actually using the CUDA embedding service. If
 the machine exposes NVIDIA hardware but the CUDA embedding service is
-unavailable, it reads `CPU (NVIDIA detected)`. The storage label reads
-`Postgres/pgvector` for the scalable backend or `JSON` for the fallback backend.
+unavailable, it reads `CPU (NVIDIA detected)`. The production repository label
+reads `Postgres/pgvector`.
 
 The same operations are available through the `workspace_rag` tool:
 
@@ -516,18 +511,22 @@ The same operations are available through the `workspace_rag` tool:
 { "action": "reindex_now" }
 ```
 
-`reindex_now` reindexes the current workspace. Background scans may still index
-inactive workspaces later, but they are serialized so a large inactive workspace
-cannot run concurrently with the active workspace scan.
+`reindex_now` forces the complete current V2 context through hashing and the
+derivative pipeline. Use `{ "action": "reconcile_now" }` for an immediate
+incremental fingerprint reconciliation. Both commands join/coalesce concurrent
+work and return the unified terminal status. Background reconciliation of other
+workspaces remains serialized.
 
 Status responses include:
 
 | Field | Meaning |
 | --- | --- |
-| `state` | `pending`, `idle`, `indexing`, or an error state. |
-| `percent` | Ingestion progress percentage. |
-| `processedFiles` / `totalFiles` | Current scan progress. |
-| `currentFile` | Current markdown file being processed while `state` is `indexing`; omitted once indexing is idle, pending, or errored. |
+| `mode` / `available` / `backend` | V2 mode, initialization availability, and `postgres-pgvector` (or test-only `memory`) repository. |
+| `activeGenerationId` / `activeState` | Atomically published generation and its `active_lexical`, `active_hybrid_partial`, or `active_hybrid_complete` state. |
+| `job` | Current or latest job, including trigger, state, current path, added/changed/unchanged/removed counts, discovery completeness, deferred-deletion flag, progress, and failure message. |
+| `lastSuccessfulReconcileAt` | Completion time of the latest successfully published reconciliation in this process. |
+| `watcher` | Watcher state, root count, pending/debounced change flag, queued-reconcile flag, last event time, and last watcher/reconciliation error. |
+| `summaries` | Routing-summary queue state and optional summarizer signature. |
 | `nvidiaAvailable` | Whether `nvidia-smi` is visible on the host. |
 | `cudaAvailable` | Whether the configured embedding service reported CUDA support at launch. |
 | `accelerated` | Whether the current ingestion backend is GPU-accelerated. |
@@ -540,14 +539,6 @@ Status responses include:
 | `embeddingMaxTokens` | Maximum input-token length reported by the active embedding model, when available. |
 | `cudaServiceUrl` | CUDA embedding service URL when configured/probed. |
 | `accelerationMessage` | Human-readable launch-time CUDA/CPU decision. |
-| `storageBackend` | `postgres-pgvector` for Postgres vectors, metadata, and chunk text, or `json` for the legacy fallback. |
-| `storageMessage` | Human-readable storage selection/fallback reason. |
-| `postgresHost` | Postgres host when Postgres/pgvector is active. |
-| `postgresPort` | Postgres port when Postgres/pgvector is active. |
-| `postgresDatabase` | Postgres database when Postgres/pgvector is active. |
-| `postgresSchema` | Postgres schema when Postgres/pgvector is active. |
-| `postgresTables` | Dimension-specific document and chunk table names when Postgres/pgvector is active. |
-| `legacyJsonPath` | Per-workspace JSON index path when JSON fallback is active. |
 | `message` | Human-readable status message. |
 
 The built-in CPU fallback uses a 384-dimensional token hash vectorizer. CUDA
@@ -578,9 +569,9 @@ The service stores downloaded Hugging Face artifacts in the
 the model again. Changing the model, revision, profile, prefixes, normalization,
 or token limit changes the embedding signature. Cortex then treats existing
 vectors as stale and rebuilds them during the next workspace scan. Postgres
-tables remain dimension-specific, so this model uses `documents_768` and
-`chunks_768`; earlier 384-dimensional tables are retained until deliberately
-cleaned up.
+derivative tables remain dimension-specific, so this model uses
+`unit_embeddings_768`; an earlier `unit_embeddings_384` table is retained until
+deliberately cleaned up.
 
 To force CPU ingestion even on CUDA-capable hardware:
 
@@ -595,18 +586,19 @@ To skip the CUDA service from the launcher without changing the environment:
 .\scripts\run.ps1 -SkipCudaIngestion
 ```
 
-To force the scalable Postgres/pgvector storage backend and fail fast if
-Postgres is not reachable:
+Postgres/pgvector is the production backend and startup reports Workspace RAG as
+unavailable if it cannot initialize. Configure its connection explicitly when
+the Docker defaults do not apply:
 
 ```powershell
-$env:CORTEX_RAG_STORAGE = "postgres-pgvector"
+$env:CORTEX_RAG_POSTGRES_URL = "postgresql://cortex_rag_app:CHANGE_ME@localhost:5432/mem0"
 .\scripts\run.ps1
 ```
 
-To force the legacy JSON backend for a self-contained diagnostic run:
+The volatile memory repository is intended only for isolated automated tests:
 
 ```powershell
-$env:CORTEX_RAG_STORAGE = "json"
+$env:CORTEX_RAG_V2_STORAGE = "memory"
 .\scripts\run.ps1
 ```
 

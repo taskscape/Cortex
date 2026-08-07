@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -326,6 +326,7 @@ test("workspace RAG V2 backfill streams authoritative and current sources before
         return {};
       },
       async recordFailure() {},
+      async markRemoved() {},
     },
   );
   t.after(() => manager.close());
@@ -510,6 +511,211 @@ test("workspace RAG V2 reuses content-addressed derivatives across duplicate sou
   assert.equal(status.job.processedFiles, 2);
 });
 
+test("workspace RAG V2 reconciles forced edits, path-based renames, deletions, and source lifecycle", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-changes-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const oldPath = path.join(docs, "old-name.md");
+  const newPath = path.join(docs, "new-name.md");
+  await writeFile(oldPath, "original marker A1", "utf8");
+
+  const removed = [];
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), {
+    async register() { return {}; },
+    async recordFailure() {},
+    async markRemoved(_workspace, _context, paths) { removed.push(...paths); },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  manager.startIngestion(workspace, context, "startup");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const firstFingerprint = (await repository.listFingerprints(workspace.id, context.id))[0];
+  const originalStat = await stat(oldPath);
+
+  await writeFile(oldPath, "updated! marker B2", "utf8");
+  await utimes(oldPath, originalStat.atime, originalStat.mtime);
+  manager.startIngestion(workspace, context, "watch", [oldPath]);
+  await manager.waitForIngestion(workspace.id, context.id);
+  const edited = await manager.search(workspace, context, "updated marker B2", { limit: 3 });
+  assert.match(edited.evidence[0].text, /updated! marker B2/);
+  assert.equal((await manager.status("primary", workspace, context)).job.changedFiles, 1);
+
+  await rename(oldPath, newPath);
+  manager.startIngestion(workspace, context, "watch");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const renamedFingerprint = (await repository.listFingerprints(workspace.id, context.id))[0];
+  assert.notEqual(renamedFingerprint.documentId, firstFingerprint.documentId, "renames retain path-based identity semantics");
+  assert.equal(renamedFingerprint.path.replaceAll("\\", "/").endsWith("/new-name.md"), true);
+  assert.equal((await manager.status("primary", workspace, context)).job.removedFiles, 1);
+  assert.ok(removed.some(value => value.endsWith("/old-name.md")));
+
+  await unlink(newPath);
+  manager.startIngestion(workspace, context, "watch");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const finalStatus = await manager.status("primary", workspace, context);
+  assert.equal(finalStatus.job.removedFiles, 1);
+  assert.equal((await repository.listFingerprints(workspace.id, context.id)).length, 0);
+  assert.equal((await manager.search(workspace, context, "updated marker B2", { limit: 3 })).evidence.length, 0);
+  assert.ok(removed.some(value => value.endsWith("/new-name.md")));
+});
+
+test("workspace RAG V2 does not publish deletions when a configured root is unavailable", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-root-outage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  const offline = path.join(root, "docs-offline");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "stable.md"), "# Stable\n\nOUTAGE-SAFE-EVIDENCE", "utf8");
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  const first = manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  await rename(docs, offline);
+  const failed = manager.startIngestion(workspace, context, "interval");
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const status = await manager.status("primary", workspace, context);
+  assert.equal(status.job.id, failed.id);
+  assert.equal(status.job.state, "retryable_failure");
+  assert.equal(status.job.discoveryComplete, false);
+  assert.equal(status.activeGenerationId, first.generationId, "the last complete publication remains active");
+  const fingerprints = await repository.listFingerprints(workspace.id, context.id);
+  assert.equal(fingerprints.length, 1);
+
+  await rename(offline, docs);
+  manager.startIngestion(workspace, context, "retry");
+  await manager.waitForIngestion(workspace.id, context.id);
+  assert.equal((await manager.status("primary", workspace, context)).job.discoveryComplete, true);
+});
+
+test("workspace RAG V2 does not publish nested-directory deletions from a discovery race", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-nested-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  const nested = path.join(docs, "z-nested");
+  const offline = path.join(root, "z-nested-offline");
+  await mkdir(nested, { recursive: true });
+  const triggerPath = path.join(docs, "a-trigger.md");
+  await writeFile(triggerPath, "# Trigger\n\nINITIAL-TRIGGER", "utf8");
+  await writeFile(path.join(nested, "evidence.md"), "# Evidence\n\nNESTED-RACE-SAFE-771", "utf8");
+  const repository = new MemoryRagV2Repository();
+  const base = testEmbedder();
+  let moveNested = false;
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: base.info,
+    async embed(texts, purpose, signal) {
+      if (moveNested) {
+        moveNested = false;
+        await rename(nested, offline);
+      }
+      return base.embed(texts, purpose, signal);
+    },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  const initial = manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  await writeFile(triggerPath, "# Trigger\n\nCHANGED-TRIGGER", "utf8");
+  moveNested = true;
+  manager.startIngestion(workspace, context, "watch", [triggerPath]);
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const failed = await manager.status("primary", workspace, context);
+  assert.equal(failed.job.state, "retryable_failure");
+  assert.equal(failed.job.discoveryComplete, false);
+  assert.equal(failed.activeGenerationId, initial.generationId);
+  assert.equal((await repository.listFingerprints(workspace.id, context.id)).length, 2);
+
+  await rename(offline, nested);
+  manager.startIngestion(workspace, context, "retry", [triggerPath]);
+  await manager.waitForIngestion(workspace.id, context.id);
+  assert.equal((await manager.status("primary", workspace, context)).job.state, "active_hybrid_complete");
+});
+
+test("workspace RAG V2 defers deletions when any discovered file fails ingestion", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-file-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const changedPath = path.join(docs, "changed.md");
+  const removedPath = path.join(docs, "removed.md");
+  await writeFile(changedPath, "# Changed\n\nORIGINAL-SAFE-EVIDENCE", "utf8");
+  await writeFile(removedPath, "# Removed\n\nPRESERVE-ON-FAILURE-991", "utf8");
+  const repository = new MemoryRagV2Repository();
+  let rejectRegistration = false;
+  const sourceBridge = {
+    async register() {
+      if (rejectRegistration) throw new Error("intentional source registration failure");
+      return {};
+    },
+    async recordFailure() {},
+    async markRemoved() {},
+  };
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), sourceBridge);
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  await unlink(removedPath);
+  await writeFile(changedPath, "# Changed\n\nUPDATED-BUT-FAILED-EVIDENCE", "utf8");
+  rejectRegistration = true;
+  manager.startIngestion(workspace, context, "watch", [changedPath]);
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const status = await manager.status("primary", workspace, context);
+  assert.equal(status.job.discoveryComplete, true);
+  assert.equal(status.job.failedFiles, 1);
+  assert.equal(status.job.deletionsDeferred, true);
+  assert.equal(status.job.removedFiles, 0);
+  assert.equal((await repository.listFingerprints(workspace.id, context.id)).length, 2);
+  const search = await manager.search(
+    workspace, context, "PRESERVE-ON-FAILURE-991", 3, new AbortController().signal,
+  );
+  assert.ok(search.evidence.some(value => value.text.includes("PRESERVE-ON-FAILURE-991")));
+});
+
+test("workspace RAG V2 derivative reuse hashes the exact path-derived embedding input", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-derivative-input-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const firstPath = path.join(docs, "alpha.md");
+  const secondPath = path.join(docs, "beta.md");
+  await writeFile(firstPath, "Body without a markdown heading.", "utf8");
+  const inputs = [];
+  const base = testEmbedder();
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: base.info,
+    async embed(texts, purpose, signal) {
+      inputs.push(...texts);
+      return base.embed(texts, purpose, signal);
+    },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  inputs.length = 0;
+  await rename(firstPath, secondPath);
+  manager.startIngestion(workspace, context, "watch");
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  assert.ok(
+    inputs.some(value => value.startsWith("beta.md\n")),
+    "a renamed path-derived title must produce a new document derivative",
+  );
+});
+
 test("workspace RAG V2 builds an unchanged corpus as a side-by-side derivative generation when the embedding signature changes", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-signature-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -569,7 +775,7 @@ test("workspace RAG V2 regenerates unchanged semantic derivatives when the summa
 
   const first = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, {
     summarizerSignature: "summary-model-v1",
-    async summarize(input) { return `V1 ${input.level}: ${input.text}`; },
+    async summarize(input) { return `OLD ${input.level}: ${input.text}`; },
   });
   first.startIngestion(workspace, context);
   await first.waitForIngestion(workspace.id, context.id);

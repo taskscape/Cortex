@@ -152,11 +152,22 @@ let workspaceRagStatus = {
   workspaceId: "default",
   contextName: "Default",
   paths: activeRagContext().paths,
-  state: "idle",
-  totalFiles: 2,
-  processedFiles: 2,
-  percent: 100,
-  message: "Indexed 2 markdown file(s).",
+  mode: "primary",
+  available: true,
+  backend: "memory",
+  activeGenerationId: "rag-generation-default",
+  activeState: "active_hybrid_complete",
+  embeddingSignature: "hash-cpu-v2",
+  job: {
+    id: "rag-job-default", generationId: "rag-generation-default", trigger: "startup",
+    state: "active_hybrid_complete", totalFiles: 2, processedFiles: 2,
+    addedFiles: 2, changedFiles: 0, unchangedFiles: 0, removedFiles: 0,
+    discoveryComplete: true, deletionsDeferred: false,
+  },
+  lastSuccessfulReconcileAt: now(),
+  summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
+  watcher: { state: "active", watchedRoots: 1, pendingChanges: false, reconcileQueued: false },
+  message: "Workspace RAG V2 publication is active_hybrid_complete.",
   nvidiaAvailable: false,
   cudaAvailable: false,
   accelerated: false,
@@ -165,8 +176,6 @@ let workspaceRagStatus = {
   embeddingModel: "token-hash-v1",
   embeddingDimensions: 384,
   accelerationMessage: "Using CPU hash vectorizer.",
-  storageBackend: "json",
-  storageMessage: "Legacy JSON workspace RAG storage active."
 };
 const workspaceRagStateByWorkspace = new Map();
 
@@ -192,7 +201,9 @@ function setWorkspaceRagStatusForActive(overrides = {}) {
     paths: context.paths,
     ...overrides
   };
-  if (nextStatus.state !== "indexing") delete nextStatus.currentFile;
+  if (nextStatus.job && (nextStatus.job.state.startsWith("active_") || nextStatus.job.state.endsWith("failure"))) {
+    delete nextStatus.job.currentPath;
+  }
   workspaceRagStatus = nextStatus;
 }
 
@@ -218,11 +229,22 @@ function restoreWorkspaceRagState(workspaceId, workspaceName = "Workspace") {
     workspaceId,
     contextName: workspaceName,
     paths: [],
-    state: "pending",
-    totalFiles: 0,
-    processedFiles: 0,
-    percent: 0,
-    message: "No markdown folders configured.",
+    mode: "primary",
+    available: true,
+    backend: "memory",
+    activeGenerationId: `rag-generation-${workspaceId}`,
+    activeState: "active_hybrid_complete",
+    embeddingSignature: "hash-cpu-v2",
+    job: {
+      id: `rag-job-${workspaceId}`, generationId: `rag-generation-${workspaceId}`, trigger: "startup",
+      state: "active_hybrid_complete", totalFiles: 0, processedFiles: 0,
+      addedFiles: 0, changedFiles: 0, unchangedFiles: 0, removedFiles: 0,
+      discoveryComplete: true, deletionsDeferred: false,
+    },
+    lastSuccessfulReconcileAt: now(),
+    summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
+    watcher: { state: "active", watchedRoots: 0, pendingChanges: false, reconcileQueued: false },
+    message: "Workspace RAG V2 published an empty context.",
     nvidiaAvailable: false,
     cudaAvailable: false,
     accelerated: false,
@@ -231,8 +253,6 @@ function restoreWorkspaceRagState(workspaceId, workspaceName = "Workspace") {
     embeddingModel: "token-hash-v1",
     embeddingDimensions: 384,
     accelerationMessage: "Using CPU hash vectorizer.",
-    storageBackend: "json",
-    storageMessage: "Legacy JSON workspace RAG storage active."
   };
 }
 
@@ -1625,11 +1645,22 @@ async function handle(req, res) {
       workspaceId: "default",
       contextName: "Default",
       paths: activeRagContext().paths,
-      state: "idle",
-      totalFiles: 2,
-      processedFiles: 2,
-      percent: 100,
-      message: "Indexed 2 markdown file(s).",
+      mode: "primary",
+      available: true,
+      backend: "memory",
+      activeGenerationId: "rag-generation-default",
+      activeState: "active_hybrid_complete",
+      embeddingSignature: "hash-cpu-v2",
+      job: {
+        id: "rag-job-default", generationId: "rag-generation-default", trigger: "startup",
+        state: "active_hybrid_complete", totalFiles: 2, processedFiles: 2,
+        addedFiles: 2, changedFiles: 0, unchangedFiles: 0, removedFiles: 0,
+        discoveryComplete: true, deletionsDeferred: false,
+      },
+      lastSuccessfulReconcileAt: now(),
+      summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
+      watcher: { state: "active", watchedRoots: 1, pendingChanges: false, reconcileQueued: false },
+      message: "Workspace RAG V2 publication is active_hybrid_complete.",
       nvidiaAvailable: false,
       cudaAvailable: false,
       accelerated: false,
@@ -1638,8 +1669,6 @@ async function handle(req, res) {
       embeddingModel: "token-hash-v1",
       embeddingDimensions: 384,
       accelerationMessage: "Using CPU hash vectorizer.",
-      storageBackend: "json",
-      storageMessage: "Legacy JSON workspace RAG storage active."
     };
     persistWorkspaceRagState("default");
     queryRuns.clear();
@@ -2195,12 +2224,21 @@ async function handleTool(res, name, rawInput) {
       };
       const context = activeRagContext();
       setWorkspaceRagStatusForActive({
-        state: context.paths.length ? "indexing" : "pending",
-        totalFiles: context.paths.length ? 3 : 0,
-        processedFiles: context.paths.length ? 2 : 0,
-        percent: context.paths.length ? 67 : 0,
-        currentFile: context.paths.length ? "C:\\Projects\\Cortex\\docs\\retrieval-probe.md" : "",
-        message: context.paths.length ? "Indexing markdown files." : "No markdown folders configured."
+        job: {
+          ...workspaceRagStatus.job,
+          trigger: "configuration",
+          state: context.paths.length ? "embedding" : "active_hybrid_complete",
+          totalFiles: context.paths.length ? 3 : 0,
+          processedFiles: context.paths.length ? 2 : 0,
+          addedFiles: context.paths.length ? 2 : 0,
+          changedFiles: 0,
+          unchangedFiles: 0,
+          removedFiles: 0,
+          discoveryComplete: !context.paths.length,
+          ...(context.paths.length ? { currentPath: "C:\\Projects\\Cortex\\docs\\retrieval-probe.md" } : {}),
+        },
+        watcher: { state: "active", watchedRoots: context.paths.length, pendingChanges: context.paths.length > 0, reconcileQueued: false },
+        message: context.paths.length ? "Workspace RAG V2 reconciliation is running." : "Workspace RAG V2 published an empty context."
       });
       return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
     }
@@ -2209,9 +2247,15 @@ async function handleTool(res, name, rawInput) {
       if (!workspaceRagConfig.contexts.some(context => context.id === contextId)) return json(res, 400, { error: `Unknown context ${contextId}` });
       workspaceRagConfig = { ...workspaceRagConfig, activeContextId: contextId };
       setWorkspaceRagStatusForActive({
-        state: activeRagContext().paths.length ? "idle" : "pending",
-        percent: activeRagContext().paths.length ? 100 : 0,
-        message: activeRagContext().paths.length ? "Indexed 2 markdown file(s)." : "No markdown folders configured."
+        job: {
+          ...workspaceRagStatus.job,
+          state: "active_hybrid_complete",
+          totalFiles: activeRagContext().paths.length ? 2 : 0,
+          processedFiles: activeRagContext().paths.length ? 2 : 0,
+          discoveryComplete: true,
+        },
+        watcher: { state: "active", watchedRoots: activeRagContext().paths.length, pendingChanges: false, reconcileQueued: false },
+        message: activeRagContext().paths.length ? "Workspace RAG V2 publication is active." : "Workspace RAG V2 published an empty context."
       });
       return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
     }
@@ -2224,16 +2268,41 @@ async function handleTool(res, name, rawInput) {
         contexts: [...workspaceRagConfig.contexts, { id: uniqueId, name, paths: [] }]
       };
       setWorkspaceRagStatusForActive({
-        state: "pending",
-        totalFiles: 0,
-        processedFiles: 0,
-        percent: 0,
-        message: "No markdown folders configured."
+        job: {
+          ...workspaceRagStatus.job,
+          trigger: "configuration",
+          state: "active_hybrid_complete",
+          totalFiles: 0,
+          processedFiles: 0,
+          addedFiles: 0,
+          changedFiles: 0,
+          unchangedFiles: 0,
+          removedFiles: 0,
+          discoveryComplete: true,
+        },
+        watcher: { state: "active", watchedRoots: 0, pendingChanges: false, reconcileQueued: false },
+        message: "Workspace RAG V2 published an empty context."
       });
       return json(res, 200, { config: workspaceRagConfigResponse(), status: workspaceRagStatus });
     }
     if (input.action === "reindex_now") {
-      setWorkspaceRagStatusForActive({ state: "idle", processedFiles: 3, totalFiles: 3, percent: 100, message: "Indexed 3 markdown file(s)." });
+      setWorkspaceRagStatusForActive({
+        job: {
+          ...workspaceRagStatus.job,
+          trigger: "manual",
+          state: "active_hybrid_complete",
+          processedFiles: 3,
+          totalFiles: 3,
+          addedFiles: 0,
+          changedFiles: 3,
+          unchangedFiles: 0,
+          removedFiles: 0,
+          discoveryComplete: true,
+        },
+        lastSuccessfulReconcileAt: now(),
+        watcher: { ...workspaceRagStatus.watcher, pendingChanges: false, reconcileQueued: false },
+        message: "Workspace RAG V2 publication is active_hybrid_complete."
+      });
       return json(res, 200, workspaceRagStatus);
     }
     if (input.action === "search") {

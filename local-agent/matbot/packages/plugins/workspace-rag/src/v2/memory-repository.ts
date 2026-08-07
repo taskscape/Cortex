@@ -127,7 +127,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
     const sections = [...this.sections.values()].filter(value => versionIds.has(value.documentVersionId));
     const passages = [...this.passages.values()].filter(value => versionIds.has(value.documentVersionId));
     return {
-      valid: versionIds.size > 0 && passages.every(value => value.endByte > value.startByte && value.endLine >= value.startLine),
+      valid: versionIds.size === 0 || passages.every(value => value.endByte > value.startByte && value.endLine >= value.startLine),
       documents: versionIds.size,
       sections: sections.length,
       passages: passages.length,
@@ -136,7 +136,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
         this.embeddings.has(
           `${this.vectorizer?.signature ?? ''}\0passage\0${value.passageId}`,
         )).length,
-      errors: versionIds.size > 0 ? [] : ['Generation contains no documents.'],
+      errors: [],
     };
   }
 
@@ -239,7 +239,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
       const existing = [...this.embeddings.values()].find(value =>
         value.signature === record.signature
         && value.level === record.level
-        && value.contentSha256 === record.contentSha256);
+        && value.inputSha256 === record.inputSha256);
       if (!existing) continue;
       await this.putEmbeddings([{ ...record, vector: existing.vector }], _vectorizer);
       reused.add(record.unitId);

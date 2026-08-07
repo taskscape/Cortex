@@ -29,7 +29,7 @@ test("hybrid retrieval migration plan has an executable completed-activity contr
     "multilingual",
     "Lazy",
     "OpenSearch",
-    "V1",
+    "filesystem watcher",
   ]) {
     assert.match(document, new RegExp(decision, "iu"), `key decision ${decision} remains explicit`);
   }
@@ -54,4 +54,3 @@ test("hybrid retrieval implementation evidence files exist", async () => {
     await access(path.resolve(relative));
   }
 });
-

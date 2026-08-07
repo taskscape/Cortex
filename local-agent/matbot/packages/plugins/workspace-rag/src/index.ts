@@ -11,13 +11,9 @@ import type {
 } from '@matatbread/matbot-plugin-api';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { access, appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { watch as watchFs, type FSWatcher } from 'node:fs';
+import { access, appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import {
-  createRagStorage,
-  documentMatchesVectorizer,
-  type RagStorage,
-} from './storage.js';
 import { ragV2ModeFromEnv } from './v2/config.js';
 import type { RagV2EvaluationCase } from './v2/evaluation.js';
 import { WorkspaceRagV2Manager, type RagV2SourceBridge } from './v2/manager.js';
@@ -31,8 +27,10 @@ import {
 import type {
   RagV2Mode,
   RagV2ConversationTurn,
+  RagV2Job,
   RagV2RetrievalVariant,
   RagV2SearchResult,
+  RagV2Status,
 } from './v2/types.js';
 
 const CONFIG_FILE = 'cortex-rag.json';
@@ -50,19 +48,14 @@ const RAG_V2_EVALUATION_VARIANTS: readonly RagV2RetrievalVariant[] = [
   'hierarchical_lazy',
 ];
 const VECTOR_DIMS = 384;
-const SCAN_INTERVAL_MS = 60_000;
-const MAX_CHUNK_CHARS = 1800;
+const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
+const MIN_RECONCILE_INTERVAL_MS = 10_000;
+const WATCH_DEBOUNCE_MS = 500;
 const MAX_CONTEXT_CHUNKS = 4;
 const DEFAULT_CUDA_EMBEDDING_URL = 'http://localhost:8890';
 const CUDA_EMBED_REQUEST_LIMIT = 256;
 const CPU_VECTOR_BACKEND = 'hash-cpu';
 const CPU_VECTOR_MODEL = 'token-hash-v1';
-const STORED_VECTOR_DECIMAL_PLACES = 6;
-const STORED_VECTOR_SCALE = 10 ** STORED_VECTOR_DECIMAL_PLACES;
-const SCAN_FILE_CONCURRENCY = 32;
-const SOURCE_ENRICHMENT_CONCURRENCY = 4;
-const SOURCE_ENRICHMENT_BACKLOG = 128;
-const DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES = 10_000;
 
 type Accelerator = 'nvidia' | 'cpu';
 type VectorizerBackend = 'hash-cpu' | 'cuda-http';
@@ -123,51 +116,40 @@ interface WorkspaceRef {
   active: boolean;
 }
 
-interface VectorChunk {
-  id: string;
-  text: string;
-  vector: number[];
+interface WorkspaceRagLockStatus {
+  locked: boolean;
+  reason?: string;
+  state?: RagV2Job['state'];
+  message?: string;
 }
 
-interface IndexedDocument {
-  id: string;
-  contextId?: string;
-  path: string;
-  hash: string;
-  vectorizer?: VectorizerMetadata;
-  updatedAt: string;
-  fileSize?: number;
-  chunks: VectorChunk[];
+interface V2ReconcileState {
+  pending: boolean;
+  triggers: Set<RagV2Job['trigger']>;
+  changedPaths: Set<string>;
+  forceAll: boolean;
+  latestContext?: RagContextConfig;
+  promise?: Promise<void>;
+  currentJob?: RagV2Job;
+  lastEventAt?: string;
+  lastError?: string;
 }
 
-interface PreparedScanFile {
-  context: RagContextConfig;
-  file: string;
-  normalized: string;
-  contextPathKey: string;
-  updatedAt: string;
-  fileSize: number;
-  hash: string;
-  content: string;
-  chunks: string[];
-  embeddingTexts: string[];
-}
-
-interface IngestionStatus {
-  workspaceId: string;
+interface WorkspaceRagStatus extends RagV2Status {
   contextName: string;
   paths: string[];
-  state: 'pending' | 'idle' | 'indexing' | 'error';
-  totalFiles: number;
-  processedFiles: number;
-  percent: number;
-  currentFile?: string;
-  lastIndexedAt?: string;
-  message?: string;
+  watcher: {
+    state: 'active' | 'degraded' | 'stopped';
+    watchedRoots: number;
+    pendingChanges: boolean;
+    reconcileQueued: boolean;
+    lastEventAt?: string;
+    lastError?: string;
+  };
+  accelerator: Accelerator;
+  accelerated: boolean;
   nvidiaAvailable: boolean;
   cudaAvailable: boolean;
-  accelerated: boolean;
-  accelerator: Accelerator;
   embeddingBackend: VectorizerBackend;
   embeddingModel: string;
   embeddingDimensions: number;
@@ -176,22 +158,7 @@ interface IngestionStatus {
   embeddingMaxTokens?: number;
   embeddingBatchSize?: number;
   cudaServiceUrl?: string;
-  accelerationMessage?: string;
-  storageBackend: 'json' | 'postgres-pgvector';
-  storageMessage: string;
-  postgresHost?: string;
-  postgresPort?: number;
-  postgresDatabase?: string;
-  postgresSchema?: string;
-  postgresTables?: string[];
-  legacyJsonPath?: string;
-}
-
-interface WorkspaceRagLockStatus {
-  locked: boolean;
-  reason?: string;
-  state?: IngestionStatus['state'];
-  message?: string;
+  accelerationMessage: string;
 }
 
 type SourceHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
@@ -257,48 +224,6 @@ interface ContextGraphLike {
   }): Promise<unknown>;
 }
 
-class BoundedTaskPool {
-  private readonly queue: Array<() => Promise<void>> = [];
-  private readonly capacityWaiters: Array<() => void> = [];
-  private readonly drainWaiters: Array<() => void> = [];
-  private readonly concurrency: number;
-  private readonly capacity: number;
-  private active = 0;
-
-  constructor(concurrency: number, capacity: number) {
-    this.concurrency = concurrency;
-    this.capacity = capacity;
-  }
-
-  async add(task: () => Promise<void>): Promise<void> {
-    while (this.active + this.queue.length >= this.capacity) {
-      await new Promise<void>(resolve => this.capacityWaiters.push(resolve));
-    }
-    this.queue.push(task);
-    this.pump();
-  }
-
-  async drain(): Promise<void> {
-    if (this.active === 0 && this.queue.length === 0) return;
-    await new Promise<void>(resolve => this.drainWaiters.push(resolve));
-  }
-
-  private pump(): void {
-    while (this.active < this.concurrency && this.queue.length > 0) {
-      const task = this.queue.shift()!;
-      this.active++;
-      void task().catch(() => undefined).finally(() => {
-        this.active--;
-        this.capacityWaiters.shift()?.();
-        if (this.active === 0 && this.queue.length === 0) {
-          for (const waiter of this.drainWaiters.splice(0)) waiter();
-        }
-        this.pump();
-      });
-    }
-  }
-}
-
 interface SearchHit {
   workspaceId: string;
   contextName: string;
@@ -357,34 +282,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function errorStack(error: unknown): string | undefined {
-  return error instanceof Error && typeof error.stack === 'string'
-    ? error.stack.slice(0, 4000)
-    : undefined;
-}
-
-function compactStoredVector(vector: readonly number[]): number[] {
-  return vector.map(value => Number.isFinite(value)
-    ? Math.round(value * STORED_VECTOR_SCALE) / STORED_VECTOR_SCALE
-    : 0);
-}
-
 async function exists(filePath: string): Promise<boolean> {
   try { await access(filePath); return true; } catch { return false; }
 }
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
-}
-
-function countNulChars(text: string): number {
-  let count = 0;
-  for (let index = text.indexOf('\0'); index !== -1; index = text.indexOf('\0', index + 1)) count++;
-  return count;
-}
-
-function stripNulChars(text: string): string {
-  return text.includes('\0') ? text.replace(/\0/g, '') : text;
 }
 
 function stableId(text: string): string {
@@ -500,15 +403,6 @@ function cpuVectorizerInfo(): VectorizerRuntime {
   };
 }
 
-function vectorizerMetadata(info: VectorizerRuntime): VectorizerMetadata {
-  return {
-    backend: info.backend,
-    model: info.model,
-    dimensions: info.dimensions,
-    signature: info.signature,
-  };
-}
-
 class HashCpuVectorizer implements TextVectorizer {
   readonly info = cpuVectorizerInfo();
 
@@ -577,15 +471,6 @@ interface VectorizerLaunchState {
 
 function isTruthyEnv(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
-}
-
-function contextGraphEnabledForScan(totalFiles: number): boolean {
-  const configured = Number.parseInt(
-    String(process.env['CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES'] ?? ''),
-    10,
-  );
-  const limit = Number.isFinite(configured) ? configured : DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES;
-  return limit < 0 || totalFiles <= limit;
 }
 
 function normalizeBaseUrl(value: string | undefined): string {
@@ -766,40 +651,6 @@ async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
   };
 }
 
-function chunkMarkdown(content: string): string[] {
-  const blocks = content.split(/\n(?=#{1,3}\s+)/g);
-  const chunks: string[] = [];
-  for (const block of blocks) {
-    const trimmed = block.trim();
-    if (!trimmed) continue;
-    if (trimmed.length <= MAX_CHUNK_CHARS) {
-      chunks.push(trimmed);
-      continue;
-    }
-    for (let start = 0; start < trimmed.length;) {
-      let end = Math.min(start + MAX_CHUNK_CHARS, trimmed.length);
-      if (
-        end < trimmed.length
-        && trimmed.charCodeAt(end - 1) >= 0xD800
-        && trimmed.charCodeAt(end - 1) <= 0xDBFF
-        && trimmed.charCodeAt(end) >= 0xDC00
-        && trimmed.charCodeAt(end) <= 0xDFFF
-      ) {
-        end--;
-      }
-      chunks.push(trimmed.slice(start, end).trim());
-      start = end;
-    }
-  }
-  return chunks;
-}
-
-function extractSummary(content: string): string {
-  const heading = content.match(/^#{1,3}\s+(.+)$/m)?.[1]?.trim();
-  if (heading) return heading.slice(0, 180);
-  return content.replace(/\s+/g, ' ').trim().slice(0, 180);
-}
-
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   try {
     return JSON.parse(await readFile(filePath, 'utf8')) as T;
@@ -811,29 +662,6 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}
-
-async function collectMarkdownFiles(root: string): Promise<string[]> {
-  const results: string[] = [];
-  // A configured path may name a single markdown file. `readdir` fails on one, which would otherwise
-  // report the context as empty instead of indexing the file the user pointed at.
-  const rootStat = await stat(root).catch(() => null);
-  if (rootStat?.isFile()) return root.toLowerCase().endsWith('.md') ? [root] : [];
-  async function walk(dir: string): Promise<void> {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const next = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.data') continue;
-        await walk(next);
-      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
-        results.push(next);
-      }
-    }
-  }
-  await walk(root);
-  return results;
 }
 
 async function detectNvidia(): Promise<boolean> {
@@ -865,7 +693,6 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
 
   async index(entry: KnowledgeEntry): Promise<void> {
     await this.upstream?.index(entry);
-    await this.manager.indexKnowledgeEntry(this.workspaceId, entry);
   }
 
   async search(terms: Array<{ term: string; context?: string }>, signal: AbortSignal): Promise<KnowledgeEntry[]> {
@@ -908,16 +735,14 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
 }
 
 class WorkspaceRagManager {
-  private readonly statuses = new Map<string, IngestionStatus>();
-  private readonly scanInFlight = new Set<string>();
-  private readonly scanQueued = new Set<string>();
-  private readonly scanPromises = new Map<string, Promise<void>>();
   private readonly logRotationChecked = new Set<string>();
-  private backgroundScanPromise: Promise<void> | undefined;
-  private backgroundScanQueued = false;
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private readonly reconcileStates = new Map<string, V2ReconcileState>();
+  private readonly watchers: Array<{ watcher: FSWatcher; workspaceId: string; contextId: string; root: string }> = [];
+  private readonly watchDebounce = new Map<string, ReturnType<typeof setTimeout>>();
+  private reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  private watcherState: 'active' | 'degraded' | 'stopped' = 'stopped';
+  private watcherError: string | undefined;
   private vectorizer: TextVectorizer = new HashCpuVectorizer();
-  private storage: RagStorage | undefined;
   private nvidiaAvailable = false;
   private cudaAvailable = false;
   private cudaServiceUrl: string | undefined;
@@ -928,9 +753,6 @@ class WorkspaceRagManager {
   private readonly contextGraph: ContextGraphLike | undefined;
   private readonly services: MatbotMachine;
   private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
-  private readonly v1BackgroundScanEnabled = !['0', 'false', 'no', 'off'].includes(
-    String(process.env['CORTEX_RAG_V1_BACKGROUND_SCAN'] ?? '1').trim().toLowerCase(),
-  );
   private v2: WorkspaceRagV2Manager | undefined;
   private v2Message = 'Workspace RAG V2 is disabled.';
 
@@ -953,46 +775,196 @@ class WorkspaceRagManager {
     this.cudaAvailable = launch.cudaAvailable;
     this.cudaServiceUrl = launch.cudaServiceUrl;
     this.accelerationMessage = launch.accelerationMessage;
-    this.storage = await createRagStorage(this.vectorizer.info);
     await this.startV2();
-    if (this.v1BackgroundScanEnabled) {
-      this.timer = setInterval(() => this.startBackgroundScan('interval'), SCAN_INTERVAL_MS);
-      this.startBackgroundScan('startup');
-    }
+    await this.refreshWatchers();
+    const configuredInterval = Number(process.env['CORTEX_RAG_RECONCILE_INTERVAL_MS'] ?? DEFAULT_RECONCILE_INTERVAL_MS);
+    const interval = Math.max(
+      MIN_RECONCILE_INTERVAL_MS,
+      Number.isFinite(configuredInterval) ? configuredInterval : DEFAULT_RECONCILE_INTERVAL_MS,
+    );
+    this.reconcileTimer = setInterval(() => {
+      void this.reconcileAll('interval').catch(error => {
+        this.watcherState = 'degraded';
+        this.watcherError = errorMessage(error);
+      });
+    }, interval);
+    void this.reconcileAll('startup').catch(error => {
+      this.watcherState = 'degraded';
+      this.watcherError = errorMessage(error);
+    });
   }
 
   stop(): void {
     this.disposed = true;
-    if (this.timer) clearInterval(this.timer);
-    void this.storage?.close?.().catch(error => {
-      console.warn(`[workspace-rag] failed to close storage backend: ${errorMessage(error)}`);
-    });
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    for (const timer of this.watchDebounce.values()) clearTimeout(timer);
+    this.watchDebounce.clear();
+    for (const { watcher } of this.watchers.splice(0)) watcher.close();
+    this.watcherState = 'stopped';
     void this.v2?.close().catch(error => {
       console.warn(`[workspace-rag-v2] failed to close: ${errorMessage(error)}`);
     });
   }
 
-  private startBackgroundScan(reason: string): void {
-    if (this.disposed) return;
-    if (this.backgroundScanPromise) {
-      this.backgroundScanQueued = true;
-      return;
-    }
-    this.backgroundScanPromise = this.runBackgroundScans(reason)
-      .finally(() => { this.backgroundScanPromise = undefined; });
+  private reconcileKey(workspaceId: string, contextId: string): string {
+    return `${workspaceId}\0${contextId}`;
   }
 
-  private async runBackgroundScans(reason: string): Promise<void> {
-    let scanReason = reason;
-    do {
-      this.backgroundScanQueued = false;
-      try {
-        await this.scanAll();
-      } catch (error) {
-        console.warn(`[workspace-rag] background scan failed (${scanReason}): ${errorMessage(error)}`);
+  private reconcileState(workspaceId: string, contextId: string): V2ReconcileState {
+    const key = this.reconcileKey(workspaceId, contextId);
+    const existing = this.reconcileStates.get(key);
+    if (existing) return existing;
+    const created: V2ReconcileState = {
+      pending: false,
+      triggers: new Set(),
+      changedPaths: new Set(),
+      forceAll: false,
+    };
+    this.reconcileStates.set(key, created);
+    return created;
+  }
+
+  private async requestV2Reconcile(
+    workspace: WorkspaceRef,
+    context: RagContextConfig,
+    trigger: RagV2Job['trigger'],
+    wait: boolean,
+    changedPaths: readonly string[] = [],
+    forceAll = false,
+  ): Promise<RagV2Job | undefined> {
+    if (this.disposed || this.v2Mode === 'off') return undefined;
+    if (!this.v2) throw new Error(this.v2Message);
+    const key = this.reconcileKey(workspace.id, context.id);
+    if (trigger !== 'watch') {
+      const debounce = this.watchDebounce.get(key);
+      if (debounce) clearTimeout(debounce);
+      this.watchDebounce.delete(key);
+    }
+    const state = this.reconcileState(workspace.id, context.id);
+    state.pending = true;
+    state.triggers.add(trigger);
+    state.latestContext = context;
+    for (const changedPath of changedPaths) state.changedPaths.add(normalizePathForId(changedPath));
+    state.forceAll ||= forceAll;
+    if (trigger === 'watch') state.lastEventAt = nowIso();
+    if (!state.promise) {
+      state.promise = (async () => {
+        while (!this.disposed && state.pending) {
+          state.pending = false;
+          const triggers = [...state.triggers];
+          const forcedPaths = [...state.changedPaths];
+          const forceEveryFile = state.forceAll;
+          state.triggers.clear();
+          state.changedPaths.clear();
+          state.forceAll = false;
+          const selected = triggers.includes('manual') ? 'manual'
+            : triggers.includes('configuration') ? 'configuration'
+              : triggers.includes('watch') ? 'watch'
+                : triggers.includes('retry') ? 'retry'
+                  : triggers.includes('interval') ? 'interval'
+                    : 'startup';
+          const latestContext = state.latestContext ?? context;
+          const job = this.v2!.startIngestion(
+            this.v2Workspace(workspace), latestContext, selected, forcedPaths, forceEveryFile,
+          );
+          state.currentJob = job;
+          await this.v2!.waitForIngestion(workspace.id, context.id);
+          const status = await this.v2!.status(this.v2Mode, this.v2Workspace(workspace), latestContext);
+          const terminal = status.job;
+          if (terminal?.state === 'retryable_failure' || terminal?.state === 'permanent_failure') {
+            state.lastError = terminal.message ?? `Workspace RAG V2 reconciliation ended in ${terminal.state}.`;
+          } else {
+            delete state.lastError;
+          }
+        }
+      })().finally(() => {
+        delete state.promise;
+        if (state.pending && !this.disposed) {
+          void this.requestV2Reconcile(workspace, context, 'retry', false).catch(error => {
+            state.lastError = errorMessage(error);
+          });
+        }
+      });
+    }
+    await Promise.resolve();
+    if (wait) await state.promise;
+    return state.currentJob;
+  }
+
+  private async reconcileAll(trigger: Extract<RagV2Job['trigger'], 'startup' | 'interval'>): Promise<void> {
+    if (this.disposed || this.v2Mode === 'off' || !this.v2) return;
+    for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
+      const config = await this.readConfig(workspace);
+      for (const context of config.contexts) {
+        if (this.disposed) return;
+        await this.requestV2Reconcile(workspace, context, trigger, true);
       }
-      scanReason = 'queued';
-    } while (!this.disposed && this.backgroundScanQueued);
+    }
+  }
+
+  private scheduleWatchReconcile(workspaceId: string, contextId: string, changedPath?: string): void {
+    const key = this.reconcileKey(workspaceId, contextId);
+    const state = this.reconcileState(workspaceId, contextId);
+    if (changedPath?.toLocaleLowerCase().endsWith('.md')) {
+      state.changedPaths.add(normalizePathForId(changedPath));
+    }
+    const existing = this.watchDebounce.get(key);
+    if (existing) clearTimeout(existing);
+    this.watchDebounce.set(key, setTimeout(() => {
+      this.watchDebounce.delete(key);
+      void (async () => {
+        const workspace = (await this.listWorkspaces()).find(item => item.id === workspaceId);
+        if (!workspace) return;
+        const context = (await this.readConfig(workspace)).contexts.find(item => item.id === contextId);
+        if (!context) return;
+        await this.requestV2Reconcile(workspace, context, 'watch', false);
+      })().catch(error => {
+        const state = this.reconcileState(workspaceId, contextId);
+        state.lastError = errorMessage(error);
+        this.watcherState = 'degraded';
+        this.watcherError = state.lastError;
+      });
+    }, WATCH_DEBOUNCE_MS));
+  }
+
+  private async refreshWatchers(): Promise<void> {
+    for (const { watcher } of this.watchers.splice(0)) watcher.close();
+    this.watcherState = this.v2Mode === 'off' || !this.v2 ? 'stopped' : 'active';
+    this.watcherError = undefined;
+    if (this.watcherState === 'stopped') return;
+    for (const workspace of await this.listWorkspaces()) {
+      const config = await this.readConfig(workspace);
+      for (const context of config.contexts) {
+        for (const root of context.paths) {
+          const rootStat = await stat(root).catch(error => {
+            this.watcherState = 'degraded';
+            this.watcherError = `Cannot watch ${root}: ${errorMessage(error)}`;
+            return undefined;
+          });
+          if (!rootStat) continue;
+          const watchRoot = rootStat.isFile() ? path.dirname(root) : root;
+          const expectedFile = rootStat.isFile() ? normalizePathForId(root) : undefined;
+          let watcher: FSWatcher;
+          try {
+            watcher = watchFs(watchRoot, { recursive: rootStat.isDirectory() }, (eventType, filename) => {
+              const changed = filename ? normalizePathForId(path.join(watchRoot, String(filename))) : undefined;
+              if (expectedFile && changed && changed !== expectedFile) return;
+              if (eventType === 'change' && changed && !changed.toLocaleLowerCase().endsWith('.md')) return;
+              this.scheduleWatchReconcile(workspace.id, context.id, changed);
+            });
+          } catch (error) {
+            this.watcherState = 'degraded';
+            this.watcherError = `Cannot watch ${root}: ${errorMessage(error)}`;
+            continue;
+          }
+          watcher.on('error', error => {
+            this.watcherState = 'degraded';
+            this.watcherError = `Watcher failed for ${root}: ${errorMessage(error)}`;
+          });
+          this.watchers.push({ watcher, workspaceId: workspace.id, contextId: context.id, root });
+        }
+      }
+    }
   }
 
   currentWorkspaceId(): string {
@@ -1034,9 +1006,8 @@ class WorkspaceRagManager {
       paths: activeContext(next).paths,
       pathsChanged,
     });
-    this.statuses.delete(workspace.id);
-    if (pathsChanged) await this.requestScanWorkspace(workspace);
-    else await this.ensureStatus(workspace, next);
+    await this.refreshWatchers();
+    if (pathsChanged) void this.requestV2Reconcile(workspace, activeContext(next), 'configuration', false);
     return configView(next);
   }
 
@@ -1052,8 +1023,6 @@ class WorkspaceRagManager {
       contextName: context.name,
       paths: context.paths,
     });
-    this.statuses.delete(workspace.id);
-    await this.requestScanWorkspace(workspace);
     return configView(next);
   }
 
@@ -1084,8 +1053,8 @@ class WorkspaceRagManager {
       contextName: name,
       paths: nextContext.paths,
     });
-    this.statuses.delete(workspace.id);
-    await this.requestScanWorkspace(workspace);
+    await this.refreshWatchers();
+    void this.requestV2Reconcile(workspace, nextContext, 'configuration', false);
     return configView(next);
   }
 
@@ -1102,55 +1071,44 @@ class WorkspaceRagManager {
     };
     await writeJson(this.configPath(workspace), next);
     await this.log(workspace, 'delete_context', { contextId: context.id, contextName: context.name });
-    this.statuses.delete(workspace.id);
-    await this.requestScanWorkspace(workspace);
+    await this.refreshWatchers();
     return configView(next);
   }
 
-  async statusCurrent(): Promise<IngestionStatus> {
+  async statusCurrent(): Promise<WorkspaceRagStatus> {
     const workspace = await this.currentWorkspace();
-    await this.ensureStatus(workspace);
-    return this.statuses.get(workspace.id)!;
+    const context = activeContext(await this.readConfig(workspace));
+    const v2 = await this.v2StatusCurrent() as RagV2Status;
+    const state = this.reconcileState(workspace.id, context.id);
+    const key = this.reconcileKey(workspace.id, context.id);
+    const statusError = state.lastError ?? this.watcherError;
+    return {
+      ...v2,
+      contextName: context.name,
+      paths: context.paths,
+      watcher: {
+        state: this.watcherState,
+        watchedRoots: this.watchers.filter(item => item.workspaceId === workspace.id && item.contextId === context.id).length,
+        pendingChanges: state.pending || this.watchDebounce.has(key),
+        reconcileQueued: state.pending,
+        ...(state.lastEventAt ? { lastEventAt: state.lastEventAt } : {}),
+        ...(statusError ? { lastError: statusError } : {}),
+      },
+      ...this.accelerationStatusFields(),
+    };
   }
 
   workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus {
-    const status = this.statuses.get(workspaceId);
-    if (this.scanPromises.has(workspaceId) || this.scanInFlight.has(workspaceId)) {
-      return {
-        locked: true,
-        reason: 'Workspace indexing is currently running.',
-        ...(status?.state !== undefined ? { state: status.state } : {}),
-        ...(status?.message !== undefined ? { message: status.message } : {}),
-      };
-    }
-    if (this.scanQueued.has(workspaceId)) {
-      return {
-        locked: true,
-        reason: 'Workspace indexing is queued.',
-        ...(status?.state !== undefined ? { state: status.state } : {}),
-        ...(status?.message !== undefined ? { message: status.message } : {}),
-      };
-    }
-    if (this.backgroundScanPromise) {
-      return {
-        locked: true,
-        reason: 'Workspace indexing is pending in the background queue.',
-        ...(status?.state !== undefined ? { state: status.state } : {}),
-        ...(status?.message !== undefined ? { message: status.message } : {}),
-      };
-    }
-    if (status?.state === 'indexing') {
-      return {
-        locked: true,
-        reason: 'Workspace indexing is currently running.',
-        state: status.state,
-        ...(status.message !== undefined ? { message: status.message } : {}),
-      };
-    }
+    const states = [...this.reconcileStates.entries()]
+      .filter(([key]) => key.startsWith(`${workspaceId}\0`))
+      .map(([, state]) => state);
+    const active = states.find(state => state.promise || state.pending);
+    if (!active) return { locked: false };
     return {
-      locked: false,
-      ...(status?.state !== undefined ? { state: status.state } : {}),
-      ...(status?.message !== undefined ? { message: status.message } : {}),
+      locked: true,
+      reason: active.pending ? 'Workspace indexing is queued.' : 'Workspace indexing is currently running.',
+      ...(active.currentJob?.state ? { state: active.currentJob.state } : {}),
+      ...(active.currentJob?.message ? { message: active.currentJob.message } : {}),
     };
   }
 
@@ -1195,42 +1153,23 @@ class WorkspaceRagManager {
     if (!workspace || !query.trim()) return { hits: [] };
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
-    if (this.v2Mode === 'primary' && this.v2 !== undefined) {
-      try {
-        const result = await this.v2.search(
-          this.v2Workspace(workspace),
-          active,
-          query,
-          {
-            limit,
-            ...(conversation?.turns.length ? { conversation: conversation.turns } : {}),
-            ...(conversation?.provider ? { rewriteProvider: conversation.provider } : {}),
-          },
-          signal,
-        );
-        if (result.evidence.length > 0) {
-          return {
-            hits: await this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace),
-            v2Result: result,
-          };
-        }
-        if (result.answerability.abstained) return { hits: [], v2Result: result };
-      } catch (error) {
-        console.warn(`[workspace-rag-v2] primary search fell back to V1: ${errorMessage(error)}`);
-      }
-    }
-    const queryVector = (await this.embedTexts([query], 'query', signal))[0] ?? [];
-    const hits = await this.getStorage().search(workspace, active, this.vectorizer.info, queryVector, limit, signal);
-    const enriched = await this.enrichSearchHits(workspace, active, hits, trace);
-    if (this.v2Mode === 'shadow' && this.v2 !== undefined) {
-      void this.v2.search(this.v2Workspace(workspace), active, query, {
+    if (this.v2Mode === 'off' || !this.v2) return { hits: [] };
+    try {
+      const result = await this.v2.search(this.v2Workspace(workspace), active, query, {
         limit,
         ...(conversation?.turns.length ? { conversation: conversation.turns } : {}),
         ...(conversation?.provider ? { rewriteProvider: conversation.provider } : {}),
-      }, signal)
-        .catch(error => console.warn(`[workspace-rag-v2] shadow search failed: ${errorMessage(error)}`));
+      }, signal);
+      return {
+        hits: result.evidence.length > 0
+          ? await this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace)
+          : [],
+        v2Result: result,
+      };
+    } catch (error) {
+      console.warn(`[workspace-rag-v2] V2-only search failed: ${errorMessage(error)}`);
+      return { hits: [] };
     }
-    return { hits: enriched };
   }
 
   async v2StatusCurrent(): Promise<unknown> {
@@ -1241,21 +1180,30 @@ class WorkspaceRagManager {
         mode: this.v2Mode,
         available: false,
         backend: 'unavailable',
+        summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
         message: this.v2Message,
       };
     }
     return this.v2.status(this.v2Mode, this.v2Workspace(workspace), context);
   }
 
-  async v2StartCurrent(): Promise<unknown> {
-    const { workspace, context, manager } = await this.v2Current();
-    return manager.startIngestion(this.v2Workspace(workspace), context);
+  async v2StartCurrent(trigger: Extract<RagV2Job['trigger'], 'manual' | 'retry'> = 'manual'): Promise<unknown> {
+    const { workspace, context } = await this.v2Current();
+    await this.requestV2Reconcile(workspace, context, trigger, false);
+    return this.statusCurrent();
+  }
+
+  async v2ReconcileCurrent(forceAll = false): Promise<unknown> {
+    const { workspace, context } = await this.v2Current();
+    await this.requestV2Reconcile(workspace, context, 'manual', true, [], forceAll);
+    return this.statusCurrent();
   }
 
   async v2WaitCurrent(): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
+    await this.reconcileState(workspace.id, context.id).promise;
     await manager.waitForIngestion(workspace.id, context.id);
-    return manager.status(this.v2Mode, this.v2Workspace(workspace), context);
+    return this.statusCurrent();
   }
 
   async v2PauseCurrent(): Promise<unknown> {
@@ -1353,58 +1301,6 @@ class WorkspaceRagManager {
     return manager.evaluate(this.v2Workspace(workspace), context, cases, k, variant, signal);
   }
 
-  async indexKnowledgeEntry(workspaceId: string, entry: KnowledgeEntry): Promise<void> {
-    const workspace = (await this.listWorkspaces()).find(item => item.id === workspaceId);
-    if (!workspace) return;
-    const config = await this.readConfig(workspace);
-    const context = activeContext(config);
-    const id = `knowledge:${context.id}:${entry.id}`;
-    const content = stripNulChars(entry.content);
-    const summary = stripNulChars(entry.summary);
-    const entities = entry.entities.map(stripNulChars);
-    const chunks = chunkMarkdown(content);
-    const vectors = await this.embedTexts(
-      chunks.map(text => `${summary}\n${entities.join(' ')}\n${text}`),
-      'document',
-    );
-    const document: IndexedDocument = {
-      id,
-      contextId: context.id,
-      path: entry.source.uuid,
-      hash: entry.contentHash ?? sha256(content),
-      vectorizer: vectorizerMetadata(this.vectorizer.info),
-      updatedAt: nowIso(),
-      chunks: chunks.map((text, index) => ({
-        id: `${id}:${index}`,
-        text,
-        vector: compactStoredVector(vectors[index] ?? []),
-      })),
-    };
-    const storage = this.getStorage();
-    await storage.upsertDocuments(workspace, [document]);
-    await storage.flush(workspace);
-    await this.registerKnowledgeSource(workspace, context, entry, document.hash);
-    await this.log(workspace, 'knowledge_indexed', {
-      entryId: entry.id,
-      contextId: context.id,
-      chunks: document.chunks.length,
-      storage: storage.describe(workspace),
-    });
-  }
-
-  async scanAll(): Promise<void> {
-    if (this.disposed) return;
-    for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
-      if (this.disposed) return;
-      await this.requestScanWorkspace(workspace);
-    }
-  }
-
-  async scanCurrent(): Promise<void> {
-    if (this.disposed) return;
-    await this.requestScanWorkspace(await this.currentWorkspace());
-  }
-
   private workspacesActiveFirst(workspaces: WorkspaceRef[]): WorkspaceRef[] {
     const current = this.currentWorkspaceId();
     return workspaces
@@ -1427,356 +1323,8 @@ class WorkspaceRagManager {
     }
   }
 
-  private async requestScanWorkspace(workspace: WorkspaceRef): Promise<void> {
-    const running = this.scanPromises.get(workspace.id);
-    if (running) {
-      this.scanQueued.add(workspace.id);
-      await this.log(workspace, 'scan_queued', { reason: 'already_in_flight' });
-      await running;
-      return;
-    }
-    const promise = (async () => {
-      do {
-        this.scanQueued.delete(workspace.id);
-        await this.scanWorkspace(workspace);
-      } while (!this.disposed && this.scanQueued.has(workspace.id));
-    })();
-    this.scanPromises.set(workspace.id, promise);
-    try {
-      await promise;
-    } finally {
-      if (this.scanPromises.get(workspace.id) === promise) this.scanPromises.delete(workspace.id);
-    }
-  }
-
-  private async scanWorkspace(workspace: WorkspaceRef): Promise<void> {
-    if (this.scanInFlight.has(workspace.id)) return;
-    this.scanInFlight.add(workspace.id);
-    try {
-      const config = await this.readConfig(workspace);
-      const active = activeContext(config);
-      const status = await this.ensureStatus(workspace, config);
-      await this.log(workspace, 'scan_start', {
-        activeContextId: active.id,
-        contextName: active.name,
-        paths: active.paths,
-        vectorizer: this.vectorizer.info,
-        storage: this.storageStatusFields(workspace),
-      });
-      if (active.paths.length === 0) {
-        this.statuses.set(workspace.id, {
-          ...status,
-          contextName: active.name,
-          paths: active.paths,
-          state: 'pending',
-          totalFiles: 0,
-          processedFiles: 0,
-          percent: 0,
-          message: 'No markdown folders configured.',
-          ...this.accelerationStatusFields(),
-          ...this.storageStatusFields(workspace),
-        });
-        await this.log(workspace, 'scan_pending', {
-          reason: 'no_markdown_folders_configured',
-          contextName: active.name,
-        });
-        return;
-      }
-
-      const acceleration = this.accelerationStatusFields();
-      const storageStatus = this.storageStatusFields(workspace);
-      const contextFiles = await Promise.all(config.contexts.map(async context => ({
-        context,
-        files: (await Promise.all(context.paths.map(collectMarkdownFiles))).flat(),
-      })));
-      const allFiles = contextFiles.flatMap(item => item.files.map(file => ({ context: item.context, file })));
-      const enrichContextGraph = this.contextGraph !== undefined && contextGraphEnabledForScan(allFiles.length);
-      await this.log(workspace, 'scan_files_collected', {
-        totalFiles: allFiles.length,
-        contextGraphEnrichment: enrichContextGraph ? 'enabled' : 'skipped_for_bulk_scan',
-        contexts: contextFiles.map(item => ({
-          contextId: item.context.id,
-          contextName: item.context.name,
-          paths: item.context.paths,
-          files: item.files.length,
-        })),
-      });
-      if (this.contextGraph !== undefined && !enrichContextGraph) {
-        await this.log(workspace, 'context_graph_enrichment_skipped', {
-          totalFiles: allFiles.length,
-          defaultMaxFiles: DEFAULT_CONTEXT_GRAPH_MAX_SCAN_FILES,
-          configuredMaxFiles: process.env['CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES'] ?? null,
-          reason: 'bulk_scan_limit',
-        });
-      }
-      const storage = this.getStorage();
-      const byContextPath = new Map((await storage.listDocumentInfo(workspace)).map(doc => [`${doc.contextId ?? 'default'}:${normalizePathForId(doc.path)}`, doc]));
-      const seen = new Set<string>();
-      let processed = 0;
-      let changedDocuments = 0;
-      let changedChunks = 0;
-      let sourceEnrichmentFailures = 0;
-      let pendingDocuments: IndexedDocument[] = [];
-      let pendingChunks = 0;
-      const sourceEnrichmentPool = new BoundedTaskPool(
-        SOURCE_ENRICHMENT_CONCURRENCY,
-        SOURCE_ENRICHMENT_BACKLOG,
-      );
-      const flushPendingDocuments = async (reason: string, currentFile?: string): Promise<void> => {
-        if (pendingDocuments.length === 0) return;
-        const batchDocuments = pendingDocuments.length;
-        const batchChunks = pendingChunks;
-        await storage.upsertDocuments(workspace, pendingDocuments);
-        pendingDocuments = [];
-        pendingChunks = 0;
-        await this.log(workspace, 'storage_upsert_progress', {
-          reason,
-          batchDocuments,
-          batchChunks,
-          changedDocuments,
-          changedChunks,
-          ...(currentFile ? { currentFile } : {}),
-          storage: storage.describe(workspace),
-        });
-      };
-      this.statuses.set(workspace.id, {
-        ...status,
-        contextName: active.name,
-        paths: active.paths,
-        state: 'indexing',
-        totalFiles: allFiles.length,
-        processedFiles: 0,
-        percent: allFiles.length === 0 ? 100 : 0,
-        message: allFiles.length === 0 ? 'No markdown files found.' : 'Indexing markdown files.',
-        ...acceleration,
-        ...storageStatus,
-      });
-
-      for (let start = 0; start < allFiles.length; start += SCAN_FILE_CONCURRENCY) {
-        const batch = allFiles.slice(start, start + SCAN_FILE_CONCURRENCY);
-        const preparedResults = await Promise.all(batch.map(async ({ context, file }): Promise<PreparedScanFile | undefined> => {
-          const normalized = normalizePathForId(file);
-          const contextPathKey = `${context.id}:${normalized}`;
-          seen.add(contextPathKey);
-          const fileStat = await stat(file).catch(() => null);
-          if (fileStat === null) {
-            const error = new Error('File disappeared before it could be indexed.');
-            await this.registerFileReadFailure(workspace, context, normalized, error);
-            await this.log(workspace, 'file_read_error', { file, error: error.message });
-            return undefined;
-          }
-          const existing = byContextPath.get(contextPathKey);
-          const updatedAt = fileStat.mtime.toISOString();
-          if (
-            existing?.fileSize === fileStat.size &&
-            existing.updatedAt === updatedAt &&
-            documentMatchesVectorizer(existing, this.vectorizer.info)
-          ) {
-            return undefined;
-          }
-          let content: string;
-          try { content = await readFile(file, 'utf8'); } catch (error) {
-            await this.registerFileReadFailure(workspace, context, normalized, error);
-            await this.log(workspace, 'file_read_error', { file, error: errorMessage(error) });
-            return undefined;
-          }
-          const nulCharsRemoved = countNulChars(content);
-          if (nulCharsRemoved > 0) {
-            content = stripNulChars(content);
-            await this.log(workspace, 'file_sanitized', {
-              file,
-              nulCharsRemoved,
-              reason: 'postgres_text_columns_do_not_accept_nul',
-            });
-          }
-          const hash = sha256(content);
-          const chunks = chunkMarkdown(content);
-          const summary = extractSummary(content);
-          return {
-            context,
-            file,
-            normalized,
-            contextPathKey,
-            updatedAt,
-            fileSize: fileStat.size,
-            hash,
-            content,
-            chunks,
-            embeddingTexts: chunks.map(text => `${path.basename(file)}\n${summary}\n${text}`),
-          };
-        }));
-
-        const prepared = preparedResults.filter((value): value is PreparedScanFile => value !== undefined);
-        const vectors = await this.embedTexts(prepared.flatMap(item => item.embeddingTexts), 'document');
-        let vectorOffset = 0;
-        const completed: Array<{ document: IndexedDocument; source: PreparedScanFile }> = [];
-        for (const source of prepared) {
-          const docId = stableId(source.contextPathKey);
-          const documentVectors = vectors.slice(vectorOffset, vectorOffset + source.chunks.length);
-          vectorOffset += source.chunks.length;
-          completed.push({
-            source,
-            document: {
-              id: docId,
-              contextId: source.context.id,
-              path: source.normalized,
-              hash: source.hash,
-              vectorizer: vectorizerMetadata(this.vectorizer.info),
-              updatedAt: source.updatedAt,
-              fileSize: source.fileSize,
-              chunks: source.chunks.map((text, index) => ({
-                id: `${docId}:${index}`,
-                text,
-                vector: compactStoredVector(documentVectors[index] ?? []),
-              })),
-            },
-          });
-        }
-
-        const previousProcessed = processed;
-        processed += batch.length;
-        const currentFile = batch.at(-1)?.file;
-        if (currentFile !== undefined) this.updateProgress(workspace.id, processed, allFiles.length, currentFile);
-        if (
-          previousProcessed === 0
-          || processed === allFiles.length
-          || Math.floor(previousProcessed / 100) !== Math.floor(processed / 100)
-        ) {
-          await this.log(workspace, 'scan_progress', {
-            processedFiles: processed,
-            totalFiles: allFiles.length,
-            percent: allFiles.length === 0 ? 100 : Math.round((processed / allFiles.length) * 100),
-            ...(currentFile !== undefined ? { currentFile } : {}),
-          });
-        }
-
-        for (const { document } of completed) {
-          pendingDocuments.push(document);
-          pendingChunks += document.chunks.length;
-          changedDocuments++;
-          changedChunks += document.chunks.length;
-        }
-        if (pendingDocuments.length >= 32 || pendingChunks >= 1024) {
-          await flushPendingDocuments('batch', currentFile);
-        }
-
-        for (const { source } of completed) {
-          await sourceEnrichmentPool.add(async () => {
-            try {
-              await this.registerFileSource(
-                workspace,
-                source.context,
-                source.normalized,
-                source.updatedAt,
-                source.hash,
-                source.content,
-                enrichContextGraph,
-              );
-            } catch (error) {
-              sourceEnrichmentFailures++;
-              await this.log(workspace, 'source_enrichment_error', {
-                file: source.file,
-                error: errorMessage(error),
-              });
-            }
-          });
-        }
-      }
-      await flushPendingDocuments('final');
-      if (changedDocuments > 0) {
-        const finalizingStatus = { ...this.statuses.get(workspace.id)! };
-        delete finalizingStatus.currentFile;
-        this.statuses.set(workspace.id, {
-          ...finalizingStatus,
-          processedFiles: allFiles.length,
-          percent: 100,
-          message: 'Finalizing source metadata.',
-        });
-        await this.log(workspace, 'source_enrichment_wait', {
-          changedDocuments,
-          concurrency: SOURCE_ENRICHMENT_CONCURRENCY,
-          backlog: SOURCE_ENRICHMENT_BACKLOG,
-        });
-        await sourceEnrichmentPool.drain();
-        await this.log(workspace, 'source_enrichment_complete', {
-          changedDocuments,
-          failures: sourceEnrichmentFailures,
-        });
-      }
-
-      const configuredContextIds = new Set(config.contexts.map(context => context.id));
-      await this.log(workspace, 'storage_finalize_start', {
-        totalFiles: allFiles.length,
-        changedDocuments,
-        changedChunks,
-        storage: storage.describe(workspace),
-      });
-      try {
-        await this.recordMissingFileSources(workspace, config, byContextPath, seen);
-        await storage.deleteStaleFiles(workspace, configuredContextIds, seen);
-        await storage.flush(workspace);
-      } catch (error) {
-        throw new Error(
-          'Failed to write workspace RAG index. ' +
-          `storage=${storage.kind}, changedDocuments=${changedDocuments}, changedChunks=${changedChunks}. ` +
-          `Original error: ${errorMessage(error)}`,
-        );
-      }
-      const dbSummary = await storage.summary(workspace);
-      const idleStatus = { ...this.statuses.get(workspace.id)! };
-      delete idleStatus.currentFile;
-      this.statuses.set(workspace.id, {
-        ...idleStatus,
-        state: 'idle',
-        processedFiles: allFiles.length,
-        percent: 100,
-        lastIndexedAt: nowIso(),
-        message: allFiles.length === 0
-          ? 'No markdown files found.'
-          : sourceEnrichmentFailures > 0
-            ? `Indexed ${allFiles.length} markdown file(s); source metadata failed for ${sourceEnrichmentFailures} file(s).`
-            : `Indexed ${allFiles.length} markdown file(s).`,
-        ...this.accelerationStatusFields(),
-        ...this.storageStatusFields(workspace),
-      });
-      await this.log(workspace, 'scan_complete', {
-        totalFiles: allFiles.length,
-        changedDocuments,
-        changedChunks,
-        sourceEnrichmentFailures,
-        storage: storage.describe(workspace),
-        ...dbSummary,
-      });
-    } catch (error) {
-      const previous = this.statuses.get(workspace.id);
-      await this.log(workspace, 'scan_error', {
-        error: errorMessage(error),
-        stack: errorStack(error),
-        previousStatus: previous,
-      });
-      this.statuses.set(workspace.id, {
-        workspaceId: workspace.id,
-        contextName: previous?.contextName ?? workspace.name,
-        paths: previous?.paths ?? [],
-        state: 'error',
-        totalFiles: previous?.totalFiles ?? 0,
-        processedFiles: previous?.processedFiles ?? 0,
-        percent: previous?.percent ?? 0,
-        message: error instanceof Error ? error.message : String(error),
-        ...this.accelerationStatusFields(),
-        ...this.storageStatusFields(workspace),
-      });
-    } finally {
-      this.scanInFlight.delete(workspace.id);
-    }
-  }
-
   private fileSourceExternalId(contextId: string, normalizedPath: string): string {
     return `${contextId}:${normalizedPath}`;
-  }
-
-  private knowledgeSourceExternalId(contextId: string, entry: KnowledgeEntry): string {
-    return `${contextId}:knowledge:${entry.source.type}:${entry.source.uuid}:${entry.id}`;
   }
 
   private sourceId(workspace: WorkspaceRef, externalId: string): string | undefined {
@@ -1785,92 +1333,6 @@ class WorkspaceRagManager {
       connectorType: 'workspace-rag',
       externalId,
     });
-  }
-
-  private async registerFileSource(
-    workspace: WorkspaceRef,
-    context: RagContextConfig,
-    normalizedPath: string,
-    updatedAt: string,
-    contentHash: string,
-    content: string,
-    enrichContextGraph: boolean,
-  ): Promise<void> {
-    if (this.sourceRegistry === undefined) return;
-    const externalId = this.fileSourceExternalId(context.id, normalizedPath);
-    const source = await this.sourceRegistry.upsertSource({
-      workspaceId: workspace.id,
-      connectorType: 'workspace-rag',
-      externalId,
-      uri: normalizedPath,
-      title: path.basename(normalizedPath),
-      sourceKind: 'document',
-      schemaOrDocumentType: 'markdown',
-      sensitivity: 'internal',
-      permissionState: 'allowed',
-      trustLevel: 'medium',
-      citationPolicy: 'cite_path',
-      healthState: 'healthy',
-      lastObservedAt: nowIso(),
-      lastSuccessfulReadAt: nowIso(),
-      knownLimitations: [
-        'Workspace RAG currently indexes Markdown text only.',
-        'Search hits are chunk-level excerpts, not full document reads.',
-      ],
-    });
-    const version = await this.sourceRegistry.upsertVersion({
-      sourceId: source.id,
-      contentHash,
-      observedAt: updatedAt,
-      provenance: {
-        activityId: `workspace-rag:${workspace.id}:${context.id}:scan`,
-      },
-    });
-    if (enrichContextGraph) {
-      await this.extractContextGraphSource(workspace, source.id, version.id, content, 'deterministic');
-    }
-  }
-
-  private async registerKnowledgeSource(
-    workspace: WorkspaceRef,
-    context: RagContextConfig,
-    entry: KnowledgeEntry,
-    contentHash: string,
-  ): Promise<void> {
-    if (this.sourceRegistry === undefined) return;
-    const externalId = this.knowledgeSourceExternalId(context.id, entry);
-    const source = await this.sourceRegistry.upsertSource({
-      workspaceId: workspace.id,
-      connectorType: 'workspace-rag',
-      externalId,
-      uri: entry.source.uuid,
-      title: entry.summary || entry.id,
-      sourceKind: 'artifact',
-      schemaOrDocumentType: entry.source.type,
-      sensitivity: 'internal',
-      permissionState: 'allowed',
-      trustLevel: 'medium',
-      citationPolicy: 'cite_path',
-      healthState: 'healthy',
-      lastObservedAt: nowIso(),
-      lastSuccessfulReadAt: nowIso(),
-      knownLimitations: ['Knowledge entries are indexed into workspace RAG as derived artifacts.'],
-    });
-    const version = await this.sourceRegistry.upsertVersion({
-      sourceId: source.id,
-      contentHash,
-      observedAt: nowIso(),
-      provenance: {
-        activityId: `workspace-rag:${workspace.id}:${context.id}:knowledge-index`,
-      },
-    });
-    await this.extractContextGraphSource(
-      workspace,
-      source.id,
-      version.id,
-      `${entry.summary}\n${entry.entities.join('\n')}\n${entry.content}`,
-      'deterministic',
-    );
   }
 
   private async extractContextGraphSource(
@@ -1926,34 +1388,6 @@ class WorkspaceRagManager {
     });
   }
 
-  private async recordMissingFileSources(
-    workspace: WorkspaceRef,
-    config: RagConfig,
-    byContextPath: Map<string, { contextId?: string; path: string; sourceType: 'file' | 'knowledge' }>,
-    seen: Set<string>,
-  ): Promise<void> {
-    if (this.sourceRegistry === undefined) return;
-    const configuredContextIds = new Set(config.contexts.map(context => context.id));
-    for (const doc of byContextPath.values()) {
-      if (doc.sourceType !== 'file') continue;
-      if (!path.isAbsolute(doc.path)) continue;
-      const contextId = doc.contextId ?? 'default';
-      const key = `${contextId}:${normalizePathForId(doc.path)}`;
-      if (configuredContextIds.has(contextId) && seen.has(key)) continue;
-      const sourceId = this.sourceId(workspace, this.fileSourceExternalId(contextId, normalizePathForId(doc.path)));
-      if (sourceId === undefined) continue;
-      const source = await this.sourceRegistry.getSource(sourceId);
-      if (source === null) continue;
-      await this.sourceRegistry.recordHealth({
-        sourceId,
-        state: 'down',
-        checkedAt: nowIso(),
-        message: 'Workspace RAG source is no longer present in configured markdown paths.',
-        details: { path: doc.path, contextId },
-      });
-    }
-  }
-
   private async enrichSearchHits(
     workspace: WorkspaceRef,
     context: RagContextConfig,
@@ -1989,7 +1423,7 @@ class WorkspaceRagManager {
   }
 
   private accelerationStatusFields(): Pick<
-    IngestionStatus,
+    WorkspaceRagStatus,
     | 'nvidiaAvailable'
     | 'cudaAvailable'
     | 'accelerated'
@@ -2019,28 +1453,6 @@ class WorkspaceRagManager {
       ...(this.cudaServiceUrl ? { cudaServiceUrl: this.cudaServiceUrl } : {}),
       accelerationMessage: this.accelerationMessage,
     };
-  }
-
-  private storageStatusFields(workspace?: WorkspaceRef): Pick<
-    IngestionStatus,
-    | 'storageBackend'
-    | 'storageMessage'
-    | 'postgresHost'
-    | 'postgresPort'
-    | 'postgresDatabase'
-    | 'postgresSchema'
-    | 'postgresTables'
-    | 'legacyJsonPath'
-  > {
-    return this.storage?.describe(workspace) ?? {
-      storageBackend: 'json',
-      storageMessage: 'Workspace RAG storage backend has not been initialized.',
-    };
-  }
-
-  private getStorage(): RagStorage {
-    if (!this.storage) throw new Error('Workspace RAG storage backend has not been initialized.');
-    return this.storage;
   }
 
   private async startV2(): Promise<void> {
@@ -2075,7 +1487,7 @@ class WorkspaceRagManager {
       this.v2Message = `Workspace RAG V2 ${this.v2Mode} mode is ready with ${repository.backend}.`;
     } catch (error) {
       await manager.close().catch(() => undefined);
-      this.v2Message = `Workspace RAG V2 initialization failed; V1 remains active. ${errorMessage(error)}`;
+      this.v2Message = `Workspace RAG V2 initialization failed; workspace RAG is unavailable. ${errorMessage(error)}`;
       console.warn(`[workspace-rag-v2] ${this.v2Message}`);
     }
   }
@@ -2085,6 +1497,15 @@ class WorkspaceRagManager {
     return {
       register: async (workspace, context, normalizedPath, contentSha256, modifiedAt, summary) => {
         const externalId = this.fileSourceExternalId(context.id, normalizedPath);
+        const workspaceRef: WorkspaceRef = {
+          id: workspace.id,
+          name: workspace.name,
+          configPath: path.join(workspace.configDir, 'matbot.yaml'),
+          configDir: workspace.configDir,
+          active: workspace.id === this.currentWorkspaceId(),
+        };
+        const stableSourceId = this.sourceId(workspaceRef, externalId);
+        const previous = stableSourceId ? await this.sourceRegistry!.getSource(stableSourceId) : null;
         const source = await this.sourceRegistry!.upsertSource({
           workspaceId: workspace.id,
           connectorType: 'workspace-rag',
@@ -2105,6 +1526,15 @@ class WorkspaceRagManager {
             'Generated summaries route retrieval but are not final answer evidence.',
           ],
         });
+        if (previous && previous.healthState !== 'healthy') {
+          await this.sourceRegistry!.recordHealth({
+            sourceId: source.id,
+            state: 'healthy',
+            checkedAt: nowIso(),
+            message: 'Workspace RAG source is present in the active V2 publication.',
+            details: { path: normalizedPath, contextId: context.id, lifecycle: 'restored' },
+          });
+        }
         const version = await this.sourceRegistry!.upsertVersion({
           sourceId: source.id,
           contentHash: contentSha256,
@@ -2142,6 +1572,29 @@ class WorkspaceRagManager {
           normalizedPath,
           error,
         );
+      },
+      markRemoved: async (workspace, context, normalizedPaths) => {
+        for (const normalizedPath of normalizedPaths) {
+          const workspaceRef: WorkspaceRef = {
+            id: workspace.id,
+            name: workspace.name,
+            configPath: path.join(workspace.configDir, 'matbot.yaml'),
+            configDir: workspace.configDir,
+            active: workspace.id === this.currentWorkspaceId(),
+          };
+          const sourceId = this.sourceId(
+            workspaceRef,
+            this.fileSourceExternalId(context.id, normalizedPath),
+          );
+          if (!sourceId || await this.sourceRegistry!.getSource(sourceId) === null) continue;
+          await this.sourceRegistry!.recordHealth({
+            sourceId,
+            state: 'down',
+            checkedAt: nowIso(),
+            message: 'Workspace RAG source is no longer present in the active V2 publication.',
+            details: { path: normalizedPath, contextId: context.id, lifecycle: 'removed' },
+          });
+        }
       },
     };
   }
@@ -2252,51 +1705,6 @@ class WorkspaceRagManager {
         ...(evidence.sourceVersionId ? { versionId: evidence.sourceVersionId } : {}),
       },
     }));
-  }
-
-  private async embedTexts(
-    texts: readonly string[],
-    purpose: EmbeddingPurpose,
-    signal?: AbortSignal,
-  ): Promise<number[][]> {
-    return this.vectorizer.embed(texts, purpose, signal);
-  }
-
-  private updateProgress(workspaceId: string, processed: number, total: number, currentFile: string): void {
-    const previous = this.statuses.get(workspaceId);
-    if (!previous) return;
-    this.statuses.set(workspaceId, {
-      ...previous,
-      processedFiles: processed,
-      totalFiles: total,
-      percent: total === 0 ? 100 : Math.round((processed / total) * 100),
-      currentFile,
-    });
-  }
-
-  private async ensureStatus(workspace: WorkspaceRef, config?: RagConfig): Promise<IngestionStatus> {
-    const cfg = config ?? await this.readConfig(workspace);
-    const active = activeContext(cfg);
-    const existing = this.statuses.get(workspace.id);
-    if (
-      existing &&
-      existing.contextName === active.name &&
-      JSON.stringify(existing.paths) === JSON.stringify(active.paths)
-    ) return existing;
-    const status: IngestionStatus = {
-      workspaceId: workspace.id,
-      contextName: active.name,
-      paths: active.paths,
-      state: active.paths.length > 0 ? 'idle' : 'pending',
-      totalFiles: 0,
-      processedFiles: 0,
-      percent: active.paths.length > 0 ? 100 : 0,
-      message: active.paths.length > 0 ? 'Waiting for next scan.' : 'No markdown folders configured.',
-      ...this.accelerationStatusFields(),
-      ...this.storageStatusFields(workspace),
-    };
-    this.statuses.set(workspace.id, status);
-    return status;
   }
 
   private async currentWorkspace(): Promise<WorkspaceRef> {
@@ -2432,14 +1840,15 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
   return {
     name: 'workspace_rag',
     description:
-      'Configure and inspect workspace-scoped markdown RAG. The tool indexes configured local folders ' +
-      'for the current Cortex workspace, monitors markdown changes, reports ingestion progress, and can search indexed context.',
+      'Configure and inspect the V2-only workspace-scoped Markdown hybrid index. The tool watches configured local roots, ' +
+      'publishes atomic reconciled generations, reports ingestion and watcher state, and searches verified V2 evidence.',
     inputSchema: {
       type: 'object',
       required: ['action'],
       properties: {
         action: {
           type: 'string',
+          description: 'reconcile_now is incremental; reindex_now forces every discovered file through the V2 pipeline.',
           enum: [
             'status', 'get_config', 'configure', 'select_context', 'create_context', 'delete_context',
             'search', 'reindex_now',
@@ -2452,7 +1861,7 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
         },
         contextId: { type: 'string', description: 'Workspace RAG context id for select_context, delete_context, or configure.' },
         contextName: { type: 'string', description: 'Human-facing name for this workspace RAG context.' },
-        paths: { type: 'array', items: { type: 'string' }, description: 'Absolute local folder paths containing markdown files.' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Absolute local folder paths or individual Markdown files.' },
         query: { type: 'string', description: 'Search query for action=search.' },
         limit: { type: 'number', default: 5 },
         documentVersionId: { type: 'string', description: 'Immutable V2 document version id for range retrieval.' },
@@ -2472,7 +1881,7 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
           type: 'string',
           enum: [...RAG_V2_EVALUATION_VARIANTS],
           default: 'hierarchical_lazy',
-          description: 'Retriever ablation persisted with evaluation metrics for V1-like flat dense, lexical, dense, RRF, translation, reranking, hierarchy, and lazy-promotion comparisons.',
+          description: 'Retriever ablation persisted with evaluation metrics for flat dense, lexical, dense, RRF, translation, reranking, hierarchy, and lazy-promotion comparisons.',
         },
         deep: {
           type: 'boolean',
@@ -2558,12 +1967,19 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             return;
           }
           if (action === 'reindex_now') {
-            await manager.scanCurrent();
-            yield { type: 'result', value: await manager.statusCurrent() };
+            yield { type: 'result', value: await manager.v2ReconcileCurrent(true) };
             return;
           }
-          if (action === 'ingestion_start' || action === 'ingestion_retry' || action === 'reconcile_now') {
-            yield { type: 'result', value: await manager.v2StartCurrent() };
+          if (action === 'reconcile_now') {
+            yield { type: 'result', value: await manager.v2ReconcileCurrent(false) };
+            return;
+          }
+          if (action === 'ingestion_start') {
+            yield { type: 'result', value: await manager.v2StartCurrent('manual') };
+            return;
+          }
+          if (action === 'ingestion_retry') {
+            yield { type: 'result', value: await manager.v2StartCurrent('retry') };
             return;
           }
           if (action === 'ingestion_pause') {
@@ -2586,7 +2002,7 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             return;
           }
           if (action === 'ingestion_status') {
-            yield { type: 'result', value: await manager.v2StatusCurrent() };
+            yield { type: 'result', value: await manager.statusCurrent() };
             return;
           }
           if (action === 'ingestion_wait') {
@@ -2843,8 +2259,12 @@ export const plugin: MatbotPluginSpec = {
         const query = latestUserText(ctx.session);
         if (!query.trim()) return;
         const status = await manager.statusCurrent();
-        if (status.state === 'pending') return {
-          markers: [{ type: 'marker', creator: 'workspace-rag', data: { state: 'pending', message: status.message } }],
+        if (!status.activeGenerationId) return {
+          markers: [{
+            type: 'marker',
+            creator: 'workspace-rag',
+            data: { state: status.job?.state ?? 'pending', message: status.message },
+          }],
         };
         const trace = { ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}), ...(ctx.config.rootTraceId !== undefined ? { rootTraceId: ctx.config.rootTraceId } : {}), sessionId: ctx.session.id };
         const startedAt = Date.now();

@@ -65,6 +65,11 @@ export interface RagV2SourceBridge {
     normalizedPath: string,
     error: unknown,
   ): Promise<void>;
+  markRemoved(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+    normalizedPaths: readonly string[],
+  ): Promise<void>;
   enrichContextGraph?(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -138,6 +143,19 @@ interface ActiveRun {
   promise: Promise<void>;
 }
 
+type IngestionTrigger = RagV2Job['trigger'];
+
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+function discoveryError(target: string, error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(`Workspace RAG V2 could not completely discover ${target}: ${detail}`);
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -148,6 +166,10 @@ function normalizedPath(value: string): string {
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function embeddingInputSha256(level: string, text: string): string {
+  return sha256(`${level}\0${text}`);
 }
 
 function stableId(namespace: string, value: string): string {
@@ -186,12 +208,23 @@ async function* discoverMarkdown(
   size: number;
   modifiedAt: string;
 }> {
-  const stack = [...paths].reverse().map(value => path.resolve(value));
+  const roots = [...paths].map(value => path.resolve(value));
+  const stack: Array<{ current: string; root: string; kind: 'root' | 'directory' | 'file' }> = roots
+    .slice()
+    .reverse()
+    .map(current => ({ current, root: current, kind: 'root' }));
   while (stack.length > 0) {
     if (signal.aborted) return;
-    const current = stack.pop()!;
-    const currentStat = await stat(current).catch(() => undefined);
-    if (!currentStat) continue;
+    const { current, root, kind } = stack.pop()!;
+    let currentStat;
+    try {
+      currentStat = await stat(current);
+    } catch (error) {
+      const code = errorCode(error);
+      if (kind === 'file' && code === 'ENOENT') continue;
+      if (kind === 'root' && code === 'ENOENT' && current.toLocaleLowerCase().endsWith('.md')) continue;
+      throw discoveryError(current, error);
+    }
     if (currentStat.isFile()) {
       if (current.toLocaleLowerCase().endsWith('.md')) {
         const normalized = normalizedPath(current);
@@ -202,13 +235,22 @@ async function* discoverMarkdown(
       continue;
     }
     if (!currentStat.isDirectory()) continue;
-    const entries = (await readdir(current, { withFileTypes: true }).catch(() => []))
-      .sort((left, right) => left.name.localeCompare(right.name));
+    let entries;
+    try {
+      entries = (await readdir(current, { withFileTypes: true }))
+        .sort((left, right) => left.name.localeCompare(right.name));
+    } catch (error) {
+      throw discoveryError(current, error);
+    }
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index]!;
       if (entry.isDirectory() && ['node_modules', '.git', '.data'].includes(entry.name)) continue;
       if (entry.isDirectory() || (entry.isFile() && entry.name.toLocaleLowerCase().endsWith('.md'))) {
-        stack.push(path.join(current, entry.name));
+        stack.push({
+          current: path.join(current, entry.name),
+          root,
+          kind: entry.isDirectory() ? 'directory' : 'file',
+        });
       }
     }
   }
@@ -241,6 +283,7 @@ export class WorkspaceRagV2Manager {
   }>();
   private lazyWorker: Promise<void> | undefined;
   private readonly retrieval: Map<string, RagV2RetrievalEngine> = new Map();
+  private readonly lastSuccessfulReconcile = new Map<string, string>();
   private readonly policy = ragV2PolicyFromEnv();
   private readonly rerankerUrl = ragV2RerankerUrlFromEnv();
   private readonly rrf = ragV2RrfFromEnv();
@@ -306,6 +349,9 @@ export class WorkspaceRagV2Manager {
         embeddingSignature: publication.embeddingSignature,
       } : {}),
       ...(job ? { job } : {}),
+      ...(this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))
+        ? { lastSuccessfulReconcileAt: this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))! }
+        : {}),
       summaries: {
         enabled: Boolean(this.semanticServices?.summarize && this.semanticServices.summarizerSignature),
         queued: this.summaryQueue.length,
@@ -318,11 +364,17 @@ export class WorkspaceRagV2Manager {
       },
       message: publication
         ? `Workspace RAG V2 publication ${publication.generationId} is ${publication.state}.`
-        : 'Workspace RAG V2 has no active publication; V1 remains the fallback.',
+        : 'Workspace RAG V2 has no active publication.',
     };
   }
 
-  startIngestion(workspace: RagV2WorkspaceRef, context: RagV2ContextRef): RagV2Job {
+  startIngestion(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+    trigger: IngestionTrigger = 'manual',
+    forcePaths: readonly string[] = [],
+    forceAll = false,
+  ): RagV2Job {
     const key = runKey(workspace.id, context.id);
     const existing = this.runs.get(key);
     if (existing) return existing.job;
@@ -347,11 +399,25 @@ export class WorkspaceRagV2Manager {
       readyEmbeddings: 0,
       queuedEmbeddings: 0,
       failedFiles: 0,
+      addedFiles: 0,
+      changedFiles: 0,
+      unchangedFiles: 0,
+      removedFiles: 0,
+      discoveryComplete: false,
+      deletionsDeferred: false,
+      trigger,
       cancelRequested: false,
       pauseRequested: false,
       message: 'Workspace RAG V2 discovery is starting.',
     };
-    const promise = this.runIngestion(workspace, context, job, controller.signal)
+    const promise = this.runIngestion(
+      workspace,
+      context,
+      job,
+      controller.signal,
+      new Set(forcePaths.map(normalizedPath)),
+      forceAll,
+    )
       .catch(error => {
         console.warn(`[workspace-rag-v2] ingestion ${job.id} stopped: ${error instanceof Error ? error.message : String(error)}`);
       })
@@ -503,7 +569,8 @@ export class WorkspaceRagV2Manager {
       createdAt: now(),
     };
     await this.repository.putRoutingSummary(record);
-    const vector = (await this.embedder.embed([`${task.title}\n${summaryText}`], 'document', signal))[0];
+    const summaryEmbeddingText = `${task.title}\n${summaryText}`;
+    const vector = (await this.embedder.embed([summaryEmbeddingText], 'document', signal))[0];
     if (vector?.length !== this.embedder.info.dimensions) return;
     await this.repository.putEmbeddings([{
       level: task.level,
@@ -512,7 +579,7 @@ export class WorkspaceRagV2Manager {
       workspaceId: task.workspaceId,
       contextId: task.contextId,
       signature: this.embedder.info.signature,
-      contentSha256: sha256(summaryText),
+      inputSha256: embeddingInputSha256(task.level, summaryEmbeddingText),
       vector,
     }], this.embedder.info);
   }
@@ -922,6 +989,8 @@ export class WorkspaceRagV2Manager {
     context: RagV2ContextRef,
     job: RagV2Job,
     signal: AbortSignal,
+    forcePaths: ReadonlySet<string>,
+    forceAll: boolean,
   ): Promise<void> {
     await this.initialize();
     await this.repository.createJob(job);
@@ -929,6 +998,8 @@ export class WorkspaceRagV2Manager {
     const fingerprints = new Map(
       (await this.repository.listFingerprints(workspace.id, context.id)).map(value => [normalizedPath(value.path), value]),
     );
+    const seenPaths = new Set<string>();
+    let removedPaths: string[] = [];
     try {
       for (const priority of ['authority', 'current', 'archive'] as const) {
         for await (const file of discoverMarkdown(context.paths, signal, priority)) {
@@ -939,6 +1010,7 @@ export class WorkspaceRagV2Manager {
         job.totalFiles = job.discoveredFiles;
         job.currentPath = file.path;
         job.checkpoint = file.path;
+        seenPaths.add(file.path);
         job.updatedAt = now();
         const elapsedSeconds = Math.max(0.001, (Date.now() - Date.parse(job.createdAt)) / 1_000);
         job.throughputBytesPerSecond = Math.round(job.processedBytes / elapsedSeconds);
@@ -966,7 +1038,10 @@ export class WorkspaceRagV2Manager {
           && existing.modifiedAt === file.modifiedAt
           && existing.embeddingSignature === this.embedder.info.signature
           && (!summarySignature || existing.summarySignature === summarySignature)
+          && !forceAll
+          && !forcePaths.has(file.path)
         ) {
+          job.unchangedFiles++;
           job.processedFiles++;
           job.processedBytes += file.size;
           await this.repository.upsertJobItem({
@@ -985,6 +1060,8 @@ export class WorkspaceRagV2Manager {
         }
         try {
           await this.ingestFile(workspace, context, job, file, signal);
+          if (existing) job.changedFiles++;
+          else job.addedFiles++;
           job.processedFiles++;
           job.processedBytes += file.size;
         } catch (error) {
@@ -1019,11 +1096,20 @@ export class WorkspaceRagV2Manager {
         }
       }
       if (signal.aborted) throw abortError(signal);
+      job.discoveryComplete = true;
       job.state = 'validating';
       job.updatedAt = now();
       job.message = 'Validating the Workspace RAG V2 staging generation.';
       await this.repository.updateJob(job);
-      await this.repository.reconcileGeneration(job.id, workspace.id, context.id, job.generationId);
+      removedPaths = [...fingerprints.keys()].filter(filePath => !seenPaths.has(filePath));
+      if (job.failedFiles > 0) {
+        job.deletionsDeferred = removedPaths.length > 0;
+        removedPaths = [];
+      } else {
+        job.removedFiles = await this.repository.reconcileGeneration(
+          job.id, workspace.id, context.id, job.generationId,
+        );
+      }
       const collections = await this.repository.rebuildCollections(
         workspace.id,
         context.id,
@@ -1031,8 +1117,9 @@ export class WorkspaceRagV2Manager {
       );
       for (let start = 0; start < collections.length; start += 32) {
         const batch = collections.slice(start, start + 32);
+        const inputs = batch.map(collection => `${collection.title}\n${collection.routingSummary}`);
         const vectors = await this.embedder.embed(
-          batch.map(collection => `${collection.title}\n${collection.routingSummary}`),
+          inputs,
           'document',
           signal,
         );
@@ -1043,7 +1130,7 @@ export class WorkspaceRagV2Manager {
           workspaceId: collection.workspaceId,
           contextId: collection.contextId,
           signature: this.embedder.info.signature,
-          contentSha256: collection.contentSha256,
+          inputSha256: embeddingInputSha256('collection', inputs[index] ?? ''),
           vector: vectors[index] ?? [],
         })).filter(record => record.vector.length === this.embedder.info.dimensions), this.embedder.info);
         for (const collection of batch) {
@@ -1068,6 +1155,11 @@ export class WorkspaceRagV2Manager {
           ? 'active_hybrid_complete'
           : 'active_hybrid_partial';
       await this.repository.publishGeneration(workspace.id, context.id, job.generationId, publicationState);
+      if (removedPaths.length > 0) {
+        await this.sourceBridge?.markRemoved(workspace, context, removedPaths).catch(error => {
+          console.warn(`[workspace-rag-v2] failed to reconcile removed source state: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
       job.state = publicationState;
       job.processedSections = validation.sections;
       job.processedPassages = validation.passages;
@@ -1075,9 +1167,14 @@ export class WorkspaceRagV2Manager {
       job.queuedEmbeddings = Math.max(0, validation.passages - validation.passageEmbeddings);
       job.estimatedRemainingSeconds = 0;
       job.updatedAt = now();
-      job.message = `Published ${validation.documents} documents, ${validation.sections} sections, and ${validation.passages} passages.`;
+      job.message = [
+        `Published ${validation.documents} documents, ${validation.sections} sections, and ${validation.passages} passages.`,
+        `${job.addedFiles} added, ${job.changedFiles} changed, ${job.unchangedFiles} unchanged, ${job.removedFiles} removed.`,
+        ...(job.deletionsDeferred ? ['Deletion reconciliation was deferred because one or more files failed.'] : []),
+      ].join(' ');
       delete job.currentPath;
       await this.repository.updateJob(job);
+      this.lastSuccessfulReconcile.set(runKey(workspace.id, context.id), job.updatedAt);
       this.startLazyWorker();
     } catch (error) {
       if (signal.aborted || job.cancelRequested) {
@@ -1150,6 +1247,8 @@ export class WorkspaceRagV2Manager {
       for (const section of batch) section.embeddingState = 'queued';
       await this.repository.appendSections(batch);
       try {
+        const embeddingText = (section: RagV2SectionRecord) =>
+          `${section.headingPath.join(' > ')}\n${section.routingSummary}`;
         const reusable = batch.map(section => ({
           level: 'section' as const,
           unitId: section.sectionId,
@@ -1157,7 +1256,7 @@ export class WorkspaceRagV2Manager {
           workspaceId: section.workspaceId,
           contextId: section.contextId,
           signature: this.embedder.info.signature,
-          contentSha256: section.contentSha256,
+          inputSha256: embeddingInputSha256('section', embeddingText(section)),
         }));
         const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
         const pending = batch.filter(section => !reused.has(section.sectionId));
@@ -1165,7 +1264,7 @@ export class WorkspaceRagV2Manager {
         if (pending.length > 0) {
           await this.embeddingLimiter.consume(pending.length, signal);
           const vectors = await this.embedder.embed(
-            pending.map(section => `${section.headingPath.join(' > ')}\n${section.routingSummary}`),
+            pending.map(embeddingText),
             'document',
             signal,
           );
@@ -1176,7 +1275,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: section.workspaceId,
             contextId: section.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: section.contentSha256,
+            inputSha256: embeddingInputSha256('section', embeddingText(section)),
             vector: vectors[index] ?? [],
           })).filter(record => record.vector.length === this.embedder.info.dimensions);
           await this.repository.putEmbeddings(records, this.embedder.info);
@@ -1234,7 +1333,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: passage.workspaceId,
             contextId: passage.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: passage.contentSha256,
+            inputSha256: embeddingInputSha256('passage', passage.text),
           }));
           const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
           const pending = eager.filter(passage => !reused.has(passage.passageId));
@@ -1250,7 +1349,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: passage.workspaceId,
             contextId: passage.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: passage.contentSha256,
+            inputSha256: embeddingInputSha256('passage', passage.text),
             vector: vectors[index] ?? [],
           })).filter(record => record.vector.length === this.embedder.info.dimensions);
           await this.repository.putEmbeddings(records, this.embedder.info);
@@ -1280,7 +1379,13 @@ export class WorkspaceRagV2Manager {
     try {
       const parsed = await parseMarkdownStream(
         object.objectPath,
-        { workspaceId: workspace.id, contextId: context.id, documentId, documentVersionId },
+        {
+          workspaceId: workspace.id,
+          contextId: context.id,
+          documentId,
+          documentVersionId,
+          sourcePath: file.path,
+        },
         this.policy,
         {
           async onSection(section) {
@@ -1340,6 +1445,7 @@ export class WorkspaceRagV2Manager {
         routingSummary: parsed.routingSummary,
       };
       try {
+        const documentEmbeddingText = `${document.title}\n${document.routingSummary}`;
         const reusable = [{
           level: 'document' as const,
           unitId: document.documentVersionId,
@@ -1347,13 +1453,13 @@ export class WorkspaceRagV2Manager {
           workspaceId: document.workspaceId,
           contextId: document.contextId,
           signature: this.embedder.info.signature,
-          contentSha256: document.contentSha256,
+          inputSha256: embeddingInputSha256('document', documentEmbeddingText),
         }];
         const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
         job.readyEmbeddings += reused.size;
         await this.embeddingLimiter.consume(reused.size > 0 ? 0 : 1, signal);
         const vector = reused.size > 0 ? undefined : (await this.embedder.embed(
-          [`${document.title}\n${document.routingSummary}`],
+          [documentEmbeddingText],
           'document',
           signal,
         ))[0];
@@ -1367,7 +1473,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: document.workspaceId,
             contextId: document.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: document.contentSha256,
+            inputSha256: embeddingInputSha256('document', documentEmbeddingText),
             vector,
           }], this.embedder.info);
           job.readyEmbeddings++;
@@ -1546,7 +1652,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: passage.workspaceId,
             contextId: passage.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: passage.contentSha256,
+            inputSha256: embeddingInputSha256('passage', passage.text),
           }));
           const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
           const pending = batch.filter(passage => !reused.has(passage.passageId));
@@ -1561,7 +1667,7 @@ export class WorkspaceRagV2Manager {
             workspaceId: passage.workspaceId,
             contextId: passage.contextId,
             signature: this.embedder.info.signature,
-            contentSha256: passage.contentSha256,
+            inputSha256: embeddingInputSha256('passage', passage.text),
             vector: vectors[index] ?? [],
           })).filter(record => record.vector.length === this.embedder.info.dimensions);
           await this.repository.putEmbeddings(records, this.embedder.info);

@@ -448,7 +448,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
         values.push(
           record.level, record.unitId, record.documentVersionId, record.workspaceId,
           record.contextId, record.signature, toVector(record.vector), now(),
-          record.contentSha256,
+          record.inputSha256,
         );
         const placeholders = Array.from({ length: 9 }, (_, index) => `$${offset + index + 1}`);
         placeholders[6] = `${placeholders[6]}::vector`;
@@ -516,7 +516,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ON CONFLICT (embedding_signature, level, unit_id) DO NOTHING
       `, [
         record.level, record.unitId, record.documentVersionId, record.workspaceId,
-        record.contextId, record.signature, now(), record.contentSha256,
+        record.contextId, record.signature, now(), record.inputSha256,
       ]));
       if (result.rowCount === 1) reused.add(record.unitId);
     }
@@ -1894,8 +1894,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
     const passages = Number(row.passages);
     const invalidCount = Number(invalid.rows[0]?.count ?? 0);
     const errors: string[] = [];
-    if (documents === 0) errors.push('Generation contains no documents.');
-    if (passages === 0) errors.push('Generation contains no passages.');
+    if (documents > 0 && passages === 0) errors.push('Generation contains no passages.');
     if (invalidCount > 0) errors.push(`Generation contains ${invalidCount} invalid passage manifests.`);
     return {
       valid: errors.length === 0,

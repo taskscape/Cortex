@@ -6,7 +6,6 @@ import test from "node:test";
 
 await import("../local-agent/matbot/apps/cli/register.js");
 
-process.env.CORTEX_RAG_STORAGE = "json";
 process.env.CORTEX_RAG_DISABLE_CUDA = "true";
 delete process.env.CORTEX_RAG_V2_MODE;
 process.env.CORTEX_RAG_V2_STORAGE = "memory";
@@ -27,7 +26,17 @@ async function execute(tool, value) {
   return events.find(event => event.type === "result")?.value;
 }
 
-test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", async t => {
+async function waitUntil(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await predicate();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`condition was not met within ${timeoutMs} ms`);
+}
+
+test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes unified status", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-plugin-"));
   t.after(async () => {
     await plugin.teardown?.();
@@ -74,14 +83,27 @@ test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", asyn
     assert.ok(tool.inputSchema.properties.action.enum.includes(action), `${action} must be exposed`);
   }
 
-  await execute(tool, { action: "configure", contextName: "Contracts", paths: [docs] });
+  const configured = await execute(tool, { action: "configure", contextName: "Contracts", paths: [docs] });
+  assert.equal(configured.status.mode, "primary");
+  assert.equal(configured.status.watcher.watchedRoots, 1);
   const census = await execute(tool, { action: "corpus_census" });
   assert.equal(census.files, 1);
-  const started = await execute(tool, { action: "ingestion_start" });
-  assert.equal(started.state, "discovered");
   const status = await execute(tool, { action: "ingestion_wait" });
   assert.equal(status.activeState, "active_hybrid_complete");
   assert.equal(status.summaries.enabled, false);
+  assert.equal(status.job.trigger, "configuration");
+  assert.equal(status.job.addedFiles, 1);
+  assert.equal(status.job.discoveryComplete, true);
+  assert.equal(status.watcher.state, "active");
+
+  const reindexed = await execute(tool, { action: "reindex_now" });
+  assert.equal(reindexed.job.trigger, "manual");
+  assert.equal(reindexed.available, true);
+  assert.equal(reindexed.job.changedFiles, 1, "reindex_now forces the V2 derivative pipeline");
+  const reconciled = await execute(tool, { action: "reconcile_now" });
+  assert.equal(reconciled.job.trigger, "manual");
+  assert.equal(reconciled.job.unchangedFiles, 1, "reconcile_now uses incremental fingerprints");
+  assert.equal(reconciled.job.changedFiles, 0);
 
   const explicit = await execute(tool, {
     action: "v2_search",
@@ -107,4 +129,59 @@ test("workspace_rag defaults to V2 primary hybrid search with V1 fallback", asyn
     limit: 3,
   });
   assert.ok(primary.hits.some(hit => hit.documentVersionId && hit.startLine));
+
+  const generationBeforeWatch = primary.generationId ?? reconciled.activeGenerationId;
+  await writeFile(path.join(docs, "contract.md"), [
+    "# Distribution Agreement",
+    "",
+    "## Termination",
+    "",
+    "The distributor may terminate after ninety days written notice. WATCHED-NOTICE-90.",
+  ].join("\n"));
+  const watched = await waitUntil(async () => {
+    const next = await execute(tool, { action: "status" });
+    return next.activeGenerationId !== generationBeforeWatch
+      && next.job?.trigger === "watch"
+      && next.job?.state?.startsWith("active_")
+      ? next
+      : undefined;
+  });
+  assert.equal(watched.job.changedFiles, 1);
+  assert.equal(watched.watcher.pendingChanges, false);
+  assert.ok(watched.watcher.lastEventAt);
+  const watchedSearch = await execute(tool, {
+    action: "search", query: "WATCHED-NOTICE-90", limit: 3,
+  });
+  assert.ok(watchedSearch.hits.some(hit => /ninety days written notice/i.test(hit.text)));
+});
+
+test("workspace_rag off mode disables V2 commands without exposing an alternate index", async t => {
+  process.env.CORTEX_RAG_V2_MODE = "off";
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-off-"));
+  t.after(async () => {
+    await plugin.teardown?.();
+    process.env.CORTEX_RAG_V2_MODE = "primary";
+    await rm(root, { recursive: true, force: true });
+  });
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(path.join(workspace, "matbot.yaml"), "plugins:\n  - workspace-rag\n");
+  const tools = new Map();
+  const registry = new Map();
+  await plugin.setup({
+    configPath: path.join(workspace, "matbot.yaml"),
+    isSubAgent: () => false,
+    async register(key, value) { registry.set(key, value); },
+    get(key) { return registry.get(key); },
+    tools: { register(tool) { tools.set(tool.name, tool); } },
+    hooks: { register() {} },
+  });
+  const tool = tools.get("workspace_rag");
+  const status = await execute(tool, { action: "status" });
+  assert.equal(status.mode, "off");
+  assert.equal(status.available, false);
+  assert.equal(status.backend, "unavailable");
+  assert.equal(status.watcher.state, "stopped");
+  assert.deepEqual(await execute(tool, { action: "search", query: "anything" }), { hits: [] });
+  await assert.rejects(() => execute(tool, { action: "reindex_now" }), /disabled/i);
 });

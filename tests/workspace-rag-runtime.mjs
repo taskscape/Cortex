@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 process.env.CORTEX_RAG_DISABLE_CUDA = "1";
-process.env.CORTEX_RAG_STORAGE = "json";
+process.env.CORTEX_RAG_V2_MODE = "primary";
+process.env.CORTEX_RAG_V2_STORAGE = "memory";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
 const { plugin: sourceRegistryPlugin } = await import("../local-agent/matbot/packages/plugins/source-registry/src/index.ts");
 const { plugin: contextGraphPlugin } = await import("../local-agent/matbot/packages/plugins/context-graph/src/index.ts");
@@ -62,6 +63,14 @@ function matches(item, filter) {
     default:
       return true;
   }
+}
+
+async function collectResult(tool, input, ctx) {
+  const events = [];
+  for await (const event of tool.executor.execute(input, ctx)) events.push(event);
+  const error = events.find(event => event.type === "error");
+  if (error) throw new Error(error.message);
+  return events.find(event => event.type === "result")?.value;
 }
 
 async function main() {
@@ -149,12 +158,17 @@ async function main() {
       configureEvents.push(event);
     }
     const configureResult = configureEvents.find(event => event.type === "result")?.value;
-    assert.equal(configureResult.status.state, "idle");
-    assert.equal(configureResult.status.percent, 100);
+    assert.equal(configureResult.status.mode, "primary");
+    for await (const _event of registeredTool.executor.execute({ action: "ingestion_wait" }, toolCtx)) {}
+    const readyEvents = [];
+    for await (const event of registeredTool.executor.execute({ action: "status" }, toolCtx)) readyEvents.push(event);
+    const readyStatus = readyEvents.find(event => event.type === "result")?.value;
+    assert.equal(readyStatus.activeState, "active_hybrid_complete");
+    assert.equal(readyStatus.job.discoveryComplete, true);
+    assert.equal(readyStatus.job.processedFiles, readyStatus.job.totalFiles);
     assert.equal(configureResult.status.accelerator, "cpu");
     assert.equal(configureResult.status.accelerated, false);
     assert.equal(configureResult.status.embeddingBackend, "hash-cpu");
-    assert.equal(configureResult.status.currentFile, undefined);
     assert.deepEqual(configureResult.config.paths, [docsDir]);
 
     const idleStatusEvents = [];
@@ -162,29 +176,41 @@ async function main() {
       idleStatusEvents.push(event);
     }
     const idleStatusResult = idleStatusEvents.find(event => event.type === "result")?.value;
-    assert.equal(idleStatusResult.currentFile, undefined);
-
-    const dbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
-    assert.match(dbText, /QuasarPump/);
-    assert.doesNotMatch(dbText, /\\u0000/);
-    assert.doesNotMatch(dbText, /NON_MARKDOWN_CANARY_771/);
+    assert.equal(idleStatusResult.job.currentPath, undefined);
+    assert.equal(idleStatusResult.backend, "memory");
 
     await rename(renamedOld, renamedNew);
     await writeFile(renamedNew, "# Rename New\n\nRAG_NEW_PATH_CANARY_993", "utf8");
-    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
-    const reconciledDbText = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "index.json"), "utf8");
-    assert.doesNotMatch(reconciledDbText, /RAG_OLD_PATH_CANARY_882/);
-    assert.match(reconciledDbText, /RAG_NEW_PATH_CANARY_993/);
+    for await (const _event of registeredTool.executor.execute({ action: "reconcile_now" }, toolCtx)) {}
+    const oldRenameSearch = await collectResult(registeredTool, {
+      action: "search", query: "RAG_OLD_PATH_CANARY_882", limit: 3,
+    }, toolCtx);
+    const newRenameSearch = await collectResult(registeredTool, {
+      action: "search", query: "RAG_NEW_PATH_CANARY_993", limit: 3,
+    }, toolCtx);
+    assert.ok(oldRenameSearch.hits.every(hit => !hit.text.includes("RAG_OLD_PATH_CANARY_882")));
+    assert.ok(newRenameSearch.hits.some(hit => hit.path.endsWith("rename-new.md")));
     const sourceListEvents = [];
     for await (const event of sourceTool.executor.execute({ action: "list" }, toolCtx)) {
       sourceListEvents.push(event);
     }
     const sourceListResult = sourceListEvents.find(event => event.type === "result")?.value;
     const retrievalSource = sourceListResult.sources.find(source => source.uri.endsWith("retrieval-probe.md"));
+    const removedRenameSource = sourceListResult.sources.find(source => source.uri.endsWith("rename-old.md"));
     assert.ok(retrievalSource, "workspace RAG should register indexed markdown as a source");
     assert.equal(retrievalSource.connectorType, "workspace-rag");
     assert.equal(retrievalSource.sourceKind, "document");
     assert.equal(retrievalSource.healthState, "healthy");
+    assert.equal(removedRenameSource?.healthState, "down", "a path rename retires the old source identity");
+
+    await writeFile(renamedOld, "# Rename Restored\n\nRAG_RESTORED_PATH_CANARY_447", "utf8");
+    await collectResult(registeredTool, { action: "reconcile_now" }, toolCtx);
+    const restoredSources = await collectResult(sourceTool, { action: "list" }, toolCtx);
+    assert.equal(
+      restoredSources.sources.find(source => source.uri.endsWith("rename-old.md"))?.healthState,
+      "healthy",
+      "a reappearing path restores its source-registry health",
+    );
 
     const graphListEvents = [];
     for await (const event of contextGraphTool.executor.execute({ action: "list" }, toolCtx)) {
@@ -197,7 +223,7 @@ async function main() {
     const retrievalSourceVersion = retrievalSource.version;
     const healthEventsBeforeUnchangedScan = stores.get("source_health_events")?.docs.size ?? 0;
     const extractionRunsBeforeUnchangedScan = stores.get("context_graph_extraction_runs")?.docs.size ?? 0;
-    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
+    for await (const _event of registeredTool.executor.execute({ action: "reconcile_now" }, toolCtx)) {}
     assert.equal(
       stores.get("sources")?.docs.get(retrievalSource.id)?.version,
       retrievalSourceVersion,
@@ -213,26 +239,6 @@ async function main() {
       extractionRunsBeforeUnchangedScan,
       "unchanged files do not rerun context-graph extraction",
     );
-
-    process.env.CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES = "0";
-    await writeFile(
-      path.join(docsDir, "retrieval-probe.md"),
-      "# Retrieval Probe\n\nThe QuasarPump calibration value is 42. Use the amber valve before startup.\n\nBulk guard update.",
-      "utf8",
-    );
-    const extractionRunsBeforeBulkGuard = stores.get("context_graph_extraction_runs")?.docs.size ?? 0;
-    for await (const _event of registeredTool.executor.execute({ action: "reindex_now" }, toolCtx)) {}
-    assert.equal(
-      stores.get("context_graph_extraction_runs")?.docs.size ?? 0,
-      extractionRunsBeforeBulkGuard,
-      "the bulk-scan guard keeps changed documents out of context-graph extraction",
-    );
-    delete process.env.CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES;
-
-    const ingestionLog = await readFile(path.join(workspaceDir, ".data", "workspace-rag", "ingestion.log"), "utf8");
-    assert.match(ingestionLog, /"event":"file_sanitized"/);
-    assert.match(ingestionLog, /"nulCharsRemoved":1/);
-    assert.match(ingestionLog, /"event":"context_graph_enrichment_skipped"/);
 
     const searchEvents = [];
     for await (const event of registeredTool.executor.execute({
@@ -260,6 +266,7 @@ async function main() {
     const createContextResult = createContextEvents.find(event => event.type === "result")?.value;
     assert.equal(createContextResult.config.contextName, "Finance Notes");
     assert.equal(createContextResult.config.activeContextId, "finance-notes");
+    for await (const _event of registeredTool.executor.execute({ action: "ingestion_wait" }, toolCtx)) {}
 
     const financeSearchEvents = [];
     for await (const event of registeredTool.executor.execute({
@@ -285,6 +292,7 @@ async function main() {
     }
     const singleFileResult = singleFileEvents.find(event => event.type === "result")?.value;
     assert.equal(singleFileResult.config.contextName, "Single Note");
+    for await (const _event of registeredTool.executor.execute({ action: "ingestion_wait" }, toolCtx)) {}
     const singleFileSourceEvents = [];
     for await (const event of sourceTool.executor.execute({ action: "list" }, toolCtx)) {
       singleFileSourceEvents.push(event);
@@ -297,15 +305,15 @@ async function main() {
 
     const singleFileSearchEvents = [];
     for await (const event of registeredTool.executor.execute({
-      action: "search",
-      query: "What is the SoloBeacon retry budget?",
+      action: "v2_search",
+      query: "How many attempts are allowed for SoloBeacon?",
       limit: 3,
     }, toolCtx)) {
       singleFileSearchEvents.push(event);
     }
     const singleFileSearchResult = singleFileSearchEvents.find(event => event.type === "result")?.value;
-    assert.ok(singleFileSearchResult.hits.length >= 1);
-    assert.match(singleFileSearchResult.hits[0].text, /SoloBeacon retry budget is 7 attempts/);
+    assert.ok(singleFileSearchResult.evidence.length >= 1, JSON.stringify(singleFileSearchResult));
+    assert.match(singleFileSearchResult.evidence[0].text, /SoloBeacon retry budget is 7 attempts/);
 
     const deleteContextEvents = [];
     for await (const event of registeredTool.executor.execute({
@@ -316,7 +324,7 @@ async function main() {
     }
     const deleteContextResult = deleteContextEvents.find(event => event.type === "result")?.value;
     assert.ok(!deleteContextResult.config.contexts.some(context => context.id === "single-note"));
-    assert.equal(deleteContextResult.status.state, "idle");
+    assert.equal(deleteContextResult.status.mode, "primary");
     const persistedConfig = JSON.parse(await readFile(path.join(workspaceDir, "cortex-rag.json"), "utf8"));
     assert.ok(!persistedConfig.contexts.some(context => context.id === "single-note"));
 
@@ -378,7 +386,7 @@ await main();
  *
  * This test ensures:
  * - Markdown files are parsed and stored with path normalization
- * - Vectors are stored in a JSON file (for testing)
+ * - Vectors are stored by the V2 hybrid repository (in memory for this test)
  * - Sources are registered with correct metadata
  * - Contexts can be created, searched, selected, and deleted
  * - Single-file search works correctly

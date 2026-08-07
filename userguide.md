@@ -214,11 +214,13 @@ the explicit attachment takes precedence for that turn.
 1. Open the workspace gear.
 2. Enter the folders containing the Markdown documentation.
 3. Save the settings.
-4. Wait for the ingestion status to finish.
+4. Wait until the status shows an `active_*` publication and no pending watcher
+   or queued reconciliation.
 5. Ask a question that depends on the indexed documentation.
 
 Relevant snippets are injected automatically into later turns. Workspace RAG
-currently indexes Markdown files only; PDF, Office, email, and spreadsheet
+uses the V2 hybrid index only and automatically reconciles folder changes.
+It currently indexes Markdown files only; PDF, Office, email, and spreadsheet
 ingestion are roadmap work rather than current WebUI behavior.
 
 ### Ask grounded questions
@@ -663,7 +665,9 @@ skills, triggers, and cognition are loaded.
 ### Workspace RAG indexes fewer files than expected
 
 Confirm that paths are absolute, accessible, and contain `.md` files. Check the
-workspace settings status and `local-agent\logs\matbot.err.log`.
+workspace settings publication/job and watcher status, then inspect
+`local-agent\logs\matbot.err.log`. An inaccessible configured root is reported
+as a retryable discovery failure and the prior complete publication is retained.
 
 ### A workflow list or panel looks stale
 

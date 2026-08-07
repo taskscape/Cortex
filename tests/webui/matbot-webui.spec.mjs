@@ -929,7 +929,7 @@ test("MISSING-03/MISSING-12 workspace RAG configuration panel saves paths and sh
   await expect(page.locator("#input-area")).not.toBeVisible();
   await expect(page.locator("#workspace-context-name")).toHaveValue("Default");
   await expect(page.locator("#workspace-rag-paths")).toHaveValue(/C:\\Projects\\Cortex\\docs/);
-  await expect(page.locator("#workspace-rag-status")).toContainText("idle");
+  await expect(page.locator("#workspace-rag-status")).toContainText("active_hybrid_complete");
   await expect(page.locator("#workspace-rag-status")).toContainText("CPU");
   await expect(page.locator("#workspace-rag-save-btn")).toBeDisabled();
   await expect(page.locator("#workspace-rag-save-btn")).toHaveCSS("background-color", "rgb(208, 213, 221)");
@@ -954,12 +954,15 @@ test("MISSING-03/MISSING-12 workspace RAG configuration panel saves paths and sh
   await expect(page.locator("#workspace-settings-screen")).toHaveClass(/open/);
   await expect(page.locator("#input-area")).not.toBeVisible();
   await expect(page.locator("#workspace-rag-save-btn")).toBeDisabled();
-  await expect(page.locator("#workspace-rag-status")).toContainText("indexing");
+  await expect(page.locator("#workspace-rag-status")).toContainText("embedding");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
+  await expect(page.locator("#workspace-rag-status")).toContainText("2/3 files");
+  await expect(page.locator("#workspace-rag-status")).toContainText("watcher active (pending)");
   await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");
 
   await page.evaluate(async () => window.matbotTransport.callTool("workspace_rag", { action: "reindex_now" }));
-  await expect(page.locator("#workspace-rag-status")).toContainText("idle");
+  await expect(page.locator("#workspace-rag-status")).toContainText("active_hybrid_complete");
+  await expect(page.locator("#workspace-rag-status")).toContainText("3 changed");
   await expect(page.locator("#workspace-rag-current-file")).toHaveText("");
   await expect(page.locator("#workspace-rag-current-file")).toHaveAttribute("title", "");
 });

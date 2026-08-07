@@ -92,7 +92,7 @@ the significant languages, runtimes, and libraries used by each module.
 | `local-agent\matbot` (runtime) | TypeScript (strict), Node.js >= 24 | pnpm monorepo; agentic runner, plugin loader, hooks, stores; provider communication via raw `fetch` + SSE (no provider SDKs); `Store` compare-and-swap persistence. |
 | Matbot WebUI (`packages\plugins\frontend\web`) | TypeScript (server), vanilla JavaScript (client) | Node HTTP + Server-Sent Events server; framework-free `app.js`/`index.html`/CSS; `localStorage` and Web Crypto in the browser. |
 | Provider adapter (`packages\plugins\providers\openai-compat`) | TypeScript | OpenAI-compatible chat-completions adapter; streaming and tool calls over `fetch` + SSE; works with OpenAI and any compatible endpoint. |
-| `workspace-rag` plugin | TypeScript, Node.js | Markdown chunking and SHA-256 content hashing; Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback; CPU hash vectorizer fallback; optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds. |
+| `workspace-rag` plugin | TypeScript, Node.js | V2 hierarchical Markdown parsing and SHA-256 content hashing; atomic Postgres/pgvector hybrid generations for document, section, and passage retrieval; CPU hash vectorizer fallback; optional CUDA embeddings through the `workspace-rag-cuda` HTTP service when launch-time CUDA probing succeeds. |
 | Retrieval plugins (`hybrid-knowledge-index`, `persist-ki-bge`, `rumsfeld`) | TypeScript | `KnowledgeIndex` implementations querying Mem0 and file-index; optional BGE reranking in `persist-ki-bge`; `contextual_search` tool. |
 | `expert-panel` plugin | TypeScript, Node.js | Tool-based multi-expert orchestration over the Matbot single-turn API; per-expert file retrieval and optional synthesis. |
 | `evaluation-observability` plugin | TypeScript, Node.js | Store-backed end-to-end spans, redacted trace replay, deterministic and model-scored regression suites, operational metrics, cost accounting, and verified ROI evidence. |
@@ -168,18 +168,16 @@ intended for multilingual and cross-language retrieval. Cortex automatically
 uses E5's `query: ` and `passage: ` prefixes when
 `WORKSPACE_RAG_EMBEDDING_PROFILE=auto`.
 
-Changing models invalidates the current workspace's vectors and starts a full
-reindex when Matbot starts. Stop Matbot before switching, particularly when a
-workspace contains many files. There is currently no action that cancels an
-in-progress reindex without stopping Matbot. Do not pass `-v` to Docker Compose
+Changing models invalidates the current workspace's derivatives and starts a
+new V2 generation when Matbot starts. Stop Matbot before switching, particularly
+when a workspace contains many files. Use `ingestion_cancel` if an active V2
+job must be cancelled; the prior complete generation remains published. Do not pass `-v` to Docker Compose
 when stopping services because the declared volumes contain Postgres data and
 the downloaded model cache.
 
-For large workspaces, Cortex batches chunks across files and stores
-high-cardinality source/graph metadata in WAL-mode SQLite. Context-graph
-expansion is skipped automatically above 10,000 files while vector and source
-indexing continue. Set `CORTEX_RAG_CONTEXT_GRAPH_MAX_SCAN_FILES=-1` only when an
-unbounded graph expansion is intentional.
+For large workspaces, Cortex streams each Markdown file within a bounded parser
+budget, rate-limits derivative and source-registry work, and stores
+high-cardinality source/graph metadata in WAL-mode SQLite.
 
 1. Stop Cortex before changing the model:
 
@@ -243,9 +241,9 @@ unbounded graph expansion is intentional.
 
    Matbot probes the sidecar at startup. The changed model, dimensions, or
    preprocessing signature causes Workspace RAG to re-embed existing documents
-   automatically. Postgres keeps dimension-specific tables: E5 uses
-   `documents_768` and `chunks_768`, while MiniLM uses `documents_384` and
-   `chunks_384`. Switching models does not delete the other model's tables.
+   automatically. Postgres keeps dimension-specific derivative tables: E5 uses
+   `unit_embeddings_768`, while MiniLM uses `unit_embeddings_384`. Switching
+   models does not delete the other model's table.
 
 6. Check reindex progress and confirm that Matbot adopted the expected model:
 
@@ -255,15 +253,16 @@ unbounded graph expansion is intentional.
      -Uri http://127.0.0.1:19778/tools/workspace_rag `
      -ContentType "application/json" `
      -Body '{"action":"status"}' |
-     Select-Object state, processedFiles, totalFiles, embeddingBackend,
-       embeddingModel, embeddingDimensions, embeddingProfile,
-       embeddingMaxTokens, storageBackend, postgresTables
+      Select-Object mode, available, activeState, activeGenerationId,
+        lastSuccessfulReconcileAt, embeddingBackend,
+        embeddingModel, embeddingDimensions, embeddingProfile,
+        embeddingMaxTokens, backend, job, watcher
    ```
 
-   Wait for `state` to become `idle` before treating the new index as complete.
-   Do not call `reindex_now` while the status is already `indexing`, because
-   that queues another scan. If startup did not schedule a scan, request one
-   explicitly:
+   Wait for `job.state` and `activeState` to report an `active_*` publication
+   before treating the new generation as complete. Overlapping requests are
+   coalesced and `watcher.reconcileQueued` makes a pending follow-up visible. If
+   startup did not schedule reconciliation, request a full rebuild explicitly:
 
    ```powershell
    Invoke-RestMethod `
@@ -273,16 +272,16 @@ unbounded graph expansion is intentional.
      -Body '{"action":"reindex_now"}'
    ```
 
-### Roll out hierarchical Workspace RAG V2
+### Operate hierarchical Workspace RAG V2
 
-V2 implements progressive collection → document → section → passage retrieval
-beside the existing index. Hybrid retrieval is initialized in `primary` mode by default,
-but startup never turns that mode into an automatic million-file reindex. Until
-an active V2 generation is published, searches continue through the V1 fallback.
+Workspace RAG uses V2 progressive collection → document → section → passage
+retrieval as its only index. It starts in `primary` mode, watches configured
+folders, and performs a periodic safety reconciliation. Search remains
+unavailable until the first validated generation is published.
 
-1. Keep the default `CORTEX_RAG_V2_MODE=primary`, or set it to `shadow` while
-   evaluating a new publication without changing answers. Configure the V2
-   Postgres/object-store variables in the active workspace `.env`. For
+1. Keep the default `CORTEX_RAG_V2_MODE=primary`. Set it to `off` only to disable
+   Workspace RAG completely. Configure the V2 Postgres/object-store variables
+   in the active workspace `.env`. For
    production, use a non-owner application database role, a separate
    `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL`, and
    `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES=1`.
@@ -295,7 +294,7 @@ an active V2 generation is published, searches continue through the V1 fallback.
    An interrupted result supplies `checkpoint`; pass it back as `resumeAfter`.
    Use the measured percentiles and storage forecast to set the 20 MB/250 MB
    prototype tier thresholds appropriately for the corpus.
-3. Start one explicit side-by-side generation:
+3. Start an explicit atomic generation when needed:
 
    ```json
    { "action": "ingestion_start" }
@@ -306,10 +305,9 @@ an active V2 generation is published, searches continue through the V1 fallback.
    a job is active returns that job instead of queuing a duplicate scan.
    Cancellation preserves the active generation, and publication is one atomic
    transaction after validation.
-4. Exercise V2 explicitly with `v2_search` and run `evaluation_run`. Shadow mode
-   records comparable traces without changing V1 answers. Keep or restore
-   `CORTEX_RAG_V2_MODE=primary` only after the authorization, citation, memory,
-   relevance, latency, and degradation gates pass.
+4. Exercise retrieval explicitly with `v2_search` and run `evaluation_run`.
+   Keep authorization, citation, memory, relevance, latency, and degradation
+   gates in release validation.
    Repeat `evaluation_run` with `evaluationVariant` set to
    `flat_dense_baseline`, `lexical_only`, `dense_only`, `hybrid_rrf`,
    `hybrid_translated`, `hybrid_reranked`, `hierarchical`, and
@@ -330,9 +328,9 @@ an active V2 generation is published, searches continue through the V1 fallback.
    `book_title` (or `collection_id` and `collection_title`) in front matter to
    add collection routing above their chapter files.
 
-Rollback changes `CORTEX_RAG_V2_MODE` to `shadow` or `off`; V1 Postgres tables
-and the JSON fallback remain untouched. V2 generations and immutable source
-versions are retained for diagnosis and a later atomic re-publication.
+For an operational rollback, set `CORTEX_RAG_V2_MODE=off`; this disables
+Workspace RAG rather than routing to an older index. Published V2 generations
+and immutable source versions are retained for diagnosis and later recovery.
 See [Hybrid Retrieval Architecture](docs/hybrid-retrieval-architecture.md) for
 the data contracts, adoption gates, and completed implementation evidence.
 

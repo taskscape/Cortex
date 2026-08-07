@@ -21,13 +21,13 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-test("workspace RAG V2 defaults to primary and preserves explicit rollback modes", () => {
+test("workspace RAG V2 is the only index mode and defaults to primary", () => {
   const previous = process.env.CORTEX_RAG_V2_MODE;
   try {
     delete process.env.CORTEX_RAG_V2_MODE;
     assert.equal(ragV2ModeFromEnv(), "primary");
-    process.env.CORTEX_RAG_V2_MODE = "shadow";
-    assert.equal(ragV2ModeFromEnv(), "shadow");
+    process.env.CORTEX_RAG_V2_MODE = "unsupported-value";
+    assert.equal(ragV2ModeFromEnv(), "primary", "unknown values cannot select an alternate index");
     process.env.CORTEX_RAG_V2_MODE = "off";
     assert.equal(ragV2ModeFromEnv(), "off");
   } finally {

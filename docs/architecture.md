@@ -62,17 +62,16 @@ Persistence is deliberately split:
 | Source registry records, versions, health events, and access events | One Cortex workspace through Matbot stores | `sources`, `source_versions`, `source_health_events`, `source_access_events` |
 | Traces, spans, evaluation suites/runs/scores, ROI baselines, and verified outcomes | One Cortex workspace through Matbot stores | `observability_traces`, `observability_spans`, `observability_events`, `evaluation_suites`, `evaluation_runs`, `evaluation_scores`, `roi_baselines`, `outcome_events` |
 | Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
-| Workspace RAG vectors/metadata/chunks | Cortex local Docker stack | Postgres/pgvector schema and tables |
-| Workspace RAG JSON fallback | One Cortex workspace | `.data\workspace-rag\index.json` |
+| Workspace RAG V2 catalog, lexical evidence, vectors, jobs, and traces | Cortex local Docker stack | Postgres/pgvector `workspace_rag_v2` schema and dimension-specific derivative tables |
 | File-index data | Host service | `local-agent\file-index\data\index.json` |
 | Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
 
-The proposed scale-out design for million-document corpora and exceptional
+The implemented scale-out design for million-document corpora and exceptional
 multi-gigabyte Markdown sources is documented in
 [`hybrid-retrieval-architecture.md`](hybrid-retrieval-architecture.md). It
-evolves Workspace RAG toward streamed versioned ingestion, document/section/
+uses streamed versioned ingestion, document/section/
 passage retrieval, lexical and dense rank fusion, reranking, range citations,
-and tiered lazy embeddings while retaining PostgreSQL/pgvector as the initial
+and tiered lazy embeddings while retaining PostgreSQL/pgvector as the
 search plane.
 
 ## Core Systems

@@ -258,7 +258,7 @@
       "id": "workspace-rag-hashing",
       "section": "Technology",
       "question": "Which hash does the workspace-rag plugin use for content hashing?",
-      "sourceQuote": "Markdown chunking and SHA-256 content hashing; Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback;",
+      "sourceQuote": "V2 hierarchical Markdown parsing and SHA-256 content hashing; atomic Postgres/pgvector hybrid generations",
       "expect": {
         "required": [["SHA-?256"]],
         "forbidden": ["MD5", "SHA-?1\\b"]
@@ -267,8 +267,8 @@
     {
       "id": "workspace-rag-storage",
       "section": "Technology",
-      "question": "Where does the workspace-rag plugin store vectors, metadata, and chunk text?",
-      "sourceQuote": "Postgres/pgvector storage for vectors, metadata, and chunk text; legacy JSON fallback; CPU hash vectorizer fallback;",
+      "question": "Which persistent hybrid index backend does the workspace-rag plugin use?",
+      "sourceQuote": "atomic Postgres/pgvector hybrid generations for document, section, and passage retrieval; CPU hash vectorizer fallback;",
       "expect": {
         "required": [
           ["Postgres", "PostgreSQL"],

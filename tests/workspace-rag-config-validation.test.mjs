@@ -6,6 +6,8 @@ import test from "node:test";
 
 await import("../local-agent/matbot/apps/cli/register.js");
 process.env.CORTEX_RAG_DISABLE_CUDA = "1";
+process.env.CORTEX_RAG_V2_MODE = "primary";
+process.env.CORTEX_RAG_V2_STORAGE = "memory";
 const { plugin } = await import("../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts");
 
 async function invoke(tool, input) {
