@@ -1,8 +1,16 @@
 providers:
-  openai:
+  GPT 4.1 Nano:
     module: ./packages/plugins/providers/openai-compat
     endpoint: https://api.openai.com/v1/chat/completions
-    model: gpt-4o
+    model: gpt-4.1-nano
+    credentials:
+      apiKey: ${OPENAI_API_KEY}
+    parameters:
+      maxTokens: 4096
+  GPT 5.6 Luna:
+    module: ./packages/plugins/providers/openai-compat
+    endpoint: https://api.openai.com/v1/chat/completions
+    model: gpt-5.6-luna
     credentials:
       apiKey: ${OPENAI_API_KEY}
     parameters:

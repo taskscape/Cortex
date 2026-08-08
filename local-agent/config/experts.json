@@ -1,5 +1,4 @@
 {
-  "defaultProvider": "openai",
   "experts": [
     {
       "id": "design",

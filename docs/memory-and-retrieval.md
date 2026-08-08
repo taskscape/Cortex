@@ -225,19 +225,16 @@ Skills also mirror saved skill content into the active `KnowledgeIndex`.
 ## Workspace RAG Retrieval
 
 Workspace RAG is scoped to the active Cortex workspace and its active RAG
-context. It is file-backed markdown retrieval with per-workspace persistence.
-It injects relevant snippets automatically before each model turn and can also
-be queried by `workspace_rag` and `contextual_search`. In normal Docker-backed
-startup, Postgres/pgvector stores vectors, document hashes, chunk text, and
-metadata in the `workspace_rag` schema. The older
-`.data\workspace-rag\index.json` file is retained only as a fallback or
-diagnostic storage mode.
+context. It injects relevant Markdown evidence automatically before each model
+turn and can also be queried by `workspace_rag` and `contextual_search`.
+Postgres/pgvector persists the hybrid index in the `workspace_rag_v2` schema,
+including immutable document versions, sections, passages, lexical indexes,
+dense vectors, ingestion jobs, and atomic publications.
 
-The proposed successor architecture for million-document and multi-gigabyte
-sources is described in
-[`hybrid-retrieval-architecture.md`](hybrid-retrieval-architecture.md). It adds
-streaming ingestion, immutable versions, document/section/passage hierarchy,
-lexical plus dense retrieval, reranking, and deterministic range citations.
+The architecture for million-document and multi-gigabyte sources is described
+in [`hybrid-retrieval-architecture.md`](hybrid-retrieval-architecture.md). It
+uses streaming ingestion, document/section/passage hierarchy, lexical plus
+dense retrieval, reranking, and deterministic range citations.
 
 ## `contextual_search` Retrieval
 
