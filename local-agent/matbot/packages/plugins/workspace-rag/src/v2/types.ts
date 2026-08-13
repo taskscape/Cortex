@@ -272,6 +272,8 @@ export interface RagV2Job {
   removedFiles: number;
   discoveryComplete: boolean;
   deletionsDeferred: boolean;
+  /** Configured source roots skipped because they are not currently indexable. */
+  skippedPaths?: string[];
   trigger: 'startup' | 'watch' | 'interval' | 'configuration' | 'manual' | 'retry';
   currentPath?: string;
   checkpoint?: string;

@@ -135,6 +135,16 @@ interface V2ReconcileState {
   lastError?: string;
 }
 
+const SKIPPABLE_WATCH_ROOT_ERROR_CODES = new Set([
+  'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
+]);
+
+function filesystemErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
 interface WorkspaceRagStatus extends RagV2Status {
   contextName: string;
   paths: string[];
@@ -893,13 +903,23 @@ class WorkspaceRagManager {
 
   private async reconcileAll(trigger: Extract<RagV2Job['trigger'], 'startup' | 'interval'>): Promise<void> {
     if (this.disposed || this.v2Mode === 'off' || !this.v2) return;
+    const scheduled: Array<Promise<unknown>> = [];
     for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
-      const config = await this.readConfig(workspace);
+      let config: RagConfig;
+      try {
+        config = await this.readConfig(workspace);
+      } catch (error) {
+        console.warn(`[workspace-rag-v2] skipped workspace ${workspace.id}: ${errorMessage(error)}`);
+        continue;
+      }
       for (const context of config.contexts) {
         if (this.disposed) return;
-        await this.requestV2Reconcile(workspace, context, trigger, true);
+        scheduled.push(this.requestV2Reconcile(workspace, context, trigger, false).catch(error => {
+          this.reconcileState(workspace.id, context.id).lastError = errorMessage(error);
+        }));
       }
     }
+    await Promise.all(scheduled);
   }
 
   private scheduleWatchReconcile(workspaceId: string, contextId: string, changedPath?: string): void {
@@ -937,6 +957,10 @@ class WorkspaceRagManager {
       for (const context of config.contexts) {
         for (const root of context.paths) {
           const rootStat = await stat(root).catch(error => {
+            if (SKIPPABLE_WATCH_ROOT_ERROR_CODES.has(filesystemErrorCode(error) ?? '')) {
+              console.warn(`[workspace-rag-v2] skipped watcher for unavailable root ${root}: ${errorMessage(error)}`);
+              return undefined;
+            }
             this.watcherState = 'degraded';
             this.watcherError = `Cannot watch ${root}: ${errorMessage(error)}`;
             return undefined;
@@ -989,7 +1013,6 @@ class WorkspaceRagManager {
     }
     const previousPaths = context.paths;
     const nextPaths = Array.isArray(config.paths) ? normalizeFolderPaths(config.paths) : context.paths;
-    await this.assertAccessiblePaths(nextPaths);
     const pathsChanged = JSON.stringify(previousPaths) !== JSON.stringify(nextPaths);
     const next: RagConfig = {
       activeContextId: context.id,
@@ -1037,7 +1060,6 @@ class WorkspaceRagManager {
     const seen = new Set(current.contexts.map(context => context.id));
     const id = uniqueContextId(name, seen);
     const nextPaths = normalizeFolderPaths(paths);
-    await this.assertAccessiblePaths(nextPaths);
     const nextContext: RagContextConfig = {
       id,
       name,
@@ -1311,16 +1333,6 @@ class WorkspaceRagManager {
         return leftPriority - rightPriority || left.index - right.index;
       })
       .map(item => item.workspace);
-  }
-
-  private async assertAccessiblePaths(paths: readonly string[]): Promise<void> {
-    for (const folder of paths) {
-      try {
-        await access(folder);
-      } catch {
-        throw new Error(`Workspace RAG path is inaccessible: ${folder}`);
-      }
-    }
   }
 
   private fileSourceExternalId(contextId: string, normalizedPath: string): string {

@@ -164,6 +164,38 @@ function normalizedPath(value: string): string {
   return path.resolve(value).replace(/\\/gu, '/');
 }
 
+const SKIPPABLE_ROOT_ERROR_CODES = new Set([
+  'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
+]);
+
+function isWithinRoot(filePath: string, root: string): boolean {
+  const relative = path.relative(root, filePath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function availableMarkdownRoots(paths: readonly string[]): Promise<{
+  paths: string[];
+  skippedPaths: string[];
+}> {
+  const available: string[] = [];
+  const skipped: string[] = [];
+  for (const configuredPath of paths) {
+    const root = path.resolve(configuredPath);
+    try {
+      const rootStat = await stat(root);
+      if (rootStat.isDirectory() || (rootStat.isFile() && root.toLocaleLowerCase().endsWith('.md'))) {
+        available.push(root);
+      } else {
+        skipped.push(root);
+      }
+    } catch (error) {
+      if (!SKIPPABLE_ROOT_ERROR_CODES.has(errorCode(error) ?? '')) throw discoveryError(root, error);
+      skipped.push(root);
+    }
+  }
+  return { paths: available, skippedPaths: skipped };
+}
+
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -362,9 +394,14 @@ export class WorkspaceRagV2Manager {
           ? { signature: this.semanticServices.summarizerSignature }
           : {}),
       },
-      message: publication
-        ? `Workspace RAG V2 publication ${publication.generationId} is ${publication.state}.`
-        : 'Workspace RAG V2 has no active publication.',
+      message: [
+        publication
+          ? `Workspace RAG V2 publication ${publication.generationId} is ${publication.state}.`
+          : 'Workspace RAG V2 has no active publication.',
+        ...(job?.skippedPaths?.length
+          ? [`Skipped ${job.skippedPaths.length} unavailable configured path${job.skippedPaths.length === 1 ? '' : 's'}.`]
+          : []),
+      ].join(' '),
     };
   }
 
@@ -994,15 +1031,37 @@ export class WorkspaceRagV2Manager {
   ): Promise<void> {
     await this.initialize();
     await this.repository.createJob(job);
-    await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
     const fingerprints = new Map(
       (await this.repository.listFingerprints(workspace.id, context.id)).map(value => [normalizedPath(value.path), value]),
     );
+    const rootSelection = await availableMarkdownRoots(context.paths);
+    if (rootSelection.skippedPaths.length > 0) {
+      job.skippedPaths = rootSelection.skippedPaths;
+      job.message = `Skipping ${rootSelection.skippedPaths.length} unavailable configured path${rootSelection.skippedPaths.length === 1 ? '' : 's'} while indexing the remaining paths.`;
+      job.updatedAt = now();
+      await this.repository.updateJob(job);
+      const unavailableRootWithIndexedDocuments = rootSelection.skippedPaths.find(root =>
+        [...fingerprints.keys()].some(filePath => isWithinRoot(filePath, root)),
+      );
+      if (unavailableRootWithIndexedDocuments) {
+        job.state = 'retryable_failure';
+        job.deletionsDeferred = true;
+        job.message = (
+          `Workspace RAG V2 could not completely discover ${unavailableRootWithIndexedDocuments}: `
+          + 'the root has indexed documents, so its previous publication remains active.'
+        );
+        job.updatedAt = now();
+        await this.repository.updateJob(job);
+        return;
+      }
+    }
+    const indexContext: RagV2ContextRef = { ...context, paths: rootSelection.paths };
+    await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
     const seenPaths = new Set<string>();
     let removedPaths: string[] = [];
     try {
       for (const priority of ['authority', 'current', 'archive'] as const) {
-        for await (const file of discoverMarkdown(context.paths, signal, priority)) {
+        for await (const file of discoverMarkdown(indexContext.paths, signal, priority)) {
         await this.waitWhilePaused(job, signal);
         if (signal.aborted) throw abortError(signal);
         job.discoveredFiles++;
@@ -1059,7 +1118,7 @@ export class WorkspaceRagV2Manager {
           continue;
         }
         try {
-          await this.ingestFile(workspace, context, job, file, signal);
+          await this.ingestFile(workspace, indexContext, job, file, signal);
           if (existing) job.changedFiles++;
           else job.addedFiles++;
           job.processedFiles++;
@@ -1170,6 +1229,9 @@ export class WorkspaceRagV2Manager {
       job.message = [
         `Published ${validation.documents} documents, ${validation.sections} sections, and ${validation.passages} passages.`,
         `${job.addedFiles} added, ${job.changedFiles} changed, ${job.unchangedFiles} unchanged, ${job.removedFiles} removed.`,
+        ...(job.skippedPaths?.length
+          ? [`Skipped ${job.skippedPaths.length} unavailable configured path${job.skippedPaths.length === 1 ? '' : 's'}.`]
+          : []),
         ...(job.deletionsDeferred ? ['Deletion reconciliation was deferred because one or more files failed.'] : []),
       ].join(' ');
       delete job.currentPath;

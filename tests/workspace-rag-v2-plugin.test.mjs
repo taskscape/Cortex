@@ -96,6 +96,14 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
   assert.equal(status.job.discoveryComplete, true);
   assert.equal(status.watcher.state, "active");
 
+  const missingRoot = path.join(root, "missing-root");
+  await execute(tool, { action: "configure", contextName: "Contracts", paths: [docs, missingRoot] });
+  const skippedRoot = await execute(tool, { action: "ingestion_wait" });
+  assert.equal(skippedRoot.activeState, "active_hybrid_complete");
+  assert.deepEqual(skippedRoot.job.skippedPaths, [path.resolve(missingRoot)]);
+  assert.equal(skippedRoot.watcher.state, "active");
+  assert.match(skippedRoot.message, /skipped 1 unavailable configured path/i);
+
   const reindexed = await execute(tool, { action: "reindex_now" });
   assert.equal(reindexed.job.trigger, "manual");
   assert.equal(reindexed.available, true);

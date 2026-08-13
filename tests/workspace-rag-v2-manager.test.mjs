@@ -594,6 +594,31 @@ test("workspace RAG V2 does not publish deletions when a configured root is unav
   assert.equal((await manager.status("primary", workspace, context)).job.discoveryComplete, true);
 });
 
+test("workspace RAG V2 skips an invalid configured root and indexes the remaining roots", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-skip-invalid-root-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  const missing = path.join(root, "missing");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "available.md"), "# Available\n\nVALID-ROOT-EVIDENCE-432", "utf8");
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  context.paths = [missing, docs];
+
+  const job = manager.startIngestion(workspace, context, "startup");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const status = await manager.status("primary", workspace, context);
+
+  assert.equal(status.job.id, job.id);
+  assert.equal(status.job.state, "active_hybrid_complete");
+  assert.deepEqual(status.job.skippedPaths, [path.resolve(missing)]);
+  assert.match(status.message, /skipped 1 unavailable configured path/i);
+  const search = await manager.search(workspace, context, "VALID-ROOT-EVIDENCE-432", { limit: 3 });
+  assert.equal(search.evidence.length, 1);
+});
+
 test("workspace RAG V2 does not publish nested-directory deletions from a discovery race", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-nested-race-"));
   t.after(() => rm(root, { recursive: true, force: true }));
