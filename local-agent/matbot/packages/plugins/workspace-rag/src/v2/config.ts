@@ -33,6 +33,11 @@ export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
   };
 }
 
+/** Files ingested between checkpoint publications; 0 publishes only when the whole scan completes. */
+export function ragV2CheckpointFilesFromEnv(): number {
+  return nonNegativeInteger(process.env['CORTEX_RAG_V2_CHECKPOINT_FILES'], 250);
+}
+
 export function ragV2RerankerUrlFromEnv(): string | undefined {
   const value = String(process.env['CORTEX_RAG_V2_RERANKER_URL'] ?? '').trim();
   return value || undefined;

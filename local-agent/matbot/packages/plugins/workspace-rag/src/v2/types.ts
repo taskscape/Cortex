@@ -272,6 +272,10 @@ export interface RagV2Job {
   removedFiles: number;
   discoveryComplete: boolean;
   deletionsDeferred: boolean;
+  /** Files this job inherited intact from the interrupted run whose generation it adopted. */
+  resumedFiles: number;
+  /** Checkpoint publications made while the scan was still running. */
+  publishedCheckpoints: number;
   /** Configured source roots skipped because they are not currently indexable. */
   skippedPaths?: string[];
   trigger: 'startup' | 'watch' | 'interval' | 'configuration' | 'manual' | 'retry';

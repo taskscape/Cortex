@@ -192,6 +192,53 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  async generation(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<RagV2Publication | undefined> {
+    const result = await this.withWorkspace(workspaceId, client => client.query<{
+      generation_id: string;
+      workspace_id: string;
+      context_id: string;
+      embedding_signature: string;
+      state: RagV2PublicationState;
+      active: boolean;
+      created_at: string;
+      published_at: string | null;
+    }>(`
+      SELECT generation_id, workspace_id, context_id, embedding_signature,
+        state, active, created_at, published_at
+      FROM ${this.table('publications')}
+      WHERE workspace_id = $1 AND context_id = $2 AND generation_id = $3
+      LIMIT 1
+    `, [workspaceId, contextId, generationId]));
+    const row = result.rows[0];
+    return row ? {
+      generationId: row.generation_id,
+      workspaceId: row.workspace_id,
+      contextId: row.context_id,
+      embeddingSignature: row.embedding_signature,
+      state: row.state,
+      active: row.active,
+      createdAt: row.created_at,
+      ...(row.published_at ? { publishedAt: row.published_at } : {}),
+    } : undefined;
+  }
+
+  async pruneStagingGenerations(
+    workspaceId: string,
+    contextId: string,
+    keepGenerationId: string,
+  ): Promise<number> {
+    const result = await this.withWorkspace(workspaceId, client => client.query(`
+      DELETE FROM ${this.table('publications')}
+      WHERE workspace_id = $1 AND context_id = $2 AND active = FALSE
+        AND state = 'staging' AND generation_id <> $3
+    `, [workspaceId, contextId, keepGenerationId]));
+    return result.rowCount ?? 0;
+  }
+
   async activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined> {
     const result = await this.withWorkspace(workspaceId, client => client.query<{
       generation_id: string;
@@ -291,13 +338,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]).then(() => undefined));
   }
 
-  async listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]> {
+  async listFingerprints(
+    workspaceId: string,
+    contextId: string,
+    generationId?: string,
+  ): Promise<RagV2DocumentFingerprint[]> {
     const result = await this.withWorkspace(workspaceId, client => client.query<{
       document_id: string;
       document_version_id: string;
       path: string;
       byte_length: string;
-      modified_at: string;
+      modified_at: string | Date;
       content_sha256: string;
       embedding_signature: string;
       summary_signature: string | null;
@@ -331,14 +382,20 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ORDER BY rs.created_at DESC
         LIMIT 1
       ) summary ON TRUE
-      WHERE p.workspace_id = $1 AND p.context_id = $2 AND p.active = TRUE
-    `, [workspaceId, contextId]));
+      WHERE p.workspace_id = $1 AND p.context_id = $2
+        AND p.generation_id = COALESCE($3::TEXT, (
+          SELECT generation_id FROM ${this.table('publications')}
+          WHERE workspace_id = $1 AND context_id = $2 AND active = TRUE
+          LIMIT 1
+        ))
+    `, [workspaceId, contextId, generationId ?? null]));
     return result.rows.map(row => ({
       documentId: row.document_id,
       documentVersionId: row.document_version_id,
       path: row.path,
       byteLength: Number(row.byte_length),
-      modifiedAt: row.modified_at,
+      // pg maps TIMESTAMPTZ to Date; the unchanged check compares against an ISO mtime string.
+      modifiedAt: new Date(row.modified_at).toISOString(),
       contentSha256: row.content_sha256,
       embeddingSignature: row.embedding_signature,
       ...(row.summary_signature ? { summarySignature: row.summary_signature } : {}),
@@ -359,25 +416,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return Number(result.rows[0]?.count ?? 0);
   }
 
-  async beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
-    await this.withWorkspace(document.workspaceId, async client => {
-      await this.upsertDocument(client, document);
-      await client.query(`
-        INSERT INTO ${this.table('publication_documents')} (
-          generation_id, workspace_id, context_id, document_id, document_version_id, path
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (generation_id, document_id) DO UPDATE SET
-          document_version_id = EXCLUDED.document_version_id,
-          path = EXCLUDED.path
-      `, [
-        generationId,
-        document.workspaceId,
-        document.contextId,
-        document.documentId,
-        document.documentVersionId,
-        document.path,
-      ]);
-    });
+  async beginDocument(_generationId: string, document: RagV2DocumentRecord): Promise<void> {
+    await this.withWorkspace(document.workspaceId, client => this.upsertDocument(client, document));
   }
 
   async appendSections(sections: readonly RagV2SectionRecord[]): Promise<void> {
@@ -597,8 +637,25 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
-  async finishDocument(_generationId: string, document: RagV2DocumentRecord): Promise<void> {
-    await this.withWorkspace(document.workspaceId, client => this.upsertDocument(client, document));
+  async finishDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
+    await this.withWorkspace(document.workspaceId, async client => {
+      await this.upsertDocument(client, document);
+      await client.query(`
+        INSERT INTO ${this.table('publication_documents')} (
+          generation_id, workspace_id, context_id, document_id, document_version_id, path
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (generation_id, document_id) DO UPDATE SET
+          document_version_id = EXCLUDED.document_version_id,
+          path = EXCLUDED.path
+      `, [
+        generationId,
+        document.workspaceId,
+        document.contextId,
+        document.documentId,
+        document.documentVersionId,
+        document.path,
+      ]);
+    });
   }
 
   async rebuildCollections(
@@ -1752,6 +1809,26 @@ export class PostgresRagV2Repository implements RagV2Repository {
         await client.query(`
           INSERT INTO ${this.table('schema_migrations')} (version, name, applied_at)
           VALUES (6, 'versioned_semantic_summaries_and_collections', $1)
+        `, [now()]);
+      }
+      const migrationSeven = await client.query<{ exists: boolean }>(`
+        SELECT EXISTS (
+          SELECT 1 FROM ${this.table('schema_migrations')} WHERE version = 7
+        ) AS exists
+      `);
+      if (!migrationSeven.rows[0]?.exists) {
+        // Generations used to admit a document before its passages were written, so an interrupted
+        // run could leave a half-ingested member behind. Drop those: resumption now trusts
+        // membership, and a dropped member is simply re-ingested by the next scan.
+        await client.query(`
+          DELETE FROM ${this.table('publication_documents')} pd
+          USING ${this.table('documents')} d
+          WHERE d.document_version_id = pd.document_version_id
+            AND d.line_count = 0 AND d.routing_summary = ''
+        `);
+        await client.query(`
+          INSERT INTO ${this.table('schema_migrations')} (version, name, applied_at)
+          VALUES (7, 'complete_documents_only_in_generations', $1)
         `, [now()]);
       }
       await client.query('COMMIT');

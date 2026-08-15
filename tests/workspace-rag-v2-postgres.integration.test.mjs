@@ -157,7 +157,122 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   assert.ok(Number(counts.rows[0].embeddings) >= 3);
   assert.ok(Number(counts.rows[0].retrieval_evidence) >= 1);
   assert.equal(Number(counts.rows[0].evaluation_runs), 1);
-  assert.equal(Number(counts.rows[0].schema_version), 6);
+  assert.equal(Number(counts.rows[0].schema_version), 7);
+});
+
+integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes abandoned generations", async t => {
+  const schema = `workspace_rag_v2_resume_${process.pid}`;
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  process.env.CORTEX_RAG_V2_CHECKPOINT_FILES = "2";
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
+  );
+  const { WorkspaceRagV2Manager } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts"
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-pg-resume-"));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  for (const name of ["a", "b", "c", "d", "e", "f"]) {
+    await writeFile(
+      path.join(docs, `${name}.md`),
+      `# Doc ${name}\n\n## Body\n\nThe ${name} answer is PG-RESUME-${name.toLocaleUpperCase()}.`,
+      "utf8",
+    );
+  }
+  const poolConfig = process.env.CORTEX_RAG_POSTGRES_URL
+    ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }
+    : {
+        host: process.env.CORTEX_RAG_POSTGRES_HOST || "127.0.0.1",
+        port: Number(process.env.CORTEX_RAG_POSTGRES_PORT || 5432),
+        database: process.env.CORTEX_RAG_POSTGRES_DB || "mem0",
+        user: process.env.CORTEX_RAG_POSTGRES_USER || "mem0",
+        password: process.env.CORTEX_RAG_POSTGRES_PASSWORD || process.env.POSTGRES_PASSWORD,
+      };
+  const cleanup = new Pool(poolConfig);
+  const repository = new PostgresRagV2Repository();
+  const embedder = {
+    info: { backend: "test", model: "test", dimensions: 32, signature: "test-pg-resume-v1" },
+    async embed(texts) { return texts.map(text => embedding(text)); },
+  };
+  const workspace = { id: "postgres-resume-workspace", name: "Postgres", configDir: root };
+  const context = { id: "resume", name: "Resume", paths: [docs] };
+
+  let interruptedManager;
+  let reached;
+  const reachedFiles = new Promise(resolve => { reached = resolve; });
+  interruptedManager = new WorkspaceRagV2Manager(repository, {
+    info: embedder.info,
+    async embed(texts, purpose, signal) {
+      const observed = signal
+        ? await interruptedManager.status("primary", workspace, context)
+        : undefined;
+      if (signal && observed.job.processedFiles >= 3) {
+        reached();
+        await new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      return embedder.embed(texts, purpose, signal);
+    },
+  });
+  const restarted = new WorkspaceRagV2Manager(repository, embedder);
+  t.after(async () => {
+    delete process.env.CORTEX_RAG_V2_CHECKPOINT_FILES;
+    await interruptedManager.close().catch(() => undefined);
+    await restarted.close().catch(() => undefined);
+    await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await cleanup.end();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const interruptedJob = interruptedManager.startIngestion(workspace, context);
+  await reachedFiles;
+  await interruptedManager.cancel(workspace.id, context.id);
+  const interruptedStatus = await interruptedManager.status("primary", workspace, context);
+  assert.equal(interruptedStatus.job.discoveryComplete, false);
+  assert.ok(interruptedStatus.job.publishedCheckpoints >= 1, "a checkpoint publishes mid-scan");
+  assert.equal(
+    interruptedStatus.activeGenerationId,
+    interruptedJob.generationId,
+    "the interrupted scan leaves a published generation behind",
+  );
+  assert.ok(interruptedStatus.indexedDocuments >= 2);
+  assert.equal(
+    (await repository.listFingerprints(workspace.id, context.id, interruptedJob.generationId)).length,
+    interruptedStatus.indexedDocuments,
+    "generation-scoped fingerprints match the documents the generation holds",
+  );
+
+  const resumedJob = restarted.startIngestion(workspace, context, "startup");
+  await restarted.waitForIngestion(workspace.id, context.id);
+  const status = await restarted.status("primary", workspace, context);
+  assert.equal(resumedJob.generationId, interruptedJob.generationId, "the restart adopts the generation");
+  assert.ok(status.job.resumedFiles >= 3, "completed files are inherited rather than re-ingested");
+  assert.equal(status.job.addedFiles + status.job.unchangedFiles, 6);
+  assert.ok(status.job.addedFiles < 6, "a restart does not start from zero");
+  assert.equal(status.job.state, "active_hybrid_complete");
+  assert.equal(status.indexedDocuments, 6);
+
+  const evidence = await restarted.search(workspace, context, "PG-RESUME-A", { limit: 3 });
+  assert.ok(evidence.evidence.length >= 1, "inherited work stays searchable");
+
+  const rescan = new WorkspaceRagV2Manager(repository, embedder);
+  t.after(() => rescan.close().catch(() => undefined));
+  rescan.startIngestion(workspace, context, "startup");
+  await rescan.waitForIngestion(workspace.id, context.id);
+  const rescanned = await rescan.status("primary", workspace, context);
+  assert.equal(rescanned.job.unchangedFiles, 6, "a completed corpus is recognised on the next run");
+  assert.equal(rescanned.job.addedFiles, 0);
+  assert.equal(rescanned.job.changedFiles, 0, "stored mtimes compare equal across restarts");
+  assert.equal(rescanned.indexedDocuments, 6);
+
+  const staging = await cleanup.query(`
+    SELECT COUNT(*)::int AS count FROM "${schema}".publications
+    WHERE workspace_id = $1 AND context_id = $2 AND state = 'staging'
+  `, [workspace.id, context.id]);
+  assert.equal(staging.rows[0].count, 0, "no abandoned staging generation is left behind");
 });
 
 integration("workspace RAG V2 enforces RLS through a separate non-owner application role", async t => {

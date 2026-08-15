@@ -77,6 +77,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
   async beginGeneration(workspaceId: string, contextId: string, generationId: string): Promise<void> {
     const publicationKey = key(workspaceId, contextId);
     const values = this.publications.get(publicationKey) ?? [];
+    if (values.some(value => value.generationId === generationId)) return;
     values.push({
       generationId,
       workspaceId,
@@ -96,6 +97,32 @@ export class MemoryRagV2Repository implements RagV2Repository {
 
   async activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined> {
     return this.publications.get(key(workspaceId, contextId))?.find(value => value.active);
+  }
+
+  async generation(
+    workspaceId: string,
+    contextId: string,
+    generationId: string,
+  ): Promise<RagV2Publication | undefined> {
+    return this.publications.get(key(workspaceId, contextId))
+      ?.find(value => value.generationId === generationId);
+  }
+
+  async pruneStagingGenerations(
+    workspaceId: string,
+    contextId: string,
+    keepGenerationId: string,
+  ): Promise<number> {
+    const publicationKey = key(workspaceId, contextId);
+    const values = this.publications.get(publicationKey) ?? [];
+    const stale = values.filter(value =>
+      !value.active && value.state === 'staging' && value.generationId !== keepGenerationId);
+    for (const publication of stale) this.generationDocuments.delete(publication.generationId);
+    this.publications.set(
+      publicationKey,
+      values.filter(value => !stale.includes(value)),
+    );
+    return stale.length;
   }
 
   async publishGeneration(
@@ -162,8 +189,14 @@ export class MemoryRagV2Repository implements RagV2Repository {
     return generation ? this.generationDocuments.get(generation)?.size ?? 0 : 0;
   }
 
-  async listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]> {
-    const active = await this.activePublication(workspaceId, contextId);
+  async listFingerprints(
+    workspaceId: string,
+    contextId: string,
+    generationId?: string,
+  ): Promise<RagV2DocumentFingerprint[]> {
+    const active = generationId
+      ? await this.generation(workspaceId, contextId, generationId)
+      : await this.activePublication(workspaceId, contextId);
     if (!active) return [];
     const versions = new Set(this.generationDocuments.get(active.generationId)?.values() ?? []);
     const documentSummarySignatures = new Map<string, string>();
@@ -203,9 +236,8 @@ export class MemoryRagV2Repository implements RagV2Repository {
       }));
   }
 
-  async beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
+  async beginDocument(_generationId: string, document: RagV2DocumentRecord): Promise<void> {
     this.documents.set(document.documentVersionId, structuredClone(document));
-    this.generationDocuments.get(generationId)?.set(document.documentId, document.documentVersionId);
   }
 
   async appendSections(sections: readonly RagV2SectionRecord[]): Promise<void> {

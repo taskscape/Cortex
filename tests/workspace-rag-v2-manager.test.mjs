@@ -372,6 +372,138 @@ test("workspace RAG V2 cancellation preserves the active publication", async t =
   await slowManager.close();
 });
 
+async function interruptedRun(repository, root, docs, stopAfterFiles) {
+  const base = testEmbedder();
+  const { workspace, context } = refs(root, docs);
+  let manager;
+  let reached;
+  const reachedFiles = new Promise(resolve => { reached = resolve; });
+  manager = new WorkspaceRagV2Manager(repository, {
+    info: base.info,
+    async embed(texts, purpose, signal) {
+      const observed = signal ? await manager.status("primary", workspace, context) : undefined;
+      if (signal && observed.job.processedFiles >= stopAfterFiles) {
+        reached();
+        await new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      return base.embed(texts, purpose, signal);
+    },
+  });
+  const job = manager.startIngestion(workspace, context);
+  await reachedFiles;
+  const interrupted = await manager.cancel(workspace.id, context.id);
+  const status = await manager.status("primary", workspace, context);
+  await manager.close();
+  return { generationId: job.generationId, job: interrupted, status };
+}
+
+async function corpus(prefix, names) {
+  const root = await mkdtemp(path.join(tmpdir(), prefix));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  for (const name of names) {
+    await writeFile(
+      path.join(docs, `${name}.md`),
+      `# Doc ${name}\n\n## Body\n\nThe ${name} answer is RESUME-EVIDENCE-${name.toLocaleUpperCase()}.`,
+      "utf8",
+    );
+  }
+  return { root, docs };
+}
+
+test("workspace RAG V2 resumes the generation an interrupted run left behind", async t => {
+  const { root, docs } = await corpus("cortex-rag-v2-resume-", ["a", "b", "c", "d", "e", "f"]);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = new MemoryRagV2Repository();
+  const { workspace, context } = refs(root, docs);
+
+  const interrupted = await interruptedRun(repository, root, docs, 3);
+  assert.equal(interrupted.job.state, "cancelled");
+  assert.equal(interrupted.job.discoveryComplete, false);
+  assert.equal(interrupted.status.activeGenerationId, undefined, "an interrupted scan publishes nothing");
+  assert.equal(interrupted.status.indexedDocuments, 0);
+
+  const restarted = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => restarted.close());
+  const resumedJob = restarted.startIngestion(workspace, context, "startup");
+  await restarted.waitForIngestion(workspace.id, context.id);
+  const status = await restarted.status("primary", workspace, context);
+
+  assert.equal(resumedJob.generationId, interrupted.generationId, "the restart adopts the abandoned generation");
+  assert.equal(status.job.resumedFiles, 3, "files the interrupted run finished are inherited");
+  assert.equal(status.job.unchangedFiles, 3, "inherited files are not re-ingested");
+  assert.equal(status.job.addedFiles, 3, "the half-written file and the untouched files are ingested");
+  assert.equal(status.job.state, "active_hybrid_complete");
+  assert.equal(status.indexedDocuments, 6);
+
+  const evidence = await restarted.search(workspace, context, "RESUME-EVIDENCE-A", { limit: 3 });
+  assert.ok(evidence.evidence.length >= 1, "work inherited from the interrupted run is searchable");
+});
+
+test("workspace RAG V2 checkpoint publications leave an interrupted scan queryable", async t => {
+  const previous = process.env.CORTEX_RAG_V2_CHECKPOINT_FILES;
+  process.env.CORTEX_RAG_V2_CHECKPOINT_FILES = "2";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CORTEX_RAG_V2_CHECKPOINT_FILES;
+    else process.env.CORTEX_RAG_V2_CHECKPOINT_FILES = previous;
+  });
+  const { root, docs } = await corpus("cortex-rag-v2-checkpoint-", ["a", "b", "c", "d", "e", "f"]);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = new MemoryRagV2Repository();
+  const { workspace, context } = refs(root, docs);
+
+  const interrupted = await interruptedRun(repository, root, docs, 4);
+  assert.ok(interrupted.job.publishedCheckpoints >= 1, "checkpoints publish while the scan runs");
+  assert.equal(
+    interrupted.status.activeGenerationId,
+    interrupted.generationId,
+    "the partially scanned generation is published rather than abandoned",
+  );
+  assert.ok(interrupted.status.activeState.startsWith("active_"));
+  assert.ok(interrupted.status.indexedDocuments >= 2, "the published checkpoint holds the completed files");
+
+  const reader = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => reader.close());
+  const evidence = await reader.search(workspace, context, "RESUME-EVIDENCE-A", { limit: 3 });
+  assert.ok(evidence.evidence.length >= 1, "a restart inherits a queryable index, not an empty one");
+
+  const resumedJob = reader.startIngestion(workspace, context, "startup");
+  await reader.waitForIngestion(workspace.id, context.id);
+  const status = await reader.status("primary", workspace, context);
+  assert.equal(resumedJob.generationId, interrupted.generationId);
+  assert.equal(status.job.state, "active_hybrid_complete");
+  assert.equal(status.indexedDocuments, 6);
+});
+
+test("workspace RAG V2 prunes staging generations abandoned by earlier runs", async t => {
+  const { root, docs } = await corpus("cortex-rag-v2-prune-", ["a", "b", "c", "d"]);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = new MemoryRagV2Repository();
+  const { workspace, context } = refs(root, docs);
+
+  const interrupted = await interruptedRun(repository, root, docs, 2);
+  assert.ok(await repository.generation(workspace.id, context.id, interrupted.generationId));
+
+  const base = testEmbedder();
+  const rekeyed = new WorkspaceRagV2Manager(repository, {
+    info: { ...base.info, signature: "test-v2" },
+    embed: base.embed,
+  });
+  t.after(() => rekeyed.close());
+  const job = rekeyed.startIngestion(workspace, context);
+  await rekeyed.waitForIngestion(workspace.id, context.id);
+
+  assert.notEqual(job.generationId, interrupted.generationId, "a changed embedding signature is never resumed");
+  assert.equal(
+    await repository.generation(workspace.id, context.id, interrupted.generationId),
+    undefined,
+    "the abandoned staging generation is pruned",
+  );
+  assert.equal((await rekeyed.status("primary", workspace, context)).job.state, "active_hybrid_complete");
+});
+
 test("workspace RAG V2 keeps complete lexical coverage and lazily promotes cold passages", async t => {
   const previousEager = process.env.CORTEX_RAG_V2_EAGER_MAX_BYTES;
   const previousAsync = process.env.CORTEX_RAG_V2_ASYNC_MAX_BYTES;

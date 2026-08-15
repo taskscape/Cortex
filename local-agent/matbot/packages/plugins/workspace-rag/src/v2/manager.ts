@@ -4,6 +4,7 @@ import path from 'node:path';
 import { analyzeCensusFile, RagV2HyperLogLog } from './census.js';
 import {
   ragV2ObjectRetentionFromEnv,
+  ragV2CheckpointFilesFromEnv,
   ragV2ColbertUrlFromEnv,
   ragV2PolicyFromEnv,
   ragV2RerankerUrlFromEnv,
@@ -360,6 +361,7 @@ export class WorkspaceRagV2Manager {
   private readonly rerankerUrl = ragV2RerankerUrlFromEnv();
   private readonly rrf = ragV2RrfFromEnv();
   private readonly objectRetention = ragV2ObjectRetentionFromEnv();
+  private readonly checkpointFiles = ragV2CheckpointFilesFromEnv();
   private readonly colbertUrl = ragV2ColbertUrlFromEnv();
   private readonly storageLimiter = new RagV2RateLimiter(this.policy.storageBytesPerSecond);
   private readonly embeddingLimiter = new RagV2RateLimiter(this.policy.embeddingTextsPerSecond);
@@ -488,6 +490,8 @@ export class WorkspaceRagV2Manager {
       removedFiles: 0,
       discoveryComplete: false,
       deletionsDeferred: false,
+      resumedFiles: 0,
+      publishedCheckpoints: 0,
       trigger,
       cancelRequested: false,
       pauseRequested: false,
@@ -1067,6 +1071,60 @@ export class WorkspaceRagV2Manager {
     return result;
   }
 
+  /**
+   * A run that dies mid-scan leaves its generation unpublished, so the next run would rediscover
+   * the whole corpus as new. Adopt that generation instead: a document joins a generation only
+   * once it is fully ingested, so everything the interrupted run left there is safe to inherit.
+   */
+  private async resumableGeneration(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+  ): Promise<{ generationId: string } | undefined> {
+    const previous = await this.repository.currentJob(workspace.id, context.id);
+    if (!previous || previous.discoveryComplete) return undefined;
+    const generation = await this.repository.generation(
+      workspace.id, context.id, previous.generationId,
+    );
+    if (!generation || generation.embeddingSignature !== this.embedder.info.signature) return undefined;
+    const documents = await this.repository.countGenerationDocuments(
+      workspace.id, context.id, previous.generationId,
+    );
+    return documents > 0 ? { generationId: previous.generationId } : undefined;
+  }
+
+  /**
+   * Publishes the work done so far so a restart inherits it. The generation carries the previous
+   * publication's documents forward, so promoting it mid-scan only ever adds to what search sees;
+   * removals still wait for discovery to complete.
+   */
+  private async publishCheckpoint(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+    job: RagV2Job,
+  ): Promise<void> {
+    try {
+      const validation = await this.repository.validateGeneration(
+        workspace.id, context.id, job.generationId,
+      );
+      if (!validation.valid || validation.documents === 0) return;
+      await this.repository.publishGeneration(
+        workspace.id,
+        context.id,
+        job.generationId,
+        validation.passageEmbeddings === 0
+          ? 'active_lexical'
+          : validation.passageEmbeddings === validation.passages
+            ? 'active_hybrid_complete'
+            : 'active_hybrid_partial',
+      );
+      job.publishedCheckpoints++;
+      job.updatedAt = now();
+      await this.repository.updateJob(job);
+    } catch (error) {
+      console.warn(`[workspace-rag-v2] checkpoint publication skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async runIngestion(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -1076,10 +1134,22 @@ export class WorkspaceRagV2Manager {
     forceAll: boolean,
   ): Promise<void> {
     await this.initialize();
+    const resumed = await this.resumableGeneration(workspace, context);
+    if (resumed) job.generationId = resumed.generationId;
     await this.repository.createJob(job);
     const fingerprints = new Map(
       (await this.repository.listFingerprints(workspace.id, context.id)).map(value => [normalizedPath(value.path), value]),
     );
+    if (resumed) {
+      const inherited = await this.repository.listFingerprints(
+        workspace.id, context.id, resumed.generationId,
+      );
+      for (const value of inherited) fingerprints.set(normalizedPath(value.path), value);
+      job.resumedFiles = inherited.length;
+      job.message = `Resuming the generation left by an interrupted run with ${job.resumedFiles} file${job.resumedFiles === 1 ? '' : 's'} already indexed.`;
+      job.updatedAt = now();
+      await this.repository.updateJob(job);
+    }
     const rootSelection = await availableMarkdownRoots(context.paths);
     if (rootSelection.skippedPaths.length > 0) {
       job.skippedPaths = rootSelection.skippedPaths;
@@ -1107,7 +1177,14 @@ export class WorkspaceRagV2Manager {
     job.updatedAt = now();
     await this.repository.updateJob(job);
     await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
+    const pruned = await this.repository.pruneStagingGenerations(
+      workspace.id, context.id, job.generationId,
+    );
+    if (pruned > 0) {
+      console.warn(`[workspace-rag-v2] pruned ${pruned} abandoned staging generation${pruned === 1 ? '' : 's'}.`);
+    }
     const seenPaths = new Set<string>();
+    let filesSinceCheckpoint = 0;
     let removedPaths: string[] = [];
     try {
       for (const priority of ['authority', 'current', 'archive'] as const) {
@@ -1173,6 +1250,7 @@ export class WorkspaceRagV2Manager {
           else job.addedFiles++;
           job.processedFiles++;
           job.processedBytes += file.size;
+          filesSinceCheckpoint++;
         } catch (error) {
           if (signal.aborted) throw error;
           job.failedFiles++;
@@ -1202,6 +1280,10 @@ export class WorkspaceRagV2Manager {
           : 0;
         job.message = `Processed ${job.processedFiles} of ${job.totalFiles} Markdown files.`;
         await this.repository.updateJob(job);
+        if (this.checkpointFiles > 0 && filesSinceCheckpoint >= this.checkpointFiles) {
+          filesSinceCheckpoint = 0;
+          await this.publishCheckpoint(workspace, context, job);
+        }
         }
       }
       if (signal.aborted) throw abortError(signal);

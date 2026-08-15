@@ -3581,13 +3581,17 @@ function renderWorkspaceRagStatus(status) {
   const indexed = Number.isFinite(Number(status.indexedDocuments))
     ? ` · ${Number(status.indexedDocuments)} indexed in database`
     : '';
+  const resumed = Number(job?.resumedFiles) > 0 ? ` · resumed ${Number(job.resumedFiles)} from interrupted run` : '';
+  const checkpoints = Number(job?.publishedCheckpoints) > 0
+    ? ` · ${Number(job.publishedCheckpoints)} checkpoint${Number(job.publishedCheckpoints) === 1 ? '' : 's'} published`
+    : '';
   const watcher = status.watcher
     ? ` · watcher ${status.watcher.state}${status.watcher.pendingChanges ? ' (pending)' : ''}${status.watcher.reconcileQueued ? ' (queued)' : ''}`
     : '';
   const message = status.message ? ' · ' + status.message : '';
   const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
   const isError = !status.available || ['retryable_failure', 'permanent_failure'].includes(state) || status.watcher?.state === 'degraded';
-  setWorkspaceRagStatus(`${state}${progress}${changes}${indexed} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
+  setWorkspaceRagStatus(`${state}${progress}${changes}${indexed}${resumed}${checkpoints} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
   if (workspaceRagCurrentFileEl) {
     const currentFile = typeof job?.currentPath === 'string' && job.currentPath.trim()
       ? job.currentPath.trim()

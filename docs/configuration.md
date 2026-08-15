@@ -65,6 +65,7 @@ Additional runtime environment variables:
 | `CORTEX_RAG_V2_OBJECT_ROOT` | workspace `.data\workspace-rag-v2` | Content-addressed immutable objects, sparse line indexes, and manifests. |
 | `CORTEX_RAG_V2_OBJECT_RETENTION` | `managed` | `managed`, `external_immutable`, or explicitly degraded `manifest_only`. |
 | `CORTEX_RAG_V2_EXTERNAL_OBJECT_ROOT` | unset | Range-readable content-addressed root required for `external_immutable`. |
+| `CORTEX_RAG_V2_CHECKPOINT_FILES` | `250` | Files ingested between checkpoint publications, so an interrupted scan leaves a queryable publication behind. `0` publishes only when the whole scan completes. |
 | `CORTEX_RAG_V2_EAGER_MAX_BYTES` | `20971520` | Largest source receiving eager passage vectors. Lexical coverage remains complete at every tier. |
 | `CORTEX_RAG_V2_ASYNC_MAX_BYTES` | `262144000` | Largest source eligible for capped asynchronous passage promotion. Larger sources remain lexical with query-triggered lazy promotion. |
 | `CORTEX_RAG_V2_EAGER_PASSAGE_VECTOR_CAP` | `20000` | Per-document cap for eager or planned asynchronous passage vectors. |
@@ -517,13 +518,36 @@ incremental fingerprint reconciliation. Both commands join/coalesce concurrent
 work and return the unified terminal status. Background reconciliation of other
 workspaces remains serialized.
 
+### Interrupted scans
+
+A scan builds a staging generation and publishes it atomically when it finishes,
+so a process that is killed mid-scan must not lose the files it already indexed.
+Two mechanisms keep that work:
+
+- **Checkpoint publications.** Every `CORTEX_RAG_V2_CHECKPOINT_FILES` ingested
+  files the staging generation is published. A generation carries the previous
+  publication's documents forward, so promoting it mid-scan only ever adds to
+  what search can see; removals still wait for discovery to complete. A restart
+  therefore inherits a queryable index rather than an empty one.
+- **Generation adoption.** When the newest job for a context did not complete
+  discovery and its generation still matches the active embedding signature, the
+  next run adopts that generation instead of starting a new one, and treats the
+  documents already in it as indexed. A document joins a generation only once it
+  is fully ingested, so a file that was mid-flight when the process died is
+  re-ingested rather than trusted.
+
+Each run also prunes staging generations abandoned by earlier interrupted runs.
+Embeddings are content-addressed and outlive any generation, so re-ingesting a
+file whose content has not changed reuses its vectors instead of recomputing
+them.
+
 Status responses include:
 
 | Field | Meaning |
 | --- | --- |
 | `mode` / `available` / `backend` | V2 mode, initialization availability, and `postgres-pgvector` (or test-only `memory`) repository. |
 | `activeGenerationId` / `activeState` | Atomically published generation and its `active_lexical`, `active_hybrid_partial`, or `active_hybrid_complete` state. |
-| `job` | Current or latest job, including trigger, state, current path, added/changed/unchanged/removed counts, discovery completeness, deferred-deletion flag, progress, and failure message. `totalFiles` is counted before the scan starts, so `processedFiles/totalFiles` is a true fraction rather than a running tally. |
+| `job` | Current or latest job, including trigger, state, current path, added/changed/unchanged/removed counts, discovery completeness, deferred-deletion flag, progress, and failure message. `totalFiles` is counted before the scan starts, so `processedFiles/totalFiles` is a true fraction rather than a running tally. `resumedFiles` reports files inherited from an interrupted run, and `publishedCheckpoints` how many checkpoint publications this job has made. |
 | `indexedDocuments` | Documents held in the database for the generation being built, or for the active publication when no job is running — the cumulative total across this and earlier scanning sessions. |
 | `lastSuccessfulReconcileAt` | Completion time of the latest successfully published reconciliation in this process. |
 | `watcher` | Watcher state, root count, pending/debounced change flag, queued-reconcile flag, last event time, and last watcher/reconciliation error. |

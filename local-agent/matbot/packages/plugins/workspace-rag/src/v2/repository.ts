@@ -102,8 +102,12 @@ export interface RagV2Repository {
   initialize(vectorizer: RagV2VectorizerInfo): Promise<void>;
   close(): Promise<void>;
 
+  /** Idempotent: adopting the generation an interrupted run left behind must not reset it. */
   beginGeneration(workspaceId: string, contextId: string, generationId: string): Promise<void>;
   activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined>;
+  generation(workspaceId: string, contextId: string, generationId: string): Promise<RagV2Publication | undefined>;
+  /** Drops staging generations abandoned by earlier interrupted runs. Returns how many were removed. */
+  pruneStagingGenerations(workspaceId: string, contextId: string, keepGenerationId: string): Promise<number>;
   publishGeneration(
     workspaceId: string,
     contextId: string,
@@ -125,7 +129,12 @@ export interface RagV2Repository {
   currentJob(workspaceId: string, contextId: string): Promise<RagV2Job | undefined>;
   upsertJobItem(item: RagV2JobItem): Promise<void>;
 
-  listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]>;
+  /** Documents held by `generationId`, or by the active publication when it is omitted. */
+  listFingerprints(
+    workspaceId: string,
+    contextId: string,
+    generationId?: string,
+  ): Promise<RagV2DocumentFingerprint[]>;
   /** Documents held for `generationId`, or for the active publication when it is omitted. */
   countGenerationDocuments(workspaceId: string, contextId: string, generationId?: string): Promise<number>;
   beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void>;
