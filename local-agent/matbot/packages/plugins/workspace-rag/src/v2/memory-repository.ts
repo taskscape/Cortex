@@ -157,6 +157,11 @@ export class MemoryRagV2Repository implements RagV2Repository {
     this.jobItems.set(`${item.jobId}\0${item.path}`, structuredClone(item));
   }
 
+  async countGenerationDocuments(workspaceId: string, contextId: string, generationId?: string): Promise<number> {
+    const generation = generationId ?? (await this.activePublication(workspaceId, contextId))?.generationId;
+    return generation ? this.generationDocuments.get(generation)?.size ?? 0 : 0;
+  }
+
   async listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]> {
     const active = await this.activePublication(workspaceId, contextId);
     if (!active) return [];

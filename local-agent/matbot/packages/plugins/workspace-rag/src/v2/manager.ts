@@ -288,6 +288,46 @@ async function* discoverMarkdown(
   }
 }
 
+/**
+ * Mirrors `discoverMarkdown` traversal without stat-ing every file, so ingestion knows the
+ * denominator before it starts. Unreadable directories are skipped: an approximate total is
+ * better than failing the count, and discovery reports the real error moments later.
+ */
+async function countMarkdown(paths: readonly string[], signal: AbortSignal): Promise<number> {
+  const directories: string[] = [];
+  let files = 0;
+  for (const value of paths) {
+    const root = path.resolve(value);
+    let rootStat;
+    try {
+      rootStat = await stat(root);
+    } catch {
+      continue;
+    }
+    if (rootStat.isDirectory()) directories.push(root);
+    else if (rootStat.isFile() && root.toLocaleLowerCase().endsWith('.md')) files++;
+  }
+  while (directories.length > 0) {
+    if (signal.aborted) return files;
+    const current = directories.pop()!;
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (['node_modules', '.git', '.data'].includes(entry.name)) continue;
+        directories.push(path.join(current, entry.name));
+      } else if (entry.isFile() && entry.name.toLocaleLowerCase().endsWith('.md')) {
+        files++;
+      }
+    }
+  }
+  return files;
+}
+
 function discoveryPriority(filePath: string): 'authority' | 'current' | 'archive' {
   const lower = filePath.toLocaleLowerCase();
   if (/(?:^|\/)(?:authority|official|signed|approved|executed)(?:\/|$)/u.test(lower)) {
@@ -369,12 +409,18 @@ export class WorkspaceRagV2Manager {
     context: RagV2ContextRef,
   ): Promise<RagV2Status> {
     const publication = await this.repository.activePublication(workspace.id, context.id);
-    const job = this.runs.get(runKey(workspace.id, context.id))?.job
-      ?? await this.repository.currentJob(workspace.id, context.id);
+    const run = this.runs.get(runKey(workspace.id, context.id));
+    const job = run?.job ?? await this.repository.currentJob(workspace.id, context.id);
+    const indexedDocuments = await this.repository.countGenerationDocuments(
+      workspace.id,
+      context.id,
+      run?.job.generationId,
+    );
     return {
       mode,
       available: this.initialized,
       backend: this.repository.backend,
+      indexedDocuments,
       ...(publication ? {
         activeGenerationId: publication.generationId,
         activeState: publication.state,
@@ -1056,6 +1102,10 @@ export class WorkspaceRagV2Manager {
       }
     }
     const indexContext: RagV2ContextRef = { ...context, paths: rootSelection.paths };
+    job.totalFiles = await countMarkdown(indexContext.paths, signal);
+    job.message = `Discovering ${job.totalFiles} Markdown file${job.totalFiles === 1 ? '' : 's'}.`;
+    job.updatedAt = now();
+    await this.repository.updateJob(job);
     await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
     const seenPaths = new Set<string>();
     let removedPaths: string[] = [];
@@ -1066,7 +1116,7 @@ export class WorkspaceRagV2Manager {
         if (signal.aborted) throw abortError(signal);
         job.discoveredFiles++;
         job.discoveredBytes += file.size;
-        job.totalFiles = job.discoveredFiles;
+        if (job.discoveredFiles > job.totalFiles) job.totalFiles = job.discoveredFiles;
         job.currentPath = file.path;
         job.checkpoint = file.path;
         seenPaths.add(file.path);
@@ -1150,12 +1200,13 @@ export class WorkspaceRagV2Manager {
             / job.throughputBytesPerSecond,
           )
           : 0;
-        job.message = `Processed ${job.processedFiles} of ${job.discoveredFiles} discovered Markdown files.`;
+        job.message = `Processed ${job.processedFiles} of ${job.totalFiles} Markdown files.`;
         await this.repository.updateJob(job);
         }
       }
       if (signal.aborted) throw abortError(signal);
       job.discoveryComplete = true;
+      job.totalFiles = job.discoveredFiles;
       job.state = 'validating';
       job.updatedAt = now();
       job.message = 'Validating the Workspace RAG V2 staging generation.';

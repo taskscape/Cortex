@@ -523,7 +523,8 @@ Status responses include:
 | --- | --- |
 | `mode` / `available` / `backend` | V2 mode, initialization availability, and `postgres-pgvector` (or test-only `memory`) repository. |
 | `activeGenerationId` / `activeState` | Atomically published generation and its `active_lexical`, `active_hybrid_partial`, or `active_hybrid_complete` state. |
-| `job` | Current or latest job, including trigger, state, current path, added/changed/unchanged/removed counts, discovery completeness, deferred-deletion flag, progress, and failure message. |
+| `job` | Current or latest job, including trigger, state, current path, added/changed/unchanged/removed counts, discovery completeness, deferred-deletion flag, progress, and failure message. `totalFiles` is counted before the scan starts, so `processedFiles/totalFiles` is a true fraction rather than a running tally. |
+| `indexedDocuments` | Documents held in the database for the generation being built, or for the active publication when no job is running — the cumulative total across this and earlier scanning sessions. |
 | `lastSuccessfulReconcileAt` | Completion time of the latest successfully published reconciliation in this process. |
 | `watcher` | Watcher state, root count, pending/debounced change flag, queued-reconcile flag, last event time, and last watcher/reconciliation error. |
 | `summaries` | Routing-summary queue state and optional summarizer signature. |

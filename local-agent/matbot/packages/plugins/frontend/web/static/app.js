@@ -3578,13 +3578,16 @@ function renderWorkspaceRagStatus(status) {
   const changes = job
     ? ` · ${job.addedFiles ?? 0} added, ${job.changedFiles ?? 0} changed, ${job.unchangedFiles ?? 0} unchanged, ${job.removedFiles ?? 0} removed`
     : '';
+  const indexed = Number.isFinite(Number(status.indexedDocuments))
+    ? ` · ${Number(status.indexedDocuments)} indexed in database`
+    : '';
   const watcher = status.watcher
     ? ` · watcher ${status.watcher.state}${status.watcher.pendingChanges ? ' (pending)' : ''}${status.watcher.reconcileQueued ? ' (queued)' : ''}`
     : '';
   const message = status.message ? ' · ' + status.message : '';
   const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
   const isError = !status.available || ['retryable_failure', 'permanent_failure'].includes(state) || status.watcher?.state === 'degraded';
-  setWorkspaceRagStatus(`${state}${progress}${changes} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
+  setWorkspaceRagStatus(`${state}${progress}${changes}${indexed} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
   if (workspaceRagCurrentFileEl) {
     const currentFile = typeof job?.currentPath === 'string' && job.currentPath.trim()
       ? job.currentPath.trim()

@@ -430,6 +430,8 @@ export interface RagV2Status {
   activeState?: RagV2PublicationState;
   embeddingSignature?: string;
   job?: RagV2Job;
+  /** Documents held in the database for the generation in flight, or the active publication when idle. */
+  indexedDocuments: number;
   lastSuccessfulReconcileAt?: string;
   summaries: {
     enabled: boolean;

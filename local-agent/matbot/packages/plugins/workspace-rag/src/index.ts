@@ -1202,6 +1202,7 @@ class WorkspaceRagManager {
         mode: this.v2Mode,
         available: false,
         backend: 'unavailable',
+        indexedDocuments: 0,
         summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
         message: this.v2Message,
       };

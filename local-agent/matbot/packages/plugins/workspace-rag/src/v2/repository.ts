@@ -126,6 +126,8 @@ export interface RagV2Repository {
   upsertJobItem(item: RagV2JobItem): Promise<void>;
 
   listFingerprints(workspaceId: string, contextId: string): Promise<RagV2DocumentFingerprint[]>;
+  /** Documents held for `generationId`, or for the active publication when it is omitted. */
+  countGenerationDocuments(workspaceId: string, contextId: string, generationId?: string): Promise<number>;
   beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void>;
   appendSections(sections: readonly RagV2SectionRecord[]): Promise<void>;
   appendPassages(passages: readonly RagV2PassageRecord[]): Promise<void>;

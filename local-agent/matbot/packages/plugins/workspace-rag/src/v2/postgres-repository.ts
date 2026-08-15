@@ -345,6 +345,20 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }));
   }
 
+  async countGenerationDocuments(workspaceId: string, contextId: string, generationId?: string): Promise<number> {
+    const result = await this.withWorkspace(workspaceId, client => client.query<{ count: string }>(`
+      SELECT COUNT(*)::TEXT AS count
+      FROM ${this.table('publication_documents')} pd
+      WHERE pd.workspace_id = $1 AND pd.context_id = $2
+        AND pd.generation_id = COALESCE($3::TEXT, (
+          SELECT generation_id FROM ${this.table('publications')}
+          WHERE workspace_id = $1 AND context_id = $2 AND active = TRUE
+          LIMIT 1
+        ))
+    `, [workspaceId, contextId, generationId ?? null]));
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
   async beginDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
     await this.withWorkspace(document.workspaceId, async client => {
       await this.upsertDocument(client, document);

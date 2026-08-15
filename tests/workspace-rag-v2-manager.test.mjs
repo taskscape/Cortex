@@ -594,6 +594,69 @@ test("workspace RAG V2 does not publish deletions when a configured root is unav
   assert.equal((await manager.status("primary", workspace, context)).job.discoveryComplete, true);
 });
 
+test("workspace RAG V2 counts the corpus before scanning and reports documents held in the database", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-precount-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  const nested = path.join(docs, "nested");
+  await mkdir(nested, { recursive: true });
+  await mkdir(path.join(docs, "node_modules"), { recursive: true });
+  await writeFile(path.join(docs, "node_modules", "ignored.md"), "# Ignored\n\nNOISE", "utf8");
+  await writeFile(path.join(docs, "notes.txt"), "not markdown", "utf8");
+  for (const name of ["alpha", "beta", "gamma"]) {
+    await writeFile(path.join(docs, `${name}.md`), `# ${name}\n\nPRECOUNT-EVIDENCE-${name}`, "utf8");
+  }
+  await writeFile(path.join(nested, "delta.md"), "# Delta\n\nPRECOUNT-EVIDENCE-delta", "utf8");
+
+  const repository = new MemoryRagV2Repository();
+  const base = testEmbedder();
+  const snapshots = [];
+  let manager;
+  manager = new WorkspaceRagV2Manager(repository, {
+    info: base.info,
+    async embed(texts, purpose, signal) {
+      const { workspace, context } = refs(root, docs);
+      const observed = await manager.status("primary", workspace, context);
+      snapshots.push({
+        totalFiles: observed.job.totalFiles,
+        processedFiles: observed.job.processedFiles,
+        indexedDocuments: observed.indexedDocuments,
+      });
+      return base.embed(texts, purpose, signal);
+    },
+  });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const first = snapshots.find(value => value.processedFiles < 4);
+  assert.ok(first, "status is observed while files are still outstanding");
+  assert.equal(first.totalFiles, 4, "the denominator is known before the scan reaches the last file");
+  assert.ok(
+    first.processedFiles / first.totalFiles < 1,
+    "progress is below 100% while files are outstanding",
+  );
+  assert.ok(
+    first.indexedDocuments < 4,
+    "the database count grows with the scan instead of tracking the denominator",
+  );
+
+  const status = await manager.status("primary", workspace, context);
+  assert.equal(status.job.totalFiles, 4);
+  assert.equal(status.job.processedFiles, 4);
+  assert.equal(status.indexedDocuments, 4, "the database holds every indexed document");
+
+  const resumed = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => resumed.close());
+  assert.equal(
+    (await resumed.status("primary", workspace, context)).indexedDocuments,
+    4,
+    "documents indexed by earlier sessions stay counted",
+  );
+});
+
 test("workspace RAG V2 skips an invalid configured root and indexes the remaining roots", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-skip-invalid-root-"));
   t.after(() => rm(root, { recursive: true, force: true }));
