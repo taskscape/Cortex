@@ -315,21 +315,37 @@ interface CortexWorkspaceManager {
   switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
+/**
+ * Optional lifecycle callbacks invoked during workspace deletion, letting callers
+ * (e.g. the local agent) run cleanup or auditing at well-defined points.
+ */
 export interface WorkspaceDeletionHooks {
+  /** Called after staging but before the registry commit; throwing aborts and rolls back. */
   beforeRegistryCommit?(workspaceId: string): void | Promise<void>;
+  /** Called with the staged path just before it is purged from disk. */
   beforePurge?(workspaceId: string, stagedPath: string): void | Promise<void>;
 }
 
+/**
+ * Outcome of a successful workspace deletion, including an audit log of every
+ * cleanup step performed (and whether disk purge is still pending).
+ */
 export interface WorkspaceDeletionResult {
   id: string;
   deleted: true;
+  /** Ordered audit messages for each cleanup operation attempted. */
   cleanupLog: string[];
+  /** True when the directory purge failed or was interrupted and must be retried. */
   cleanupPending?: true;
+  /** Staged path awaiting purge when `cleanupPending` is set. */
   pendingCleanupPath?: string;
 }
 
+/** Options for constructing a {@link FileWorkspaceManager}. */
 export interface FileWorkspaceManagerOptions {
+  /** Lifecycle callbacks invoked during workspace deletion. */
   deletionHooks?: WorkspaceDeletionHooks;
+  /** Sink for deletion audit messages; defaults to console.info. */
   deletionLogger?: (message: string) => void;
 }
 
@@ -421,6 +437,13 @@ function absolutizeLocalConfigSpecifiers(text: string, configDir: string): strin
   );
 }
 
+/**
+ * File-backed manager for Cortex workspaces: a JSON registry of named workspace
+ * directories (each with its own matbot.yaml/.env) plus create/rename/delete/switch
+ * operations. Deletion stages the directory under a `.deleting-` name so a failed
+ * registry commit rolls back, and an optional restarter hook re-launches the runtime
+ * on switch.
+ */
 export class FileWorkspaceManager implements CortexWorkspaceManager {
   private restarter: ((id: string) => Promise<void>) | undefined;
   private readonly registryPath: string;
@@ -428,6 +451,12 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
   private readonly deletionHooks: WorkspaceDeletionHooks;
   private readonly deletionLogger: (message: string) => void;
 
+  /**
+   * Create the manager over a workspace registry file.
+   * @param registryPath Path to cortex-workspaces.json (created on first use).
+   * @param rootConfigPath Path to the root matbot.yaml new workspaces are cloned from.
+   * @param options Optional deletion hooks and audit logger.
+   */
   constructor(
     registryPath: string,
     rootConfigPath: string,
@@ -439,20 +468,34 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     this.deletionLogger = options.deletionLogger ?? (message => console.info(message));
   }
 
+  /**
+   * Register the restart callback used by {@link switch} to relaunch the runtime
+   * after the active workspace changes.
+   * @param restarter Async callback receiving the id of the newly activated workspace.
+   */
   setRestarter(restarter: (id: string) => Promise<void>): void {
     this.restarter = restarter;
   }
 
+  /**
+   * @returns The path of the registry file backing this manager.
+   */
   getRegistryPath(): string {
     return this.registryPath;
   }
 
+  /**
+   * @returns The currently active workspace summary.
+   */
   async current(): Promise<CortexWorkspaceSummary> {
     const registry = await this.load();
     const current = registry.workspaces.find(w => w.id === registry.active) ?? registry.workspaces[0]!;
     return this.summarize(current, current.id === registry.active);
   }
 
+  /**
+   * @returns The active workspace id plus a summary of every registered workspace.
+   */
   async list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }> {
     const registry = await this.load();
     return {
@@ -461,6 +504,13 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     };
   }
 
+  /**
+   * Create a new workspace: a directory under `workspaces/` containing a copy of the
+   * root config (with local specifiers absolutized) and, if present, the root .env.
+   * @param name Human-readable workspace name; must be non-empty.
+   * @returns The created workspace summary.
+   * @exception Error When the name is empty.
+   */
   async create(name: string): Promise<CortexWorkspaceSummary> {
     const cleanName = name.trim();
     if (!cleanName) throw new Error('Workspace name is required.');
@@ -495,6 +545,13 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return this.summarize(record, false);
   }
 
+  /**
+   * Rename an existing workspace, updating its `updatedAt` timestamp.
+   * @param id Id of the workspace to rename.
+   * @param name New human-readable name; must be non-empty.
+   * @returns The updated workspace summary.
+   * @exception Error When the name is empty or the workspace id is unknown.
+   */
   async rename(id: string, name: string): Promise<CortexWorkspaceSummary> {
     const cleanName = name.trim();
     if (!cleanName) throw new Error('Workspace name is required.');
@@ -507,6 +564,15 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return this.summarize(record, record.id === registry.active);
   }
 
+  /**
+   * Delete a workspace: stage its directory under a `.deleting-` name, commit the
+   * registry removal (rolling back the rename on failure), then purge the staged
+   * directory from disk.
+   * @param id Id of the workspace to delete.
+   * @returns A deletion result with an audit log; `cleanupPending` is set when the
+   *          disk purge could not be completed and must be retried later.
+   * @exception Error When the id is unknown, the workspace is active, or it is the only workspace.
+   */
   async delete(id: string): Promise<WorkspaceDeletionResult> {
     const registry = await this.load();
     const record = registry.workspaces.find(w => w.id === id);
@@ -563,6 +629,13 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return { id, deleted: true, cleanupLog };
   }
 
+  /**
+   * Make a workspace active, persisting the registry and invoking the registered
+   * restarter (if any) to relaunch the runtime against it.
+   * @param id Id of the workspace to activate.
+   * @returns The new active id and whether a restart was performed.
+   * @exception Error When the id is unknown.
+   */
   async switch(id: string): Promise<{ active: string; restarting: boolean }> {
     const registry = await this.load();
     if (!registry.workspaces.some(w => w.id === id)) throw new Error(`Unknown workspace "${id}".`);
@@ -573,6 +646,12 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return { active: id, restarting: true };
   }
 
+  /**
+   * Pick the config file the process should boot: the workspace named by
+   * `CORTEX_WORKSPACE_ID` if valid, otherwise the active (or first) workspace.
+   * The selection is persisted as the registry's active entry.
+   * @returns Absolute path of the selected workspace's matbot.yaml.
+   */
   async selectConfigPath(): Promise<string> {
     const registry = await this.load();
     const requested = process.env['CORTEX_WORKSPACE_ID'];
@@ -584,6 +663,13 @@ export class FileWorkspaceManager implements CortexWorkspaceManager {
     return path.resolve(path.dirname(this.registryPath), workspace.configPath);
   }
 
+  /**
+   * Ensure a root-relative plugin specifier appears in the `plugins:` list of every
+   * workspace config, inserting it before `options.before` when given. Non-root
+   * workspaces get the specifier absolutized to the root directory.
+   * @param rootRelativeSpecifier Root-relative path of the plugin to add.
+   * @param options Optional `before` specifier anchoring insertion order in each config.
+   */
   async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string, options: { before?: string } = {}): Promise<void> {
     const registry = await this.load();
     const rootDir = path.dirname(this.rootConfigPath);

@@ -22,11 +22,14 @@ import path from 'node:path';
 
 // ── Specifier classification ────────────────────────────────────────────────────
 
+/**
+ * The result of classifying a load specifier: where its code comes from and how to install it.
+ */
 export type Classified =
-  | { kind: 'local';        dir: string }   // a package.json was confirmed at/above the resolved dir
-  | { kind: 'npm';          spec: string }  // bare registry name → pnpm add / node_modules resolution
-  | { kind: 'remote';       spec: string }  // http(s)/github raw source → materialize into .plugins/
-  | { kind: 'pnpm-url';     spec: string }  // .tgz tarball / git repo → pnpm add
+  | { kind: 'local';        dir: string }
+  | { kind: 'npm';          spec: string }
+  | { kind: 'remote';       spec: string }
+  | { kind: 'pnpm-url';     spec: string }
   | { kind: 'missing-path'; resolved: string }; // looked like a path but no package.json exists there
 
 function isTarballOrGit(url: string): boolean {
@@ -87,10 +90,12 @@ export async function classifySpecifier(spec: string, projectDir: string): Promi
 
 // ── Remote manifest + entry resolution ──────────────────────────────────────────
 
+/** A remote plugin's resolved manifest and entry — enough to vet it before any code is fetched. */
 export interface RemoteManifest {
+  /** The parsed governing package.json. */
   pkg:      Record<string, unknown>;
-  pkgUrl:   string;             // the governing package.json URL (always resolved — its absence is an error)
-  entryUrl: string;             // absolute URL of the module entry to import
+  pkgUrl:   string;
+  entryUrl: string;
   runtimes: readonly string[] | undefined; // package.json `matbotRuntime`, if declared
 }
 
@@ -139,6 +144,11 @@ async function fetchText(url: string): Promise<{ ok: boolean; status: number; te
  * Resolve a remote specifier to its package.json (if any) and entry URL — WITHOUT downloading the
  * module graph. The caller uses this to verify the plugin (matbotRuntime, a resolvable entry)
  * before consenting to download and execute any code. Memoised per specifier.
+ *
+ * @param spec - A remote specifier (https URL, `github:` shorthand, or a direct entry URL).
+ * @returns The resolved manifest with entry and runtime declarations.
+ * @throws When the package.json cannot be fetched/parsed, declares no `name`, or exposes no
+ *         resolvable entry (`exports`/`module`/`main`).
  */
 export async function fetchRemoteManifest(spec: string): Promise<RemoteManifest> {
   const cached = manifestCache.get(spec);
@@ -265,6 +275,12 @@ function scanImports(code: string): { relative: string[]; bare: string[] } {
  * the plugin makes (`@matatbread/matbot-plugin-api`, …) is resolved from here and symlinked into
  * `.plugins/node_modules/`, so the cached files resolve those packages to the SAME physical module
  * the host loaded (identity-sensitive checks like `instanceof MissingSecretError` depend on this).
+ *
+ * @param spec - The remote specifier (as for {@link fetchRemoteManifest}).
+ * @param dotPlugins - The `.plugins/` cache root.
+ * @param resolveBase - Directory whose module graph defines the host singletons to symlink in.
+ * @returns Absolute local path of the materialised entry module, ready to import.
+ * @throws When the manifest cannot be resolved or any module of the graph cannot be fetched.
  */
 export async function materializeRemote(spec: string, dotPlugins: string, resolveBase: string): Promise<string> {
   const manifest = await fetchRemoteManifest(spec);

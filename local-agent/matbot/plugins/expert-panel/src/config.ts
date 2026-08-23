@@ -3,6 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExpertConfig, ExpertPanelConfig } from "./types.js";
 
+/**
+ * Load and validate the expert panel configuration (experts.json or the file named by
+ * `EXPERT_PANEL_CONFIG`): normalizes each expert, resolves knowledge roots against the
+ * config directory, and verifies they are accessible.
+ * @returns The validated panel config with absolutized roots.
+ * @throws When the config is missing required fields, defines no experts, contains
+ *         duplicate expert ids (case-insensitive), or a knowledge root is inaccessible.
+ */
 export async function loadExpertConfig(): Promise<ExpertPanelConfig> {
   const configPath = expertConfigPath();
   const configDir = path.dirname(configPath);

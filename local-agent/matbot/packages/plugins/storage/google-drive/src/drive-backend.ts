@@ -7,6 +7,7 @@ import { DriveFileStore } from './drive-file-store.js';
 const FILES_FOLDER = '__files';
 
 /** OAuth scope: per-file access (`drive.file`) — matbot only ever sees files it created. */
+/** OAuth scope requested for the backend. */
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
 /**
@@ -17,6 +18,10 @@ export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
  *
  * The root and per-namespace folders are resolved (and created) lazily and memoised, so activating
  * the backend costs one OAuth popup and the folder structure materialises on first use of each store.
+ */
+/**
+ * A {@link StorageBackend} storing JSON documents and files in a Google
+ * Drive folder tree (browser runtime). Namespaces map to subfolders.
  */
 export class GoogleDriveStorageBackend implements StorageBackend {
   private readonly drive:    DriveClient;
@@ -48,6 +53,9 @@ export class GoogleDriveStorageBackend implements StorageBackend {
    * as a connectivity probe *before* committing to this backend, so a broken Drive never gets swapped
    * in to brick every subsequent store operation.
    */
+  /**
+   * Ensures the root and namespace folder structure exists in Drive.
+   */
   async ready(): Promise<void> {
     await this.rootId;
   }
@@ -56,6 +64,12 @@ export class GoogleDriveStorageBackend implements StorageBackend {
    * Build the backend from an already-authorised {@link DriveAuth}. Authorisation is the caller's job
    * (the setup overlay drives the GIS popup from a user gesture, or a cached token is reused) — the
    * backend itself does no interactive auth, so it can be constructed off the gesture path.
+   */
+  /**
+   * Builds a backend bound to an authenticated client and Drive folder.
+   * @param auth - Authenticated Drive auth helper.
+   * @param rootFolder - Drive folder id used as the data root.
+   * @returns The new backend instance.
    */
   static fromAuth(auth: DriveAuth, rootFolder: string): GoogleDriveStorageBackend {
     if (typeof document === 'undefined') {

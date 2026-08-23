@@ -11,25 +11,50 @@ const RECOVERABLE_FILE_ERROR_CODES = new Set([
   "EACCES", "EBUSY", "EIO", "EMFILE", "ENFILE", "ENOENT", "EPERM",
 ]);
 
+/** Inputs for an index run over one root directory. */
 export interface IndexOptions {
+  /** Root directory to walk (resolved internally). */
   root: string;
-  // Indexing-only noise filters (build output, vendor trees). Not an access-control boundary —
-  // the broker deliberately does not apply these; see evaluateAccess for what actually gates reads.
+  /**
+   * Indexing-only noise filters (build output, vendor trees). Not an access-control boundary —
+   * the broker deliberately does not apply these; see evaluateAccess for what actually gates reads.
+   */
   indexExcludedPatterns: string[];
+  /** Maximum file size in bytes that will be read and indexed. */
   maxFileBytes: number;
-  // Indexing a file is a read, and it is served back through /search, so it clears the same bar as
-  // GET /read on the broker: one deny policy, enforced in both services.
+  /**
+   * Indexing a file is a read, and it is served back through /search, so it clears the same bar as
+   * GET /read on the broker: one deny policy, enforced in both services.
+   */
   workspaces: WorkspaceConfig;
+  /** Security policy applied to every candidate file. */
   policy: SecurityPolicy;
+  /** Optional signal; when aborted, indexing stops promptly. */
   signal?: AbortSignal;
 }
 
+/** High-level counts describing an index store after a run. */
 export interface IndexSummary {
+  /** Distinct files represented in the store. */
   indexedFiles: number;
+  /** Total chunks in the store. */
   chunks: number;
+  /** Files/directories skipped during indexing. */
   skipped: number;
 }
 
+/**
+ * Walks `root`, extracts and redacts text from eligible files, and returns a
+ * new store combining fresh chunks with unchanged chunks carried over (matched
+ * by size/mtime) and all chunks for paths outside this root. Unreadable
+ * directories/files are recorded as skipped instead of failing the run.
+ *
+ * @param options - Index run parameters including exclusions, limits, policy, and abort signal.
+ * @param existing - Previous store whose chunks are reused or replaced.
+ * @returns The updated store (not persisted; callers save it).
+ * @throws Any non-recoverable filesystem error (codes outside EACCES/EBUSY/EIO/EMFILE/ENFILE/ENOENT/EPERM)
+ * or an abort raised via `options.signal`.
+ */
 export async function indexRoot(options: IndexOptions, existing: IndexStore): Promise<IndexStore> {
   const root = path.resolve(options.root);
   const nextChunks: IndexedChunk[] = [];
@@ -153,6 +178,12 @@ function isWithinRoot(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}\\`);
 }
 
+/**
+ * Computes summary counts for a store.
+ *
+ * @param store - The store to summarise.
+ * @returns Distinct indexed file count, total chunk count, and skipped count.
+ */
 export function summarize(store: IndexStore): IndexSummary {
   const files = new Set(store.chunks.map(chunk => chunk.canonicalPath));
   return {

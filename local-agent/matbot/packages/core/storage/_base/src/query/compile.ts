@@ -21,6 +21,15 @@ function order(a: unknown, b: Orderable): number | undefined {
 // Compile the AST to a composed closure — the same one-pass "compile to native" the SQL/ES
 // backends do, with JS closures as the target. No `eval`/`new Function`: CSP-safe, and operands
 // are captured as data so there is no injection surface.
+/**
+ * Compile a validated filter AST into a predicate closure — the in-memory analogue of the
+ * "compile to native" the SQL/ES backends do. No `eval`/`new Function`: CSP-safe, operands
+ * captured as data. Null and absent collapse to a single "missing" state; only `exists`
+ * observes missing-ness, and cross-type order comparisons never match.
+ *
+ * @param f - The filter AST (assumed already validated).
+ * @returns A predicate over one document row.
+ */
 export function compileFilter(f: Filter): Predicate {
   switch (f.op) {
     case 'and': { const ps = f.clauses.map(compileFilter); return r => ps.every(p => p(r)); }

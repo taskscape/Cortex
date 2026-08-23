@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { detectPassageLanguage } from './language.js';
 
+/**
+ * Per-file statistics gathered during a census scan.
+ */
 export interface RagV2CensusFileAnalysis {
   contentSha256: string;
   similarityFingerprint: string;
@@ -18,10 +21,17 @@ export interface RagV2CensusFileAnalysis {
  * avoids retaining a hash per source while still exposing the approximation
  * error in the census result.
  */
+/**
+ * A HyperLogLog cardinality estimator used to size corpora cheaply during census.
+ */
 export class RagV2HyperLogLog {
   private readonly precision = 14;
   private readonly registers = new Uint8Array(1 << this.precision);
 
+  /**
+   * Adds one value to the sketch.
+   * @param value - Value to count toward the estimate.
+   */
   add(value: string): void {
     const hash = createHash('sha256').update(value).digest();
     const first = hash.readUInt32BE(0);
@@ -34,6 +44,10 @@ export class RagV2HyperLogLog {
     this.registers[index] = Math.max(this.registers[index]!, rank);
   }
 
+  /**
+   * Estimates the number of distinct values added so far.
+   * @returns Approximate distinct count.
+   */
   estimate(): number {
     const count = this.registers.length;
     const alpha = 0.7213 / (1 + 1.079 / count);
@@ -48,6 +62,10 @@ export class RagV2HyperLogLog {
     return raw;
   }
 
+  /**
+   * Reports the sketch's theoretical relative error bound.
+   * @returns Relative error as a fraction (e.g. 0.016).
+   */
   relativeError(): number {
     return 1.04 / Math.sqrt(this.registers.length);
   }

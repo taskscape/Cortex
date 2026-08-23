@@ -97,6 +97,13 @@ function parseRankerResponse(raw: string): RankerCallResponse | undefined {
 
 /** Construct an LLM-backed ranker bound to a configured provider name. The provider must already
  *  exist in matbot.yaml; if it does not, calls error out at use time (the standard pattern). */
+/**
+ * Constructs an LLM-backed ranker bound to a configured provider name.
+ * @param services The matbot machine (used for `singleTurn`).
+ * @param provider Provider key the ranking prompts are sent to.
+ * @returns A {@link Ranker} that scores each fact against all candidates in
+ *          parallel and degrades to zero scores (never throws) on per-fact failure.
+ */
 export function createLlmRanker(services: MatbotMachine, provider: string): Ranker {
   return {
     async rank(

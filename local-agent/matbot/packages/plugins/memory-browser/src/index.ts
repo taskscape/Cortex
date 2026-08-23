@@ -113,6 +113,15 @@ async function serveStatic(res: ServerResponse, path: string, contentType: strin
   res.end(body);
 }
 
+/**
+ * Create the local HTTP server backing the memory browser UI. Serves static assets plus a JSON API
+ * over the store: list/query memories, create, read, patch (compare-and-swap), and delete. Every
+ * request runs under the given principal so store authorization applies.
+ *
+ * @param store The `remembered_facts` store to browse.
+ * @param principal Principal under which all store operations execute.
+ * @returns A Node HTTP server; call `.listen()` to start it.
+ */
 export function createMemoryBrowserServer(store: Store<RememberedFact>, principal: Principal) {
   return createServer(async (req, res) => {
     const method = req.method ?? 'GET';
@@ -224,6 +233,13 @@ export function createMemoryBrowserServer(store: Store<RememberedFact>, principa
   });
 }
 
+/**
+ * Close a server created by {@link createMemoryBrowserServer}, releasing idle keep-alive sockets
+ * immediately and force-closing any remaining connections after the grace period, so shutdown can
+ * never hang on an in-flight request.
+ * @param server The server to close.
+ * @param graceMs How long to wait before force-closing active connections.
+ */
 export async function closeMemoryBrowserServer(
   server: ReturnType<typeof createServer>,
   graceMs = CLOSE_GRACE_MS,
@@ -264,6 +280,11 @@ function openMemoryBrowserTool(): Tool {
   };
 }
 
+/**
+ * The memory-browser plugin. Registers the `open_memory_browser` tool in every session and, except
+ * in sub-agents, starts a local HTTP server on `MATBOT_MEMORY_BROWSER_HOST:PORT` (default
+ * 127.0.0.1:19779) browsing the shared `remembered_facts` store.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

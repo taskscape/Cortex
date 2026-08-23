@@ -5,6 +5,11 @@ import type {
 
 const HOOK_ERROR_CREATOR = 'matbot-hooks';
 
+/**
+ * Registry and dispatcher for pipeline hooks, keyed by {@link HookPoint}. Handlers run in priority
+ * order (default 50); a throwing handler is isolated — logged, recorded once as a durable
+ * `matbot-hooks` marker, and treated as "returned nothing" so one bad hook cannot brick a turn.
+ */
 export class HookRegistry {
   private readonly hooks = new Map<HookPoint, Hook[]>();
 
@@ -18,6 +23,11 @@ export class HookRegistry {
   private readonly markedFailures = new Set<Hook>();
   private pendingFailureMarkers: { channel: HookPoint; pluginName?: string; message: string }[] = [];
 
+  /**
+   * Register a hook under its `on` channel, keeping per-channel priority order.
+   *
+   * @param hook - The hook definition (channel discriminator plus handler).
+   */
   register(hook: Hook): void {
     const list = this.hooks.get(hook.on) ?? [];
     list.push(hook);
@@ -25,6 +35,11 @@ export class HookRegistry {
     this.hooks.set(hook.on, list);
   }
 
+  /**
+   * Remove every hook registered by the named plugin (called on plugin unload).
+   *
+   * @param pluginName - The plugin whose hooks to drop.
+   */
   removeByPlugin(pluginName: string): void {
     for (const [point, list] of this.hooks) {
       this.hooks.set(point, list.filter(h => h.pluginName !== pluginName));
@@ -88,6 +103,15 @@ export class HookRegistry {
 
   // screen folds across hooks: each sees the session as shaped so far, accumulates ephemeral, and
   // the first `abort` short-circuits (the partial session is returned so the caller can persist it).
+  /**
+   * Fold the session through each `screen` hook (once per turn, before the first provider call).
+   * Each hook sees the session as shaped so far; ephemeral/durable context and markers accumulate;
+   * the first `abort` short-circuits.
+   *
+   * @param ctx - The turn's screen context (session, config, signal, prompt).
+   * @returns The final session (with durable folds and markers appended), accumulated
+   *          `ephemeral`/`durable`/`markers` blocks, and an `abort` reason if any hook aborted.
+   */
   async runScreen(ctx: Omit<ScreenContext, 'removeHook'>): Promise<{ session: Session; ephemeral: MessageContent[]; durable: MessageContent[]; markers: MessageContent[]; abort?: string }> {
     let session = ctx.session;
     const ephemeral: MessageContent[] = [];
@@ -133,6 +157,13 @@ export class HookRegistry {
 
   // contribute folds the outgoing array through each hook — a pure transform pipeline; the stored
   // session is never touched.
+  /**
+   * Fold the outgoing message array through each `contribute` hook — a pure transform pipeline;
+   * the stored session is never touched. Runs before every provider call.
+   *
+   * @param ctx - The contribute context (outgoing messages, session, config, signal).
+   * @returns The transformed outgoing array (unchanged when no hook contributes).
+   */
   async runContribute(ctx: Omit<ContributeContext, 'removeHook'>): Promise<Message[]> {
     let outgoing = ctx.outgoing as Message[];
     for (const hook of this.hooks.get('contribute') ?? []) {
@@ -143,7 +174,13 @@ export class HookRegistry {
     return outgoing;
   }
 
-  // toolcall stops at the first hook that rejects or aborts; the rest don't run.
+  /**
+   * Run each `toolcall` hook before a tool executes. Stops at the first hook that rejects or
+   * aborts; the rest don't run.
+   *
+   * @param ctx - The tool-call context (session, call, tool, config, signal).
+   * @returns The first rejection/abort result, or an empty object when every hook allowed the call.
+   */
   async runToolCall(ctx: Omit<ToolCallContext, 'removeHook'>): Promise<ToolCallResult> {
     for (const hook of this.hooks.get('toolcall') ?? []) {
       if (hook.on !== 'toolcall') continue;
@@ -155,6 +192,13 @@ export class HookRegistry {
 
   // toolresult folds the tool result through each hook — a transform pipeline (redaction, truncation);
   // a hook that returns nothing just observes (auditing). Returns the final result.
+  /**
+   * Fold a tool result through each `toolresult` hook — a transform pipeline (redaction,
+   * truncation); a hook returning nothing just observes.
+   *
+   * @param ctx - The tool-result context (session, call, tool, result, error/duration info).
+   * @returns The final result after all hooks have had their say.
+   */
   async runToolResult(ctx: Omit<ToolResultContext, 'removeHook'>): Promise<unknown> {
     let result = ctx.result;
     for (const hook of this.hooks.get('toolresult') ?? []) {
@@ -169,6 +213,13 @@ export class HookRegistry {
   // turn), any durable markers (appended to the committed session by the pump), and any
   // retract-and-rerun requests. A turn can be popped only once, so multiple hooks' retraction
   // contexts merge into a single redo (in practice only one fires); `retract` is omitted when none did.
+  /**
+   * Run every `followup` hook after a turn commits, collecting resubmissions (each becomes its own
+   * head-enqueued turn), durable markers, and retract-and-rerun requests (merged into a single redo).
+   *
+   * @param ctx - The followup context (committed session, resubmit depth, config, signal, prompt).
+   * @returns Collected `resubmits`, `markers`, and a `retract` request when any hook asked for one.
+   */
   async runFollowup(ctx: Omit<FollowupContext, 'removeHook'>): Promise<{ resubmits: MessageContent[][]; markers: MessageContent[]; retract?: { context: MessageContent[] } }> {
     const resubmits: MessageContent[][] = [];
     const markers:   MessageContent[]   = [];

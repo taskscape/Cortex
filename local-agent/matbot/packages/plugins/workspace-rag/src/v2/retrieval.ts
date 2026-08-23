@@ -20,6 +20,9 @@ import type {
   RagV2SearchResult,
 } from './types.js';
 
+/**
+ * Caller-supplied options controlling one retrieval search.
+ */
 export interface RetrievalOptions {
   principalId?: string;
   groupIds?: string[];
@@ -144,6 +147,12 @@ function stripDiacritics(value: string): string {
   return value.normalize('NFKD').replace(/\p{M}+/gu, '');
 }
 
+/**
+ * Builds the full {@link RagV2RetrievalPlan} for a question: rewrite,
+ * language/intent detection, reference extraction, and query variants.
+ * @param params - Question, conversation turns, corpus info, and options.
+ * @returns The resolved plan.
+ */
 export function planRagV2Query(
   query: string,
   workspaceId: string,
@@ -207,6 +216,12 @@ export function planRagV2Query(
   };
 }
 
+/**
+ * Fuses per-retriever ranked lists into a single ranking via weighted RRF.
+ * @param lists - Ranked hit lists keyed by retriever, with weights.
+ * @param k - RRF smoothing constant.
+ * @returns Hits sorted by fused score with fusion metadata attached.
+ */
 export function reciprocalRankFusion(
   resultSets: readonly RagV2RankedHit[][],
   weights: Readonly<Record<string, number>> = {},
@@ -444,6 +459,11 @@ function assessAnswerability(
   };
 }
 
+/**
+ * Executes planned retrieval: runs lexical/dense/exact lanes, fuses and
+ * diversifies results, optionally reranks, assesses answerability, and
+ * records the audit run.
+ */
 export class RagV2RetrievalEngine {
   private readonly repository: RagV2Repository;
   private readonly objectStore: RagV2ObjectStore;
@@ -469,6 +489,12 @@ export class RagV2RetrievalEngine {
     this.semanticServices = dependencies.semanticServices;
   }
 
+  /**
+   * Performs one end-to-end retrieval for a plan.
+   * @param plan - The retrieval plan to execute.
+   * @param options - Limits, variant selection, and reranker controls.
+   * @returns The complete {@link RagV2SearchResult}.
+   */
   async search(
     workspaceId: string,
     contextId: string,

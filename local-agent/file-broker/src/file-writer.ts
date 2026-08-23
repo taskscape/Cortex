@@ -3,9 +3,13 @@ import path from "node:path";
 import { createBackup } from "./backup.js";
 import { createUnifiedDiff } from "./diff.js";
 
+/** Outcome of a successful write: the written path, optional backup, and diff. */
 export interface WriteResult {
+  /** Absolute path of the file that was written. */
   path: string;
+  /** Path of the pre-write backup snapshot, absent when the file did not exist. */
   backupPath?: string;
+  /** Unified diff of the file before versus after the write. */
   diff: string;
 }
 
@@ -16,6 +20,19 @@ export interface WriteResult {
 // a recoverable snapshot.
 const writeTails = new Map<string, Promise<void>>();
 
+/**
+ * Writes UTF-8 text to a file, creating a backup of any existing content first
+ * and returning a unified diff. Writes to the same resolved path are
+ * serialised (per the per-path queue above) while unrelated paths proceed in
+ * parallel.
+ *
+ * @param targetPath - File to write; parent directories are created as needed.
+ * @param content - Full new text content for the file.
+ * @param backupRoot - Directory under which the pre-write backup is stored.
+ * @returns The write result including backup path (when a prior file existed) and diff.
+ * @throws Any filesystem error other than ENOENT when reading the previous content,
+ * from creating the backup, or from writing the file.
+ */
 export async function writeTextFile(targetPath: string, content: string, backupRoot: string): Promise<WriteResult> {
   const resolvedTarget = path.resolve(targetPath);
   const key = process.platform === "win32" ? resolvedTarget.toLowerCase() : resolvedTarget;

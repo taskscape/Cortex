@@ -6,6 +6,13 @@ import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { WebPrincipalResolver } from '@matatbread/matbot-frontend-web';
 import process from 'node:process';
 
+/**
+ * Plugin registering a {@link WebPrincipalResolver} that derives the request
+ * principal from the `USER` environment variable (falling back to `"unknown"`).
+ * Type-only augmentation of the web frontend; no frontend is loaded here.
+ *
+ * @returns The plugin specification registering the resolver service.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

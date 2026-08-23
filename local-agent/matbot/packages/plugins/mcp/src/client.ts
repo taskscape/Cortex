@@ -26,6 +26,7 @@ function tokenize(cmd: string): string[] {
 
 /** MCP client over a local child process speaking JSON-RPC on stdio. Node-only (child_process). */
 export class StdioMCPClient implements MCPClient {
+/** Server-provided usage instructions, set by {@link initialize} when the server offers them. */
   instructions: string | undefined;
   private readonly child;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -33,6 +34,12 @@ export class StdioMCPClient implements MCPClient {
   private buf = '';
   private dead = false;
 
+  /**
+   * Spawn the server process and start reading its stdout.
+   * @param command Command to run; shell-like quoting (single/double) is respected.
+   * @param extraArgs Extra arguments appended after the command's own.
+   * @param env Additional environment variables merged over `process.env`.
+   */
   constructor(command: string, extraArgs: string[], env?: Record<string, string>) {
     const parts = tokenize(command);
     const exe   = parts[0] ?? command;
@@ -94,22 +101,40 @@ export class StdioMCPClient implements MCPClient {
     });
   }
 
+  /**
+   * Perform the MCP initialize handshake and send the initialized notification.
+   * @throws On spawn failure, process exit, timeout, or JSON-RPC error response.
+   */
   async initialize(): Promise<void> {
     const result = await this.request('initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO }) as { instructions?: unknown };
     if (typeof result?.instructions === 'string') this.instructions = result.instructions;
     this.write({ jsonrpc: '2.0', method: 'notifications/initialized' });
   }
 
+  /**
+   * List the tools the server exposes via `tools/list`.
+   * @returns The tool definitions, or an empty array if none are reported.
+   * @throws On spawn failure, process exit, timeout, or JSON-RPC error response.
+   */
   async listTools(): Promise<MCPToolDef[]> {
     const result = await this.request('tools/list') as { tools?: MCPToolDef[] };
     return result.tools ?? [];
   }
 
+  /**
+   * Invoke a tool on the server via `tools/call`.
+   * @param name Tool name on the server.
+   * @param args Arguments object passed to the tool.
+   * @param signal Checked before sending; aborting mid-request is not supported by stdio.
+   * @returns The tool result (content parts and error flag).
+   * @throws If already closed or aborted, or on process exit, timeout, or JSON-RPC error response.
+   */
   async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPToolResult> {
     if (signal?.aborted) throw new Error('Aborted');
     return await this.request('tools/call', { name, arguments: args }) as MCPToolResult;
   }
 
+  /** Reject all pending requests and terminate the server process with SIGTERM. Idempotent. */
   close(): void {
     if (this.dead) return;
     this.fail(new Error('MCP client is closed'));
@@ -117,6 +142,12 @@ export class StdioMCPClient implements MCPClient {
   }
 }
 
+/**
+ * Create a connected {@link StdioMCPClient} for a local server config.
+ * @param command Command to run. @param args Extra arguments. @param env Extra environment variables.
+ * @returns An initialized client ready for `listTools`/`callTool`.
+ * @throws If the process cannot be spawned or the initialize handshake fails/times out.
+ */
 export async function createStdioClient(command: string, args: string[], env?: Record<string, string>): Promise<StdioMCPClient> {
   const client = new StdioMCPClient(command, args, env);
   await client.initialize();

@@ -12,11 +12,13 @@ type AnthropicToolUse          = { type: 'tool_use';          id: string; name: 
 type AnthropicToolResult       = { type: 'tool_result';       tool_use_id: string; content: string; is_error?: boolean };
 type AnthropicContent          = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinking | AnthropicImageBlock | AnthropicToolUse | AnthropicToolResult;
 
+/** One message in Anthropic's wire format. */
 export interface AnthropicMessage {
   role:    'user' | 'assistant';
   content: AnthropicContent[];
 }
 
+/** A tool definition in Anthropic's wire format, optionally carrying a cache breakpoint. */
 export interface AnthropicToolDef {
   name:         string;
   description:  string;
@@ -26,6 +28,16 @@ export interface AnthropicToolDef {
 
 // ── Message conversion ────────────────────────────────────────────────────────
 
+/**
+ * Convert neutral matbot messages to Anthropic's wire format. System messages are dropped here
+ * (use {@link toAnthropicSystem}); provider-native thinking/reasoning blocks are deterministically
+ * elided; unsupported content types degrade to short text placeholders or are stripped; tool
+ * results become `tool_result` blocks under a `user` turn. Marks the second-to-last user turn
+ * with an ephemeral cache breakpoint.
+ *
+ * @param messages The conversation in neutral format.
+ * @returns Anthropic-format messages, empty-content turns removed.
+ */
 export function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
   const result: AnthropicMessage[] = [];
 
@@ -100,6 +112,11 @@ export function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
   return result;
 }
 
+/**
+ * Extract the system prompt from system-role messages.
+ * @param messages The conversation in neutral format.
+ * @returns The joined system text, or `undefined` when there is none.
+ */
 export function toAnthropicSystem(messages: Message[]): string | undefined {
   const parts = messages
     .filter(m => m.role === 'system')
@@ -110,6 +127,13 @@ export function toAnthropicSystem(messages: Message[]): string | undefined {
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
+/**
+ * Convert matbot tools to Anthropic tool definitions, marking the last definition with an
+ * ephemeral cache breakpoint (tool defs are stable across turns).
+ *
+ * @param tools The tools offered to the model.
+ * @returns Anthropic-format tool definitions (empty when there are none).
+ */
 export function toAnthropicTools(tools: readonly Tool[]): AnthropicToolDef[] {
   const defs: AnthropicToolDef[] = tools.map(t => ({
     name:         t.name,

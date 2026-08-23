@@ -125,6 +125,11 @@ function makeValidatorHook(): Hook {
   };
 }
 
+/**
+ * Plugin spec registering the JSON Schema validation hook. On every `toolcall` it validates the
+ * tool's input against its `inputSchema` and rejects the call with a message listing violations;
+ * schema keywords this validator does not enforce are reported once per tool.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

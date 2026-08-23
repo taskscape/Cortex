@@ -1,10 +1,7 @@
 /**
- * A trigger is a data-driven hook: a set of natural-language conditions and the single tool call to
- * make when any of them is judged to match. The conditions are the OR — many ways to recognise the
- * situation — and `invoke` is the one consequence. There is no skill coupling: a trigger names a
- * tool, not a skill, so firing a skill is just `invoke: skill_action({ action: 'use', … })` like
- * any other tool call (`use` applies the skill as a directive; `load` returns raw content, which is
- * for reading/editing, not firing). What the model sees afterwards is decided observationally — see dispatch.ts.
+ * Types for the triggers plugin: data-driven hooks judged by an LLM classifier.
+ *
+ * @packageDocumentation
  */
 
 /**
@@ -34,12 +31,19 @@
  */
 export type TriggerKind = 'ephemeral' | 'contextual' | 'retract' | 'followup';
 
-/** The conversational surface a `kind` is judged against, and which hook does the judging:
- *  `ephemeral`/`contextual` read the user message (pre-response `screen` hook); `retract`/`followup`
- *  read the assistant response (post-commit `followup` hook). Derived from `kind` — see
- *  {@link surfaceOfKind}. */
+/**
+ * The conversational surface a `kind` is judged against, and which hook does the judging:
+ * `ephemeral`/`contextual` read the user message (pre-response `screen` hook); `retract`/`followup`
+ * read the assistant response (post-commit `followup` hook). Derived from `kind` — see
+ * {@link surfaceOfKind}.
+ */
 export type TriggerSurface = 'user' | 'agent';
 
+/**
+ * Maps a trigger kind to the surface it judges.
+ * @param kind - The trigger kind.
+ * @returns `'user'` for ephemeral/contextual kinds, `'agent'` otherwise.
+ */
 export function surfaceOfKind(kind: TriggerKind): TriggerSurface {
   return kind === 'ephemeral' || kind === 'contextual' ? 'user' : 'agent';
 }
@@ -68,14 +72,24 @@ export interface TriggerInvoke {
   params?: unknown;
 }
 
+/**
+ * A stored trigger: a set of LLM-judged conditions (OR) and the tool call made
+ * when any of them matches.
+ */
 export interface Trigger {
+  /** Stable identifier. */
   id:         string;
+  /** Optimistic-concurrency version token. */
   version:    string;
+  /** Conditions judged against the surface — any match fires the trigger. */
   conditions: TriggerCondition[];
+  /** The consequence: the tool call to make on a match. */
   invoke:     TriggerInvoke;
   /** Absent ⇒ enabled. A disabled trigger is kept but never evaluated. */
   enabled?:   boolean;
+  /** ISO timestamp of creation. */
   createdAt:  string;
+  /** ISO timestamp of last update. */
   updatedAt:  string;
 }
 

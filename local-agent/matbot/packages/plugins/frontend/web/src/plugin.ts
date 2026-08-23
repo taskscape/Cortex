@@ -11,6 +11,7 @@ let webServer: Awaited<ReturnType<typeof createWebServer>> | undefined;
 let toolRegistry: ToolRegistry | undefined;
 const port = Number(process.env['MATBOT_WEB_PORT'] ?? 19778); // 19778 is "MB" in hex, a cute easter egg :)
 const listenRetryTimeoutMs = Number(process.env['MATBOT_WEB_LISTEN_RETRY_TIMEOUT_MS'] ?? 15000);
+/** Host interface the web server binds to (loopback only). */
 export const WEB_LISTEN_HOST = '127.0.0.1';
 
 // Mint a shareable URL for a stored file — but only one this server actually serves: a file marked
@@ -46,6 +47,11 @@ const urlForResourceTool: Tool = {
 };
 
 
+/**
+ * Web frontend plugin: starts the HTTP+SSE chat server on loopback, registers
+ * the `url_for_resource` tool, and reports the UI URL as its installation
+ * message. No-op in sub-agent processes.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion:  PLUGIN_API_VERSION,
 

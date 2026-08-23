@@ -219,6 +219,10 @@ function makeSessionEditTool(store: Store<Session>): Tool {
 
 // ── plugin ────────────────────────────────────────────────────────────────────
 
+/**
+ * Plugin exporting the `session_edit` tool (cut/fork/split/compact operations
+ * on a session's message history, backed by the sessions store).
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

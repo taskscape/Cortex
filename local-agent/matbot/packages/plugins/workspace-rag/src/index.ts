@@ -423,6 +423,9 @@ class HashCpuVectorizer implements TextVectorizer {
   }
 }
 
+/**
+ * Health payload reported by the CUDA embedding sidecar.
+ */
 export interface CudaHealthResponse {
   ok?: boolean;
   cudaAvailable?: boolean;
@@ -2275,6 +2278,13 @@ function sourceWarningsForHit(hit: SearchHit): SourceWarning[] {
 
 let activeManager: WorkspaceRagManager | undefined;
 
+/**
+ * Default plugin specification: builds and starts the workspace RAG manager,
+ * registers it as the `WorkspaceRagManager` service, installs the
+ * `workspace_rag` tool, and adds a screen hook injecting per-turn context.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

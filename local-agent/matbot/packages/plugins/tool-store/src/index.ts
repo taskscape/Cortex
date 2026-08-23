@@ -1,3 +1,11 @@
+/**
+ * tool-store plugin: lets the model define persistent stores and exposes a
+ * generated CRUD (`<namespace>_action`) tool over each, plus the `store_action`
+ * management tool.
+ *
+ * @packageDocumentation
+ */
+
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type {
   MatbotPluginSpec, MatbotMachine, Tool, ToolEvent, Store, StoreQuery,
@@ -275,6 +283,12 @@ function makeStoreActionTool(services: MatbotMachine, meta: Store<StoreDef>): To
 
 // ── plugin ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Default plugin specification: registers `store_action` and re-registers a
+ * generated tool for every previously defined store on startup.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

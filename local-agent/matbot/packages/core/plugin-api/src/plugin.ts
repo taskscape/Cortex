@@ -5,27 +5,42 @@ import type {
 } from './types.js';
 import type { HookRegistry } from './hooks.js';
 
+/** The plugin API contract version this host implements; plugins declare compatibility via their `apiVersion`. */
 export const PLUGIN_API_VERSION = '0.1';
 
 // ── Sub-runner types ──────────────────────────────────────────────────────────
 
+/** A one-shot completion request against a named provider. */
 export interface CompletionRequest {
+  /** Provider key (a `ProviderConfig` name) to route the call through. */
   provider:    string;
+  /** The full conversation to send. */
   messages:    Message[];
+  /** Optional system prompt. */
   system?:     string;
+  /** Optional model parameter overrides for this call. */
   parameters?: Partial<ModelParameters>;
+  /** Optional abort signal; aborting cancels the provider call. */
   signal?:     AbortSignal;
 }
 
+/** A completed completion: final text plus token usage. */
 export interface CompletionResponse {
+  /** The assistant's full text output. */
   text:  string;
+  /** Token usage reported by the provider. */
   usage: { inputTokens: number; outputTokens: number };
 }
 
+/** A single-prompt convenience request over {@link CompletionRequest}. */
 export interface SingleTurnRequest {
+  /** Provider key to route the call through. */
   provider: string;
+  /** The user prompt text. */
   prompt:   string;
+  /** Optional system prompt. */
   system?:  string;
+  /** Optional abort signal; aborting cancels the provider call. */
   signal?:  AbortSignal;
 }
 
@@ -33,8 +48,27 @@ export interface SingleTurnRequest {
 
 /** Scoped key-value store for a single plugin's runtime settings. */
 export interface PluginSettings {
+  /**
+   * Read a stored setting.
+   *
+   * @param key - The setting key.
+   * @returns The stored value, or `undefined` when unset.
+   */
   get<T>(key: string): Promise<T | undefined>;
+  /**
+   * Store a setting.
+   *
+   * @param key - The setting key.
+   * @param value - The value to store.
+   * @returns Resolves when persisted.
+   */
   set<T>(key: string, value: T): Promise<void>;
+  /**
+   * Remove a setting.
+   *
+   * @param key - The setting key.
+   * @returns Resolves when removed.
+   */
   delete(key: string): Promise<void>;
 }
 
@@ -55,6 +89,12 @@ export type Runtime = 'node' | 'browser';
  * MatbotServices rather than living in the platform-neutral core.
  */
 export interface PluginResolver {
+  /**
+   * Derive a plugin's canonical name from its load specifier.
+   *
+   * @param specifier - The load specifier (npm name or URL path).
+   * @returns The plugin's canonical name (e.g. derived from package.json or the CDN URL).
+   */
   identify(specifier: string): Promise<string>;
   /**
    * The runtimes a plugin declares support for via its package.json `matbotRuntime`
@@ -102,6 +142,12 @@ export type MatbotMachine = MatbotServices & MatbotRuntime;
  * `systemContext`), plugin lifecycle, and the registry API itself. Not augmentable, not registerable.
  */
 export interface MatbotRuntime {
+  /**
+   * Run a full completion against a named provider and await the aggregated result.
+   *
+   * @param req - The messages, optional system prompt, parameters, and abort signal.
+   * @returns The final text plus token usage.
+   */
   complete(req: CompletionRequest): Promise<CompletionResponse>;
 
   /**
@@ -251,6 +297,7 @@ export function unifyServices(services: MatbotMachine): MatbotMachine {
 
 // ── Capture-safe swap proxies ───────────────────────────────────────────────────
 
+/** Callback that repoints a swappable proxy at a new implementation. */
 export type SwapFn<T extends object> = (next: T) => void;
 
 /**
@@ -313,6 +360,13 @@ export interface MountConsumeOptions<K extends keyof MatbotServices> {
 
 /** The mount-table consumer facet exposed on {@link MatbotRuntime.mounted}. */
 export interface Mounted {
+  /**
+   * Subscribe to mount transitions of a registry service. Handlers may re-fire on later remounts
+   * and must therefore be idempotent.
+   *
+   * @param options - Which key to watch, plus `replay`, `signal`, and `onUnmount` behaviour.
+   * @param handler - Invoked with the machine, the watched key narrowed to present.
+   */
   consume<K extends keyof MatbotServices>(
     options: MountConsumeOptions<K>,
     handler: (machine: MountedMachine<K>) => void | Promise<void>,
@@ -427,8 +481,21 @@ export function singleTurnRequest(req: SingleTurnRequest): CompletionRequest {
 
 // ── Factory types ─────────────────────────────────────────────────────────────
 
+/**
+ * Factory a provider plugin exports to build its adapter from config.
+ *
+ * @param config - The named provider profile from matbot.yaml.
+ * @returns A ready-to-use provider adapter.
+ */
 export type ProviderAdapterFactory = (config: ProviderConfig) => ProviderAdapter;
 
+/**
+ * Factory a plugin exports under `storage.<kind>` to build stores of that kind.
+ *
+ * @param kind - The store kind name.
+ * @param options - Kind-specific options.
+ * @returns A compare-and-swap document store.
+ */
 export type StoreFactory = (
   kind:    string,
   options: Record<string, unknown>,
@@ -450,8 +517,20 @@ export interface PluginManifest {
  * Registered by a plugin's storageBackend.open() before the services object is built.
  */
 export interface StorageBackend {
+  /**
+   * Create (or retrieve) a typed store for the given namespace.
+   *
+   * @param namespace - Isolated document namespace (e.g. 'schedules', 'settings').
+   * @returns A compare-and-swap store over that namespace.
+   */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T>;
+  /** The backend's file store for binary/file content. */
   readonly fileStore: FileStore;
+  /**
+   * Release backend resources (handles, connections). Called when the owning plugin unloads.
+   *
+   * @returns Resolves when the backend is closed.
+   */
   close?(): Promise<void>;
 }
 

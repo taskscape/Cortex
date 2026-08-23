@@ -1,12 +1,14 @@
 import type { Tool, ToolEvent, ToolContext } from '@matatbread/matbot-plugin-api';
 import type { AvailableProvider, ProviderDraft } from './setup.js';
 
+/** One row of the provider list returned by the `provider` tool's `list` action. */
 export interface ProviderRow {
   name:        string;
   module:      string;
   model:       string;
   endpoint?:   string;
   parameters?: Record<string, unknown>;
+  /** Whether an API key credential is configured for this profile. */
   hasKey:      boolean;
 }
 
@@ -16,9 +18,25 @@ export interface ProviderRow {
  * filesystem YAML editing, which is the only reason the node tool wasn't reusable here.
  */
 export interface ProviderAdmin {
+  /** Adapter types the setup wizard/tool can offer. */
   available: AvailableProvider[];
+  /**
+   * List the currently configured provider profiles.
+   * @returns One row per configured profile.
+   */
   list(): ProviderRow[];
-  add(draft: ProviderDraft): Promise<string>;   // persist + load adapter + canonicalise + register
+  /**
+   * Persist a new provider profile, load its adapter plugin if needed, and register it.
+   * @param draft The provider configuration collected from the user or tool call.
+   * @returns The canonical name of the added provider.
+   * @throws When persisting or loading the adapter plugin fails.
+   */
+  add(draft: ProviderDraft): Promise<string>;
+  /**
+   * Remove a provider profile from the live map and persisted storage.
+   * @param name Name of the profile to remove.
+   * @returns True if a profile with that name existed and was removed.
+   */
   remove(name: string): Promise<boolean>;
 }
 

@@ -58,6 +58,15 @@ async function addToPluginsList(configPath: string, specifier: string): Promise<
 
 // ── Main install flow ─────────────────────���─────────────────────────────────��─
 
+/**
+ * Install a plugin into the project: install the npm package via the detected package
+ * manager (skipped for local paths), inspect its manifest to surface the description,
+ * and add the specifier to the `plugins:` list in matbot.yaml.
+ * @param specifier Plugin specifier — a local path or an npm package name.
+ * @param configPath Path to the matbot.yaml to update.
+ * @returns Resolves when installation completes; throws if the package manager command fails.
+ * @exception Error When the package-manager invocation exits non-zero.
+ */
 export async function installPlugin(specifier: string, configPath: string): Promise<void> {
   const projectDir = path.dirname(configPath);
 

@@ -8,11 +8,17 @@ import type { MatbotPlugin } from './plugin.js';
 import { HookRegistry } from './hooks.js';
 import { appendMessage, createMessage } from './session.js';
 
+/** Everything one agentic turn needs: session, provider wiring, registries, and injection points. */
 export interface RunSessionOpts {
+  /** The session to run the turn against (already screen-shaped by the caller? no — screened here). */
   session:        Session;
+  /** Provider key, persona, and trace correlation for this turn. */
   config:         RunConfig;
+  /** The resolved provider adapter to call. */
   provider:       ProviderAdapter;
+  /** The named provider profile (endpoint, model, credentials, parameters). */
   providerConfig: ProviderConfig;
+  /** Turn-start snapshot of tools advertised to the model. */
   tools?:         ReadonlyMap<string, Tool>;
   /**
    * Live registry consulted to *resolve the executor* at call time. The `tools` map above is a
@@ -24,13 +30,21 @@ export interface RunSessionOpts {
    * `tools`).
    */
   toolRegistry?:  ToolRegistry;
+  /** Store the session is persisted to at turn end and abort points. */
   store:          Store<Session>;
+  /** Pipeline hook registry (screen/contribute/toolcall/toolresult). */
   hooks?:         HookRegistry;
+  /** System-prompt contributor registry, built once per submission. */
   systemContext?: SystemContextRegistry;
+  /** Aborting ends the turn (persisting partial content) with an `aborted` event. */
   signal:         AbortSignal;
+  /** Vault handed to tools for secret resolution; defaults to a pass-through stub. */
   vault?:         Vault;
+  /** Default working directory forwarded to tool contexts. */
   workdir?:       string;
+  /** Config file path forwarded to tool contexts. */
   configPath?:    string;
+  /** File store forwarded to tool contexts. */
   files?:         FileStore;
   /** Supply a prompt implementation to allow tools to ask interactive questions. */
   prompt?:        PromptFn;
@@ -44,11 +58,23 @@ export interface RunSessionOpts {
   /** Frontend-supplied per-submit context. It follows screen-hook context so an explicit
    *  interaction choice remains the freshest instruction for the provider. */
   tailEphemeral?: MessageContent[];
+  /** Optional durable trace sink for turn/provider/tool spans. */
   observability?: ObservabilitySink;
+  /** Hot-load a plugin (delegated into tool contexts). */
   loadPlugin:     (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
+  /** Hot-unload a plugin (delegated into tool contexts). */
   unloadPlugin:   (specifier: string) => Promise<boolean>;
 }
 
+/**
+ * Run one agentic turn: screen hooks, system context, then loop provider calls and tool
+ * executions until the model produces a turn with no tool calls. Persists the session at
+ * every exit (done, abort, error) before yielding the terminal event.
+ *
+ * @param opts - Session, provider wiring, registries, and injection points.
+ * @returns The turn's pipeline event stream, ending with exactly one terminal event
+ *          (`done`, `aborted`, or `error`).
+ */
 export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineEvent> {
   const { config, provider, providerConfig, store, signal } = opts;
   const tools   = opts.tools   ?? new Map<string, Tool>();

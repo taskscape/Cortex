@@ -2,6 +2,16 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+/**
+ * Copies an existing file into `backupRoot` under a timestamped, UUID-suffixed
+ * name derived from its path, so concurrent same-millisecond writes never
+ * overwrite one another's snapshots.
+ *
+ * @param targetPath - The file to snapshot.
+ * @param backupRoot - Directory under which the copy is stored.
+ * @returns Absolute path of the backup copy, or undefined if the target does not exist.
+ * @throws Any filesystem error from creating directories or copying the file.
+ */
 export async function createBackup(targetPath: string, backupRoot: string): Promise<string | undefined> {
   try {
     await fs.access(targetPath);

@@ -62,6 +62,10 @@ export interface LoaderApi {
   loadRemote(url: string): Promise<{ spec: string; name: string; runtimes?: readonly Runtime[] }>;
 }
 
+/**
+ * Everything the browser bootstrap needs to start the in-page runtime: the baked
+ * config, assembler-provided specifier metadata, and the in-page remote loader.
+ */
 export interface BootEnv {
   config:    BrowserConfig;
   /** specifier → canonical plugin name, baked by the assembler so the resolver needn't walk a tree. */
@@ -96,6 +100,16 @@ async function resolveCredentials(creds: Record<string, string>, vault: Vault): 
   return out;
 }
 
+/**
+ * Boot the browser matbot runtime: install the single-principal carrier, wire up the
+ * swappable vault/storage/knowledge services, load the first-run provider wizard when
+ * no provider is configured, pre-scan for a plugin-supplied StorageBackend, register
+ * the `provider` and `single_turn` tools, and load all baked plugins.
+ * @param env Baked config, specifier metadata, and the in-page loader API.
+ * @returns Resolves when the runtime is fully wired and plugins are loaded.
+ * @throws When a required secret cannot be resolved interactively or a plugin load
+ *         fails irrecoverably.
+ */
 export async function boot(env: BootEnv): Promise<void> {
   const { config, specNames, loader } = env;
   const specRuntimes = env.specRuntimes ?? {};

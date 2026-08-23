@@ -17,10 +17,15 @@ export interface PluginLoadRequest {
   runtimes?:  readonly Runtime[];
 }
 
-// Where to begin the upward package.json search for a load specifier. Specifiers that
-// reach the runtime are file: URLs (resolved by the CLI before registration); install-time
-// specifiers may be relative paths or bare npm names. A bare name is resolved through the
-// project's module graph, which only works once the package is actually on disk.
+/**
+ * Determine the directory where the upward package.json search for a plugin
+ * specifier begins: file: URLs resolve to their file's directory, relative/absolute
+ * paths resolve against `baseDir`, and bare npm names resolve through the project's
+ * module graph (which only works once the package is on disk).
+ * @param specifier Plugin specifier (file: URL, path, or bare package name).
+ * @param baseDir Project directory used to resolve relative paths and module lookups.
+ * @returns The start directory, or undefined if a bare name cannot be resolved.
+ */
 export function startDir(specifier: string, baseDir: string): string | undefined {
   const bare = (specifier.split('?')[0]) ?? specifier;
   if (bare.startsWith('file://')) return path.dirname(fileURLToPath(bare));
@@ -74,10 +79,14 @@ export async function readPluginMeta(specifier: string, baseDir: string): Promis
   }
 }
 
-// Fill in plugin.manifest.description from the plugin's package.json, unless the plugin
-// already declares a description. Presence is checked with `in` so a getter (a description
-// computed at read time from some condition) counts as declared and is left untouched —
-// we never read it, only observe that it exists.
+/**
+ * Fill in `plugin.manifest.description` from the plugin's package.json, unless the plugin
+ * already declares a description (a declared getter counts as declared and is left untouched).
+ * @param plugin The freshly loaded plugin to annotate.
+ * @param specifier Specifier the plugin was loaded with; used to locate its package.json.
+ * @param baseDir Project directory that path/module resolution anchors against.
+ * @returns Resolves when the manifest has been updated (or no description was found).
+ */
 export async function backfillPluginDescription(
   plugin:    MatbotPlugin,
   specifier: string,
@@ -93,10 +102,18 @@ export async function backfillPluginDescription(
   }
 }
 
-// loadPlugins lives in the platform-neutral runner and so cannot read package.json itself.
-// This wrapper is the Node entry point: every CLI plugin load goes through it, so a freshly
-// loaded plugin always has its package.json description folded into its manifest. baseDir is
-// the project directory (where package.json paths and node_modules resolve from).
+/**
+ * Node entry point for every CLI plugin load: delegates to the platform-neutral
+ * `loadPlugins`, then folds each freshly loaded plugin's package.json description into
+ * its manifest.
+ * @param requests Host-resolved load requests (spec plus importSpec per plugin).
+ * @param services Machine services passed through to the loader and plugin setup().
+ * @param baseDir Project directory where package.json paths and node_modules resolve from.
+ * @param bustCache When true, re-import plugins bypassing the module cache (hot reload).
+ * @param prompt Optional user-prompt function handed to plugins during setup.
+ * @param onLoadError Whether a failing load is skipped ('skip') or thrown ('throw').
+ * @returns The loaded plugins, with descriptions backfilled.
+ */
 export async function loadPluginsWithDescriptions(
   requests:   readonly PluginLoadRequest[],
   services:   MatbotMachine,

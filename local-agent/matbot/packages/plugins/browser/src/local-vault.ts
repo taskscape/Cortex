@@ -28,6 +28,11 @@ export class LocalStorageVault extends WebCryptoVault implements Vault {
     this.mirror = { ...seed };
   }
 
+  /**
+   * Writes a secret to the in-memory map and mirrors it to `localStorage`.
+   * @param name Secret name.
+   * @param value Secret value.
+   */
   override async writeSecret(name: string, value: string): Promise<void> {
     await super.writeSecret(name, value);
     this.mirror[name] = value;

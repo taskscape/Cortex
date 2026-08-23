@@ -65,7 +65,17 @@ export class TriggerManager implements Triggers {
     }
   }
 
+  /**
+   * Every stored trigger, in insertion order.
+   * @returns All triggers.
+   */
   all(): Trigger[] { return [...this.triggers.values()]; }
+
+  /**
+   * Looks a trigger up by id.
+   * @param id - Trigger identifier.
+   * @returns The trigger, or undefined when absent.
+   */
   get(id: string): Trigger | undefined { return this.triggers.get(id); }
 
   /** Triggers whose invocation matches the filter: `tool` (if given) must equal `invoke.tool`, and
@@ -80,6 +90,11 @@ export class TriggerManager implements Triggers {
     });
   }
 
+  /**
+   * Creates and persists a new trigger.
+   * @param spec - Conditions, invocation and enabled flag.
+   * @returns The stored trigger (fresh id and version).
+   */
   async add(spec: TriggerSpec): Promise<Trigger> {
     const now = new Date().toISOString();
     const doc: Trigger = {
@@ -96,6 +111,12 @@ export class TriggerManager implements Triggers {
     return doc;
   }
 
+  /**
+   * Applies a partial update to a trigger via compare-and-swap.
+   * @param id - Trigger identifier.
+   * @param patch - Fields to change; omitted fields stay untouched.
+   * @returns The updated trigger, or undefined when the id is unknown.
+   */
   async update(id: string, patch: Partial<TriggerSpec>): Promise<Trigger | undefined> {
     const cur = this.triggers.get(id);
     if (cur === undefined) return undefined;
@@ -109,6 +130,11 @@ export class TriggerManager implements Triggers {
     }));
   }
 
+  /**
+   * Deletes a trigger by id (version-checked against the in-memory copy).
+   * @param id - Trigger identifier.
+   * @returns True if the trigger existed and was removed.
+   */
   async remove(id: string): Promise<boolean> {
     const cur = this.triggers.get(id);
     if (cur === undefined) return false;
@@ -124,6 +150,9 @@ export class TriggerManager implements Triggers {
     return this.add(spec);
   }
 
+  /**
+   * Drops all in-memory state and aborts the manager lifecycle (teardown only).
+   */
   clear(): void { this.lifecycle.abort(); this.triggers.clear(); }
 
   /**

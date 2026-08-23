@@ -38,11 +38,22 @@ type FileBrokerInput =
   | { action: "read"; path: string }
   | { action: "write"; path: string; content: string; approved?: boolean };
 
+/** Options for constructing a {@link FileBrokerClient}. */
 export interface FileBrokerClientOptions {
+  /** Base URL of the local file-broker service. */
   baseUrl: string;
 }
 
+/**
+ * Error thrown when the file-broker service responds with a non-OK HTTP status,
+ * carrying the status code and parsed response payload.
+ */
 export class FileBrokerRequestError extends Error {
+  /**
+   * @param status HTTP status code returned by the broker.
+   * @param payload Parsed JSON body of the error response (or `{ text }` fallback).
+   * @param message Human-readable error description.
+   */
   constructor(
     readonly status: number,
     readonly payload: unknown,
@@ -53,25 +64,62 @@ export class FileBrokerRequestError extends Error {
   }
 }
 
+/**
+ * HTTP client for the local file-broker service: health checks plus list/read/write
+ * access to host filesystem paths inside the broker's configured roots.
+ */
 export class FileBrokerClient {
+  /**
+   * @param options Client options; only `baseUrl` is required.
+   */
   constructor(private readonly options: FileBrokerClientOptions) {}
 
+  /**
+   * Check broker availability.
+   * @param signal Optional cancellation signal.
+   * @returns The parsed /health response payload.
+   * @throws {@link FileBrokerRequestError} on non-OK status; Error on network failure.
+   */
   health(signal?: AbortSignal): Promise<unknown> {
     return this.request("GET", "/health", { signal });
   }
 
+  /**
+   * List a directory served by the broker.
+   * @param filePath Absolute or configured-root-relative directory path.
+   * @param signal Optional cancellation signal.
+   * @returns The parsed /list response payload.
+   * @throws {@link FileBrokerRequestError} on non-OK status; Error on network failure.
+   */
   list(filePath: string, signal?: AbortSignal): Promise<unknown> {
     const url = this.url("/list");
     url.searchParams.set("path", filePath);
     return this.requestUrl("GET", url, { signal });
   }
 
+  /**
+   * Read a text file served by the broker.
+   * @param filePath Absolute or configured-root-relative file path.
+   * @param signal Optional cancellation signal.
+   * @returns The parsed /read response payload.
+   * @throws {@link FileBrokerRequestError} on non-OK status; Error on network failure.
+   */
   read(filePath: string, signal?: AbortSignal): Promise<unknown> {
     const url = this.url("/read");
     url.searchParams.set("path", filePath);
     return this.requestUrl("GET", url, { signal });
   }
 
+  /**
+   * Write text content to a broker-served path (policy-checked server-side; returns
+   * a unified diff plus backup path when an existing file is overwritten).
+   * @param filePath Absolute or configured-root-relative file path.
+   * @param content Text content to write.
+   * @param approved Whether the write carries explicit user approval (required for high-risk writes).
+   * @param signal Optional cancellation signal.
+   * @returns The parsed /write response payload.
+   * @throws {@link FileBrokerRequestError} on non-OK status; Error on network failure.
+   */
   write(filePath: string, content: string, approved: boolean, signal?: AbortSignal): Promise<unknown> {
     return this.request("POST", "/write", {
       signal,
@@ -114,6 +162,12 @@ export class FileBrokerClient {
   }
 }
 
+/**
+ * Build the `file_broker_action` tool: health/list/read/write against host filesystem
+ * paths via the file-broker service, surfacing broker errors as tool error events.
+ * @param client Configured client pointing at the local file-broker service.
+ * @returns The registered tool descriptor.
+ */
 export function createFileBrokerTool(client: FileBrokerClient): Tool {
   return {
     name: "file_broker_action",
@@ -169,6 +223,11 @@ export function createFileBrokerTool(client: FileBrokerClient): Tool {
   };
 }
 
+/**
+ * The file-broker plugin: registers the `file_broker_action` tool, which proxies
+ * host filesystem list/read/write operations through the local file-broker HTTP
+ * service (base URL from `FILE_BROKER_BASE_URL`, defaulting to localhost:8878).
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: "0.1",
   setup(services) {

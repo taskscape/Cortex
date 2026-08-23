@@ -1,12 +1,20 @@
+/** A Telegram Bot API `update` object (only the fields this frontend consumes). */
 export interface TelegramUpdate {
+  /** Monotonic update id used as the long-poll offset. */
   update_id: number;
+  /** The message carried by the update, if any. */
   message?: TelegramMessage;
 }
 
+/** A Telegram Bot API `message` object (only the fields this frontend consumes). */
 export interface TelegramMessage {
+  /** Message id within the chat. */
   message_id: number;
+  /** Chat the message belongs to. */
   chat: { id: number; type: string };
+  /** Sender identity, absent for channel posts. */
   from?: { id: number; first_name?: string; username?: string };
+  /** Message text, absent for non-text messages. */
   text?: string;
 }
 
@@ -45,6 +53,15 @@ async function postWithRetry(
   }
 }
 
+/**
+ * Sends a chat message, splitting it into 4096-unit chunks and retrying on
+ * Telegram's 429 rate-limit responses.
+ * @param botToken Bot API token.
+ * @param chatId Target chat id.
+ * @param text Text to send.
+ * @param signal Optional cancellation signal.
+ * @throws If the API returns a non-OK response for any chunk.
+ */
 export async function sendMessage(
   botToken: string,
   chatId: number,
@@ -60,6 +77,12 @@ export async function sendMessage(
   }
 }
 
+/**
+ * Sends a transient chat action indicator (e.g. "typing").
+ * @param botToken Bot API token.
+ * @param chatId Target chat id.
+ * @param action Action name; defaults to "typing".
+ */
 export async function sendChatAction(
   botToken: string,
   chatId: number,
@@ -75,6 +98,15 @@ export async function sendChatAction(
 
 interface GetUpdatesResponse { ok: boolean; result: TelegramUpdate[] }
 
+/**
+ * Long-polls Telegram for new updates.
+ * @param botToken Bot API token.
+ * @param offset First update_id to return (last seen + 1).
+ * @param timeout Long-poll seconds the server should hold the connection.
+ * @param signal Cancellation signal.
+ * @returns The new updates, in id order.
+ * @throws On non-OK HTTP status, non-JSON body, or `ok=false` responses.
+ */
 export async function getUpdates(
   botToken: string,
   offset: number,

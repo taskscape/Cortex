@@ -24,23 +24,51 @@ export class WebCryptoVault implements Vault {
     }
   }
 
+  /**
+   * Creates a new secret, failing if one with the same name already exists.
+   * @param name Secret name.
+   * @param value Secret value.
+   * @returns The secret name that was created.
+   * @throws If a secret with `name` already exists (via the shared helper).
+   */
   createSecret(name: string, value: string): Promise<string> {
     return applyCreateSecret(this, name, value);
   }
 
+  /**
+   * Writes or overwrites a secret in the in-memory map.
+   * @param name Secret name.
+   * @param value Secret value.
+   */
   async writeSecret(name: string, value: string): Promise<void> {
     this.plain.set(name, value);
   }
 
+  /**
+   * Checks whether a secret exists.
+   * @param name Secret name.
+   * @returns `true` if the vault holds a value for `name`.
+   */
   hasKey(name: string): boolean {
     return this.plain.has(name);
   }
 
+  /**
+   * Reverse lookup: finds the first secret name whose value matches.
+   * @param value Value to search for.
+   * @returns The matching secret name, or `undefined`.
+   */
   findByValue(value: string): string | undefined {
     for (const [k, v] of this.plain) if (v === value) return k;
     return undefined;
   }
 
+  /**
+   * Substitutes `${NAME}` placeholders in a string with stored secret values.
+   * @param ref Template text containing `${NAME}` references.
+   * @returns The text with all references resolved.
+   * @throws {@link MissingSecretError} if any referenced secret is absent.
+   */
   async resolve(ref: string): Promise<string> {
     const errors: string[] = [];
     const result = ref.replace(REF_RE, (_, name: string) => {
@@ -57,6 +85,11 @@ export class WebCryptoVault implements Vault {
     return result;
   }
 
+  /**
+   * Redacts every stored secret value (4+ chars) found in the given text.
+   * @param text Text that may contain secret values.
+   * @returns The text with matching secret values replaced by `[REDACTED]`.
+   */
   scrub(text: string): string {
     let result = text;
     for (const value of this.plain.values()) {
@@ -86,6 +119,12 @@ export class WebCryptoVault implements Vault {
     );
   }
 
+  /**
+   * Encrypts plaintext with AES-GCM under a PBKDF2-derived key.
+   * @param passphrase Passphrase to derive the encryption key from.
+   * @param plaintext Text to encrypt.
+   * @returns Base64 blob of `[salt(16)] [iv(12)] [ciphertext]`.
+   */
   static async encrypt(passphrase: string, plaintext: string): Promise<string> {
     const saltBuf = crypto.getRandomValues(new Uint8Array(16)).buffer as ArrayBuffer;
     const ivBuf   = crypto.getRandomValues(new Uint8Array(12)).buffer as ArrayBuffer;
@@ -101,6 +140,12 @@ export class WebCryptoVault implements Vault {
     return btoa(String.fromCharCode(...combined));
   }
 
+  /**
+   * Decrypts a blob produced by {@link WebCryptoVault.encrypt}.
+   * @param passphrase Passphrase the blob was encrypted with.
+   * @param encoded Base64 `[salt][iv][ciphertext]` blob.
+   * @returns The decrypted plaintext.
+   */
   static async decrypt(passphrase: string, encoded: string): Promise<string> {
     const bytes  = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
     const salt   = bytes.buffer.slice(bytes.byteOffset,       bytes.byteOffset + 16) as ArrayBuffer;

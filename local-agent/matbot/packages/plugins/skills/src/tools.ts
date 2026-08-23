@@ -12,6 +12,12 @@ type SkillInput =
   | { action: 'save';     name: string; content: string; catalogue?: boolean }
   | { action: 'delete';   name: string };
 
+/**
+ * Builds the `skill_action` multi-action tool (list/load/use/metadata/save/delete)
+ * bound to the given manager.
+ * @param manager - The live skill set.
+ * @returns The `skill_action` tool.
+ */
 export function createSkillTool(manager: SkillManager): Tool {
   const executor: ToolExecutor = {
     async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {

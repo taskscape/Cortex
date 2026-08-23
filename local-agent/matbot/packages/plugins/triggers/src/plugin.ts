@@ -370,4 +370,9 @@ export function createTriggersPlugin(): MatbotPluginSpec {
   };
 }
 
+/**
+ * Default instance of the cross-runtime triggers plugin.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = createTriggersPlugin();

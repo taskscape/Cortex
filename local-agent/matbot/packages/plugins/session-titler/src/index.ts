@@ -157,6 +157,12 @@ function makeSessionTitler(services: MatbotMachine): SessionTitler {
   };
 }
 
+/**
+ * Plugin registering the {@link SessionTitler} service and a `followup` hook
+ * that titles each committed session once.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

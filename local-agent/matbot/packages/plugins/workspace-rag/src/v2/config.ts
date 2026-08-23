@@ -12,11 +12,19 @@ function nonNegativeInteger(value: string | undefined, fallback: number): number
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+/**
+ * Reads the v2 mode from the environment.
+ * @returns The configured {@link RagV2Mode} (default 'off').
+ */
 export function ragV2ModeFromEnv(): RagV2Mode {
   const value = String(process.env['CORTEX_RAG_V2_MODE'] ?? 'primary').trim().toLowerCase();
   return value === 'off' ? 'off' : 'primary';
 }
 
+/**
+ * Builds the ingestion policy from environment variables with defaults.
+ * @returns The resolved {@link RagV2IngestionPolicy}.
+ */
 export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
   return {
     eagerPassageMaxBytes: positiveInteger(process.env['CORTEX_RAG_V2_EAGER_MAX_BYTES'], 20 * MIB),
@@ -34,15 +42,27 @@ export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
 }
 
 /** Files ingested between checkpoint publications; 0 publishes only when the whole scan completes. */
+/**
+ * Reads the checkpoint publication interval (files) from the environment.
+ * @returns Number of files between checkpoints (0 disables).
+ */
 export function ragV2CheckpointFilesFromEnv(): number {
   return nonNegativeInteger(process.env['CORTEX_RAG_V2_CHECKPOINT_FILES'], 250);
 }
 
+/**
+ * Reads the reranker sidecar URL from the environment.
+ * @returns The URL, or undefined when not configured.
+ */
 export function ragV2RerankerUrlFromEnv(): string | undefined {
   const value = String(process.env['CORTEX_RAG_V2_RERANKER_URL'] ?? '').trim();
   return value || undefined;
 }
 
+/**
+ * Reads reciprocal-rank-fusion tuning from the environment.
+ * @returns The RRF constant and per-retriever weights.
+ */
 export function ragV2RrfFromEnv(): { k: number; weights: Record<string, number> } {
   const k = positiveInteger(process.env['CORTEX_RAG_V2_RRF_K'], 60);
   const raw = process.env['CORTEX_RAG_V2_RRF_WEIGHTS']?.trim();
@@ -64,6 +84,10 @@ export function ragV2RrfFromEnv(): { k: number; weights: Record<string, number> 
   }
 }
 
+/**
+ * Reads cold-object retention settings from the environment.
+ * @returns Retention thresholds controlling eviction of passage embeddings.
+ */
 export function ragV2ObjectRetentionFromEnv(): {
   mode: 'managed' | 'external_immutable' | 'manifest_only';
   externalRoot?: string;
@@ -79,6 +103,10 @@ export function ragV2ObjectRetentionFromEnv(): {
   return { mode, ...(externalRoot ? { externalRoot } : {}) };
 }
 
+/**
+ * Reads the ColBERT late-interaction sidecar URL from the environment.
+ * @returns The URL, or undefined when not configured.
+ */
 export function ragV2ColbertUrlFromEnv(): string | undefined {
   const value = process.env['CORTEX_RAG_V2_COLBERT_URL']?.trim();
   return value || undefined;

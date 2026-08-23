@@ -1,3 +1,10 @@
+"""CUDA embedding sidecar exposing normalized sentence embeddings over HTTP.
+
+The FastAPI application loads a pinned sentence-transformers model at startup,
+reports its configuration through ``GET /health``, and encodes batches of texts
+through ``POST /embed`` with query/document prefixes and CUDA OOM handling.
+"""
+
 import hashlib
 import json
 import os
@@ -17,6 +24,16 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def resolve_profile(model_name: str) -> str:
+    """Resolve the embedding profile for a model.
+
+    Args:
+        model_name: Hugging Face model identifier; E5-family names select the
+            asymmetric E5 profile unless overridden via ``EMBEDDING_PROFILE``.
+
+    Returns:
+        The profile name, either the configured value or
+        ``e5-asymmetric-v1``/``plain-v1`` based on the model name.
+    """
     configured = os.getenv("EMBEDDING_PROFILE", "auto").strip().lower()
     if configured and configured != "auto":
         return configured
@@ -52,12 +69,25 @@ signature = hashlib.sha256(
 
 
 class EmbedRequest(BaseModel):
+    """Request body for the ``POST /embed`` endpoint.
+
+    Attributes:
+        texts: Texts to embed (at most 256).
+        inputType: Either ``"query"`` or ``"document"``, selecting the prefix.
+    """
+
     texts: List[str] = Field(default_factory=list, max_length=256)
     inputType: str = Field(default="document", pattern="^(query|document)$")
 
 
 @app.get("/health")
 def health():
+    """Report service health and the active embedding configuration.
+
+    Returns:
+        dict: Health payload including CUDA availability, device, model,
+        revision, profile, signature, dimensions, limits, and prefixes.
+    """
     cuda_available = torch.cuda.is_available()
     return {
         "ok": True,
@@ -79,6 +109,19 @@ def health():
 
 @app.post("/embed")
 def embed(request: EmbedRequest):
+    """Encode texts into normalized embeddings on the GPU.
+
+    Args:
+        request: Parsed embed request containing the texts and input type.
+
+    Returns:
+        dict: Model/profile/signature metadata plus the embeddings; also
+        includes timing and CUDA memory statistics for non-empty batches.
+
+    Raises:
+        HTTPException: 503 when CUDA is unavailable or encoding hits a CUDA
+            out-of-memory error (after releasing cached blocks).
+    """
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="CUDA is not available to PyTorch.")
     if not request.texts:

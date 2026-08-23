@@ -122,4 +122,9 @@ export function createSkillsPlugin(): MatbotPluginSpec {
   };
 }
 
+/**
+ * Default instance of the cross-runtime skills plugin.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = createSkillsPlugin();

@@ -671,6 +671,13 @@ const executor = {
 
 // ── Tool definition ───────────────────────────────────────────────────────────
 
+/**
+ * The `plugin` tool: lets the model list/discover, install/remove, and hot-reload plugins,
+ * and store a secret a plugin reported missing. Privileged actions gate on an out-of-band
+ * human confirmation via the context's prompt — never an input parameter.
+ *
+ * See the inline `description` for the full action/specifier grammar.
+ */
 export const pluginTool: Tool = {
   name:        'plugin',
   description:

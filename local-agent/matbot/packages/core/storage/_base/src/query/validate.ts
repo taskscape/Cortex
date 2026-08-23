@@ -93,6 +93,14 @@ function validateFilter(f: Filter, ptr: string): void {
   }
 }
 
+/**
+ * Validate a query at the boundary, before any backend touches data. Input is treated as
+ * untrusted (LLM/JSON-sourced) despite the static types.
+ *
+ * @param q - The query to validate.
+ * @throws {StoreQueryError} Pointing at the offending node (JSON pointer) with a machine-readable
+ *         code, so an LLM author can fix the clause and retry.
+ */
 export function validateQuery(q: StoreQuery): void {
   if (q.where !== undefined) validateFilter(q.where, '/where');
 

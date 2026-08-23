@@ -1,3 +1,9 @@
+/**
+ * Public API of the cross-runtime `skills` plugin: skill CRUD manager,
+ * knowledge-index integration, and the `skill_action` / `skills_config` tools.
+ *
+ * @packageDocumentation
+ */
 export type { SkillDoc, SkillEvent }        from './types.js';
 export { SkillManager, skillToKnowledgeEntry } from './manager.js';
 export type { SkillSummary }                from './manager.js';

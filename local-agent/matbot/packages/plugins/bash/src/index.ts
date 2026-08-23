@@ -4,7 +4,9 @@ import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import process from 'node:process';
 
+/** Configuration for running scripts inside a Docker container instead of the local shell. */
 export interface DockerConfig {
+  /** Container image to run (e.g. `node:20-alpine`). */
   image:    string;
   /** Docker --network value. Defaults to Docker's own default (bridge). */
   network?: string;
@@ -239,8 +241,13 @@ export function createBashTool(docker?: DockerConfig): Tool {
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
+/** Shared `bash` tool instance using the default local-shell executor. */
 export const bashTool: Tool = createBashTool();
 
+/**
+ * Plugin spec exporting the `bash` tool (local shell executor).
+ * @returns The matbot plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools:      [bashTool],

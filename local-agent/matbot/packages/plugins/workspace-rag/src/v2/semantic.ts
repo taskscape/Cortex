@@ -37,6 +37,12 @@ function hash(value: string): string {
  * Keeps only recent human/model text and caps both per-turn and aggregate size.
  * Retrieved robo context and tool results are deliberately not accepted here.
  */
+/**
+ * Compacts recent conversation turns into a bounded context string.
+ * @param turns - Turns newest-last.
+ * @param maxChars - Character budget for the output.
+ * @returns The compacted transcript.
+ */
 export function compactRagV2Conversation(
   turns: readonly RagV2ConversationTurn[],
   maxTurns = 6,
@@ -120,6 +126,11 @@ export async function rewriteRagV2ConversationQuery(
   };
 }
 
+/**
+ * Deterministically decomposes a user question into retriever variants.
+ * @param input - Question text, language, and detected references.
+ * @returns Weighted {@link RagV2QueryVariant} list feeding the plan.
+ */
 export function decomposeRagV2Query(
   query: string,
   intent: 'exact_reference' | 'fact_lookup' | 'comparison' | 'diagnostic' | 'as_of' | 'broad_synthesis',

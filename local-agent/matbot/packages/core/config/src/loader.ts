@@ -1,9 +1,11 @@
 import type { ModelParameters, Principal, ProviderConfig } from '@matatbread/matbot-plugin-api';
 import { parseYaml, type YamlMap, type YamlValue } from './yaml.js';
 
+/** Parsed contents of a `matbot.yaml` file (optionally merged over a base document). */
 export interface MatbotConfig {
   /** Ordered list of plugin specifiers to load at startup (npm names or URL paths) */
   plugins:    readonly string[];
+  /** Named provider profiles, keyed by provider name. */
   providers:  Map<string, ProviderConfig>;
   /** If set, run this prompt as a single non-interactive turn then exit. */
   prompt?:           string;
@@ -117,6 +119,16 @@ function toOpenAICompatibleProviderConfigs(raw: YamlValue | undefined): Map<stri
   return providers;
 }
 
+/**
+ * Parse a `matbot.yaml` document (optionally merged over a base document) into a {@link MatbotConfig}.
+ *
+ * @param text - The derived YAML source (the user's `matbot.yaml`).
+ * @param base - Optional base YAML merged underneath; keys in `text` take precedence.
+ * @returns The parsed configuration.
+ * @throws If any field has the wrong type — e.g. `plugins` is not a list, a provider entry
+ *         lacks a string `module`/`model`, or `principal` is neither a string id nor an
+ *         `{ id, type? }` mapping.
+ */
 export function parseConfig(
   text:  string,
   base?: string,

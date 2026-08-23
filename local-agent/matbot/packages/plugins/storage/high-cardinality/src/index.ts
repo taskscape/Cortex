@@ -5,6 +5,12 @@ import { HighCardinalityStorageBackend } from './backend.js';
 
 export { HIGH_CARDINALITY_NAMESPACES, HighCardinalityStorageBackend } from './backend.js';
 
+/**
+ * Plugin routing high-cardinality namespaces (source registry, context graph)
+ * to WAL-mode SQLite while leaving other state filesystem-backed.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

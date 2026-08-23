@@ -4,6 +4,9 @@ import { DRIVE_SCOPE } from './drive-backend.js';
 const CREATE_CLIENT_URL = 'https://console.cloud.google.com/auth/clients/create';
 const ENABLE_API_URL    = 'https://console.cloud.google.com/apis/library/drive.googleapis.com';
 
+/**
+ * Values collected by the first-run setup overlay.
+ */
 export interface DriveSetupResult {
   auth:       DriveAuth;
   clientId:   string;
@@ -31,6 +34,12 @@ function el<K extends keyof HTMLElementTagNameMap>(
  *    script is preloaded as the dialog mounts so the click handler can open the popup synchronously.
  *
  * Resolves with an authorised {@link DriveAuth} once sign-in succeeds; rejects if the user cancels.
+ */
+/**
+ * Shows a browser overlay collecting the OAuth client id and root folder,
+ * including links to create them in Google Cloud Console.
+ * @param initial - Previously saved values to prefill.
+ * @returns The entered values once submitted.
  */
 export function runDriveSetup(initial: { clientId?: string; rootFolder?: string }): Promise<DriveSetupResult> {
   const httpOrigin = location.protocol === 'http:' || location.protocol === 'https:';

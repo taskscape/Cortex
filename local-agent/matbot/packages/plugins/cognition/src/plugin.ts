@@ -116,6 +116,12 @@ async function innerVoiceStatus(services: MatbotMachine | undefined): Promise<st
     (ok ? 'responded to a test prompt.' : `did NOT respond: ${error}. It falls back to the turn's own model until fixed.`);
 }
 
+/**
+ * Builds the cognition plugin spec: registers the inner-voice and remember
+ * tools, seeds the built-in skills, arms the dream-time scheduler, and exposes
+ * a health-check installation message.
+ * @returns A fresh plugin specification (call once per plugin instance).
+ */
 export function createCognitionPlugin(): MatbotPluginSpec {
   let captured: MatbotMachine | undefined;   // captured in setup() so installationMessage() can probe
   const lifecycle = new AbortController();    // ends the SkillManager mount subscription on teardown
@@ -213,4 +219,5 @@ The store is idempotent: a re-seed on restart keeps the existing data.
   };
 }
 
+/** The singleton cognition plugin instance. */
 export const plugin: MatbotPluginSpec = createCognitionPlugin();

@@ -1,3 +1,13 @@
+/**
+ * Filesystem storage backend plugin — the node host's default StorageBackend.
+ *
+ * Exports {@link FilesystemStore} and {@link FilesystemStorageBackend} for
+ * hosts constructing their own boot base, and a plugin that activates the
+ * same backend when hot-loaded.
+ *
+ * @packageDocumentation
+ */
+
 import { dirname, join } from 'node:path';
 import type { MatbotPluginSpec, MatbotMachine } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
@@ -10,6 +20,11 @@ import { FilesystemStorageBackend } from './backend.js';
 export { FilesystemStore } from './store.js';
 export { FilesystemStorageBackend } from './backend.js';
 
+/**
+ * Default filesystem storage plugin specification.
+ *
+ * @returns The plugin specification opening the backend under `<config dir>/.data`.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   storageBackend: {

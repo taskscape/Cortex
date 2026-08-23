@@ -1,4 +1,11 @@
 /**
+ * Types for the tool-store plugin: definitions of model-managed stores and
+ * the records they hold.
+ *
+ * @packageDocumentation
+ */
+
+/**
  * The definition of a store managed by this plugin — its own persisted record, kept in the
  * plugin's meta store. One {@link StoreDef} governs one `Store<StoreRecord>` namespace and the
  * generated `<namespace>_action` tool over it. A def exists exactly when a tool is exposed for
@@ -22,7 +29,9 @@ export interface StoreDef {
    *    - JSON instances matching it can be handed straight to a NoSQL store (e.g. Elasticsearch).
    *  We may implement some or all of these later; the string is kept as canonical TS so they stay open. */
   shape:       string;
+  /** ISO timestamp of creation. */
   createdAt:   string;
+  /** ISO timestamp of last update. */
   updatedAt:   string;
 }
 

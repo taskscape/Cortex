@@ -526,6 +526,11 @@ const BASH_CONFIG_INPUT_SCHEMA = {
   },
 } as const;
 
+/**
+ * Plugin registering the `bash` tool (runs scripts inside a persistent Ubuntu
+ * container with streaming output) and the `bash_config` management tool
+ * (get/set/restart of container overrides persisted in plugin settings).
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

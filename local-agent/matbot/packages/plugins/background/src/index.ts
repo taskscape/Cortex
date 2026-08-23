@@ -524,6 +524,11 @@ id "*" to act on ALL schedules at once. cancel requires a specific id — "*" is
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
+/**
+ * Plugin exporting the `background` (spawn detached prompt runs / recurring
+ * schedules) and `every_action` (list/suspend/resume/cancel schedules) tools.
+ * On setup it arms persisted schedule loops unless running as a sub-agent.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools: [backgroundTool, everyActionTool],

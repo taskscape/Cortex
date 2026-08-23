@@ -1,11 +1,21 @@
 import type { PluginSettings, Store } from '@matatbread/matbot-plugin-api';
 
+/** The persisted settings document backing a plugin's scoped key-value store. */
 export interface SettingsDoc {
+  /** Document id — the slugged namespace. */
   id:      string;
+  /** Optimistic-concurrency version. */
   version: string;
+  /** The plugin's settings payload. */
   data:    Record<string, unknown>;
 }
 
+/**
+ * Runtime shape check distinguishing a settings document from the legacy flat-object format.
+ *
+ * @param v - Any value read from the settings store.
+ * @returns True when `v` is a well-formed {@link SettingsDoc}.
+ */
 export function isSettingsDoc(v: unknown): v is SettingsDoc {
   return typeof v === 'object' && v !== null &&
     typeof (v as SettingsDoc).id      === 'string' &&
@@ -22,7 +32,14 @@ export function slugSettingsNamespace(name: string): string {
   return name.replace(/[^\w-]+/g, '_');
 }
 
-/** Build a PluginSettings facade over the shared settings store, scoped to one document id. */
+/**
+ * Build a PluginSettings facade over the shared settings store, scoped to one document id.
+ * Writes use compare-and-swap with retry; a pre-Store flat-object document is migrated on read.
+ *
+ * @param store - The shared settings store (namespace 'settings').
+ * @param namespace - The plugin's settings namespace (slugged to a document id).
+ * @returns A get/set/delete view scoped to that namespace.
+ */
 export function makePluginSettings(store: Store<SettingsDoc>, namespace: string): PluginSettings {
   const id = slugSettingsNamespace(namespace);
 

@@ -16,6 +16,7 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** Business-object categories an entity in the graph may take. */
 export type ContextEntityType =
   | 'person'
   | 'team'
@@ -30,10 +31,14 @@ export type ContextEntityType =
   | 'contract'
   | 'task';
 
+/** Data-sensitivity classification of entities and assertions. */
 export type ContextSensitivity = 'public' | 'internal' | 'confidential' | 'restricted';
+/** How an assertion's content was derived. */
 export type ExtractionMethod = 'deterministic' | 'connector_metadata' | 'model_extracted' | 'user_confirmed';
+//** Lifecycle state of a queued Neo4j projection operation. */
 export type ProjectionStatus = 'queued' | 'applied' | 'failed';
 
+/** A canonical business entity (person, system, ticket, ...) in one workspace's graph. */
 export interface ContextEntity {
   id: string;
   version: string;
@@ -47,6 +52,7 @@ export interface ContextEntity {
   updatedAt: string;
 }
 
+/** Fields accepted by `upsertEntity`; omitted fields keep existing values on update. */
 export type ContextEntityInput = {
   id?: string;
   workspaceId: string;
@@ -57,12 +63,14 @@ export type ContextEntityInput = {
   sensitivity?: ContextSensitivity;
 };
 
+/** Span of the source text that evidences an assertion. */
 export interface EvidenceSpan {
   start?: number;
   end?: number;
   text?: string;
 }
 
+/** A source-backed, confidence-scored subject-predicate-object assertion between two entities. */
 export interface ContextRelationshipAssertion {
   id: string;
   version: string;
@@ -81,6 +89,7 @@ export interface ContextRelationshipAssertion {
   evidenceSpan?: EvidenceSpan;
 }
 
+/** Fields accepted by `assertRelationship`; omitted fields keep existing values on update. */
 export type ContextRelationshipAssertionInput = {
   id?: string;
   workspaceId: string;
@@ -96,6 +105,7 @@ export type ContextRelationshipAssertionInput = {
   evidenceSpan?: EvidenceSpan;
 };
 
+/** Record of one deterministic source-ingestion pass and what it produced. */
 export interface ContextExtractionRun {
   id: string;
   version: string;
@@ -111,6 +121,7 @@ export interface ContextExtractionRun {
   error?: string;
 }
 
+/** One queued/applied/failed Cypher MERGE operation in the durable Neo4j projection outbox. */
 export interface Neo4jProjectionOperation {
   id: string;
   version: string;
@@ -125,6 +136,7 @@ export interface Neo4jProjectionOperation {
   error?: string;
 }
 
+/** A retrieval-ready fact: a relationship plus resolved endpoints and source citation/provenance metadata. */
 export interface ContextGraphFact {
   relationship: ContextRelationshipAssertion;
   subject: ContextEntity;
@@ -139,6 +151,7 @@ export interface ContextGraphFact {
   warning?: string;
 }
 
+/** Input to `ingestSource`. */
 export type ContextIngestSourceInput = {
   sourceId: string;
   sourceVersionId?: string;
@@ -146,6 +159,7 @@ export type ContextIngestSourceInput = {
   extractionMethod?: ExtractionMethod;
 };
 
+/** Query for `retrieveGraphContext`: seed terms/entities/sources with traversal bounds. */
 export type GraphRetrievalInput = {
   workspaceId: string;
   terms?: string[];
@@ -155,25 +169,81 @@ export type GraphRetrievalInput = {
   maxRelationships?: number;
 };
 
+/** Seeds, facts, and de-duplicated warnings returned by graph retrieval. */
 export interface GraphRetrievalResult {
   seedEntities: ContextEntity[];
   facts: ContextGraphFact[];
   warnings: string[];
 }
 
+/** Read/write facade over the workspace context graph: entity upserts,
+ *  source-backed relationship assertions, deterministic source ingestion,
+ *  traversal (search/neighbors/path), retrieval, and the projection outbox. */
 export interface ContextGraph {
+  /** Deterministic store id for an entity.
+   * @param workspaceId Owning workspace.
+   * @param type Entity category.
+   * @param canonicalName Canonical display name.
+   * @returns Hash-derived stable id. */
   stableEntityId(workspaceId: string, type: ContextEntityType, canonicalName: string): string;
+  /** Deterministic store id for a relationship assertion.
+   * @param input Assertion identity fields.
+   * @returns Hash-derived stable id. */
   stableRelationshipAssertionId(input: ContextRelationshipAssertionInput): string;
+  /** Creates or updates an entity (merging aliases/identifiers) and queues its Neo4j projection.
+   * @param input Entity fields; id derives from workspace/type/name when omitted.
+   * @returns The stored {@link ContextEntity}. */
   upsertEntity(input: ContextEntityInput): Promise<ContextEntity>;
+  /** Creates or updates a source-backed relationship assertion and queues its projection.
+   * @param input Assertion fields; both endpoint entities must already exist in the same workspace.
+   * @returns The stored {@link ContextRelationshipAssertion}.
+   * @throws If either endpoint entity is unknown or belongs to a different workspace. */
   assertRelationship(input: ContextRelationshipAssertionInput): Promise<ContextRelationshipAssertion>;
+  /** Runs deterministic extraction over a registered source (headings, tickets, emails, URLs,
+   *  paths, dates, dotted identifiers), asserting relationships back to the source entity.
+   * @param input Source to ingest, optional text override and extraction method.
+   * @returns The completed (or failed) run record — failures are recorded, never thrown. */
   ingestSource(input: ContextIngestSourceInput): Promise<ContextExtractionRun>;
+  /** Scores entities by normalized-term matches against names/aliases/identifiers.
+   * @param workspaceId Workspace to search.
+   * @param terms Terms to match; empty returns the first `limit` entities.
+   * @param limit Maximum results (default 20).
+   * @returns Matching entities, best score first. */
   searchEntities(workspaceId: string, terms: string[], limit?: number): Promise<ContextEntity[]>;
+  /** Breadth-first expansion around one entity, bounded by depth and relationship count,
+   *  skipping assertions whose source is denied.
+   * @param entityId Starting entity.
+   * @param options Traversal bounds (depth default 1 max 4; relationships default 25 max 100).
+   * @returns Adjacent entities, relationships, and hydrated facts.
+   * @throws If the starting entity is unknown. */
   neighbors(entityId: string, options?: { depth?: number; maxRelationships?: number }): Promise<{ entities: ContextEntity[]; relationships: ContextRelationshipAssertion[]; facts: ContextGraphFact[] }>;
+  /** Finds up to `maxPaths` short paths (BFS) between two entities within one workspace.
+   * @param startEntityId Path origin.
+   * @param targetEntityId Path destination.
+   * @param options Bounds (maxDepth default 3 max 5; maxPaths default 3 max 10).
+   * @returns One entry per found path with entities, relationships, and facts.
+   * @throws If either endpoint entity is unknown. */
   pathSearch(startEntityId: string, targetEntityId: string, options?: { maxDepth?: number; maxPaths?: number }): Promise<Array<{ entities: ContextEntity[]; relationships: ContextRelationshipAssertion[]; facts: ContextGraphFact[] }>>;
+  /** Builds retrieval context from seed terms/entities/source ids, expanding each seed via
+   *  neighbors until the relationship budget is spent.
+   * @param input Retrieval query.
+   * @returns Seed entities, facts, and unique per-source warnings. */
   retrieveGraphContext(input: GraphRetrievalInput): Promise<GraphRetrievalResult>;
+  /** Queries stored entities.
+   * @param query Optional filter/sort/paging; empty means all.
+   * @returns Matching records. */
   queryEntities(query?: StoreQuery): Promise<ContextEntity[]>;
+  /** Queries stored relationship assertions.
+   * @param query Optional filter/sort/paging; empty means all.
+   * @returns Matching records. */
   queryRelationships(query?: StoreQuery): Promise<ContextRelationshipAssertion[]>;
+  /** Queries stored extraction runs.
+   * @param query Optional filter/sort/paging; empty means all.
+   * @returns Matching records. */
   queryExtractionRuns(query?: StoreQuery): Promise<ContextExtractionRun[]>;
+  /** Queries stored projection operations.
+   * @param query Optional filter/sort/paging; empty means all.
+   * @returns Matching records. */
   projectionOperations(query?: StoreQuery): Promise<Neo4jProjectionOperation[]>;
 }
 
@@ -994,6 +1064,12 @@ function createContextGraphTool(graph: ContextGraph): Tool {
   };
 }
 
+/**
+ * Builds a store-backed {@link ContextGraph}, optionally wired to the
+ * SourceRegistry service for provenance, permission checks, and citations.
+ * @param services The matbot machine.
+ * @returns The graph instance.
+ */
 export function createContextGraph(services: MatbotMachine): ContextGraph {
   const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
   return new StoreBackedContextGraph(
@@ -1005,6 +1081,10 @@ export function createContextGraph(services: MatbotMachine): ContextGraph {
   );
 }
 
+/**
+ * Context-graph plugin: registers the ContextGraph service and the
+ * `context_graph_action` tool over it.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

@@ -2,6 +2,10 @@ import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { MatbotPluginSpec, KnowledgeEntry, Store } from '@matatbread/matbot-plugin-api';
 import { PersistBGEKnowledgeIndex } from './knowledge-index.js';
 
+/**
+ * Build the persist-ki-bge plugin spec. On setup it creates a `knowledge` store and registers
+ * {@link PersistBGEKnowledgeIndex} as the machine's `KnowledgeIndex`, replacing the default.
+ */
 export function createPersistKIBGEPlugin(): MatbotPluginSpec {
   return {
     apiVersion: PLUGIN_API_VERSION,
@@ -21,4 +25,5 @@ export function createPersistKIBGEPlugin(): MatbotPluginSpec {
   };
 }
 
+/** The default plugin instance produced by {@link createPersistKIBGEPlugin}. */
 export const plugin: MatbotPluginSpec = createPersistKIBGEPlugin();

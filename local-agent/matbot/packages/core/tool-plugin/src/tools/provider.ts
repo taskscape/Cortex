@@ -396,6 +396,17 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
 
 // ── Tool factory ──────────────────────────────────────────────────────────────
 
+/**
+ * Build the `provider` tool: lets the model list configured provider profiles, add a new
+ * one (writing a validated, loadable `providers:` block into matbot.yaml and storing its
+ * credential in the vault), or remove one (never the last remaining profile). Mutations
+ * update the live provider map immediately and persist to config.
+ *
+ * @param providers - The live provider profile map (mutated by add/remove without a restart).
+ * @param pluginNameToOrigPath - Optional map of provider plugin name → original YAML specifier,
+ *        used to echo human-authored paths back instead of internal names.
+ * @returns The `provider` tool definition.
+ */
 export function createProviderTool(
   providers:          ReadonlyMap<string, ProviderConfig>,
   pluginNameToOrigPath?: ReadonlyMap<string, string>,

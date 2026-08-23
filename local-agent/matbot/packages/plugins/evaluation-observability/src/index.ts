@@ -14,6 +14,7 @@ import type {
   ToolEvent,
 } from '@matatbread/matbot-plugin-api';
 
+/** Aggregated trace record: rollup of spans/events with token and cost totals. */
 export interface CortexTrace {
   id: string;
   version: string;
@@ -35,6 +36,7 @@ export interface CortexTrace {
   error?: string;
 }
 
+/** A single span within a trace (llm, tool, retriever, guardrail, ...). */
 export interface CortexSpan {
   id: string;
   version: string;
@@ -54,12 +56,14 @@ export interface CortexSpan {
   durationMs?: number;
 }
 
+/** A persisted observability event with store identity. */
 export interface CortexTraceEvent extends ObservabilityEvent {
   id: string;
   version: string;
   attributes?: Record<string, unknown>;
 }
 
+//** The scorer implementations evaluation suites can apply. */
 export type ScorerType =
   | 'equals'
   | 'contains'
@@ -74,6 +78,7 @@ export type ScorerType =
   | 'retrieval_recall_at_k'
   | 'model_rubric';
 
+/** One configured scorer inside an evaluation suite. */
 export interface ScorerDefinition {
   id: string;
   version: string;
@@ -93,6 +98,7 @@ export interface ScorerDefinition {
   config?: Record<string, unknown>;
 }
 
+/** Fields accepted when defining a scorer; omitted fields take defaults. */
 export type ScorerDefinitionInput = Omit<ScorerDefinition, 'id' | 'version' | 'workspaceId' | 'createdAt' | 'updatedAt' | 'threshold' | 'weight' | 'required'> & {
   id?: string;
   threshold?: number;
@@ -100,6 +106,7 @@ export type ScorerDefinitionInput = Omit<ScorerDefinition, 'id' | 'version' | 'w
   required?: boolean;
 };
 
+/** A single test case in a suite: input, expectation, and which scorers judge it. */
 export interface EvaluationCase {
   id: string;
   version: string;
@@ -114,6 +121,7 @@ export interface EvaluationCase {
   updatedAt: string;
 }
 
+/** Fields accepted when defining a case inside `EvaluationSuiteInput`. */
 export interface EvaluationCaseInput {
   id?: string;
   name: string;
@@ -123,6 +131,7 @@ export interface EvaluationCaseInput {
   tags?: string[];
 }
 
+/** A named regression suite of cases plus scorers and a pass threshold. */
 export interface EvaluationSuite {
   id: string;
   version: string;
@@ -136,6 +145,7 @@ export interface EvaluationSuite {
   updatedAt: string;
 }
 
+/** Fields accepted by `upsertSuite`. */
 export interface EvaluationSuiteInput {
   id?: string;
   workspaceId: string;
@@ -146,6 +156,7 @@ export interface EvaluationSuiteInput {
   passThreshold?: number;
 }
 
+/** Record of one execution of an evaluation suite against a candidate. */
 export interface EvaluationRun {
   id: string;
   version: string;
@@ -165,6 +176,7 @@ export interface EvaluationRun {
   error?: string;
 }
 
+/** One scorer's verdict for one case in an evaluation run. */
 export interface ScoreResult {
   id: string;
   version: string;
@@ -186,6 +198,7 @@ export interface ScoreResult {
   outputTokens?: number;
 }
 
+/** Manual-effort and cost baseline used to compute ROI for a workflow. */
 export interface RoiBaseline {
   id: string;
   version: string;
@@ -201,6 +214,7 @@ export interface RoiBaseline {
   notes?: string;
 }
 
+/** A recorded business outcome of one workflow run, judged against a baseline. */
 export interface OutcomeEvent {
   id: string;
   version: string;
@@ -220,6 +234,7 @@ export interface OutcomeEvent {
   note?: string;
 }
 
+/** Workspace-level operational metrics aggregated across traces, outcomes, and evaluation runs. */
 export interface ObservabilityMetrics {
   traces: { total: number; completed: number; errors: number };
   tokens: { input: number; output: number };
@@ -234,6 +249,7 @@ export interface ObservabilityMetrics {
   evaluations: { runs: number; passed: number; passRate: number };
 }
 
+/** Computed return-on-investment report for a workspace. */
 export interface RoiReport {
   workspaceId: string;
   verifiedOutcomes: number;
@@ -269,17 +285,61 @@ interface WorkflowRunnerLike {
   recordBusinessOutcome?(runId: string, outcomeId: string, status: 'verified_completed' | 'estimated_completed' | 'failed' | 'cancelled' | 'escalated'): Promise<unknown>;
 }
 
+/** Store-backed observability sink extended with traces inspection,
+ *  side-effect-free replay, regression suites, metrics, and ROI reporting. */
 export interface EvaluationObservability extends ObservabilitySink {
+
+  /** Lists stored trace aggregates.
+   * @param query Optional filter/sort/paging.
+   * @returns Matching {@link CortexTrace} records. */
   listTraces(query?: StoreQuery): Promise<CortexTrace[]>;
+  /** Loads everything recorded about one trace.
+   * @param traceId Trace to inspect.
+   * @returns The trace aggregate, its time-ordered spans/events, and evaluator scores. */
   inspectTrace(traceId: string): Promise<{ trace: CortexTrace | null; spans: CortexSpan[]; events: CortexTraceEvent[]; scores: ScoreResult[] }>;
+  /** Replays a trace as playback only — no writes are executed.
+   * @param traceId Trace to replay.
+   * @returns The trace and its event timeline, explicitly marked playback/no-writes. */
   replayTrace(traceId: string): Promise<{ mode: 'playback'; writesExecuted: false; trace: CortexTrace | null; timeline: CortexTraceEvent[] }>;
+  /** Creates or updates a suite along with its embedded cases and scorers.
+   * @param input Suite definition; ids derive from workspace/name when omitted.
+   * @returns The stored suite plus the cases and scorers written this call. */
   upsertSuite(input: EvaluationSuiteInput): Promise<{ suite: EvaluationSuite; cases: EvaluationCase[]; scorers: ScorerDefinition[] }>;
+  /** Lists stored evaluation suites.
+   * @param query Optional filter/sort/paging.
+   * @returns Matching suites. */
   listSuites(query?: StoreQuery): Promise<EvaluationSuite[]>;
+  /** Executes every case in a suite, scoring each with its assigned scorers.
+   *  Cases resolve their target from a trace id, a workflow dry-run, or inline input;
+   *  `model_rubric` scorers call the given (or fallback) provider via `singleTurn`.
+   * @param suiteId Suite to run.
+   * @param candidate Candidate label recorded on the run.
+   * @param provider Optional provider for model-rubric scoring.
+   * @returns The completed run and all score results.
+   * @throws If the suite is unknown, or if case resolution fails (the failed run is persisted before rethrowing). */
   runSuite(suiteId: string, candidate?: string, provider?: string): Promise<{ run: EvaluationRun; results: ScoreResult[] }>;
+  /** Lists recorded evaluation runs.
+   * @param query Optional filter/sort/paging.
+   * @returns Matching runs. */
   listEvaluationRuns(query?: StoreQuery): Promise<EvaluationRun[]>;
+  /** Aggregates operational metrics across traces, spans, events, outcomes, and runs.
+   * @param workspaceId Optional workspace filter; omit for all workspaces.
+   * @returns The computed metrics snapshot. */
   metrics(workspaceId?: string): Promise<ObservabilityMetrics>;
+  /** Creates or updates a manual-effort/cost ROI baseline for a workflow.
+   * @param input Baseline fields; negative numbers are clamped to zero.
+   * @returns The stored baseline. */
   upsertBaseline(input: Omit<RoiBaseline, 'id' | 'version' | 'createdAt' | 'updatedAt'> & { id?: string }): Promise<RoiBaseline>;
+  /** Records a business outcome for a workflow run and notifies the WorkflowRunner if present.
+   * @param input Outcome fields.
+   * @returns The persisted outcome.
+   * @throws If the baseline is unknown or belongs to another workspace/workflow,
+   *          or a verified outcome lacks `verifiedByPrincipalId`. */
   recordOutcome(input: Omit<OutcomeEvent, 'id' | 'version' | 'recordedAt'> & { id?: string }): Promise<OutcomeEvent>;
+  /** Computes the ROI report for a workspace from verified outcomes, baselines,
+   *  and trace operating costs.
+   * @param workspaceId Workspace to report on.
+   * @returns Time saved, benefits, costs, net benefit, ROI ratio, and payback estimate. */
   roi(workspaceId: string): Promise<RoiReport>;
 }
 
@@ -1006,6 +1066,12 @@ function createEvaluationActionTool(service: EvaluationObservability): Tool {
   };
 }
 
+/**
+ * Builds the store-backed {@link EvaluationObservability} service using ten
+ * dedicated stores created through the machine's store factory.
+ * @param services The matbot machine providing stores, providers, and singleTurn.
+ * @returns The service instance.
+ */
 export function createEvaluationObservability(services: MatbotMachine): EvaluationObservability {
   return new StoreBackedEvaluationObservability(
     services,
@@ -1022,6 +1088,10 @@ export function createEvaluationObservability(services: MatbotMachine): Evaluati
   );
 }
 
+/**
+ * Evaluation & observability plugin: registers the EvaluationObservability
+ * service (Observability sink) and the `evaluation_action` tool.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   async setup(services) {

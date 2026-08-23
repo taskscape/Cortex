@@ -41,9 +41,21 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Mock provider adapter that simulates a hopeless customer-service line: streams fake "thinking"
+ * phrases, then a random canned response, character by character. Useful for demos and testing
+ * without any network access.
+ */
 export class CustomerServicesAdapter implements ProviderAdapter {
+  /** Adapter name used in provider configuration (`customer-services`). */
   readonly name = 'customer-services';
 
+  /**
+   * Produce a mock streaming completion. Input messages, config, and tools are ignored.
+   * @param _messages Ignored. @param _config Ignored. @param _tools Ignored.
+   * @param signal Aborting ends the stream early.
+   * @returns Stream of thinking/text events ending with `done`.
+   */
   complete(
     _messages: Message[],
     _config:   ProviderConfig,
@@ -82,6 +94,10 @@ export class CustomerServicesAdapter implements ProviderAdapter {
     yield { type: 'done' };
   }
 
+  /**
+   * Always reports `degraded` with a hold-music reason.
+   * @returns Current health status.
+   */
   async health(): Promise<HealthStatus> {
     return { status: 'degraded', reason: 'All agents are currently busy. Your query is important to us \u{1F3B5}' };
   }

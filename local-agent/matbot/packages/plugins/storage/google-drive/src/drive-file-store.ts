@@ -41,6 +41,11 @@ async function collect(data: AsyncIterable<Uint8Array>): Promise<Uint8Array<Arra
  * demand when a handle is streamed. Uploads buffer the full blob in memory before sending — adequate
  * for the chat-attachment sizes this serves, not for very large files.
  */
+/**
+ * A {@link FileStore} storing each file in Drive as a `.data` blob plus a
+ * `.meta.json` sidecar, namespaced under per-namespace subfolders. Watchers
+ * are not supported (no push events in this backend).
+ */
 export class DriveFileStore implements FileStore {
   private readonly drive:    DriveClient;
   private readonly folderId: Promise<string>;
@@ -95,6 +100,15 @@ export class DriveFileStore implements FileStore {
     };
   }
 
+  /**
+   * Stores (or replaces) a file and its metadata sidecar in Drive.
+   * @param name - File name/id.
+   * @param mimeType - MIME type of the content.
+   * @param data - Byte chunks making up the file.
+   * @param opts - Optional namespace/session/message linkage.
+   * @returns The handle for the stored file.
+   * @throws When the Drive uploads fail.
+   */
   async put(
     name:     string | undefined,
     mimeType: MimeType,
@@ -149,6 +163,10 @@ export class DriveFileStore implements FileStore {
     return slot !== undefined ? this.makeHandle(slot.meta) : null;
   }
 
+  /**
+   * Resolves a file handle by name within an optional namespace folder.
+   * @returns The handle, or null when not found.
+   */
   async getByName(name: string, namespace?: string): Promise<FileHandle | null> {
     await this.ensureLoaded();
     const slot = this.findByName(name, namespace);
@@ -188,6 +206,10 @@ export class DriveFileStore implements FileStore {
     }
   }
 
+  /**
+   * Stores a temporary (root-namespaced) file.
+   * @returns The handle for the stored file.
+   */
   async putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle> {
     return this.put(name, mimeType, data);
   }

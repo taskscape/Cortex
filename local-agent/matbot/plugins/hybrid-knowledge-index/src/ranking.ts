@@ -1,5 +1,12 @@
 import type { KnowledgeEntry } from "./types.js";
 
+/**
+ * Rank entries by confidence (plus a source-type boost for mem0/file-index) and
+ * drop duplicates by source type + uuid + content hash.
+ * @param entries Candidate entries from one or more backends.
+ * @param limit Maximum number of entries to return; defaults to 12.
+ * @returns Up to `limit` highest-scored, deduplicated entries, best first.
+ */
 export function mergeRankAndDeduplicate(entries: KnowledgeEntry[], limit = 12): KnowledgeEntry[] {
   const seen = new Set<string>();
   const ranked = entries

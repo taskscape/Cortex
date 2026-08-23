@@ -49,6 +49,12 @@ function validConditions(x: unknown): x is TriggerCondition[] {
     typeof (c as { rule?: unknown }).rule === 'string');
 }
 
+/**
+ * Builds the `trigger_action` multi-action tool (list/query/get/add/update/remove)
+ * bound to the given manager.
+ * @param manager - The live trigger set.
+ * @returns The `trigger_action` tool.
+ */
 export function createTriggerActionTool(manager: TriggerManager): Tool {
   const executor: ToolExecutor = {
     async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {

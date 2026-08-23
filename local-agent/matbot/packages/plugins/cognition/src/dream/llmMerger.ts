@@ -85,7 +85,13 @@ function parseMergeResult(raw: string): MergeResult | undefined {
   return { content: obj.content, contradictions };
 }
 
-/** Construct an LLM-backed merger bound to a configured provider name. */
+/**
+ * Constructs an LLM-backed merger bound to a configured provider name.
+ * @param services The matbot machine (used for `singleTurn`).
+ * @param provider Provider key the merge prompts are sent to.
+ * @returns A {@link Merger} whose `merge` throws on unparseable or
+ *          content-shrinking model responses, and propagates transport errors.
+ */
 export function createLlmMerger(services: MatbotMachine, provider: string): Merger {
   return {
     async merge(

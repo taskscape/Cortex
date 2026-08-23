@@ -28,6 +28,14 @@ async function importFile(
  * and imports them on arrival. Falls back to polling if watch is unavailable. Node-only — this
  * is the filesystem capability the cross-runtime base plugin deliberately omits.
  */
+/**
+ * Watches a directory of Markdown files and imports each as a skill into the
+ * given {@link SkillManager}.
+ * @param dir - Directory to import and watch.
+ * @param manager - Skill manager receiving imported skills.
+ * @param signal - Abort signal terminating the watcher.
+ * @returns Resolves when the signal aborts or the directory becomes unreadable.
+ */
 export async function watchAndImportSkillDir(
   dir:     string,
   manager: SkillManager,

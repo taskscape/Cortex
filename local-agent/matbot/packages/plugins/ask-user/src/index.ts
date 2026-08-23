@@ -40,6 +40,7 @@ const executor = {
   },
 };
 
+/** Tool that prompts the user with a single interactive form field and returns their answer. */
 export const askUserTool: Tool = {
   name: 'ask_user',
   description: `Use this tool when you need the user to choose, confirm, or supply a value
@@ -129,6 +130,10 @@ These are different and you should design for the first one. If the user might l
   executor,
 };
 
+/**
+ * Plugin spec exporting the `ask_user` tool.
+ * @returns The matbot plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools:      [askUserTool],

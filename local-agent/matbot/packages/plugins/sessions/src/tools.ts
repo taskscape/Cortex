@@ -8,6 +8,11 @@ function sessionPreview(session: Session): string {
   return text.length > 60 ? `${text.slice(0, 60)}…` : text;
 }
 
+/**
+ * Builds the session management tools bound to the given session store.
+ * @param store - Store holding the {@link Session} documents.
+ * @returns The registered tool set (currently just `session_action`).
+ */
 export function makeSessionTools(store: Store<Session>): readonly Tool[] {
   return [makeSessionActionTool(store)];
 }

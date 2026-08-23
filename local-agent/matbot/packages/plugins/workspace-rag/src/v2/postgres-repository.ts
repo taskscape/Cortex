@@ -125,6 +125,10 @@ function numeric(value: string | null): number | undefined {
   return value === null ? undefined : Number(value);
 }
 
+/**
+ * Postgres/pgvector-backed {@link RagV2Repository}: durable generations,
+ * publications, jobs, records, embeddings, searches, and audit runs.
+ */
 export class PostgresRagV2Repository implements RagV2Repository {
   readonly backend = 'postgres-pgvector' as const;
   private readonly pool: PgPool;
@@ -135,6 +139,9 @@ export class PostgresRagV2Repository implements RagV2Repository {
   private embeddingsTableSql: string | undefined;
   private readonly vectorIndexMode: 'full' | 'half' | 'binary';
 
+  /**
+   * @param settings - Connection settings (defaults from the environment).
+   */
   constructor(settings = settingsFromEnv()) {
     this.pool = new Pool(settings.poolConfig);
     this.pool.on('error', error => {
@@ -152,6 +159,10 @@ export class PostgresRagV2Repository implements RagV2Repository {
     this.vectorIndexMode = indexMode === 'half' || indexMode === 'binary' ? indexMode : 'full';
   }
 
+  /**
+   * Applies schema migrations and validates the stored vectorizer signature.
+   * @param vectorizer - Active vectorizer descriptor.
+   */
   async initialize(vectorizer: RagV2VectorizerInfo): Promise<void> {
     this.vectorizer = vectorizer;
     this.embeddingsTableSql = `${this.schemaSql}.${quoteIdentifier(`unit_embeddings_${vectorizer.dimensions}`)}`;

@@ -1,9 +1,19 @@
+/**
+ * A stored skill document: named Markdown content with optional tags, tool
+ * binding and catalogue advertisement metadata.
+ */
 export interface SkillDoc {
+  /** Stable identifier. */
   id:           string;
+  /** Optimistic-concurrency version token. */
   version:      string;
+  /** Unique human-readable skill name. */
   name:         string;
+  /** Skill body (Markdown). */
   content:      string;
+  /** Optional free-form tags. */
   tags?:        string[];
+  /** Optional tool the skill is bound to. */
   toolBinding?: string;
   /**
    * Whether this skill is advertised in the always-on skills catalogue in the system prompt (so the
@@ -18,7 +28,9 @@ export interface SkillDoc {
    * summary fills the blank — but the field is here so authoring it later needs no schema change.
    */
   catalogSummary?: string;
+  /** ISO timestamp of creation. */
   createdAt:    string;
+  /** ISO timestamp of last update. */
   updatedAt:    string;
   /**
    * Cached LLM analysis of `content`, valid only while `contentHash` matches the current content.

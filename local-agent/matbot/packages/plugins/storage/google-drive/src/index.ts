@@ -64,6 +64,12 @@ async function authoriseAndBuild(): Promise<GoogleDriveStorageBackend> {
  * plugin then replays on every boot). On node there is no `document`, so it throws and the host keeps
  * its filesystem backend.
  */
+/**
+ * Google Drive storage backend plugin (browser): runs first-run setup,
+ * mounts a Drive-backed StorageBackend/Vault, and syncs remote plugins.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest:   { description: 'Persist matbot sessions, settings, files and secrets to a folder in your Google Drive (browser).' },

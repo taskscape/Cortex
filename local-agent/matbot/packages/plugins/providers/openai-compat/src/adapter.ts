@@ -69,13 +69,32 @@ interface OAIChunk {
   usage?:   { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
 }
 
+/**
+ * Provider adapter for any OpenAI-compatible chat-completions endpoint (OpenAI, DeepSeek,
+ * OpenRouter, vLLM, ollama, …). Streams over SSE via `fetch` (no SDK), handles model-specific
+ * quirks (token-limit parameter naming, optional prompt-cache breakpoints), and emits usage,
+ * reasoning, text, and tool-call events. Throws on HTTP errors and truncated tool-call JSON.
+ */
 export class OpenAICompatAdapter implements ProviderAdapter {
+  /** Adapter name reported to the runtime; configurable for multiple compat profiles. */
   readonly name: string;
 
+  /**
+   * @param name Adapter name; defaults to `'openai-compat'`.
+   */
   constructor(name = 'openai-compat') {
     this.name = name;
   }
 
+  /**
+   * Request a streaming completion.
+   * @param messages The conversation, including system, tool, and reasoning content.
+   * @param config Provider configuration (endpoint/model/apiUrl, credentials, parameters such as `capabilities`, `promptCache`, `tokenLimitParam`).
+   * @param tools Tools offered to the model (omitted when capabilities say `tools: false`).
+   * @param signal Abort signal for the underlying request.
+   * @returns Stream of usage/text/thinking/tool-call events ending with `done`.
+   * @throws On non-OK HTTP responses or tool-call arguments that fail to parse (e.g. truncation at the token limit).
+   */
   complete(
     messages: Message[],
     config:   ProviderConfig,
@@ -254,6 +273,10 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     yield { type: 'done' };
   }
 
+  /**
+   * Lightweight health check — always reports `ok` without contacting the endpoint.
+   * @returns Current health status.
+   */
   async health(): Promise<HealthStatus> {
     return { status: 'ok' };
   }

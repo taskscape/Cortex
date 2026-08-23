@@ -1,6 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+/**
+ * Reads up to `maxBytes` of a file as UTF-8 text, reporting whether the
+ * content was truncated and the full file size.
+ *
+ * @param filePath - The file to read.
+ * @param maxBytes - Maximum number of bytes to read.
+ * @returns The decoded content, truncation flag, and total size in bytes.
+ * @throws Any filesystem error from stat-ing or opening the file (e.g. ENOENT).
+ * @throws Error if the path is not a regular file.
+ */
 export async function readTextFile(filePath: string, maxBytes: number): Promise<{ content: string; truncated: boolean; size: number }> {
   const stats = await fs.stat(filePath);
 
@@ -23,6 +33,14 @@ export async function readTextFile(filePath: string, maxBytes: number): Promise<
   }
 }
 
+/**
+ * Lists a directory's immediate entries with type and (for files) size,
+ * stat-ing entries with bounded concurrency.
+ *
+ * @param directoryPath - Directory to enumerate (non-recursive).
+ * @returns Entries with name, absolute path, `directory`/`file` type, and file size when applicable.
+ * @throws Any filesystem error from reading or stat-ing the directory contents.
+ */
 export async function listDirectory(directoryPath: string): Promise<Array<{ name: string; path: string; type: string; size?: number }>> {
   const entries = await fs.readdir(directoryPath, { withFileTypes: true });
   return mapWithConcurrency(entries, 16, async entry => {

@@ -23,6 +23,13 @@ function encodeName(id: string): string {
   return encoded;
 }
 
+/**
+ * A {@link Store} implementation persisting each document as a pretty-printed
+ * JSON file in a directory. Ids that are not filesystem-safe are percent-
+ * encoded per UTF-8 byte; over-long names fall back to a `%h%<sha256>` digest.
+ * Writes are atomic (tmp file + rename) and `cas`/`delete` serialise per id
+ * with an in-process promise-chain mutex (single-process safety only).
+ */
 export class FilesystemStore<T extends { id: string; version: string }> implements Store<T> {
   private initPromise: Promise<void> | undefined;
   private locks = new Map<string, Promise<unknown>>();
@@ -74,6 +81,12 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
 
   // ── Store<T> implementation ───────────────────────────────────────────────────
 
+  /**
+   * Reads the document stored under `id`.
+   * @param id - Record identifier.
+   * @returns The parsed document, or null when absent.
+   * @throws Propagates read or parse errors other than a missing file.
+   */
   async get(id: string): Promise<T | null> {
     try {
       return JSON.parse(await fs.readFile(this.filePath(id), 'utf8')) as T;
@@ -83,11 +96,25 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
     }
   }
 
+  /**
+   * Unconditionally writes a document under `id`.
+   * @param id - Record identifier.
+   * @param value - Document to persist.
+   * @throws Any error raised while writing or renaming the file.
+   */
   async set(id: string, value: T): Promise<void> {
     await this.init();
     await this.writeAtomic(this.filePath(id), JSON.stringify(value, null, 2));
   }
 
+  /**
+   * Compare-and-swap write: replaces the document only if its current version
+   * equals `expected`.
+   * @param id - Record identifier.
+   * @param expected - Version the caller believes is current.
+   * @param next - Replacement document.
+   * @returns `{ ok: true, doc: next }` on success, otherwise `{ ok: false, current }`.
+   */
   async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
     return this.withLock(id, async () => {
       const current = await this.get(id);
@@ -99,6 +126,12 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
     });
   }
 
+  /**
+   * Deletes the document under `id`, optionally gated on a version check.
+   * @param id - Record identifier.
+   * @param expectedVersion - When given, delete only if the stored version matches.
+   * @returns True if the file was deleted (or already gone), false on version mismatch.
+   */
   async delete(id: string, expectedVersion?: string): Promise<boolean> {
     return this.withLock(id, async () => {
       if (expectedVersion !== undefined) {
@@ -114,6 +147,13 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
     });
   }
 
+  /**
+   * Loads every readable `.json` document in the directory and filters,
+   * sorts and paginates it through the shared query engine. Corrupted files
+   * are skipped silently.
+   * @param q - The store query to execute.
+   * @returns Matching items plus the total count before pagination.
+   */
   async query(q: StoreQuery): Promise<QueryResult<T>> {
     await this.init();
 

@@ -1,3 +1,10 @@
+"""Multilingual cross-encoder reranker sidecar exposed over HTTP.
+
+The FastAPI application loads a revision-pinned CrossEncoder model at startup
+and serves ``GET /health`` plus ``POST /rerank``, scoring query/candidate pairs
+with CUDA out-of-memory handling and a configurable candidate cap.
+"""
+
 import hashlib
 import json
 import os
@@ -59,6 +66,13 @@ app = FastAPI(title="Cortex workspace-rag multilingual reranker")
 
 
 class RerankRequest(BaseModel):
+    """Request body for the ``POST /rerank`` endpoint.
+
+    Attributes:
+        query: The query to score against (1-16384 characters).
+        texts: Candidate texts; may be empty.
+        truncate: Whether the model may truncate long inputs.
+    """
     query: str = Field(min_length=1, max_length=16_384)
     texts: List[str] = Field(default_factory=list)
     truncate: bool = True
@@ -66,6 +80,12 @@ class RerankRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    """Report service health and the active reranker configuration.
+
+    Returns:
+        dict: Health payload including CUDA availability, device, model,
+        revisions, signature, and batching/length limits.
+    """
     cuda_available = torch.cuda.is_available()
     return {
         "ok": True,
@@ -83,6 +103,19 @@ def health():
 
 @app.post("/rerank")
 def rerank(request: RerankRequest):
+    """Score each candidate text against the query with the cross-encoder.
+
+    Args:
+        request: Parsed rerank request containing the query and candidate texts.
+
+    Returns:
+        dict: Model name, signature, and relevance scores (one float per text,
+        in input order).
+
+    Raises:
+        HTTPException: 422 when the number of texts exceeds ``MAX_TEXTS``, or
+            503 when prediction fails with a CUDA out-of-memory error.
+    """
     if len(request.texts) > MAX_TEXTS:
         raise HTTPException(
             status_code=422,

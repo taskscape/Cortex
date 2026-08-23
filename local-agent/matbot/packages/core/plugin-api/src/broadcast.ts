@@ -9,18 +9,38 @@ interface Subscriber<T> {
   done:  boolean;
 }
 
-// The consumer facet — what a stream hands out. `emit` is the producer's, kept off this so a
-// surface that only exposes observation (e.g. services.mounted) cannot forge events.
+/**
+ * The consumer facet of a broadcast stream — what a surface hands out to observers.
+ * `emit` is deliberately kept off this interface so a view that only exposes observation
+ * (e.g. `services.mounted`) cannot forge events.
+ */
 export interface Subscribable<T> {
+  /**
+   * Subscribe to the stream.
+   *
+   * @param signal - Optional abort signal; aborting ends the iteration.
+   * @returns An async iterable yielding each emitted value as it arrives.
+   */
   subscribe(signal?: AbortSignal): AsyncIterable<T>;
-  // Detached observation loop: awaits each handler before pulling the next (no overlapping runs),
-  // isolates a throwing handler (logged, never propagated — a bad observer must not kill the stream),
-  // and ends when the source ends or `signal` aborts. The fire-and-forget form of the for-await loop
-  // every watch call site otherwise hand-writes.
+  /**
+   * Detached observation loop: awaits each handler before pulling the next (no overlapping
+   * runs), isolates a throwing handler (logged, never propagated), and ends when the source
+   * ends or `signal` aborts.
+   *
+   * @param handler - Called with each value; may be async and may throw safely.
+   * @param signal - Optional abort signal that terminates the loop.
+   */
   consume(handler: (value: T) => void | Promise<void>, signal?: AbortSignal): void;
 }
 
+/** A {@link Subscribable} that can also produce events. Producers hold this facet; consumers receive only the base interface. */
 export interface Broadcaster<T> extends Subscribable<T> {
+  /**
+   * Fan an event out to every active subscriber (each gets its own unbounded queue).
+   * Synchronous and never throws.
+   *
+   * @param value - The value to deliver to all subscribers.
+   */
   emit(value: T): void;
 }
 
@@ -41,6 +61,12 @@ export function subscribable<T>(subscribe: (signal?: AbortSignal) => AsyncIterab
   return { subscribe, consume };
 }
 
+/**
+ * Create a multi-subscriber fan-out broadcaster for observation streams. Each subscriber gets
+ * its own unbounded queue, so a slow consumer never blocks `emit` or its peers.
+ *
+ * @returns A broadcaster with `emit`, `subscribe`, and `consume`.
+ */
 export function createBroadcaster<T>(): Broadcaster<T> {
   const subs = new Set<Subscriber<T>>();
 

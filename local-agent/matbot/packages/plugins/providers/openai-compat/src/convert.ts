@@ -4,6 +4,7 @@ import type { Message, Tool, JSONSchema } from '@matatbread/matbot-plugin-api';
 
 type OAIRole    = 'system' | 'user' | 'assistant' | 'tool';
 
+/** One message in OpenAI chat-completions wire format. */
 export interface OAIMessage {
   role:         OAIRole;
   content?:     string | OAIContentPart[] | null;
@@ -24,6 +25,7 @@ interface OAIToolCall {
   function: { name: string; arguments: string };
 }
 
+/** A tool definition in OpenAI's wire format, optionally carrying a cache breakpoint. */
 export interface OAIToolDef {
   type:     'function';
   function: { name: string; description: string; parameters: JSONSchema };
@@ -59,6 +61,17 @@ function applyCacheBreakpoints(result: OAIMessage[]): void {
   if (userTurns.length >= 2) markCacheable(result[userTurns[userTurns.length - 2]!]!);
 }
 
+/**
+ * Convert neutral matbot messages to OpenAI chat-completions format. System messages become a
+ * single `system` message; tool results become `tool` messages; provider-native thinking blocks
+ * are stripped; images become data/URL content parts; text-only messages collapse to plain
+ * strings; empty assistant turns are dropped. With `cache`, marks Anthropic-style ephemeral
+ * breakpoints on the system message and second-to-last user turn.
+ *
+ * @param messages The conversation in neutral format.
+ * @param cache Add `cache_control` breakpoints (only for endpoints that honour them).
+ * @returns OpenAI-format messages.
+ */
 export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] {
   const result: OAIMessage[] = [];
 
@@ -151,6 +164,14 @@ export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] 
   return result;
 }
 
+/**
+ * Convert matbot tools to OpenAI function-tool definitions; with `cache`, marks the last
+ * definition with an ephemeral breakpoint (tool defs are stable across turns).
+ *
+ * @param tools The tools offered to the model.
+ * @param cache Add a `cache_control` breakpoint on the last tool definition.
+ * @returns OpenAI-format tool definitions.
+ */
 export function toOAITools(tools: readonly Tool[], cache = false): OAIToolDef[] {
   const defs: OAIToolDef[] = tools.map(t => ({
     type:     'function' as const,

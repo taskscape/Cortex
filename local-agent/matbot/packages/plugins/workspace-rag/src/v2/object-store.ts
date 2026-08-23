@@ -24,6 +24,9 @@ async function exists(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Appends (line, byteOffset) entries to a content-addressed line index file.
+ */
 export class RagV2LineIndexWriter {
   private readonly stream: ReturnType<typeof createWriteStream>;
   private closed = false;
@@ -32,6 +35,11 @@ export class RagV2LineIndexWriter {
     this.stream = createWriteStream(filePath, { flags: 'wx', encoding: 'utf8' });
   }
 
+  /**
+   * Appends one line entry.
+   * @param line - 1-based line number.
+   * @param byteOffset - Byte offset of the line start in the source object.
+   */
   async add(line: number, byteOffset: number): Promise<void> {
     if (this.closed) throw new Error('Workspace RAG V2 line index is already closed.');
     if (!this.stream.write(`${line}\t${byteOffset}\n`)) {
@@ -50,6 +58,10 @@ export class RagV2LineIndexWriter {
   }
 }
 
+/**
+ * Content-addressed on-disk store of source objects plus optional line
+ * indexes, enabling byte-range reads without loading whole files.
+ */
 export class RagV2ObjectStore {
   readonly root: string;
   readonly retentionMode: 'managed' | 'external_immutable' | 'manifest_only';
@@ -73,6 +85,11 @@ export class RagV2ObjectStore {
     await mkdir(path.join(this.root, 'staging'), { recursive: true });
   }
 
+  /**
+   * Stores a file by content hash; identical content is deduplicated.
+   * @param params - Source path, bytes and hashing inputs.
+   * @returns The stored object reference.
+   */
   async putFile(
     sourcePath: string,
     signal?: AbortSignal,
@@ -162,6 +179,11 @@ export class RagV2ObjectStore {
     }
   }
 
+  /**
+   * Opens a line-index writer for an existing object.
+   * @param contentSha256 - Content hash of the object.
+   * @returns A writer, or undefined when an index already exists.
+   */
   async createLineIndexWriter(contentSha256: string): Promise<RagV2LineIndexWriter | undefined> {
     const finalPath = this.lineIndexPath(contentSha256);
     if (await exists(finalPath)) return undefined;
@@ -181,6 +203,11 @@ export class RagV2ObjectStore {
     return writer;
   }
 
+  /**
+   * Reads a byte range out of a stored object.
+   * @param params - Object hash plus byte range.
+   * @returns The requested bytes decoded as UTF-8 text.
+   */
   async fetchRange(
     contentSha256: string,
     startByte: number,
@@ -208,6 +235,11 @@ export class RagV2ObjectStore {
     }
   }
 
+  /**
+   * Reads a 1-based inclusive line range via the line index.
+   * @param params - Object hash, line index path, and line range.
+   * @returns The lines joined with newlines (empty when no index exists).
+   */
   async fetchLines(
     contentSha256: string,
     startLine: number,
@@ -275,6 +307,11 @@ export class RagV2ObjectStore {
     };
   }
 
+  /**
+   * Resolves the on-disk path for a content hash.
+   * @param contentSha256 - Content hash.
+   * @returns Absolute object path.
+   */
   objectPath(contentSha256: string): string {
     this.assertHash(contentSha256);
     const result = this.contentPath(this.root, contentSha256);
@@ -282,6 +319,11 @@ export class RagV2ObjectStore {
     return result;
   }
 
+  /**
+   * Resolves the on-disk path of a content hash's line index.
+   * @param contentSha256 - Content hash.
+   * @returns Absolute line-index path.
+   */
   lineIndexPath(contentSha256: string): string {
     return path.join(path.dirname(this.objectPath(contentSha256)), 'lines.tsv');
   }

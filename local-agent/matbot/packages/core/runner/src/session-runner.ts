@@ -10,17 +10,34 @@ import { appendMessage, createMessage } from './session.js';
 import { contextSwitch } from '@matatbread/matbot-plugin-api';
 import { runSession } from './runner.js';
 
+/** Dependencies a host supplies to build the session runner: persistence, provider resolution, registries. */
 export interface SessionRunnerDeps {
+  /** The session store (system of record). */
   store:           Store<Session>;
+  /**
+   * Resolve a named provider profile to its adapter and config.
+   *
+   * @param name - Provider key from the submission.
+   * @returns The adapter plus config, or `null` when unknown.
+   */
   resolveProvider: (name: string) => Promise<{ adapter: ProviderAdapter; config: ProviderConfig } | null>;
+  /** Live tool registry consulted per call. */
   tools?:          ToolRegistry;
+  /** Pipeline hook registry (screen/contribute/toolcall/toolresult/followup). */
   hooks?:          HookRegistry;
+  /** System-prompt contributor registry, built once per turn. */
   systemContext?:  SystemContextRegistry;
+  /** Vault forwarded into tool contexts. */
   vault?:          Vault;
+  /** File store forwarded into tool contexts. */
   files?:          FileStore;
+  /** Default working directory forwarded into tool contexts. */
   workdir?:        string;
+  /** Config file path forwarded into tool contexts. */
   configPath?:     string;
+  /** Hot-load a plugin (delegated into tool contexts). */
   loadPlugin:      (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
+  /** Hot-unload a plugin (delegated into tool contexts). */
   unloadPlugin:    (specifier: string) => Promise<boolean>;
   /** Late-bound so a plugin loaded after runner construction can install the sink. */
   observability?:  () => ObservabilitySink | undefined;
@@ -119,6 +136,13 @@ function createSink(dispose: () => void): Sink {
   };
 }
 
+/**
+ * Build the per-session turn serialiser: submissions queue FIFO, each turn runs under the
+ * submitter's principal via a context switch, and `followup` hooks fire post-commit.
+ *
+ * @param deps - Persistence, provider resolution, and registry wiring.
+ * @returns A {@link SessionRunner} with open/abort/cancelTurn/status.
+ */
 export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
   const states = new Map<string, SessionState>();
 

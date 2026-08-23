@@ -1,3 +1,11 @@
+/**
+ * File-index HTTP service entry point. Exposes `/health`, `/index` (re-index a
+ * configured workspace root, serialised through an internal queue), and
+ * `/search` (scored keyword search over the persisted store). This module has
+ * no exports; it loads any existing store, then listens on `FILE_INDEX_PORT`
+ * (default 8877) when run directly.
+ */
+
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";

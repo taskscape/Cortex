@@ -265,6 +265,12 @@ class ExpertPanel {
   }
 }
 
+/**
+ * The expert-panel plugin: on setup(), loads experts.json, opens the durable review
+ * store, registers an `ExpertPanel` service, and exposes the `expert_panel` tool for
+ * listing experts, running grounded panel asks, and creating/inspecting structured
+ * expert review records.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: "0.1",
   async setup(services) {

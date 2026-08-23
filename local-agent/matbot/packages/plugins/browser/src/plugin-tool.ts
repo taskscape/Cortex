@@ -11,8 +11,20 @@ import { getRegisteredPlugins, getRegisteredTools, getRegisteredFrontendPlugins,
  * baseline to produce the full configured set.
  */
 export interface ExtraPlugins {
+  /**
+   * Lists persisted user-added plugin specifiers.
+   * @returns The stored specifiers, in insertion order.
+   */
   list(): Promise<string[]>;
+  /**
+   * Persists a plugin specifier for auto-load on future boots.
+   * @param specifier Specifier to persist (ignored if already stored).
+   */
   add(specifier: string): Promise<void>;
+  /**
+   * Removes a plugin specifier from the persisted set.
+   * @param specifier Specifier to forget.
+   */
   remove(specifier: string): Promise<void>;
 }
 

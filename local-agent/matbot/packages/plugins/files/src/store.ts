@@ -65,8 +65,17 @@ async function *nodeStreamToAsyncIterable(
   }
 }
 
+/**
+ * Node `FileStore` backed by the filesystem. Named files store data at a path
+ * mirroring their name; anonymous files use UUID ids with a `.data` extension.
+ * Each entry carries a sibling `<id>.meta.json`; writes go through a temp file
+ * + rename so data and metadata land atomically.
+ */
 export class FilesystemFileStore implements FileStore {
   private readonly dir: string;
+  /**
+   * @param dir Root directory for stored files (created lazily).
+   */
   constructor(dir: string) { this.dir = dir; }
 
   private async ensureDir(): Promise<void> {
@@ -97,6 +106,14 @@ export class FilesystemFileStore implements FileStore {
     }
   }
 
+  /**
+   * Writes a file, upserting by name when provided.
+   * @param name File name (used as the id); omit for an anonymous UUID entry.
+   * @param mimeType MIME type stored alongside the file.
+   * @param data Chunked content to stream to disk.
+   * @param opts Optional session/message/namespace/allowed annotations.
+   * @returns A handle for reading the file's metadata and content.
+   */
   async put(
     name:     string | undefined,
     mimeType: MimeType,
@@ -130,6 +147,11 @@ export class FilesystemFileStore implements FileStore {
     return makeHandle(id, meta, this.dir);
   }
 
+  /**
+   * Fetches a file handle by id.
+   * @param id File identifier.
+   * @returns The handle, or `null` if metadata or the data file is missing.
+   */
   async get(id: string): Promise<FileHandle | null> {
     const meta = await this.getRawMeta(id);
     if (!meta) return null;
@@ -141,6 +163,12 @@ export class FilesystemFileStore implements FileStore {
     }
   }
 
+  /**
+   * Looks up the first file whose name matches, optionally within a namespace.
+   * @param name File name to find.
+   * @param namespace Optional namespace restriction.
+   * @returns The matching handle, or `null`.
+   */
   async getByName(name: string, namespace?: string): Promise<FileHandle | null> {
     // Direct O(1) lookup for named files (id === name).
     const direct = await this.get(name);
@@ -152,6 +180,10 @@ export class FilesystemFileStore implements FileStore {
     return null;
   }
 
+  /**
+   * Removes a file's data and metadata files.
+   * @param id File identifier.
+   */
   async delete(id: string): Promise<void> {
     const meta = await this.getRawMeta(id);
     const dp = meta ? resolveDataPath(this.dir, id, meta) : path.join(this.dir, id + '.data');
@@ -161,6 +193,11 @@ export class FilesystemFileStore implements FileStore {
     ]);
   }
 
+  /**
+   * Recursively lists stored files matching the filter.
+   * @param filter Optional namespace/session/MIME/date filters.
+   * @returns An async iterable of matching file handles.
+   */
   async *list(filter?: FileFilter): AsyncIterable<FileHandle> {
     await this.ensureDir();
     for await (const mfp of this.findMetaFiles(this.dir)) {
@@ -193,10 +230,23 @@ export class FilesystemFileStore implements FileStore {
     }
   }
 
+  /**
+   * Writes a temporary file with no session/message/namespace annotations.
+   * @param name File name.
+   * @param mimeType MIME type of the file.
+   * @param data Chunked content to store.
+   * @returns A handle for the stored temp file.
+   */
   async putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle> {
     return this.put(name, mimeType, data);
   }
 
+  /**
+   * Watches the store directory and yields debounced change events.
+   * @param signal Abort signal that ends the watch.
+   * @returns An async iterable of {@link FileEvent}s describing changed fields.
+   * @throws Re-throws watcher or change-handler errors before terminating.
+   */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
     // Storage backends construct their FileStore eagerly but create this directory lazily. The WebUI
     // starts watching during boot, before the first file write, so watch() must establish its own

@@ -57,6 +57,11 @@ const executor = {
   },
 };
 
+/**
+ * The `http` tool. Performs a single HTTP request via `fetch` and yields the response body as text
+ * or parsed JSON. Network errors, non-2xx statuses, and JSON parse failures are reported as error
+ * events rather than thrown.
+ */
 export const httpTool: Tool = {
   name:        'http',
   description: 'Make an HTTP request and return the response body.',
@@ -74,6 +79,7 @@ export const httpTool: Tool = {
   executor,
 };
 
+/** Plugin spec registering the {@link httpTool}. */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools:      [httpTool],

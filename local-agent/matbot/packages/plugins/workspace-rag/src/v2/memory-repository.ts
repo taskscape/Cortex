@@ -50,6 +50,10 @@ function key(workspaceId: string, contextId: string): string {
   return `${workspaceId}\0${contextId}`;
 }
 
+/**
+ * In-memory {@link RagV2Repository} used when no Postgres backend is
+ * configured. All state lives for the process lifetime only.
+ */
 export class MemoryRagV2Repository implements RagV2Repository {
   readonly backend = 'memory' as const;
   private readonly publications = new Map<string, RagV2Publication[]>();
@@ -69,6 +73,10 @@ export class MemoryRagV2Repository implements RagV2Repository {
   readonly regexRuns: RagV2RegexRunRecord[] = [];
   private vectorizer: RagV2VectorizerInfo | undefined;
 
+  /**
+   * Prepares the repository and records the active vectorizer signature.
+   * @param vectorizer - Active vectorizer descriptor.
+   */
   async initialize(vectorizer: RagV2VectorizerInfo): Promise<void> {
     this.vectorizer = structuredClone(vectorizer);
   }

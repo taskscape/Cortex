@@ -1,3 +1,12 @@
+/**
+ * File-broker HTTP service entry point. Exposes `/health`, `/list`, `/read`,
+ * and `/write` over localhost, gating every operation with
+ * {@link evaluateRealAccess} against reloadable workspace/security configs.
+ * Writes of high-risk targets require `approved=true` and always produce a
+ * pre-write backup plus diff. This module has no exports; it starts the server
+ * on `FILE_BROKER_PORT` (default 8878) when run directly.
+ */
+
 import http from "node:http";
 import path from "node:path";
 import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";

@@ -3,10 +3,19 @@ import type { FileStore, FileHandle, FileMetaData, FileEvent, FileFilter, MimeTy
 
 const file_table_name = 'file_meta';
 
+/**
+ * A {@link FileStore} persisting file metadata and blobs in the shared SQLite
+ * database (`file_meta` table). Blobs are stored whole and streamed lazily;
+ * watchers are notified of every write in-process.
+ */
 export class SQLiteFileStore implements FileStore {
   private readonly db:       DatabaseSync;
   private readonly watchers = new Set<(event: FileEvent) => void>();
 
+  /**
+   * Creates the metadata table and indexes if absent.
+   * @param db - Shared SQLite database connection.
+   */
   constructor(db: DatabaseSync) {
     this.db = db;
     db.exec(`CREATE TABLE IF NOT EXISTS ${file_table_name} (
@@ -28,6 +37,16 @@ export class SQLiteFileStore implements FileStore {
     try { db.exec(`ALTER TABLE ${file_table_name} ADD COLUMN allowed INTEGER`); } catch { /* column exists */ }
   }
 
+  /**
+   * Stores a file (replacing any existing row with the same id) and emits a
+   * change event to watchers.
+   * @param name - File id; a UUID is minted when undefined.
+   * @param mimeType - MIME type of the content.
+   * @param data - Byte chunks making up the file.
+   * @param opts - Optional namespace, session/message linkage and allowed flag.
+   * @returns The handle for the stored file.
+   * @throws Re-throws SQLite errors after rolling back the transaction.
+   */
   async put(
     name:     string | undefined,
     mimeType: MimeType,
@@ -83,10 +102,19 @@ export class SQLiteFileStore implements FileStore {
     return row !== undefined ? this.buildHandle(row) : null;
   }
 
+  /**
+   * Deletes a file row.
+   * @param id - File identifier.
+   */
   async delete(id: string): Promise<void> {
     this.db.prepare(`DELETE FROM ${file_table_name} WHERE id = ?`).run(id);
   }
 
+  /**
+   * Streams handles for all files matching the filter.
+   * @param filter - Optional criteria on namespace, session, MIME prefix or dates.
+   * @returns Matching {@link FileHandle}s.
+   */
   async *list(filter?: FileFilter): AsyncIterable<FileHandle> {
     const rows = this.db.prepare(META_SELECT).all() as unknown as MetaRow[];
     for (const row of rows) {
@@ -104,6 +132,11 @@ export class SQLiteFileStore implements FileStore {
     return this.put(name, mimeType, data);
   }
 
+  /**
+   * Yields every subsequent write event until the signal aborts.
+   * @param signal - Optional abort signal ending the stream.
+   * @returns Change events describing each write (fields changed vs. prior state).
+   */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
     const queue: FileEvent[] = [];
     let notify: (() => void) | undefined;

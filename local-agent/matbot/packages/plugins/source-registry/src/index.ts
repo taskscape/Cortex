@@ -1,3 +1,12 @@
+/**
+ * Source-registry plugin: durable provenance records for indexed sources
+ * (documents, tables, metrics, dashboards, …) with freshness, health,
+ * citation policy and access auditing, exposed as the `SourceRegistry` service
+ * plus `source_action` / `source_health_action` tools.
+ *
+ * @packageDocumentation
+ */
+
 import { createHash, randomUUID } from 'node:crypto';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type {
@@ -16,6 +25,7 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** The kind of artefact a source record describes. */
 export type SourceKind =
   | 'document'
   | 'table'
@@ -26,14 +36,23 @@ export type SourceKind =
   | 'artifact'
   | 'query_result';
 
+/** How widely the source may be shared. */
 export type SourceSensitivity = 'public' | 'internal' | 'confidential' | 'restricted';
+/** Effective permission state for reading the source. */
 export type SourcePermissionState = 'unknown' | 'allowed' | 'denied' | 'partial';
+/** Confidence in the source's reliability. */
 export type SourceTrustLevel = 'unknown' | 'low' | 'medium' | 'high';
+/** Freshness classification of the source's content. */
 export type SourceStalenessState = 'unknown' | 'fresh' | 'stale' | 'expired';
+/** How (and whether) the source may be cited in answers. */
 export type SourceCitationPolicy = 'cite_path' | 'cite_link' | 'cite_query' | 'do_not_cite';
+/** Availability state of the source's backing system. */
 export type SourceHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
+/** The audited operation performed against a source. */
 export type SourceAccessAction = 'read' | 'retrieve' | 'cite' | 'write' | 'delete' | 'health_check';
+/** Severity of a health finding. */
 export type SourceHealthSeverity = 'info' | 'warning' | 'critical';
+/** The class of problem detected for a source. */
 export type SourceHealthIssueType =
   | 'stale'
   | 'expired'
@@ -42,13 +61,24 @@ export type SourceHealthIssueType =
   | 'permission_denied'
   | 'unknown_freshness';
 
+/**
+ * Natural-key identity of a source: workspace plus connector plus external id.
+ */
 export interface SourceIdentityInput {
+  /** Workspace the source belongs to. */
   workspaceId: string;
+  /** Connector type that produced the source. */
   connectorType: string;
+  /** Optional connector instance identifier. */
   connectorInstanceId?: string;
+  /** Connector-specific external identifier. */
   externalId: string;
 }
 
+/**
+ * A stored source record: identity, classification (sensitivity, trust,
+ * permission), freshness/health state and optional governance metadata.
+ */
 export interface SourceRecord {
   id: string;
   version: string;
@@ -79,10 +109,18 @@ export interface SourceRecord {
   retentionPolicyId?: string;
 }
 
+/**
+ * Input for creating or updating a source record. Omitted classification
+ * fields are preserved from the existing record (or defaulted).
+ */
 export type SourceRecordInput = SourceIdentityInput & {
+  /** Explicit id override; derived from identity when omitted. */
   id?: string;
+  /** Canonical URI of the source. */
   uri: string;
+  /** Human-readable title. */
   title: string;
+  /** The artefact kind. */
   sourceKind: SourceKind;
   sensitivity?: SourceSensitivity;
   permissionState?: SourcePermissionState;
@@ -163,6 +201,9 @@ export interface SourceAccessEvent {
   message?: string;
 }
 
+/**
+ * Input for recording an access event.
+ */
 export type SourceAccessInput = {
   sourceId: string;
   sourceVersionId?: string;
@@ -176,6 +217,9 @@ export type SourceAccessInput = {
   message?: string;
 };
 
+/**
+ * A citation rendered per the source's citation policy.
+ */
 export interface SourceCitation {
   sourceId: string;
   policy: SourceCitationPolicy;
@@ -215,6 +259,9 @@ export interface SourceHealthConnectorSnapshot {
   message?: string;
 }
 
+/**
+ * Aggregate health report over a workspace's sources.
+ */
 export interface SourceHealthReport {
   id: string;
   version: string;
@@ -230,29 +277,123 @@ export interface SourceHealthReport {
   workspaceId?: string;
 }
 
+/**
+ * Options controlling a health evaluation.
+ */
 export type SourceHealthEvaluationInput = {
   workspaceId?: string;
   includeUnknownFreshness?: boolean;
   connectorHealth?: SourceHealthConnectorSnapshot[];
 };
 
+/**
+ * The source registry service: stable id derivation, CRUD over sources and
+ * versions, health/access auditing, citation resolution, staleness queries
+ * and health-report evaluation.
+ */
 export interface SourceRegistry {
+  /**
+   * Derives the deterministic id for a source identity.
+   * @param input - Workspace/connector/external-id triple.
+   * @returns A stable `source:<hash>` id.
+   */
   stableSourceId(input: SourceIdentityInput): string;
+  /**
+   * Derives the deterministic id for a source version.
+   * @param input - Source id plus content/schema hashes.
+   * @returns A stable `source-version:<hash>` id.
+   */
   stableSourceVersionId(input: Pick<SourceVersionInput, 'sourceId' | 'contentHash' | 'schemaHash'>): string;
+  /**
+   * Derives the deterministic id for a workspace's health report.
+   * @param workspaceId - Optional workspace scope; omit for all workspaces.
+   * @returns A stable `source-health-report:<hash>` id.
+   */
   stableSourceHealthReportId(workspaceId?: string): string;
+  /**
+   * Creates or updates a source record (classification fields preserved when omitted).
+   * @param input - Source fields.
+   * @returns The stored record.
+   */
   upsertSource(input: SourceRecordInput): Promise<SourceRecord>;
+  /**
+   * Creates or updates a source version.
+   * @param input - Version fields including provenance.
+   * @returns The stored version.
+   */
   upsertVersion(input: SourceVersionInput): Promise<SourceVersion>;
+  /**
+   * Fetches a source record.
+   * @param id - Source id.
+   * @returns The record, or null when absent.
+   */
   getSource(id: string): Promise<SourceRecord | null>;
+  /**
+   * Fetches a source version.
+   * @param id - Version id.
+   * @returns The version, or null when absent.
+   */
   getVersion(id: string): Promise<SourceVersion | null>;
+  /**
+   * Lists source versions, optionally filtered by source.
+   * @param sourceId - Optional source filter.
+   * @returns Matching versions.
+   */
   sourceVersions(sourceId?: string): Promise<SourceVersion[]>;
+  /**
+   * Records a health check event and updates the source's health state.
+   * @param input - Health observation (message/details are secret-redacted).
+   * @returns The stored event.
+   */
   recordHealth(input: SourceHealthInput): Promise<SourceHealthEvent>;
+  /**
+   * Records an audited access event.
+   * @param input - Access observation.
+   * @returns The stored event.
+   */
   recordAccess(input: SourceAccessInput): Promise<SourceAccessEvent>;
+  /**
+   * Renders a citation per the source's policy.
+   * @param sourceId - Source to cite.
+   * @param versionId - Optional version to cite specifically.
+   * @returns The rendered citation (`do_not_cite` text for unknown sources).
+   */
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitation>;
+  /**
+   * Queries sources; returned records carry effective (recomputed) staleness.
+   * @param query - Optional store query.
+   * @returns Matching source records.
+   */
   querySources(query?: StoreQuery): Promise<SourceRecord[]>;
+  /**
+   * Lists stale or expired sources.
+   * @param workspaceId - Optional workspace filter.
+   * @returns Sources past their freshness SLA.
+   */
   staleSources(workspaceId?: string): Promise<SourceRecord[]>;
+  /**
+   * Lists recorded health events.
+   * @param sourceId - Optional source filter.
+   * @returns Matching events.
+   */
   healthEvents(sourceId?: string): Promise<SourceHealthEvent[]>;
+  /**
+   * Lists recorded access events.
+   * @param sourceId - Optional source filter.
+   * @returns Matching events.
+   */
   accessEvents(sourceId?: string): Promise<SourceAccessEvent[]>;
+  /**
+   * Evaluates findings across sources and persists a report.
+   * @param input - Scope and options, plus optional connector snapshots.
+   * @returns The persisted {@link SourceHealthReport}.
+   */
   evaluateHealth(input?: SourceHealthEvaluationInput): Promise<SourceHealthReport>;
+  /**
+   * Lists previously generated health reports.
+   * @param workspaceId - Optional workspace filter.
+   * @returns Stored reports.
+   */
   healthReports(workspaceId?: string): Promise<SourceHealthReport[]>;
 }
 
@@ -305,6 +446,13 @@ function computeStaleAfter(input: {
   return new Date(readAt + input.freshnessSlaSeconds * 1000).toISOString();
 }
 
+/**
+ * Computes the effective staleness state: an explicit state wins; otherwise
+ * freshness is derived from `staleAfter` / the freshness SLA against `at`.
+ * @param input - Staleness inputs.
+ * @param at - Reference time (default now).
+ * @returns `'fresh'`, `'stale'`, or `'unknown'`.
+ */
 export function effectiveStaleness(input: {
   stalenessState?: SourceStalenessState | undefined;
   staleAfter?: string | undefined;
@@ -888,6 +1036,12 @@ function createSourceHealthActionTool(registry: SourceRegistry, services: Matbot
   };
 }
 
+/**
+ * Builds a store-backed {@link SourceRegistry} over five namespaces
+ * (`sources`, `source_versions`, health/access events, health reports).
+ * @param services - Runtime machine providing store creation.
+ * @returns The registry instance.
+ */
 export function createSourceRegistry(services: MatbotMachine): SourceRegistry {
   return new StoreBackedSourceRegistry(
     services.createStore<SourceRecord>(SOURCE_STORE),
@@ -898,6 +1052,12 @@ export function createSourceRegistry(services: MatbotMachine): SourceRegistry {
   );
 }
 
+/**
+ * Default plugin specification registering the SourceRegistry service and the
+ * source inspection tools.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

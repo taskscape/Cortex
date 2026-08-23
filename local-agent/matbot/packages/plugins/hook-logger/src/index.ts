@@ -48,6 +48,11 @@ function redactDeep(value: unknown): unknown {
   return value;
 }
 
+/**
+ * The diagnostic plugin spec. On setup it registers one observer hook on each channel
+ * (`screen`, `contribute`, `toolcall`, `toolresult`, `followup`) and logs when each fires;
+ * see module comment for the `screen` injection and `toolresult` redaction demos.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

@@ -195,6 +195,13 @@ const workspaceTool: Tool = {
   },
 };
 
+/**
+ * Workspace plugin: registers the `workspace_action` tool, a scratch file area
+ * (read/write/list/delete) backed by the session's FileStore under the
+ * `workspace` namespace.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools: [workspaceTool],

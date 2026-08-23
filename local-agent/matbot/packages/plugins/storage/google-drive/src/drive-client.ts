@@ -20,6 +20,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Metadata of a Drive file/folder as returned by list operations.
+ */
 export interface DriveFile {
   id:        string;
   name:      string;
@@ -30,6 +33,10 @@ function qEscape(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+/**
+ * Minimal typed client over the Drive v3 REST API: folder management,
+ * reads, multipart uploads, deletes — with retry on transient errors.
+ */
 export class DriveClient {
   private readonly auth: DriveAuth;
 
@@ -71,6 +78,12 @@ export class DriveClient {
 
   /** List children of a folder, optionally filtered to one exact name. Folders themselves excluded
    *  unless `foldersOnly`. Walks pagination so callers get the full set. */
+  /**
+   * Lists children of a folder, optionally filtered by name or type.
+   * @param parentId - Folder id to list.
+   * @param opts - Optional name filter and folders-only flag.
+   * @returns Matching entries (empty when the parent is missing).
+   */
   async list(parentId: string, opts?: { name?: string; foldersOnly?: boolean }): Promise<DriveFile[]> {
     const clauses = [`'${qEscape(parentId)}' in parents`, 'trashed=false'];
     if (opts?.name !== undefined)  clauses.push(`name='${qEscape(opts.name)}'`);
@@ -100,6 +113,12 @@ export class DriveClient {
   }
 
   /** Find a child folder by name, creating it if absent. `parentId` of 'root' targets Drive root. */
+  /**
+   * Finds a child folder by name, creating it when absent.
+   * @param name - Folder name.
+   * @param parentId - Parent folder id.
+   * @returns The folder id.
+   */
   async ensureFolder(name: string, parentId: string): Promise<string> {
     const existing = await this.list(parentId, { name, foldersOnly: true });
     if (existing[0] !== undefined) return existing[0].id;
@@ -118,6 +137,10 @@ export class DriveClient {
     return parent;
   }
 
+  /**
+   * Downloads a file as UTF-8 text.
+   * @throws When the download fails after retries.
+   */
   async readText(fileId: string): Promise<string> {
     const res = await this.fetch(`${API}/files/${encodeURIComponent(fileId)}?alt=media`, { method: 'GET' });
     if (!res.ok) throw new Error(`Google Drive read ${res.status} for ${fileId}`);
@@ -131,6 +154,11 @@ export class DriveClient {
   }
 
   /** Create a file with body, returning its id. */
+  /**
+   * Uploads a new file into a folder.
+   * @returns The new file id.
+   * @throws When the upload fails after retries.
+   */
   async createFile(name: string, parentId: string, body: Blob | string, mimeType: string): Promise<string> {
     const metadata = { name, parents: [parentId] };
     const { contentType, payload } = multipart(metadata, body, mimeType);
@@ -143,6 +171,10 @@ export class DriveClient {
   }
 
   /** Overwrite an existing file's content in place (metadata unchanged). */
+  /**
+   * Replaces the content of an existing file.
+   * @throws When the upload fails after retries.
+   */
   async updateFile(fileId: string, body: Blob | string, mimeType: string): Promise<void> {
     const res = await this.fetch(`${UPLOAD}/${encodeURIComponent(fileId)}?uploadType=media`, {
       method:  'PATCH',
@@ -152,6 +184,10 @@ export class DriveClient {
     await this.json<DriveFile>(res);
   }
 
+  /**
+   * Deletes (trash) a file.
+   * @throws When the delete fails after retries.
+   */
   async deleteFile(fileId: string): Promise<void> {
     const res = await this.fetch(`${API}/files/${encodeURIComponent(fileId)}`, { method: 'DELETE' });
     // 404 ⇒ already gone, which is the caller's desired end state.

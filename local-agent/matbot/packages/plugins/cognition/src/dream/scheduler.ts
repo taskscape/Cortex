@@ -32,6 +32,12 @@ async function runScheduledPass(services: MatbotMachine, signal: AbortSignal): P
   }
 }
 
+/**
+ * Starts the hourly dream_time scheduler loop (after a one-minute startup delay).
+ * No-op in sub-agent processes.
+ * @param services The matbot machine used to run dream passes.
+ * @returns A stop function that aborts the loop.
+ */
 export function startDreamTimeScheduler(services: MatbotMachine): () => void {
   if (services.isSubAgent()) return () => undefined;
 

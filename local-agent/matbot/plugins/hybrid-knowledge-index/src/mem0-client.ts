@@ -8,9 +8,33 @@ export interface Mem0ClientOptions {
   workspaceId?: string;
 }
 
+/** Options for constructing a {@link Mem0Client}. */
+export interface Mem0ClientOptions {
+  baseUrl: string;
+  apiKey?: string;
+  userId?: string;
+  workspaceId?: string;
+}
+
+/**
+ * Client for a Mem0 memory service: adds knowledge entries as memories and searches
+ * them, mapping responses back into `KnowledgeEntry` shape. Endpoint paths are tried
+ * against both legacy and versioned API routes.
+ */
 export class Mem0Client {
+  /**
+   * @param options Base URL plus optional API key, user id (defaults to "local-agent"),
+   *                and workspace id (defaults to "default").
+   */
   constructor(private readonly options: Mem0ClientOptions) {}
 
+  /**
+   * Add an entry to the memory store as a user message with full entry metadata.
+   * @param entry The knowledge entry to persist.
+   * @param signal Optional cancellation signal.
+   * @returns Resolves when the memory is stored.
+   * @throws Error when all candidate endpoints fail or return a non-OK status.
+   */
   async add(entry: KnowledgeEntry, signal?: AbortSignal): Promise<void> {
     const payload = {
       messages: [{ role: "user", content: entry.content }],
@@ -37,6 +61,14 @@ export class Mem0Client {
     });
   }
 
+  /**
+   * Search the memory store and map results into knowledge entries, dropping rows
+   * with empty content.
+   * @param query Free-text query.
+   * @param signal Optional cancellation signal.
+   * @returns Up to 10 mapped entries (score used as confidence when present).
+   * @throws Error when all candidate endpoints fail or return a non-OK status.
+   */
   async search(query: string, signal?: AbortSignal): Promise<KnowledgeEntry[]> {
     const payload = {
       query,

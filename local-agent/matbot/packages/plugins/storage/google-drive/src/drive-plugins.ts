@@ -20,6 +20,10 @@ interface ManifestDoc {
  * Its shape satisfies the browser plugin tool's `ExtraPlugins` persistence interface, so the very
  * same `plugin` tool can be backed by Drive instead of IndexedDB (see {@link createSyncedPluginTool}).
  */
+/**
+ * The persisted list of remote plugin specifiers, stored as a manifest
+ * document in Drive so the set survives reloads.
+ */
 export class DrivePluginSet {
   private readonly store: Store<ManifestDoc>;
 
@@ -31,12 +35,20 @@ export class DrivePluginSet {
     return (await this.store.get(DOC_ID))?.specifiers ?? [];
   }
 
+  /**
+   * Adds a plugin specifier to the manifest.
+   * @param specifier - Plugin specifier to record.
+   */
   async add(specifier: string): Promise<void> {
     const cur = await this.list();
     if (cur.includes(specifier)) return;
     await this.store.set(DOC_ID, { id: DOC_ID, version: crypto.randomUUID(), specifiers: [...cur, specifier] });
   }
 
+  /**
+   * Removes a plugin specifier from the manifest.
+   * @param specifier - Plugin specifier to drop.
+   */
   async remove(specifier: string): Promise<void> {
     const cur = await this.list();
     await this.store.set(DOC_ID, { id: DOC_ID, version: crypto.randomUUID(), specifiers: cur.filter(s => s !== specifier) });
@@ -57,6 +69,13 @@ export class DrivePluginSet {
  *    this Google Drive plugin itself (it lives in the local extras, not the Drive set — a Drive
  *    remove couldn't uninstall it, it'd just reload next boot). Delegation, not a silent no-op.
  *  - `list` → annotates each loaded plugin with whether it's Drive-synced or local-only.
+ */
+/**
+ * Wraps the host plugin tool so install/remove actions also update the
+ * Drive-synced manifest (falling back to the original tool when absent).
+ * @param driveSet - The synced manifest store.
+ * @param original - The underlying plugin tool, if any.
+ * @returns The wrapped tool.
  */
 export function createSyncedPluginTool(driveSet: DrivePluginSet, original: Tool | null): Tool {
   const driveTool = createBrowserPluginTool(driveSet);

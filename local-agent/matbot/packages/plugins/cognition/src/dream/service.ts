@@ -15,10 +15,24 @@ function serialise<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/**
+ * Picks the default provider used by dream ranker/merger when nothing is pinned.
+ * @param services The matbot machine.
+ * @returns The first registered provider key, or `undefined` if none exist.
+ */
 export function resolveDreamFallbackProvider(services: MatbotMachine): string | undefined {
   return [...services.providers.keys()][0];
 }
 
+/**
+ * Runs a single dream-time pass (rank + merge unassigned memories) and persists
+ * the resulting DreamRun. Passes are serialised process-wide.
+ * @param services The matbot machine.
+ * @param fallbackProvider Provider used when no ranker/merger provider is pinned.
+ * @param signal Abort signal cancelling the pass.
+ * @returns The completed dream run.
+ * @throws If no fallback provider is configured or the named one is missing.
+ */
 export async function runDreamTimePass(
   services: MatbotMachine,
   fallbackProvider: string | undefined,

@@ -79,11 +79,20 @@ export class ChatUI {
   // undefined and messages render as plain text — keeping the bundle self-contained and offline.
   private renderMd: ((src: string) => string) | undefined;
 
+  /**
+   * @param services The matbot machine (sessions store, runner, providers).
+   * @param root DOM element the UI mounts into.
+   */
   constructor(services: MatbotMachine, root: HTMLElement) {
     this.services = services;
     this.root = root;
   }
 
+  /**
+   * Builds the UI, wires event handlers, and loads the most recent session
+   * (or creates one).
+   * @returns Resolves once the UI is mounted and a session is selected.
+   */
   async mount(): Promise<void> {
     document.getElementById('mb-loading')?.remove();
     const style = el('style');

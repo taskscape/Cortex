@@ -6,6 +6,12 @@ import { SQLiteStorageBackend } from './backend.js';
 export { SQLiteStore } from './store.js';
 export { SQLiteStorageBackend } from './backend.js';
 
+/**
+ * SQLite storage backend plugin — persists all namespaces and files in a
+ * single WAL-mode database under `<config dir>/.data/matbot.db`.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   storageBackend: {

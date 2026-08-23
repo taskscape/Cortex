@@ -1,6 +1,10 @@
+/** Whether RAG v2 is disabled or serves as the primary retrieval path. */
 export type RagV2Mode = 'off' | 'primary';
+/** Granularity level of an indexed unit. */
 export type RagV2Level = 'collection' | 'document' | 'section' | 'passage';
+/** Whether text is embedded as a query or as indexed document content (some models use asymmetric prefixes). */
 export type RagV2EmbeddingPurpose = 'query' | 'document';
+/** Retrieval strategy variants evaluated by the v2 engine. */
 export type RagV2RetrievalVariant =
   | 'flat_dense_baseline'
   | 'lexical_only'
@@ -10,6 +14,7 @@ export type RagV2RetrievalVariant =
   | 'hybrid_reranked'
   | 'hierarchical'
   | 'hierarchical_lazy';
+/** Publication lifecycle state of a generation's records. */
 export type RagV2PublicationState =
   | 'staging'
   | 'active_lexical'
@@ -17,6 +22,7 @@ export type RagV2PublicationState =
   | 'active_hybrid_complete'
   | 'retired'
   | 'quarantined';
+/** Ingestion job lifecycle states. */
 export type RagV2JobState =
   | 'discovered'
   | 'hashing'
@@ -33,21 +39,28 @@ export type RagV2JobState =
   | 'retryable_failure'
   | 'permanent_failure'
   | 'quarantined';
+/** Vector-index availability of a unit's embedding. */
 export type RagV2EmbeddingState = 'not_planned' | 'queued' | 'ready' | 'failed' | 'evicted';
+/**
+ * Lexical-index availability of a unit.
+ */
 export type RagV2LexicalState = 'pending' | 'ready' | 'failed';
 
+/** Identifies a workspace and its configuration directory. */
 export interface RagV2WorkspaceRef {
   id: string;
   name: string;
   configDir: string;
 }
 
+/** Identifies an indexed context and the source paths it covers. */
 export interface RagV2ContextRef {
   id: string;
   name: string;
   paths: string[];
 }
 
+/** Describes the active vectorizer; vectors are only mixable within one signature. */
 export interface RagV2VectorizerInfo {
   backend: string;
   model: string;
@@ -56,6 +69,7 @@ export interface RagV2VectorizerInfo {
   maxTokens?: number;
 }
 
+/** Embeds texts for query or document purposes. */
 export interface RagV2Embedder {
   readonly info: RagV2VectorizerInfo;
   embed(
@@ -65,6 +79,7 @@ export interface RagV2Embedder {
   ): Promise<number[][]>;
 }
 
+/** A heading in a document's table of contents, addressed by line and byte offset. */
 export interface RagV2HeadingRef {
   level: number;
   text: string;
@@ -72,6 +87,7 @@ export interface RagV2HeadingRef {
   byte: number;
 }
 
+/** Detected language distribution over a span of text. */
 export interface RagV2LanguageResult {
   primary: string | 'und';
   confidence: number;
@@ -80,6 +96,7 @@ export interface RagV2LanguageResult {
   script: string;
 }
 
+/** A content-addressed object stored on disk plus its optional line index. */
 export interface RagV2SourceObject {
   contentSha256: string;
   objectPath: string;
@@ -87,6 +104,7 @@ export interface RagV2SourceObject {
   byteLength: number;
 }
 
+/** Indexed document metadata with publication and embedding state. */
 export interface RagV2DocumentRecord {
   documentId: string;
   documentVersionId: string;
@@ -119,6 +137,7 @@ export interface RagV2DocumentRecord {
   embeddingState: RagV2EmbeddingState;
 }
 
+/** An indexed collection grouping documents under a routing summary. */
 export interface RagV2CollectionRecord {
   collectionId: string;
   collectionVersionId: string;
@@ -133,6 +152,10 @@ export interface RagV2CollectionRecord {
   createdAt: string;
 }
 
+/**
+ * Hierarchy level a routing summary was generated at.
+ */
+export
 export type RagV2SummaryLevel = 'collection' | 'document' | 'section';
 
 /**
@@ -153,11 +176,13 @@ export interface RagV2RoutingSummaryRecord {
   createdAt: string;
 }
 
+/** One prior conversation turn used for query rewriting. */
 export interface RagV2ConversationTurn {
   role: 'user' | 'assistant';
   text: string;
 }
 
+/** Result of rewriting the latest question into a standalone query. */
 export interface RagV2QueryRewrite {
   latestQuestion: string;
   standaloneQuery: string;
@@ -166,6 +191,7 @@ export interface RagV2QueryRewrite {
   contextHash?: string;
 }
 
+/** An indexed section: a heading-scoped byte range of a document version. */
 export interface RagV2SectionRecord {
   sectionId: string;
   documentId: string;
@@ -188,6 +214,7 @@ export interface RagV2SectionRecord {
   embeddingState: RagV2EmbeddingState;
 }
 
+/** An indexed passage: the atomic retrieval unit within a section. */
 export interface RagV2PassageRecord {
   passageId: string;
   documentId: string;
@@ -221,6 +248,7 @@ export interface RagV2PassageRecord {
   embeddingState: RagV2EmbeddingState;
 }
 
+/** Parser output for one document before it is written to the repository. */
 export interface RagV2ParsedDocument {
   title: string;
   lineCount: number;
@@ -231,6 +259,10 @@ export interface RagV2ParsedDocument {
   passages: RagV2PassageRecord[];
 }
 
+/**
+ * Tunable ingestion limits: passage sizing, parser memory, and rate caps.
+ */
+export
 export interface RagV2IngestionPolicy {
   eagerPassageMaxBytes: number;
   asyncPassageMaxBytes: number;
@@ -245,6 +277,7 @@ export interface RagV2IngestionPolicy {
   contextGraphOpsPerSecond: number;
 }
 
+/** Progress record of an ingestion job over one context. */
 export interface RagV2Job {
   id: string;
   workspaceId: string;
@@ -286,6 +319,7 @@ export interface RagV2Job {
   pauseRequested: boolean;
 }
 
+/** Per-file progress entry of an ingestion job. */
 export interface RagV2JobItem {
   jobId: string;
   workspaceId: string;
@@ -299,6 +333,7 @@ export interface RagV2JobItem {
   error?: string;
 }
 
+/** One weighted retriever/query pair produced by planning. */
 export interface RagV2QueryVariant {
   retriever:
     | 'document_lexical'
@@ -315,6 +350,7 @@ export interface RagV2QueryVariant {
   weight: number;
 }
 
+/** The fully resolved retrieval plan for one user question. */
 export interface RagV2RetrievalPlan {
   originalQuery: string;
   latestQuestion: string;
@@ -343,6 +379,7 @@ export interface RagV2RetrievalPlan {
   };
 }
 
+/** A single ranked search hit at any level. */
 export interface RagV2RankedHit {
   level: RagV2Level;
   id: string;
@@ -374,6 +411,7 @@ export interface RagV2RankedHit {
   retrievalReasons: string[];
 }
 
+/** Citation-ready evidence assembled from a hit. */
 export interface RagV2Evidence {
   evidenceId: string;
   sourceId?: string;
@@ -399,6 +437,7 @@ export interface RagV2Evidence {
   score: number;
 }
 
+/** Complete result of one v2 retrieval run, including answerability and diagnostics. */
 export interface RagV2SearchResult {
   runId: string;
   plan: RagV2RetrievalPlan;
@@ -426,6 +465,7 @@ export interface RagV2SearchResult {
   };
 }
 
+/** Current status of the v2 subsystem for status reporting. */
 export interface RagV2Status {
   mode: RagV2Mode;
   available: boolean;

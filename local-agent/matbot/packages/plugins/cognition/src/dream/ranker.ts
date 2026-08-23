@@ -43,6 +43,13 @@ import type { RememberedFact, SkillCandidate, Score, MergeResult } from './types
  * propagates aborts (from the tool-call cancellation path) down.
  */
 export interface Ranker {
+  /**
+   * Scores every (fact, skill) pair in the cross-product of the inputs.
+   * @param facts Still-unassigned facts, capped pipeline-side.
+   * @param skills Non-blocklisted skill metadata views.
+   * @param signal Cancellation signal; must be honoured.
+   * @returns One Score per (fact, skill) pair, in any order; missing pairs count as 0.
+   */
   rank(
     facts:  readonly RememberedFact[],
     skills: readonly SkillCandidate[],
@@ -64,6 +71,14 @@ export interface Ranker {
  * a merger failure leaves the skill untouched.
  */
 export interface Merger {
+  /**
+   * Splices one fact into one skill's markdown.
+   * @param skillName Name of the target skill.
+   * @param skillContent Current complete skill markdown.
+   * @param fact The fact to splice in.
+   * @param signal Cancellation signal; must be honoured.
+   * @returns The complete updated markdown plus any contradiction notes.
+   */
   merge(
     skillName:    string,
     skillContent: string,

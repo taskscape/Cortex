@@ -31,6 +31,12 @@ import type { MatbotMachine, Tool, ToolExecutor, ToolContext, ToolEvent } from '
 import type { DreamRun } from './types.js';
 import { runDreamTimePass } from './service.js';
 
+/**
+ * Constructs the zero-input `dream_time` tool, which runs one serialised
+ * memory-consolidation pass and yields its DreamRun record.
+ * @param services The matbot machine (providers, stores, skill manager).
+ * @returns The `dream_time` tool.
+ */
 export function createDreamTimeTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
     async *execute(_input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {

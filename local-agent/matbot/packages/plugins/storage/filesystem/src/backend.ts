@@ -10,19 +10,40 @@ import { FilesystemStore } from './store.js';
 // filesystem store becomes nameable, so you can assert it to override another backend instead of only
 // reaching it implicitly by unregistering whatever is in force. Stores mkdir lazily, so open() opens
 // nothing eagerly (cf. SQLite, which must create its db file).
+/**
+ * A {@link StorageBackend} mapping each namespace to a directory of per-id
+ * JSON files under `<dotData>/<namespace>`, with binary files under
+ * `<dotData>/files`. Mirrors the node host's implicit default layout, but as a
+ * nameable registered backend. Nothing is opened eagerly — stores mkdir lazily.
+ */
 export class FilesystemStorageBackend implements StorageBackend {
+  /** FileStore rooted at `<dotData>/files`. */
   readonly fileStore: FileStore;
   private readonly dotData: string;
 
+  /**
+   * @param dotData - Root directory for all namespaces and files.
+   */
   constructor(dotData: string) {
     this.dotData   = dotData;
     this.fileStore = new FilesystemFileStore(join(dotData, 'files'));
   }
 
+  /**
+   * Creates the backend (kept async to match the StorageBackend contract).
+   * @param dotData - Root directory.
+   * @returns The new backend instance.
+   */
   static open(dotData: string): Promise<FilesystemStorageBackend> {
     return Promise.resolve(new FilesystemStorageBackend(dotData));
   }
 
+  /**
+   * Creates a JSON-file store for a namespace directory.
+   * @param namespace - Subdirectory name under the data root.
+   * @returns A store persisting documents of type `T`.
+   * @template T - Stored document shape ({ id, version } at minimum).
+   */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     return new FilesystemStore<T>(join(this.dotData, namespace));
   }

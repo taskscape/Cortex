@@ -71,6 +71,10 @@ function loadGsi(): Promise<GisOAuth2> {
 }
 
 /** Load the GIS script ahead of any user gesture (call when the connect UI mounts). */
+/**
+ * Pre-loads the Google Identity Services script so later token requests are instant.
+ * @returns Resolves when the GIS client is available (never rejects).
+ */
 export function preloadGsi(): Promise<void> {
   return loadGsi().then(() => {});
 }
@@ -89,6 +93,10 @@ function loadCachedToken(): { token: string; expiresAt: number } | undefined {
  * `token()` is the single read path the DriveClient calls, and `invalidate()` is what a 401 handler
  * calls to force the next `token()` to re-request.
  */
+/**
+ * Browser-side Google Drive OAuth via Google Identity Services, with a
+ * localStorage token cache and expiry tracking.
+ */
 export class DriveAuth {
   private readonly clientId: string;
   private readonly scope:    string;
@@ -105,6 +113,10 @@ export class DriveAuth {
   }
 
   /** Whether a cached, non-expired token is in hand — i.e. we can reach Drive with no popup. */
+  /**
+   * Whether a cached token exists that is still within its validity window.
+   * @returns True when a fresh cached token is available.
+   */
   hasFreshToken(): boolean {
     // 30s skew guard so we don't hand out a token that dies mid-request.
     return this.accessToken !== undefined && Date.now() < this.expiresAt - 30_000;
@@ -138,6 +150,10 @@ export class DriveAuth {
    * lapsed; that path is best-effort (a 401 mid-session is rare) and the user can always re-run the
    * setup flow, which re-authorises from a real gesture.
    */
+  /**
+   * Returns a valid access token, using the cache or requesting silently.
+   * @throws When no interactive consent is possible or the request fails.
+   */
   async token(): Promise<string> {
     if (this.hasFreshToken()) return this.accessToken!;
     if (this.pending !== undefined) return this.pending;
@@ -150,6 +166,9 @@ export class DriveAuth {
   }
 
   /** Drop the current token (e.g. after a 401) so the next `token()` re-requests. */
+  /**
+   * Discards the cached token so the next request re-authenticates.
+   */
   invalidate(): void {
     this.accessToken = undefined;
     this.expiresAt = 0;

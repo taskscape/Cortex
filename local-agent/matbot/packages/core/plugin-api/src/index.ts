@@ -1,3 +1,8 @@
+/**
+ * Public barrel of `@matatbread/matbot-plugin-api` — shared types, the services/machine surface,
+ * hooks, principal context, and errors.
+ * @module
+ */
 export type * from './types.js';
 export { CONFIRM_YES, CONFIRM_NO } from './types.js';
 export * from './store-query.js';

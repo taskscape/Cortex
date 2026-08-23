@@ -19,6 +19,11 @@ interface Entry<T> {
  * store's per-key lock — cross-machine concurrency is out of scope, as it is for the filesystem
  * backend across processes).
  */
+/**
+ * A {@link Store} persisting each document as a JSON file in a Drive folder.
+ * `cas` is implemented with an immediate read-modify-write (single-browser
+ * safety only); queries load every document in the folder.
+ */
 export class DriveStore<T extends { id: string; version: string }> implements Store<T> {
   private readonly drive:    DriveClient;
   private readonly folderId: Promise<string>;
@@ -52,6 +57,11 @@ export class DriveStore<T extends { id: string; version: string }> implements St
     return run;
   }
 
+  /**
+   * Reads the document stored under `id`.
+   * @param id - Record identifier.
+   * @returns The parsed document, or null when absent.
+   */
   async get(id: string): Promise<T | null> {
     await this.ensureLoaded();
     return this.cache.get(id)?.doc ?? null;
@@ -86,6 +96,11 @@ export class DriveStore<T extends { id: string; version: string }> implements St
     });
   }
 
+  /**
+   * Loads all documents and applies the shared query engine.
+   * @param q - The store query to execute.
+   * @returns Matching items plus totals/cursor when applicable.
+   */
   async query(q: StoreQuery): Promise<QueryResult<T>> {
     await this.ensureLoaded();
     return executeQuery([...this.cache.values()].map(e => e.doc), q);

@@ -19,8 +19,11 @@ import {
   validateDreamSettings,
 } from '../dream/types.js';
 
+/** Settings key pinning the provider used by the ask_inner_voice tool. */
 export const INNER_VOICE_PROVIDER_KEY = 'innerVoiceProvider';
+/** Settings key pinning the provider dream-time uses for ranking. */
 export const DREAM_RANKER_PROVIDER_KEY = 'dreamRankerProvider';
+/** Settings key pinning the provider dream-time uses for merging. */
 export const DREAM_MERGER_PROVIDER_KEY = 'dreamMergerProvider';
 
 /** Every provider pin `cognition_config` understands. One flat list so the get/set/clear logic and
@@ -34,6 +37,13 @@ const PROVIDER_SETTING_KEYS = [
 /** Every DreamSettings field `cognition_config` understands, alongside the provider pins above. */
 const DREAM_SETTING_KEYS = ['strongThreshold', 'weakThreshold', 'maxClusterSize', 'blocklist', 'weakDeferralMs'] as const;
 
+/**
+ * Constructs the `ask_inner_voice` tool: records a durable fact about the user
+ * into the remembered_facts store (with optional provenance), using a pinned or
+ * turn provider.
+ * @param services The matbot machine.
+ * @returns The `ask_inner_voice` tool.
+ */
 export function createAskInnerVoiceTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
@@ -116,6 +126,12 @@ async function readEffectiveConfig(services: MatbotMachine): Promise<CognitionCo
   };
 }
 
+/**
+ * Constructs the `cognition_config` tool: view/pin/clear the providers used by
+ * inner-voice and dream rank/merge, and get/set dream settings.
+ * @param services The matbot machine.
+ * @returns The `cognition_config` tool.
+ */
 export function createCognitionConfigTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
     async *execute(input: unknown, _ctx: ToolContext): AsyncIterable<ToolEvent> {

@@ -1,25 +1,31 @@
+/** Config for one remote (HTTP/SSE) MCP server, as persisted and passed to {@link createHttpClient}. */
 export interface MCPRemoteConfig {
+  /** Unique short server id; prefixes its proxy tool names. */
   type:     'remote';
   name:     string;
   endpoint: string;
   headers?: Record<string, string>;
 }
 
+/** Persistence document listing all configured remote servers. */
 export interface MCPPersistedRemote {
   servers: MCPRemoteConfig[];
 }
 
+/** A tool advertised by a remote MCP server. */
 export interface MCPToolDef {
   name:         string;
   description?: string;
   inputSchema?: Record<string, unknown>;
 }
 
+/** One content part of an MCP tool result. */
 export type MCPContentPart =
   | { type: 'text';     text: string }
   | { type: 'image';    data: string; mimeType: string }
   | { type: 'resource'; resource: { uri: string; mimeType?: string; text?: string; blob?: string } };
 
+/** Result of invoking a tool on an MCP server. */
 export interface MCPToolResult {
   content?: MCPContentPart[];
   isError?: boolean;
@@ -27,12 +33,21 @@ export interface MCPToolResult {
 
 /** Transport-agnostic MCP client. mcp-http provides the HTTP impl; a node plugin can provide stdio. */
 export interface MCPClient {
+  /** Server-provided usage instructions, set by `initialize` if offered. */
   readonly instructions: string | undefined;
+  /** @returns The server's tool definitions. @throws On connection or protocol failure. */
   listTools(): Promise<MCPToolDef[]>;
+  /**
+   * Invoke a tool on the server.
+   * @param name Tool name. @param args Arguments object. @param signal Optional abort signal.
+   * @returns The tool result. @throws On connection or protocol failure.
+   */
   callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPToolResult>;
+  /** Release the transport (no-op for stateless HTTP). */
   close(): void;
 }
 
+/** Summary of one connected remote server, for `list`. */
 export interface MCPRemoteServerInfo {
   name:          string;
   endpoint:      string;

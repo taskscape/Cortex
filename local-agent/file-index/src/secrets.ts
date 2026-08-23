@@ -21,7 +21,13 @@ function looksLikeSecretValue(value: string): boolean {
   return /^[A-Za-z0-9_\-./+=~]{12,}$/.test(value);
 }
 
-/** The name of the shape that makes this file unsafe to index at all, if any. */
+/**
+ * Detects credential shapes so unambiguous that the whole file should be
+ * withheld from the index.
+ *
+ * @param content - Full file text to scan.
+ * @returns The matched shape's name (e.g. "api-key-literal"), or undefined if none.
+ */
 export function fileLevelSecret(content: string): string | undefined {
   return FILE_LEVEL_SECRETS.find(secret => secret.pattern.test(content))?.name;
 }
@@ -30,6 +36,9 @@ export function fileLevelSecret(content: string): string | undefined {
  * Replaces credential-shaped assigned values with `[redacted]`, leaving the rest of the text
  * searchable. Previously a single match dropped the entire file from the index, which read to the
  * operator as "search cannot find something I know is there", with no visible cause.
+ *
+ * @param text - Chunk text to redact.
+ * @returns The redacted text and how many values were replaced.
  */
 export function redactSecrets(text: string): { text: string; redactions: number } {
   let redactions = 0;

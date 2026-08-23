@@ -66,6 +66,14 @@ async function writeData(dir: FileSystemDirectoryHandle, id: string, data: Async
  * Requires a browser environment with `navigator.storage.getDirectory()`.
  */
 export class OPFSFileStore implements FileStore {
+  /**
+   * Writes a file to OPFS, creating a new entry or upserting by name.
+   * @param name File name; when provided and an entry with the same name (+namespace) exists, its content is replaced in place.
+   * @param mimeType MIME type of the file.
+   * @param data Chunked file content to stream into storage.
+   * @param meta Optional session/message/namespace/allowed annotations stored with the file.
+   * @returns A handle for reading the stored file's metadata and content.
+   */
   async put(
     name:     string | undefined,
     mimeType: MimeType,
@@ -116,6 +124,11 @@ export class OPFSFileStore implements FileStore {
     return makeHandle(fileMeta, dir);
   }
 
+  /**
+   * Fetches a file handle by id.
+   * @param id File identifier.
+   * @returns The file's handle, or `null` if no metadata exists for `id`.
+   */
   async get(id: string): Promise<FileHandle | null> {
     try {
       const dir    = await filesDir();
@@ -128,6 +141,12 @@ export class OPFSFileStore implements FileStore {
     }
   }
 
+  /**
+   * Fetches the first file whose name matches, optionally within a namespace.
+   * @param name File name to look up.
+   * @param namespace Optional namespace to restrict the search to.
+   * @returns The matching handle, or `null` if none found.
+   */
   async getByName(name: string, namespace?: string): Promise<FileHandle | null> {
     for await (const handle of this.list(namespace !== undefined ? { namespace } : {})) {
       if (handle.name === name) return handle;
@@ -135,6 +154,10 @@ export class OPFSFileStore implements FileStore {
     return null;
   }
 
+  /**
+   * Removes a file's data and metadata entries.
+   * @param id File identifier.
+   */
   async delete(id: string): Promise<void> {
     const dir = await filesDir();
     await Promise.allSettled([
@@ -143,6 +166,11 @@ export class OPFSFileStore implements FileStore {
     ]);
   }
 
+  /**
+   * Yields handles of stored files matching the given filter.
+   * @param filter Optional namespace/session/MIME/date filters.
+   * @returns An async iterable of matching file handles.
+   */
   async *list(filter?: FileFilter): AsyncIterable<FileHandle> {
     const dir = await filesDir();
     // TypeScript DOM lib doesn't expose the async iterator methods on
@@ -163,12 +191,25 @@ export class OPFSFileStore implements FileStore {
     }
   }
 
+  /**
+   * Writes a temporary file (no session/message/namespace annotations).
+   * @param name File name.
+   * @param mimeType MIME type of the file.
+   * @param data Chunked content to store.
+   * @returns A handle for the stored temp file.
+   */
   async putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle> {
     return this.put(name, mimeType, data);
   }
 
   // OPFS has no native change notification; watch() is not implementable in the browser
   // without a SharedWorker or polling. Yield nothing and return when the signal fires.
+  /**
+   * No-op watcher: OPFS has no change notifications, so this yields nothing
+   * and resolves when the signal aborts.
+   * @param signal Abort signal that terminates the (empty) watch.
+   * @returns An empty async iterable of file events.
+   */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
     if (signal === undefined || signal.aborted) return;
     await new Promise<void>(resolve => { signal.addEventListener('abort', () => resolve(), { once: true }); });

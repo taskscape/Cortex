@@ -12,6 +12,9 @@ interface ColbertResponse {
  * version is re-authorized and every byte range is rehashed before evidence is
  * delivered.
  */
+/**
+ * Client for the ColBERT late-interaction sidecar used for reranking.
+ */
 export class RagV2ColbertAdapter {
   readonly url: URL;
 
@@ -19,6 +22,11 @@ export class RagV2ColbertAdapter {
     this.url = new URL(url);
   }
 
+  /**
+   * Reranks candidate passages against the query via the sidecar.
+   * @param params - Query text and candidate passages.
+   * @returns Passages with late-interaction scores (empty on sidecar failure).
+   */
   async search(
     query: string,
     scope: RagV2SearchScope,

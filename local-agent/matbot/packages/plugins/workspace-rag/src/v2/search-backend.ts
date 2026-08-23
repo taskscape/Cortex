@@ -5,6 +5,9 @@ import type {
 } from './types.js';
 import type { RagV2Repository, RagV2SearchScope } from './repository.js';
 
+/**
+ * A batch of records to index into a search backend for one generation.
+ */
 export interface SearchRecordBatch {
   generationId: string;
   level: RagV2Level;
@@ -36,6 +39,9 @@ export interface SearchRecordBatch {
   }>;
 }
 
+/**
+ * Result of validating that a generation is fully indexed.
+ */
 export interface SearchBackendValidationReport {
   valid: boolean;
   generationId: string;
@@ -43,8 +49,16 @@ export interface SearchBackendValidationReport {
   errors: string[];
 }
 
+/**
+ * Contract for pluggable hybrid (lexical + dense) search backends.
+ */
 export interface HybridSearchBackend {
   readonly kind: 'postgres-pgvector' | 'opensearch';
+  /**
+   * Indexes one batch of records for the generation.
+   * @param batch - Records to index.
+   * @param signal - Abort signal cancelling the write.
+   */
   indexGeneration(batch: SearchRecordBatch, signal?: AbortSignal): Promise<void>;
   validateGeneration(generationId: string): Promise<SearchBackendValidationReport>;
   publishGeneration(generationId: string): Promise<void>;
@@ -58,6 +72,9 @@ export interface HybridSearchBackend {
   deleteRetiredGeneration(generationId: string): Promise<void>;
 }
 
+/**
+ * Measured performance figures comparing candidate backends.
+ */
 export interface SearchBackendMeasurements {
   lexicalNdcg: number;
   recallAtK: number;
@@ -68,6 +85,9 @@ export interface SearchBackendMeasurements {
   citationCorrectness: number;
 }
 
+/**
+ * Inputs to the deterministic OpenSearch adoption decision.
+ */
 export interface OpenSearchAdoptionGateInput {
   postgres: SearchBackendMeasurements;
   opensearch: SearchBackendMeasurements;
@@ -83,6 +103,9 @@ export interface OpenSearchAdoptionGateInput {
   operationalApproval: boolean;
 }
 
+/**
+ * Outcome of the adoption-gate evaluation.
+ */
 export interface OpenSearchAdoptionGateResult {
   recommendation: 'keep_postgres' | 'promote_opensearch';
   postgresTriggers: string[];
@@ -90,6 +113,12 @@ export interface OpenSearchAdoptionGateResult {
   measurements: OpenSearchAdoptionGateInput;
 }
 
+/**
+ * Deterministically decides whether OpenSearch should be adopted based on
+ * measured recall/latency against the Postgres baseline and thresholds.
+ * @param input - Measurements, baseline, and thresholds.
+ * @returns The adoption verdict with reasons.
+ */
 export function evaluateOpenSearchAdoption(
   input: OpenSearchAdoptionGateInput,
 ): OpenSearchAdoptionGateResult {
@@ -140,6 +169,10 @@ export function evaluateOpenSearchAdoption(
   };
 }
 
+/**
+ * {@link HybridSearchBackend} delegating lexical/dense/exact search to the
+ * Postgres repository (the default backend).
+ */
 export class PostgresHybridSearchBackend implements HybridSearchBackend {
   readonly kind = 'postgres-pgvector' as const;
   private readonly repository: RagV2Repository;
@@ -202,6 +235,9 @@ interface OpenSearchOptions {
   password?: string;
 }
 
+/**
+ * {@link HybridSearchBackend} backed by an OpenSearch cluster.
+ */
 export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
   readonly kind = 'opensearch' as const;
   private readonly baseUrl: URL;

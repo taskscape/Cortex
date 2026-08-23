@@ -14,12 +14,18 @@ interface JsonRpcResponse { jsonrpc: string; id?: unknown; result?: unknown; err
  * node-only mcp plugin.)
  */
 export class HttpMCPClient implements MCPClient {
+  /** Server-provided usage instructions, set by {@link initialize} when the server offers them. */
   instructions: string | undefined;
   private nextId = 1;
   private readonly endpoint: string;
   private readonly extraHeaders: Record<string, string> | undefined;
   private readonly requestTimeoutMs: number;
 
+  /**
+   * @param endpoint The MCP server URL (JSON-RPC POST target).
+   * @param extraHeaders Extra HTTP headers sent with every request (e.g. auth).
+   * @param requestTimeoutMs Per-request timeout in milliseconds; non-positive or non-finite values fall back to the default.
+   */
   constructor(endpoint: string, extraHeaders?: Record<string, string>, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.endpoint = endpoint;
     this.extraHeaders = extraHeaders;
@@ -28,8 +34,10 @@ export class HttpMCPClient implements MCPClient {
       : DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
-  // Best-effort: stateless HTTP MCP servers serve tools/call without an init handshake, so a server
-  // that rejects initialize must not block the connection. We only want the `instructions` if offered.
+  /**
+   * Best-effort MCP initialize handshake; captures the server's `instructions` if offered.
+   * Never throws — a stateless server that rejects initialize must not block the connection.
+   */
   async initialize(): Promise<void> {
     try {
       const result = await this.post('initialize', {
@@ -126,18 +134,38 @@ export class HttpMCPClient implements MCPClient {
     }
   }
 
+  /**
+   * List the tools the server exposes via `tools/list`.
+   * @returns The tool definitions, or an empty array if none are reported.
+   * @throws On HTTP failure, JSON-RPC error response, timeout, or SSE stream failure.
+   */
   async listTools(): Promise<MCPToolDef[]> {
     const result = await this.post('tools/list') as { tools?: MCPToolDef[] };
     return result.tools ?? [];
   }
 
+  /**
+   * Invoke a tool on the server via `tools/call`.
+   * @param name Tool name on the server.
+   * @param args Arguments object passed to the tool.
+   * @param signal Optional abort signal forwarded to the underlying request.
+   * @returns The tool result (content parts and error flag).
+   * @throws On HTTP failure, JSON-RPC error response, timeout, or SSE stream failure.
+   */
   async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPToolResult> {
     return await this.post('tools/call', { name, arguments: args }, signal) as MCPToolResult;
   }
 
+  /** No-op: HTTP is stateless. */
   close(): void { /* HTTP is stateless */ }
 }
 
+/**
+ * Create a connected {@link HttpMCPClient} from persisted remote-server config.
+ * @param config The endpoint and optional headers for the server.
+ * @returns An initialized client ready for `listTools`/`callTool`.
+ * @throws If the connection or initialize handshake fails.
+ */
 export async function createHttpClient(config: MCPRemoteConfig): Promise<HttpMCPClient> {
   const client = new HttpMCPClient(config.endpoint, config.headers);
   await client.initialize();

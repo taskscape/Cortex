@@ -1,4 +1,9 @@
 export type * from './types.js';
+/**
+ * Public barrel of `@matatbread/matbot-core` — the agentic runner, plugin loader/registry,
+ * session runner, settings, and re-exports of the shared plugin API.
+ * @module
+ */
 // Explicit value re-export: MissingSecretError is a class, so the `export type *`
 // above would otherwise win and strip its value meaning under verbatimModuleSyntax.
 export { MissingSecretError, PromptCancelledError, IncompatibleRuntimeError, NotAPluginError, StoreQueryError } from '@matatbread/matbot-plugin-api';

@@ -21,61 +21,164 @@ APP_PATH = (
 
 
 class FakeHttpException(Exception):
+    """Stand-in for ``fastapi.HTTPException`` carrying status code and detail."""
+
     def __init__(self, *, status_code: int, detail: str):
+        """Store the response status and human-readable detail.
+
+        Args:
+            status_code: HTTP status code the exception represents.
+            detail: Error message exposed to clients.
+        """
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
 
 
 class FakeFastApi:
+    """Minimal FastAPI double whose decorators pass handlers through unchanged."""
+
     def __init__(self, **_kwargs):
+        """Accept and ignore FastAPI constructor arguments.
+
+        Args:
+            **_kwargs: Ignored keyword arguments.
+        """
         pass
 
     def get(self, _path):
+        """Return an identity decorator for a GET route.
+
+        Args:
+            _path: URL path; ignored.
+
+        Returns:
+            A decorator returning the handler as-is.
+        """
         return lambda handler: handler
 
     def post(self, _path):
+        """Return an identity decorator for a POST route.
+
+        Args:
+            _path: URL path; ignored.
+
+        Returns:
+            A decorator returning the handler as-is.
+        """
         return lambda handler: handler
 
 
 class FakeCuda:
+    """In-memory ``torch.cuda`` double that always reports CUDA available."""
+
     def __init__(self):
+        """Initialize the empty-cache call counter."""
         self.empty_cache_calls = 0
 
     def is_available(self):
+        """Report CUDA availability.
+
+        Returns:
+            Always True.
+        """
         return True
 
     def get_device_name(self, _index):
+        """Return the fake device name.
+
+        Args:
+            _index: Device index; ignored.
+
+        Returns:
+            The fixed name ``"fake-gpu"``.
+        """
         return "fake-gpu"
 
     def empty_cache(self):
+        """Record an empty-cache call instead of releasing memory."""
         self.empty_cache_calls += 1
 
 
 class FakeScores:
+    """Iterable double standing in for the numpy score array."""
+
     def __init__(self, values):
+        """Wrap score values.
+
+        Args:
+            values: Sequence of float scores to expose.
+        """
         self.values = values
 
     def __iter__(self):
+        """Iterate over the wrapped scores.
+
+        Returns:
+            An iterator over the stored values.
+        """
         return iter(self.values)
 
 
 class Recorder:
+    """Captures model loads and predict calls made by the app under test."""
+
     def __init__(self, oom=False):
+        """Create a recorder.
+
+        Args:
+            oom: When true, fake prediction raises a CUDA OOM error.
+        """
         self.oom = oom
         self.loads = []
         self.calls = []
 
 
 def load_app(*, oom=False):
+    """Load a fresh copy of app.py with mocked third-party modules.
+
+    Installs fake ``torch``, ``fastapi``, ``pydantic``, and
+    ``sentence_transformers`` modules plus fixed reranker environment variables,
+    then imports the real application module.
+
+    Args:
+        oom: When true, the fake cross-encoder raises CUDA OOM on predict.
+
+    Returns:
+        Tuple of (loaded module, recorder, FakeCuda instance).
+
+    Raises:
+        AssertionError: If the module spec cannot be created.
+    """
     recorder = Recorder(oom)
     cuda = FakeCuda()
 
     class FakeCrossEncoder:
+        """CrossEncoder double recording loads and predict calls."""
+
         def __init__(self, name, **options):
+            """Record the requested model and options.
+
+            Args:
+                name: Model identifier requested by the app.
+                **options: Keyword options forwarded by the app.
+            """
             recorder.loads.append((name, options))
 
         def predict(self, pairs, **options):
+            """Record the call and return deterministic scores.
+
+            Args:
+                pairs: Query/text pairs to score.
+                **options: Prediction options such as batch size.
+
+            Returns:
+                A :class:`FakeScores` with one score per pair.
+
+            Raises:
+                RuntimeError: When the recorder is configured to simulate
+                    CUDA out-of-memory failures.
+            """
             recorder.calls.append((list(pairs), options))
             if recorder.oom:
                 raise RuntimeError("CUDA out of memory")
@@ -139,10 +242,20 @@ def load_app(*, oom=False):
 
 
 def request(query, texts):
+    """Build a request-like object for the rerank endpoint.
+
+    Args:
+        query: The query to score against.
+        texts: Candidate texts.
+
+    Returns:
+        A namespace exposing ``query``, ``texts``, and ``truncate``.
+    """
     return types.SimpleNamespace(query=query, texts=texts, truncate=True)
 
 
 def main():
+    """Run all reranker runtime assertions and print a success message."""
     module, recorder, _cuda = load_app()
     health = module.health()
     assert health["ok"] is True

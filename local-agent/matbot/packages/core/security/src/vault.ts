@@ -16,6 +16,12 @@ const REF_RE = /\$\{([^}]+)\}/g;
 export class VaultImpl implements Vault {
   private readonly store = new Map<string, string>();
 
+  /**
+   * Build a vault over an in-memory snapshot.
+   *
+   * @param secrets - Explicit secret values; win over env on name clash.
+   * @param env - Environment-style variables, seeded for any name not already present.
+   */
   constructor(
     secrets?: Record<string, string>,
     env?:     Record<string, string | undefined>,
@@ -32,23 +38,56 @@ export class VaultImpl implements Vault {
     }
   }
 
+  /**
+   * Store a secret under the standard `createSecret` policy (reference/dedup-aware).
+   *
+   * @param name - The requested key name.
+   * @param value - The value to store (or a reference to an existing key).
+   * @returns The key name callers must reference — possibly not `name`.
+   */
   createSecret(name: string, value: string): Promise<string> {
     return applyCreateSecret(this, name, value);
   }
 
+  /**
+   * Store `value` under exactly `name`, overwriting any previous value.
+   *
+   * @param name - The key to write.
+   * @param value - The literal value to store.
+   * @returns Resolves when stored.
+   */
   async writeSecret(name: string, value: string): Promise<void> {
     this.store.set(name, value);
   }
 
+  /**
+   * Whether a secret is stored under this exact name.
+   *
+   * @param name - The key to test.
+   * @returns True when the key exists in the snapshot.
+   */
   hasKey(name: string): boolean {
     return this.store.has(name);
   }
 
+  /**
+   * Reverse-index a stored value to its key name.
+   *
+   * @param value - The value to search for.
+   * @returns The first matching key name, or `undefined` when absent.
+   */
   findByValue(value: string): string | undefined {
     for (const [k, v] of this.store) if (v === value) return k;
     return undefined;
   }
 
+  /**
+   * Replace every `${NAME}` placeholder in a string with its stored value.
+   *
+   * @param ref - Text containing zero or more `${NAME}` placeholders.
+   * @returns The text with all references resolved.
+   * @throws {MissingSecretError} Listing every unresolved placeholder name.
+   */
   async resolve(ref: string): Promise<string> {
     const errors: string[] = [];
 
@@ -64,6 +103,12 @@ export class VaultImpl implements Vault {
     return result;
   }
 
+  /**
+   * Redact every stored secret value (length ≥ 4) found in a text.
+   *
+   * @param text - Text that may contain literal secret values.
+   * @returns The text with each occurrence replaced by `[REDACTED]`.
+   */
   scrub(text: string): string {
     let result = text;
     for (const value of this.store.values()) {

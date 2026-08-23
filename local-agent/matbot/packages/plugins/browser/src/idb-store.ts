@@ -38,16 +38,35 @@ export class IDBStore<T extends { id: string; version: string }> implements Stor
     return db.transaction(this.storeName, mode).objectStore(this.storeName);
   }
 
+  /**
+   * Fetches a document by id.
+   * @param id Document identifier.
+   * @returns The document, or `null` if not found.
+   */
   async get(id: string): Promise<T | null> {
     const store = await this.tx('readonly');
     return (await idbPromise(store.get(id) as IDBRequest<T | undefined>)) ?? null;
   }
 
+  /**
+   * Unconditionally writes (inserts or overwrites) a document.
+   * @param id Document identifier.
+   * @param value Document to store.
+   * @throws IndexedDB request errors propagate on transaction failure.
+   */
   async set(id: string, value: T): Promise<void> {
     const store = await this.tx('readwrite');
     await idbPromise(store.put(value));
   }
 
+  /**
+   * Compare-and-swap: replaces the document only if its stored version matches `expected`.
+   * @param id Document identifier.
+   * @param expected Version the caller believes is current.
+   * @param next New document to write on success.
+   * @returns A result indicating success with the new doc, or failure with the current state.
+   * @throws IndexedDB request errors propagate on transaction failure.
+   */
   async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
     const db    = await this.dbp;
     const tx    = db.transaction(this.storeName, 'readwrite');
@@ -66,6 +85,12 @@ export class IDBStore<T extends { id: string; version: string }> implements Stor
     return { ok: true, doc: next };
   }
 
+  /**
+   * Deletes a document by id.
+   * @param id Document identifier.
+   * @param _expectedVersion Unused; deletion does not check the current version.
+   * @returns `true` if a document existed and was deleted, `false` otherwise.
+   */
   async delete(id: string, _expectedVersion?: string): Promise<boolean> {
     const store   = await this.tx('readwrite');
     const current = await idbPromise(store.get(id) as IDBRequest<T | undefined>);
@@ -74,6 +99,11 @@ export class IDBStore<T extends { id: string; version: string }> implements Stor
     return true;
   }
 
+  /**
+   * Loads all documents and applies filtering/sorting/paging in memory.
+   * @param q Query describing filters, sort, and paging.
+   * @returns Matching documents plus total count.
+   */
   async query(q: StoreQuery): Promise<QueryResult<T>> {
     const store = await this.tx('readonly');
     const all: T[] = await idbPromise(store.getAll() as IDBRequest<T[]>);

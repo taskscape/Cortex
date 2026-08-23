@@ -1,7 +1,9 @@
 import type { KnowledgeEntry } from "./types.js";
 import { hashText, makeKnowledgeEntry } from "./entry.js";
 
+/** Options for constructing a {@link LocalFileIndexClient}. */
 export interface LocalFileIndexClientOptions {
+  /** Base URL of the local file-index search service. */
   baseUrl: string;
 }
 
@@ -13,9 +15,23 @@ interface FileSearchResult {
   metadata: Record<string, unknown>;
 }
 
+/**
+ * Client for the local file-index search service: POSTs queries to /search and maps
+ * snippet results into `KnowledgeEntry` shape with deterministic file-index ids.
+ */
 export class LocalFileIndexClient {
+  /**
+   * @param options Client options; only `baseUrl` is required.
+   */
   constructor(private readonly options: LocalFileIndexClientOptions) {}
 
+  /**
+   * Search the file index and map results into knowledge entries.
+   * @param query Free-text query.
+   * @param signal Optional cancellation signal.
+   * @returns Up to 10 entries, one per search result snippet.
+   * @throws Error when the service responds with a non-OK status.
+   */
   async search(query: string, signal?: AbortSignal): Promise<KnowledgeEntry[]> {
     const response = await fetch(new URL("/search", this.options.baseUrl), {
       method: "POST",

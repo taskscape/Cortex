@@ -13,6 +13,9 @@ import type {
   RagV2VectorizerInfo,
 } from './types.js';
 
+/**
+ * Change-detection fingerprint for one indexed source path.
+ */
 export interface RagV2DocumentFingerprint {
   documentId: string;
   documentVersionId: string;
@@ -24,6 +27,9 @@ export interface RagV2DocumentFingerprint {
   summarySignature?: string;
 }
 
+/**
+ * A published generation of a context's index, with its completeness state.
+ */
 export interface RagV2Publication {
   generationId: string;
   workspaceId: string;
@@ -35,6 +41,9 @@ export interface RagV2Publication {
   publishedAt?: string;
 }
 
+/**
+ * A stored embedding vector bound to a unit and vectorizer signature.
+ */
 export interface RagV2EmbeddingRecord {
   level: RagV2Level;
   unitId: string;
@@ -46,6 +55,9 @@ export interface RagV2EmbeddingRecord {
   vector: number[];
 }
 
+/**
+ * Authorization scope bounding all searches (workspace/context/principal).
+ */
 export interface RagV2SearchScope {
   workspaceId: string;
   contextId: string;
@@ -61,6 +73,9 @@ export interface RagV2SearchScope {
   limit: number;
 }
 
+/**
+ * Persisted audit record of one retrieval run.
+ */
 export interface RagV2RetrievalRunRecord {
   id: string;
   workspaceId: string;
@@ -76,6 +91,9 @@ export interface RagV2RetrievalRunRecord {
   timingsJson?: unknown;
 }
 
+/**
+ * One hit persisted as part of a retrieval run.
+ */
 export interface RagV2StoredRetrievalHit {
   runId: string;
   hit: RagV2RankedHit;
@@ -83,6 +101,9 @@ export interface RagV2StoredRetrievalHit {
   exclusionReason?: string;
 }
 
+/**
+ * Persisted audit record of one regex/grep retrieval run.
+ */
 export interface RagV2RegexRunRecord {
   id: string;
   workspaceId: string;
@@ -97,6 +118,11 @@ export interface RagV2RegexRunRecord {
   createdAt: string;
 }
 
+/**
+ * Persistence contract shared by the memory and Postgres repositories:
+ * generation lifecycle, job tracking, document/section/passage/embedding
+ * writes, searches, and audit-run storage.
+ */
 export interface RagV2Repository {
   readonly backend: 'postgres-pgvector' | 'memory';
   initialize(vectorizer: RagV2VectorizerInfo): Promise<void>;

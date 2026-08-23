@@ -19,13 +19,20 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** Wire protocol a connector speaks. */
 export type ConnectorProtocol = 'native' | 'mcp' | 'postgres' | 'http';
+/** Access level a connector, binding, or action requires or grants. */
 export type ConnectorCapability = 'read' | 'write' | 'admin';
+/** Data-sensitivity classification applied to connector tool bindings. */
 export type ConnectorSensitivity = 'public' | 'internal' | 'confidential' | 'restricted';
+/** How a connector instance authenticates to its backing system. */
 export type ConnectorAuthMode = 'none' | 'api_key' | 'oauth_user' | 'oauth_service' | 'windows';
+/** Liveness classification of a connector instance. */
 export type ConnectorHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
+/** Outcome recorded for an audited connector tool call. */
 export type ConnectorAuditStatus = 'allowed' | 'denied' | 'error';
 
+/** Catalogued connector type: what protocol it speaks and what it can do. */
 export interface ConnectorDefinition {
   id: string;
   version: string;
@@ -39,6 +46,7 @@ export interface ConnectorDefinition {
   description?: string;
 }
 
+/** Partial definition accepted by `upsertDefinition`; omitted fields keep existing values. */
 export type ConnectorDefinitionInput = {
   id?: string;
   type: string;
@@ -49,6 +57,7 @@ export type ConnectorDefinitionInput = {
   description?: string;
 };
 
+/** A configured, workspace-scoped deployment of a connector definition. */
 export interface ConnectorInstance {
   id: string;
   version: string;
@@ -70,6 +79,7 @@ export interface ConnectorInstance {
   nextSyncAt?: string;
 }
 
+/** Partial instance accepted by `upsertInstance`; omitted fields keep existing values. */
 export type ConnectorInstanceInput = {
   id?: string;
   definitionId: string;
@@ -88,6 +98,8 @@ export type ConnectorInstanceInput = {
   nextSyncAt?: string;
 };
 
+/** Authorization grant letting a principal use specific tools of one connector instance,
+ *  subject to scopes, tool allow/deny lists, sensitive-field redaction, approval rules, and expiry. */
 export interface ConnectorGrant {
   id: string;
   version: string;
@@ -104,6 +116,7 @@ export interface ConnectorGrant {
   expiresAt?: string;
 }
 
+/** Partial grant accepted by `upsertGrant`; omitted fields keep existing values. */
 export type ConnectorGrantInput = {
   id?: string;
   connectorInstanceId: string;
@@ -117,6 +130,7 @@ export type ConnectorGrantInput = {
   expiresAt?: string;
 };
 
+/** Maps a connector capability onto a registered tool name/prefix, with policy metadata used for enforcement and audit. */
 export interface ConnectorToolBinding {
   id: string;
   version: string;
@@ -136,6 +150,7 @@ export interface ConnectorToolBinding {
   description?: string;
 }
 
+/** Partial binding accepted by `upsertToolBinding`; omitted fields keep existing values. */
 export type ConnectorToolBindingInput = {
   id?: string;
   connectorInstanceId: string;
@@ -152,6 +167,7 @@ export type ConnectorToolBindingInput = {
   description?: string;
 };
 
+/** Persisted incremental-sync position for one connector instance (per cursor kind/partition). */
 export interface ConnectorSyncCursor {
   id: string;
   version: string;
@@ -162,6 +178,7 @@ export interface ConnectorSyncCursor {
   partitionKey?: string;
 }
 
+/** Fields accepted by `upsertSyncCursor`. */
 export type ConnectorSyncCursorInput = {
   id?: string;
   connectorInstanceId: string;
@@ -170,6 +187,7 @@ export type ConnectorSyncCursorInput = {
   partitionKey?: string;
 };
 
+/** Recorded health-check result for a connector instance. */
 export interface ConnectorHealthEvent {
   id: string;
   version: string;
@@ -180,6 +198,7 @@ export interface ConnectorHealthEvent {
   details?: Record<string, unknown>;
 }
 
+/** Fields accepted by `recordHealth`. */
 export type ConnectorHealthInput = {
   connectorInstanceId: string;
   state: ConnectorHealthState;
@@ -188,6 +207,7 @@ export type ConnectorHealthInput = {
   details?: Record<string, unknown>;
 };
 
+/** Immutable audit record of one connector-backed tool call (allow/deny/error) with input/output hashes. */
 export interface ConnectorAuditEvent {
   id: string;
   version: string;
@@ -214,6 +234,7 @@ export interface ConnectorAuditEvent {
   errorMessage?: string;
 }
 
+/** Fields accepted by `recordAudit`; missing fields are defaulted or omitted. */
 export type ConnectorAuditInput = {
   connectorInstanceId: string;
   workspaceId: string;
@@ -238,6 +259,7 @@ export type ConnectorAuditInput = {
   errorMessage?: string;
 };
 
+/** Result of evaluating a tool call against connector bindings, instance state, and grants. */
 export interface ConnectorPolicyDecision {
   bound: boolean;
   allowed: boolean;
@@ -253,36 +275,117 @@ export interface ConnectorPolicyDecision {
   approvalPolicyId?: string;
 }
 
+/** Input to `evaluateToolCall`. */
 export interface ConnectorPolicyInput {
   toolName: string;
   input: unknown;
   principal?: Principal;
 }
 
+/** Registry over connector definitions, instances, grants, bindings,
+ *  sync cursors, health events, and audit events; plus the tool-call policy evaluator. */
 export interface ConnectorRegistry {
+  /** Deterministic store id for a definition of the given type.
+   * @param type Connector type.
+   * @returns Stable id derived from the type name. */
   stableConnectorDefinitionId(type: string): string;
+  /** Deterministic store id for an instance.
+   * @param workspaceId Owning workspace.
+   * @param type Connector type.
+   * @param displayName Instance display name.
+   * @returns Hash-derived stable id. */
   stableConnectorInstanceId(workspaceId: string, type: string, displayName: string): string;
+  /** Deterministic store id for a grant.
+   * @param connectorInstanceId Target connector instance.
+   * @param principalId Granted principal ('*' allowed).
+   * @param effectiveUserId Optional on-behalf-of user.
+   * @returns Hash-derived stable id. */
   stableConnectorGrantId(connectorInstanceId: string, principalId: string, effectiveUserId?: string): string;
+  /** Deterministic store id for a tool binding.
+   * @param input Binding identity fields.
+   * @returns Hash-derived stable id. */
   stableConnectorToolBindingId(input: Pick<ConnectorToolBindingInput, 'connectorInstanceId' | 'toolName' | 'toolNamePrefix'>): string;
+  /** Creates or updates a definition (id from the input or its stable-id derivation).
+   * @param input Field values; omitted optional fields keep existing ones on update.
+   * @returns The stored record. */
   upsertDefinition(input: ConnectorDefinitionInput): Promise<ConnectorDefinition>;
+  /** Creates or updates a instance (id from the input or its stable-id derivation).
+   * @param input Field values; omitted optional fields keep existing ones on update.
+   * @returns The stored record. */
   upsertInstance(input: ConnectorInstanceInput): Promise<ConnectorInstance>;
+  /** Creates or updates a grant (id from the input or its stable-id derivation).
+   * @param input Field values; omitted optional fields keep existing ones on update.
+   * @returns The stored record. */
   upsertGrant(input: ConnectorGrantInput): Promise<ConnectorGrant>;
+  /** Creates or updates a tool binding (id from the input or its stable-id derivation).
+   * @param input Field values; omitted optional fields keep existing ones on update.
+   * @returns The stored record. */
   upsertToolBinding(input: ConnectorToolBindingInput): Promise<ConnectorToolBinding>;
+  /** Creates or updates a sync cursor (id from the input or its stable-id derivation).
+   * @param input Field values; omitted optional fields keep existing ones on update.
+   * @returns The stored record. */
   upsertSyncCursor(input: ConnectorSyncCursorInput): Promise<ConnectorSyncCursor>;
+  /** Fetches a ConnectorDefinition by id.
+   * @param id Record id.
+   * @returns The record, or `null` if absent. */
   getDefinition(id: string): Promise<ConnectorDefinition | null>;
+  /** Fetches a ConnectorInstance by id.
+   * @param id Record id.
+   * @returns The record, or `null` if absent. */
   getInstance(id: string): Promise<ConnectorInstance | null>;
+  /** Fetches a ConnectorGrant by id.
+   * @param id Record id.
+   * @returns The record, or `null` if absent. */
   getGrant(id: string): Promise<ConnectorGrant | null>;
+  /** Fetches a ConnectorToolBinding by id.
+   * @param id Record id.
+   * @returns The record, or `null` if absent. */
   getToolBinding(id: string): Promise<ConnectorToolBinding | null>;
+  /** Resolves the binding governing a tool call: exact toolName first, then the longest matching prefix.
+   * @param toolName Registered tool name.
+   * @returns The best-matching binding, or `null` when the tool is not connector-bound. */
   getBindingForTool(toolName: string): Promise<ConnectorToolBinding | null>;
+  /** Queries stored definitions.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   queryDefinitions(query?: StoreQuery): Promise<ConnectorDefinition[]>;
+  /** Queries stored instances.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   queryInstances(query?: StoreQuery): Promise<ConnectorInstance[]>;
+  /** Queries stored grants.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   queryGrants(query?: StoreQuery): Promise<ConnectorGrant[]>;
+  /** Queries stored tool bindings.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   queryToolBindings(query?: StoreQuery): Promise<ConnectorToolBinding[]>;
+  /** Queries stored sync cursors.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   querySyncCursors(query?: StoreQuery): Promise<ConnectorSyncCursor[]>;
+  /** Records a health event and updates the instance's current health state when it exists.
+   * @param input Health observation.
+   * @returns The persisted {@link ConnectorHealthEvent}. */
   recordHealth(input: ConnectorHealthInput): Promise<ConnectorHealthEvent>;
+  /** Lists recorded health events.
+   * @param connectorInstanceId Optional restriction to one instance.
+   * @returns Matching events. */
   healthEvents(connectorInstanceId?: string): Promise<ConnectorHealthEvent[]>;
+  /** Appends an immutable audit event for a connector tool call.
+   * @param input Audit observation (source ids are de-duplicated).
+   * @returns The persisted {@link ConnectorAuditEvent}. */
   recordAudit(input: ConnectorAuditInput): Promise<ConnectorAuditEvent>;
+  /** Queries stored audit events.
+   * @param query Optional filter/sort/paging query; empty means all.
+   * @returns Matching records. */
   auditEvents(query?: StoreQuery): Promise<ConnectorAuditEvent[]>;
+  /** Evaluates whether a tool call may proceed: resolves the binding, checks instance
+   *  availability/read-write flags, then finds an unexpired grant matching the principal,
+   *  required scopes, tool/action patterns, and approval rules.
+   * @param input Tool name, raw call input, and optional explicit principal.
+   * @returns The decision; unbound tools are allowed with `bound: false`. */
   evaluateToolCall(input: ConnectorPolicyInput): Promise<ConnectorPolicyDecision>;
 }
 
@@ -1396,6 +1499,12 @@ async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void>
   for (const grant of grants) await registry.upsertGrant(grant);
 }
 
+/**
+ * Builds a store-backed {@link ConnectorRegistry} using seven dedicated stores
+ * created through the machine's store factory.
+ * @param services The matbot machine providing `createStore`.
+ * @returns The registry instance.
+ */
 export function createConnectorRegistry(services: MatbotMachine): ConnectorRegistry {
   return new StoreBackedConnectorRegistry(
     services.createStore<ConnectorDefinition>(DEFINITION_STORE),
@@ -1408,6 +1517,12 @@ export function createConnectorRegistry(services: MatbotMachine): ConnectorRegis
   );
 }
 
+/**
+ * Connector-fabric plugin: registers the ConnectorRegistry service, seeds the
+ * default connector definitions/instances/bindings/grants, exposes the
+ * `connector_action` admin tool, and installs toolcall/toolresult hooks that
+ * enforce grants and write audit events for connector-bound tools.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

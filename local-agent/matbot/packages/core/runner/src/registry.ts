@@ -29,6 +29,12 @@ const state = {
 // not in `state` — it owns subscribers across the registry's lifetime, not per-plugin data.
 const pluginEvents = createBroadcaster<PluginRegistryEvent>();
 
+/**
+ * Observe plugin load/unload events for the registry's lifetime.
+ *
+ * @param signal - Optional abort signal; aborting ends the iteration.
+ * @returns An async iterable of plugin loaded/unloaded events.
+ */
 export function watchPlugins(signal?: AbortSignal): AsyncIterable<PluginRegistryEvent> {
   return pluginEvents.subscribe(signal);
 }
@@ -110,6 +116,14 @@ function checkApiVersion(plugin: MatbotPlugin): void {
 
 // ── Registration ──────────────────────────────────────────────────────────────
 
+/**
+ * Register a loaded plugin: check its declared API version against the runtime, claim
+ * provider/storage factory slots, and emit a `loaded` event. Does not run setup().
+ *
+ * @param plugin - The plugin (already identity-stamped by the loader).
+ * @throws On an incompatible API major version, a duplicate plugin/provider name, or a
+ *         storage type already owned by another plugin.
+ */
 export function registerPlugin(plugin: MatbotPlugin): void {
   checkApiVersion(plugin);
 
@@ -145,6 +159,13 @@ export function registerPlugin(plugin: MatbotPlugin): void {
 
 // ── Resolution ────────────────────────────────────────────────────────────────
 
+/**
+ * Look up the provider adapter factory registered by a provider plugin.
+ *
+ * @param module - The provider's module key (its plugin name).
+ * @returns The factory for building that provider's adapter.
+ * @throws When no provider plugin is registered under this module.
+ */
 export function resolveProviderFactory(module: string): ProviderAdapterFactory {
   const factory = state.providers.get(module);
   if (factory === undefined) {
@@ -158,14 +179,29 @@ export function resolveProviderFactory(module: string): ProviderAdapterFactory {
   return factory;
 }
 
+/**
+ * List all currently registered tools.
+ *
+ * @returns A read-only snapshot of registered tools; empty before any plugin has set up.
+ */
 export function getRegisteredTools(): readonly Tool[] {
   return state.toolRegistry?.list() ?? [];
 }
 
+/**
+ * List all registered plugins in registration order.
+ *
+ * @returns A read-only view of the registered plugins.
+ */
 export function getRegisteredPlugins(): readonly MatbotPlugin[] {
   return state.plugins;
 }
 
+/**
+ * Map plugin names to the frontend info they declared via `services.registerFrontend()`.
+ *
+ * @returns A read-only map of frontend plugins.
+ */
 export function getRegisteredFrontendPlugins(): ReadonlyMap<string, FrontendInfo> {
   return state.frontendPlugins;
 }

@@ -9,9 +9,25 @@ const DEFAULT_MAX_TOKENS = 4096;
 // Minimal shapes for Anthropic SSE events — enough to drive CompletionEvent
 interface AEvent { type: string; [k: string]: unknown }
 
+/**
+ * Provider adapter for the Anthropic Messages API. Streams completions over SSE via `fetch`
+ * (no SDK), translating matbot messages/tools to Anthropic's wire format and emitting
+ * text deltas, thinking blocks (including redacted and unknown block types), tool calls,
+ * usage, and a final `done`. Throws on truncated/malformed tool-call JSON and stream errors.
+ */
 export class AnthropicAdapter implements ProviderAdapter {
+  /** Adapter name used in provider configuration (`anthropic`). */
   readonly name = 'anthropic';
 
+  /**
+   * Request a streaming completion.
+   * @param messages The conversation, including system, tool, and thinking content.
+   * @param config Provider configuration (endpoint, model, credentials, parameters).
+   * @param tools Tools offered to the model.
+   * @param signal Abort signal for the underlying request.
+   * @returns Stream of completion events ending with `done`.
+   * @throws On non-OK HTTP responses, mid-stream `error` events, or tool-call arguments that fail to parse (e.g. truncation at max_tokens).
+   */
   complete(
     messages: Message[],
     config:   ProviderConfig,
@@ -206,6 +222,10 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
   }
 
+  /**
+   * Lightweight health check — reports `ok` without contacting the API.
+   * @returns Current health status.
+   */
   async health(): Promise<HealthStatus> {
     // Lightweight check — just verify credentials key is present
     return { status: 'ok', latencyMs: 0 };

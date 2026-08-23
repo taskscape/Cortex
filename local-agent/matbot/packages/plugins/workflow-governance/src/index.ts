@@ -1,3 +1,13 @@
+/**
+ * Workflow-governance plugin: governed workflow definitions, approval-gated
+ * and shadow-mode runs, evidence resolution, deterministic workflow
+ * compilation, and tool-call policy enforcement. Exposes the
+ * `WorkflowRegistry`, `WorkflowRunner` and `WorkflowCompiler` services plus
+ * the `workflow_action` tool.
+ *
+ * @packageDocumentation
+ */
+
 import { createHash, randomUUID } from 'node:crypto';
 import { PLUGIN_API_VERSION, tryCurrentPrincipal } from '@matatbread/matbot-plugin-api';
 import type {
@@ -22,36 +32,68 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** Risk classification of a workflow definition. */
 export type WorkflowRiskLevel = 'low' | 'medium' | 'high' | 'critical';
+/** Execution mode of a run (from passive observation to live execution). */
 export type WorkflowRunMode = 'dry_run' | 'shadow' | 'approval_gated' | 'execute';
+/** Lifecycle status of a workflow run. */
 export type WorkflowRunStatus = 'created' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'escalated';
+/** Decision state of an approval request. */
 export type WorkflowApprovalStatus = 'pending' | 'approved' | 'rejected' | 'escalated';
+/** Review state of a proposed action within a run. */
 export type WorkflowActionStatus = 'proposed' | 'approved' | 'rejected' | 'blocked' | 'executed';
+/** Capability a connector-bound action requires. */
 export type ConnectorCapability = 'read' | 'write' | 'admin';
+/** Human verdict on a shadow-mode recommendation. */
 export type ShadowComparisonOutcome = 'accepted' | 'rejected' | 'mixed' | 'unlabeled';
+/** Outcome status of a compilation attempt. */
 export type WorkflowCompilationStatus = 'drafted' | 'published' | 'dry_run_completed' | 'failed';
+/** Fine-grained business-completion state of a run. */
 export type WorkflowCompletionState = 'planned' | 'awaiting_approval' | 'approved_pending_execution' | 'executing' | 'action_succeeded' | 'business_outcome_verified' | 'failed' | 'cancelled' | 'escalated';
 
+/**
+ * A single validation failure, addressed by JSON path.
+ */
 export interface ValidationError {
+  /** Path to the offending value (e.g. `$.approvalGates[0].id`). */
   path: string;
+  /** Human-readable explanation. */
   message: string;
 }
 
+/**
+ * A gate that must be cleared before (or during) execution.
+ */
 export interface ApprovalGate {
+  /** Stable gate id within the definition. */
   id: string;
+  /** What the gate guards. */
   type: 'action' | 'stale_source' | 'low_confidence' | 'cost' | 'risk' | 'expert_review';
+  /** Optional human-readable explanation shown to approvers. */
   message?: string;
+  /** Threshold used by threshold-based gates (confidence/cost). */
   threshold?: number;
+  /** Minimum risk level triggering risk/expert-review gates. */
   requiredRiskLevel?: WorkflowRiskLevel;
 }
 
+/**
+ * Evidence a run must cite before it can complete.
+ */
 export interface RequiredEvidence {
+  /** Logical name of the evidence requirement. */
   name: string;
+  /** Expected source kind. */
   sourceKind?: string;
+  /** Freshness SLA applied to the cited source. */
   freshnessSlaSeconds?: number;
+  /** Minimum number of citations required. */
   minCitations?: number;
 }
 
+/**
+ * A stored evaluation test case for a workflow.
+ */
 export interface WorkflowEvalCase {
   id: string;
   version: string;
@@ -64,6 +106,7 @@ export interface WorkflowEvalCase {
   updatedAt: string;
 }
 
+/** Input for creating or updating an eval case. */
 export type WorkflowEvalCaseInput = {
   id?: string;
   name: string;
@@ -71,7 +114,12 @@ export type WorkflowEvalCaseInput = {
   expected?: Record<string, unknown>;
 };
 
+/**
+ * A stored workflow definition: allowed tools/connectors/sources, evidence
+ * requirements, risk level and approval gates.
+ */
 export interface WorkflowDefinition {
+  /** Stable identifier (derived from workspace + name unless overridden). */
   id: string;
   version: string;
   workspaceId: string;
@@ -93,6 +141,7 @@ export interface WorkflowDefinition {
   triggerSchema?: Record<string, unknown>;
 }
 
+/** Input for creating/updating a workflow definition (omitted fields preserved). */
 export type WorkflowDefinitionInput = {
   id?: string;
   workspaceId: string;
@@ -160,6 +209,9 @@ export type ActionProposalInput = {
   costEstimateUsd?: number;
 };
 
+/**
+ * The outcome of one executed (approved) action.
+ */
 export interface ExecutedAction {
   id: string;
   proposalId: string;
@@ -210,6 +262,9 @@ export interface WorkflowRunEvent {
   sourceIds?: string[];
 }
 
+/**
+ * A human approval decision requested for a run or action.
+ */
 export interface WorkflowApproval {
   id: string;
   version: string;
@@ -230,6 +285,9 @@ export interface WorkflowApproval {
   escalationReason?: string;
 }
 
+/**
+ * The recorded comparison of a shadow-run recommendation against human labels.
+ */
 export interface WorkflowShadowComparison {
   id: string;
   version: string;
@@ -251,6 +309,9 @@ export interface WorkflowShadowComparison {
   note?: string;
 }
 
+/**
+ * Aggregate acceptance statistics over shadow comparisons.
+ */
 export interface WorkflowShadowSummary {
   total: number;
   accepted: number;
@@ -269,6 +330,7 @@ export interface WorkflowShadowSummary {
   }>;
 }
 
+/** A message (or tool call) excerpt supplied to the compiler. */
 export interface WorkflowCompilerMessage {
   role?: string;
   text?: string;
@@ -337,6 +399,9 @@ export interface WorkflowCompilation {
   warnings?: string[];
 }
 
+/**
+ * The result of compiling a workflow from conversation/tool-call evidence.
+ */
 export interface WorkflowCompileResult {
   compilation: WorkflowCompilation;
   definition: WorkflowDefinitionInput;
@@ -345,6 +410,7 @@ export interface WorkflowCompileResult {
   dryRun?: WorkflowRun;
 }
 
+/** Input for starting a workflow run. */
 export type StartWorkflowInput = {
   workflowId?: string;
   workflowName?: string;
@@ -360,6 +426,9 @@ export type StartWorkflowInput = {
   parentSpanId?: string;
 };
 
+/**
+ * Verdict of the tool-call policy check for a workflow-scoped call.
+ */
 export type WorkflowPolicyDecision = {
   allowed: boolean;
   active: boolean;
@@ -368,8 +437,18 @@ export type WorkflowPolicyDecision = {
   capability?: ConnectorCapability;
 };
 
+/**
+ * The workflow definition registry: stable ids, validation and CRUD over
+ * definitions, versions and eval cases.
+ */
 export interface WorkflowRegistry {
+  /**
+   * Derives the deterministic id for a definition name.
+   */
   stableWorkflowId(workspaceId: string, name: string): string;
+  /**
+   * Derives the deterministic id for a definition version.
+   */
   stableWorkflowVersionId(workflowId: string, workflowVersion: string): string;
   validateDefinition(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[];
   upsertDefinition(input: WorkflowDefinitionInput): Promise<{ definition: WorkflowDefinition; version: WorkflowVersion; validation: ValidationError[] }>;
@@ -381,6 +460,11 @@ export interface WorkflowRegistry {
   queryEvalCases(query?: StoreQuery): Promise<WorkflowEvalCase[]>;
 }
 
+/**
+ * The run engine: starts runs (dry-run/shadow/approval-gated), manages
+ * approvals and escalation, records executed tool results, labels/compares
+ * shadow recommendations, and evaluates per-call tool policy.
+ */
 export interface WorkflowRunner {
   startRun(input: StartWorkflowInput): Promise<WorkflowRun>;
   approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }>;
@@ -398,6 +482,11 @@ export interface WorkflowRunner {
   evaluateToolPolicy(toolName: string, input: unknown, principal?: Principal): Promise<WorkflowPolicyDecision>;
 }
 
+/**
+ * The deterministic compiler service: derives a workflow definition from a
+ * transcript/tool-call selection, optionally publishing it and running a
+ * dry run.
+ */
 export interface WorkflowCompiler {
   stableCompilationId(input: WorkflowCompileInput): string;
   compile(input: WorkflowCompileInput): Promise<WorkflowCompileResult>;
@@ -450,6 +539,9 @@ interface ObservabilityLike {
   record(event: ObservabilityEvent): void | Promise<void>;
 }
 
+/**
+ * The canonical JSON Schema describing a workflow definition input.
+ */
 export const WORKFLOW_DEFINITION_SCHEMA: Record<string, unknown> = {
   type: 'object',
   required: ['workspaceId', 'name'],
@@ -2106,6 +2198,11 @@ function registerWorkflowHooks(runner: WorkflowRunner, services: MatbotMachine):
   });
 }
 
+/**
+ * Builds the store-backed {@link WorkflowRegistry}.
+ * @param services - Runtime machine providing stores.
+ * @returns The registry instance.
+ */
 export function createWorkflowRegistry(services: MatbotMachine): WorkflowRegistry {
   return new StoreBackedWorkflowRegistry(
     services.createStore<WorkflowDefinition>(DEFINITION_STORE),
@@ -2114,6 +2211,13 @@ export function createWorkflowRegistry(services: MatbotMachine): WorkflowRegistr
   );
 }
 
+/**
+ * Builds the store-backed {@link WorkflowRunner}, wired to optional
+ * SourceRegistry, ConnectorRegistry and Observability services when present.
+ * @param services - Runtime machine providing stores.
+ * @param registry - Registry resolving definitions and versions.
+ * @returns The runner instance.
+ */
 export function createWorkflowRunner(services: MatbotMachine, registry: WorkflowRegistry): WorkflowRunner {
   const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
   const connectorRegistry = services.get('ConnectorRegistry' as never) as ConnectorRegistryLike | undefined;
@@ -2137,6 +2241,12 @@ export function createWorkflowCompiler(services: MatbotMachine, registry: Workfl
   );
 }
 
+/**
+ * Default plugin specification registering the three workflow services, the
+ * `workflow_action` tool and the toolcall/toolresult policy hooks.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {

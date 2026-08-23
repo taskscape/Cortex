@@ -13,6 +13,9 @@ const MIGRATION_BATCH_SIZE = 512;
 const PROJECTION_NAMESPACE = 'context_graph_projection_ops';
 const PROJECTION_MIGRATION_VERSION = 'stable-target-v2';
 
+/**
+ * Namespaces backed by SQLite rather than the filesystem default.
+ */
 export const HIGH_CARDINALITY_NAMESPACES = new Set([
   'sources',
   'source_versions',
@@ -71,6 +74,12 @@ export class HighCardinalityStorageBackend implements StorageBackend {
     this.fileStore = new FilesystemFileStore(join(dotData, 'files'));
   }
 
+  /**
+   * Opens (creating if needed) the SQLite database under `<dotData>` and runs
+   * legacy-JSON migration for every high-cardinality namespace.
+   * @param dotData - Root data directory.
+   * @returns The initialised backend.
+   */
   static async open(dotData: string): Promise<HighCardinalityStorageBackend> {
     await mkdir(dotData, { recursive: true });
     const db = new DatabaseSync(join(dotData, DATABASE_FILE));
@@ -91,6 +100,13 @@ export class HighCardinalityStorageBackend implements StorageBackend {
     return backend;
   }
 
+  /**
+   * Returns the shared SQLite store for high-cardinality namespaces, or a
+   * fresh FilesystemStore otherwise. SQLite stores are cached per namespace.
+   * @param namespace - Store namespace.
+   * @returns A store persisting documents of type `T`.
+   * @template T - Stored document shape ({ id, version } at minimum).
+   */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     if (!HIGH_CARDINALITY_NAMESPACES.has(namespace)) {
       return new FilesystemStore<T>(join(this.dotData, namespace));
@@ -103,6 +119,9 @@ export class HighCardinalityStorageBackend implements StorageBackend {
     return store as SQLiteStore<T>;
   }
 
+  /**
+   * Closes the underlying SQLite database.
+   */
   async close(): Promise<void> {
     this.db.close();
   }

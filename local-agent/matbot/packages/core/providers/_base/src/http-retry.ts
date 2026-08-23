@@ -3,6 +3,12 @@ const BASE_DELAY_MS        = 500;
 const MAX_DELAY_MS         = 8_000;
 const MAX_RETRY_AFTER_MS   = 60_000;
 
+/**
+ * Whether an HTTP status warrants a retry: 408, 429, or any 5xx.
+ *
+ * @param status - The response status code.
+ * @returns True when the failure is transient.
+ */
 export function isTransientStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
@@ -29,6 +35,12 @@ function retryAfterMs(res: Response): number | undefined {
  * Fetch with bounded retry for transient connect-time failures — network errors and
  * 408/429/5xx responses. Only safe for requests whose streaming begins after the
  * response headers arrive: a stream that dies mid-flight is never retried here.
+ *
+ * @param url - The request URL.
+ * @param init - Standard fetch init (its `signal`, if any, also cancels pending backoff).
+ * @param maxAttempts - Maximum attempts before the last error/response is returned or thrown. Default 3.
+ * @returns The final response (success, or a non-transient/exhausted transient failure).
+ * @throws The underlying fetch error when a network failure persists past `maxAttempts` or the signal aborts.
  */
 export async function fetchWithRetry(
   url: string,

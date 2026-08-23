@@ -1,3 +1,4 @@
+/** Browser plugin barrel: OPFS-backed storage, WebCrypto vault, and in-browser remote-plugin management. */
 export { plugin }                from './plugin.js';
 export { BrowserStorageBackend } from './storage-backend.js';
 export { IDBStore }              from './idb-store.js';

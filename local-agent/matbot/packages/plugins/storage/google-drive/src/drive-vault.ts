@@ -19,6 +19,11 @@ interface VaultDoc {
  * Stored in plaintext, matching the localStorage vault's posture — adequate for a single-user realm,
  * not for shared storage. (WebCryptoVault's AES-GCM helpers are the eventual upgrade path.)
  */
+/**
+ * A {@link Vault} storing secrets in a single Drive document, with
+ * `${NAME}`-style reference resolution and scrubbing of secret values from
+ * free text.
+ */
 export class DriveVault implements Vault {
   private readonly store: Store<VaultDoc>;
   private readonly secrets: Map<string, string>;
@@ -33,6 +38,10 @@ export class DriveVault implements Vault {
   }
 
   /** Merge any secrets not already present (e.g. migrating the localStorage vault) and persist once. */
+  /**
+   * Writes any provided secrets that do not already exist.
+   * @param secrets - Default secret values keyed by name.
+   */
   async seedMissing(secrets: Record<string, string>): Promise<void> {
     let changed = false;
     for (const [k, v] of Object.entries(secrets)) {
@@ -50,15 +59,31 @@ export class DriveVault implements Vault {
     await this.persist();
   }
 
+  /**
+   * Whether a secret with the given name exists.
+   * @param name - Secret name.
+   * @returns True when present.
+   */
   hasKey(name: string): boolean {
     return this.secrets.has(name);
   }
 
+  /**
+   * Reverse lookup: the secret name holding this exact value.
+   * @param value - Value to search for.
+   * @returns The name, or undefined when unknown.
+   */
   findByValue(value: string): string | undefined {
     for (const [k, v] of this.secrets) if (v === value) return k;
     return undefined;
   }
 
+  /**
+   * Resolves a `${NAME}` reference (or a bare name) to its stored value.
+   * @param ref - Reference to resolve.
+   * @returns The secret value.
+   * @throws When the referenced secret does not exist.
+   */
   async resolve(ref: string): Promise<string> {
     const errors: string[] = [];
     const result = ref.replace(REF_RE, (_, name: string) => {
@@ -70,6 +95,11 @@ export class DriveVault implements Vault {
     return result;
   }
 
+  /**
+   * Replaces every stored secret value occurring in `text` with a placeholder.
+   * @param text - Text to scrub.
+   * @returns Text with known secret values redacted.
+   */
   scrub(text: string): string {
     let result = text;
     for (const value of this.secrets.values()) {

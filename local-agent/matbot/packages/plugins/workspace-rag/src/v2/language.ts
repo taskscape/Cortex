@@ -19,6 +19,11 @@ function scriptFor(text: string): string {
   return 'Unknown';
 }
 
+/**
+ * Detects the dominant language, script, and mixing of a text span.
+ * @param text - Text to analyse.
+ * @returns Language distribution with primary language and confidence.
+ */
 export function detectPassageLanguage(text: string): RagV2LanguageResult {
   const normalized = ` ${text.toLocaleLowerCase().replace(/\s+/gu, ' ')} `;
   const scores: Record<string, number> = {};

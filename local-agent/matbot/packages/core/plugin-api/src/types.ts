@@ -3,8 +3,11 @@ import type { StoreQuery, QueryResult } from './store-query.js';
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 
+/** An ISO-8601 timestamp string. */
 export type ISODate = string;
+/** An RFC-style MIME type string (e.g. `text/plain`). */
 export type MimeType = string;
+/** A JSON-Schema object describing a tool's input. */
 export type JSONSchema = Record<string, unknown>;
 
 // ── Principal ───────────────────────────────────────────────────────────────
@@ -20,6 +23,7 @@ export interface Principal {
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
+/** Sampling and limit parameters forwarded to the provider; open to provider-specific extensions. */
 export interface ModelParameters {
   temperature?:    number;
   maxTokens?:      number;
@@ -28,17 +32,25 @@ export interface ModelParameters {
   [key: string]:   unknown;
 }
 
+/** A named provider profile from matbot.yaml: which adapter module to load, what model and credentials to use. */
 export interface ProviderConfig {
+  /** The profile's key in the `providers` map. */
   name:         string;
   /** Plugin module specifier (npm name or file URL) that provides the adapter for this provider. */
   module:       string;
+  /** The model identifier sent to the provider. */
   model:        string;
+  /** Secret values (often `${NAME}` references resolved by the Vault). */
   credentials?:  Record<string, string>;
+  /** Provider API base URL; defaults are adapter-specific. */
   endpoint?:    string;
+  /** Model sampling/limit parameters. */
   parameters?:  ModelParameters;
+  /** Provider name to fall back to when this one fails. */
   fallback?:    string;
 }
 
+/** The streaming events a provider adapter yields while producing one completion. */
 export type CompletionEvent =
   | { type: 'text-delta';          delta: string }
   | { type: 'tool-call';           id: string; name: string; input: unknown }
@@ -52,21 +64,39 @@ export type CompletionEvent =
   | { type: 'usage';               inputTokens: number; outputTokens: number; costUsd?: number; cacheReadTokens?: number; cacheCreationTokens?: number }
   | { type: 'done' };
 
+/** A provider adapter plugin: turns matbot messages into provider API calls and streams back events. */
 export interface ProviderAdapter {
+  /** The adapter's provider name. */
   readonly name: string;
+  /**
+   * Run a completion and stream its events.
+   *
+   * @param messages - The full conversation to send.
+   * @param config - The named provider profile (endpoint, model, credentials, parameters).
+   * @param tools - Tool definitions the model may call.
+   * @param signal - Aborting cancels the underlying request.
+   * @returns An async iterable of completion events, ending with `done`.
+   */
   complete(
     messages: Message[],
     config:   ProviderConfig,
     tools:    readonly Tool[],
     signal:   AbortSignal
   ): AsyncIterable<CompletionEvent>;
+  /**
+   * Probe the provider's reachability.
+   *
+   * @returns The health status (ok/degraded/down, with reason and latency where known).
+   */
   health(): Promise<HealthStatus>;
 }
 
 // ── Messages & Session ────────────────────────────────────────────────────────
 
+/** LLM-protocol roles of a message in a session. */
 export type MessageRole = 'user' | 'assistant' | 'tool' | 'system' | 'marker';
 
+/** One content block of a message: text, media, tool traffic, forms, markers, or opaque passthrough. */
 export type MessageContent = (
   | { type: 'text';              text: string }
   | { type: 'thinking';          thinking: string; signature: string }
@@ -126,10 +156,15 @@ export type Marker<K extends string = string> = {
   data:    K extends keyof MarkerData ? MarkerData[K] : unknown;
 };
 
+/** One field of a structured prompt rendered by a frontend. */
 export interface FormField {
+  /** Machine name of the field, returned as part of a form response. */
   name:        string;
+  /** Human-readable label shown to the user. */
   label:       string;
+  /** The control to render. */
   type:        'text' | 'password' | 'select' | 'confirm';
+  /** select-only: the preset options offered. */
   options?:    string[];
   /** select-only: render an "Other…" affordance that lets the user type a free-form answer instead
    *  of picking an option. The typed value is returned verbatim, on the same channel as a pick —
@@ -151,43 +186,84 @@ export interface FormField {
 export const CONFIRM_YES = 'yes';
 export const CONFIRM_NO  = 'no';
 
+/** One message in a session: role, content blocks, and correlation metadata. */
 export interface Message {
+  /** Unique message id. */
   id:            string;
+  /** LLM-protocol role. */
   role:          MessageRole;
+  /** The message's content blocks. */
   content:       MessageContent[];
+  /** ISO-8601 creation timestamp. */
   createdAt:     ISODate;
+  /** Correlation id of the turn that produced this message. */
   traceId:       string;
+  /** Provider key that generated the content, when machine-authored. */
   providerName?: string;
+  /** Free-form, frontend-extensible metadata. */
   metadata?:     Record<string, unknown>;
 }
 
+/** Lifecycle state of a session. */
 export type SessionStatus = 'active' | 'archived' | 'pinned';
 
+/** A conversation: ordered messages, ownership, and branching provenance. */
 export interface Session {
+  /** Unique session id. */
   id:                    string;
+  /** Optimistic-concurrency version for compare-and-swap writes. */
   version:               string;
+  /** Id of the principal that owns the session. */
   ownerPrincipalId:      string;
+  /** Id of the principal acting within the session, when different from the owner. */
   actorPrincipalId?:     string;
+  /** Persona/system-context label applied to the conversation. */
   persona?:              string;
+  /** Human-readable title (usually derived from the first turn). */
   title?:                string;
+  /** Lifecycle state. */
   status:                SessionStatus;
+  /** Context tags attached to the session. */
   contexts:              string[];
+  /** The full message history. */
   messages:              Message[];
+  /** Parent session id when this session was branched/forked from another. */
   parentSessionId?:      string;
+  /** Message in the parent at which the branch occurred. */
   branchPointMessageId?: string;
+  /** ISO-8601 creation timestamp. */
   createdAt:             ISODate;
+  /** ISO-8601 last-update timestamp. */
   updatedAt:             ISODate;
 }
 
 // ── System context ────────────────────────────────────────────────────────────
 
+/**
+ * Contributes a fragment of the system prompt for a turn. Return `null` to contribute nothing.
+ *
+ * @param ctx - The session being run and the turn's abort signal.
+ * @returns A text fragment, or `null`.
+ */
 export type SystemContextContributor = (ctx: {
   session:   Session;
   signal:    AbortSignal;
 }) => string | null | Promise<string | null>;
 
+/** Registry of {@link SystemContextContributor}s, managed per-plugin by the loader. */
 export interface SystemContextRegistry {
+  /**
+   * Register a system-context contributor.
+   *
+   * @param contributor - The contributor to call on each turn.
+   * @param pluginName - Owning plugin, used to bulk-remove on unload.
+   */
   register(contributor: SystemContextContributor, pluginName?: string): void;
+  /**
+   * Remove every contributor registered by the named plugin.
+   *
+   * @param pluginName - The plugin whose contributors to drop.
+   */
   removeByPlugin(pluginName: string): void;
   /** Calls all contributors and joins non-null, non-empty results with double newlines. */
   build(ctx: { session: Session; signal: AbortSignal }): Promise<string | null>;
@@ -195,15 +271,21 @@ export interface SystemContextRegistry {
 
 // ── Pipeline hooks ────────────────────────────────────────────────────────────
 
+/** Configuration for running one turn: provider, persona, session, and trace correlation. */
 export interface RunConfig {
+  /** Provider key to route the turn through. */
   provider:   string;
+  /** Persona label applied to the turn. */
   persona?:   string;
+  /** Session to run against; a new one is created when absent. */
   sessionId?: string;
+  /** Correlation id for this submission; generated when absent. */
   traceId?:   string;
   /** Root human-submission trace for resubmission chains. Defaults to traceId. */
   rootTraceId?: string;
 }
 
+/** The kind of operation an observability span covers. */
 export type ObservabilitySpanKind =
   | 'agent'
   | 'llm'
@@ -215,7 +297,9 @@ export type ObservabilitySpanKind =
   | 'evaluator'
   | 'chain';
 
+/** Where in a span's lifetime the event sits. */
 export type ObservabilityEventPhase = 'start' | 'event' | 'end';
+/** Outcome recorded on span-end events. */
 export type ObservabilityStatus = 'unset' | 'ok' | 'error';
 
 /** Vendor-neutral event that an optional service can persist and export as OTLP. */
@@ -235,7 +319,13 @@ export interface ObservabilityEvent {
   attributes?:    Record<string, unknown>;
 }
 
+/** Receives observability events for persistence/export (e.g. as OTLP). */
 export interface ObservabilitySink {
+  /**
+   * Record one observability event.
+   *
+   * @param event - The event to persist.
+   */
   record(event: ObservabilityEvent): void | Promise<void>;
 }
 
@@ -280,6 +370,7 @@ export interface ObservabilitySink {
  */
 export type HookPoint = 'screen' | 'contribute' | 'toolcall' | 'toolresult' | 'followup';
 
+/** Context handed to a `screen` hook (once per turn, before the first provider call). */
 export interface ScreenContext {
   session: Session;
   config:  RunConfig;
@@ -291,6 +382,7 @@ export interface ScreenContext {
   /** Unregister the hook currently running. For one-shot hooks that should fire at most once. */
   removeHook(): void;
 }
+/** What a `screen` hook may return: any mix of session replacement, context, markers, or abort. */
 export interface ScreenResult {
   session?:   Session;
   /** Turn-scoped context appended onto the tail of this turn's outgoing messages (the freshest
@@ -317,6 +409,7 @@ export interface ScreenResult {
   abort?:     string;
 }
 
+/** Read-only context handed to a `contribute` hook before every provider call. */
 export interface ContributeContext {
   readonly outgoing: readonly Message[];
   readonly session:  Session;
@@ -326,6 +419,7 @@ export interface ContributeContext {
   removeHook(): void;
 }
 
+/** Read-only context handed to a `toolcall` hook before each tool execution. */
 export interface ToolCallContext {
   readonly session:  Session;
   readonly toolCall: { id: string; name: string; input: unknown };
@@ -335,11 +429,15 @@ export interface ToolCallContext {
   /** Unregister the hook currently running. For one-shot hooks that should fire at most once. */
   removeHook(): void;
 }
+/** A `toolcall` hook's verdict: reject the call, abort the turn, or nothing (allow). */
 export interface ToolCallResult {
+  /** Skip the tool execution and feed this error message back to the model. */
   rejectTool?: { message: string };
+  /** Abort the whole turn with this reason. */
   abort?:      string;
 }
 
+/** Read-only context handed to a `toolresult` hook after each tool execution. */
 export interface ToolResultContext {
   readonly session:    Session;
   readonly toolCall:   { id: string; name: string; input: unknown };
@@ -355,6 +453,7 @@ export interface ToolResultContext {
 // The toolresult hook returns `{ result }` to replace the tool's result, or nothing to leave it
 // (and just observe) — a trivial single-field return, inlined in the Hook union like `contribute`'s.
 
+/** Context handed to a `followup` hook once per committed turn. */
 export interface FollowupContext {
   readonly session:       Session;
   readonly resubmitDepth: number;
@@ -369,6 +468,7 @@ export interface FollowupContext {
   /** Unregister the hook currently running. For one-shot hooks that should fire at most once. */
   removeHook(): void;
 }
+/** What a `followup` hook may return: resubmit, retract-and-rerun, append markers, or nothing. */
 export interface FollowupResult {
   resubmit?: { content: MessageContent[] };
   /**
@@ -395,6 +495,7 @@ export interface FollowupResult {
   markers?: MessageContent[];
 }
 
+/** The discriminated union of pipeline hooks; `on` selects channel, context, and allowed effects. */
 export type Hook =
   | { on: 'screen';     priority?: number; pluginName?: string; handler(ctx: ScreenContext):     ScreenResult | void | Promise<ScreenResult | void> }
   | { on: 'contribute'; priority?: number; pluginName?: string; handler(ctx: ContributeContext): Message[]    | void | Promise<Message[]    | void> }
@@ -405,20 +506,61 @@ export type Hook =
 // ── Storage ───────────────────────────────────────────────────────────────────
 // The query grammar (Filter AST, StoreQuery, QueryResult, StoreQueryError) lives in ./store-query.
 
+/** Outcome of a compare-and-swap write: the new doc on success, or the current doc on version conflict. */
 export type CASResult<T> =
   | { ok: true;  doc: T }
   | { ok: false; current: T | null };
 
+/**
+ * The universal document-store interface. All writes that may race use compare-and-swap
+ * (`cas`) — never write without a version check when concurrent updates are possible.
+ */
 export interface Store<T extends { id: string; version: string }> {
+  /**
+   * Fetch one document by id.
+   *
+   * @param id - Document id.
+   * @returns The document, or `null` when absent.
+   */
   get(id: string): Promise<T | null>;
+  /**
+   * Unconditionally write a document (no version check).
+   *
+   * @param id - Document id.
+   * @param value - The document to store.
+   * @returns Resolves when persisted.
+   */
   set(id: string, value: T): Promise<void>;
+  /**
+   * Compare-and-swap write.
+   *
+   * @param id - Document id.
+   * @param expected - The version the caller last read.
+   * @param next - The new document content.
+   * @returns `{ ok: true, doc }` on success, or `{ ok: false, current }` on mismatch.
+   */
   cas(id: string, expected: string, next: T): Promise<CASResult<T>>;
+  /**
+   * Delete a document, optionally guarded by an expected version.
+   *
+   * @param id - Document id.
+   * @param expectedVersion - When supplied, delete only if the stored version matches.
+   * @returns Whether a document was deleted.
+   */
   delete(id: string, expectedVersion?: string): Promise<boolean>;
+  /**
+   * Run a query over the namespace.
+   *
+   * @param q - Filter/sort/page specification.
+   * @returns One page of matching documents.
+   * @throws {StoreQueryError} If the query fails validation.
+   */
   query(q: StoreQuery): Promise<QueryResult<T>>;
 }
 
 // ── Knowledge index ───────────────────────────────────────────────────────────
 
+/** One indexed knowledge document. */
 export interface KnowledgeEntry {
   id:           string;
   version:      string;
@@ -433,8 +575,22 @@ export interface KnowledgeEntry {
   updatedAt:    string;
 }
 
+/** A searchable knowledge index — a core, swappable service. */
 export interface KnowledgeIndex {
+  /**
+   * Index (or replace) a knowledge entry.
+   *
+   * @param entry - The entry to store.
+   * @returns Resolves when the entry is searchable.
+   */
   index(entry: KnowledgeEntry): Promise<void>;
+  /**
+   * Search the index for entries matching the terms.
+   *
+   * @param terms - Terms to match; `context` may guide ranking.
+   * @param signal - Aborting cancels the search.
+   * @returns Matching entries, best first.
+   */
   search(terms: Array<{ term: string; context?: string }>, signal: AbortSignal): Promise<KnowledgeEntry[]>;
   /** Enumerate all indexed entries. When present, register('KnowledgeIndex', …) drains these into the incoming backend. */
   entries?(): Iterable<KnowledgeEntry>;
@@ -442,6 +598,7 @@ export interface KnowledgeIndex {
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
 
+/** Streaming events a tool emits while executing (output chunks, progress, results, markers, errors). */
 export type ToolEvent =
   | { type: 'stdout';   chunk: string }
   | { type: 'stderr';   chunk: string }
@@ -506,20 +663,35 @@ export interface ToolContext {
   unloadPlugin(specifier: string): Promise<boolean>;
 }
 
+/** A tool's execution half: streams events as it runs. */
 export interface ToolExecutor {
+  /**
+   * Execute the tool.
+   *
+   * @param input - The parsed tool-call input (validated against the tool's `inputSchema`).
+   * @param ctx - Execution context (session, signal, vault, prompt, plugin loading).
+   * @returns An async iterable of {@link ToolEvent}s; a terminal `result` or `error` event closes the call.
+   */
   execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent>;
 }
 
+/** A tool the model can call: name/description/schema for the LLM plus an executor. */
 export interface Tool {
+  /** Unique tool name. */
   name:         string;
+  /** Description shown to the LLM; for multi-action tools this teaches the per-action contract. */
   description:  string;
+  /** JSON schema of the `input` argument (`required: ['action']` at loosest for multi-action tools). */
   inputSchema:  JSONSchema;
+  /** The execution implementation. */
   executor:     ToolExecutor;
+  /** Plugin that registered the tool. */
   pluginName?:  string;
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
 
+/** Metadata for one stored file. */
 export interface FileMetaData {
   id:          string;
   version:     string;
@@ -536,12 +708,21 @@ export interface FileMetaData {
   allowed?:    boolean;
 }
 
+/** A stored file plus a handle to stream its bytes. */
 export interface FileHandle extends FileMetaData {
+  /**
+   * Stream the file's contents.
+   *
+   * @param signal - Optional abort signal that terminates the stream.
+   * @returns Chunks of the file's bytes.
+   */
   stream(signal?: AbortSignal): AsyncIterable<Uint8Array>;
 }
 
+/** A change notification for one file: its metadata plus which members changed. */
 export type FileEvent = FileMetaData & { changed: Array<keyof FileMetaData> };
 
+/** Criteria narrowing a `FileStore.list` query. */
 export interface FileFilter {
   sessionId?:     string;
   mimeType?:      string;
@@ -559,9 +740,36 @@ export interface FileStore {
     meta?:    { sessionId?: string; messageId?: string; namespace?: string; allowed?: boolean }
   ): Promise<FileHandle>;
   get(id: string): Promise<FileHandle | null>;
+  /**
+   * Fetch a file by (name + namespace).
+   *
+   * @param name - The file's upsert name.
+   * @param namespace - Optional namespace scope.
+   * @returns The handle, or `null` when absent.
+   */
   getByName(name: string, namespace?: string): Promise<FileHandle | null>;
+  /**
+   * Delete a stored file.
+   *
+   * @param id - The file id.
+   * @returns Resolves when deleted.
+   */
   delete(id: string): Promise<void>;
+  /**
+   * List files matching a filter.
+   *
+   * @param filter - Optional narrowing criteria.
+   * @returns Matching file handles.
+   */
   list(filter?: FileFilter): AsyncIterable<FileHandle>;
+  /**
+   * Store an ephemeral scratch copy of named content.
+   *
+   * @param name - A name for the temporary file.
+   * @param mimeType - Content MIME type.
+   * @param data - Byte chunks to store.
+   * @returns The created file handle.
+   */
   putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle>;
   /** Observe file changes. Implementations that cannot watch their backing store omit this. */
   watch(signal?: AbortSignal): AsyncIterable<FileEvent>;
@@ -615,6 +823,7 @@ export interface Vault extends VaultSpec {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
+/** Provider reachability: ok, degraded (with reason), or down. */
 export type HealthStatus =
   | { status: 'ok';       latencyMs?: number }
   | { status: 'degraded'; reason: string; latencyMs?: number }
@@ -622,21 +831,50 @@ export type HealthStatus =
 
 // ── Registries ────────────────────────────────────────────────────────────────
 
+/** An event on the tool registry watch stream. */
 export type ToolRegistryEvent =
   | { type: 'registered'; name: string; pluginName?: string }
   | { type: 'removed';    name: string };
 
+/** Registry of callable tools, managed per-plugin by the loader. */
 export interface ToolRegistry {
+  /**
+   * Register a tool.
+   *
+   * @param tool - The tool to make available to the model.
+   */
   register(tool: Tool): void;
+  /**
+   * Remove a tool by name.
+   *
+   * @param name - The tool's unique name.
+   */
   remove(name: string): void;
+  /**
+   * Look up a tool by name.
+   *
+   * @param name - The tool's unique name.
+   * @returns The tool, or `null` when not registered.
+   */
   resolve(name: string): Tool | null;
+  /**
+   * List all registered tools.
+   *
+   * @returns A read-only snapshot of the registered tools.
+   */
   list(): readonly Tool[];
+  /**
+   * Remove every tool registered by the named plugin (called on plugin unload).
+   *
+   * @param pluginName - The plugin whose tools to drop.
+   */
   removeByPlugin(pluginName: string): void;
   /** Observe tool CRUD as it happens. Read-only — observers cannot veto a registration. One event
    *  per tool (removeByPlugin emits a `removed` per matched tool). The stream ends when `signal` aborts. */
   watch(signal?: AbortSignal): AsyncIterable<ToolRegistryEvent>;
 }
 
+/** An event on the plugin registry watch stream (loaded/unloaded). */
 export type PluginRegistryEvent =
   | { type: 'loaded';   name: string }
   | { type: 'unloaded'; name: string };

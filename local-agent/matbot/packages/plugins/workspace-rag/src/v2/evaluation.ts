@@ -1,3 +1,6 @@
+/**
+ * One judged evidence item in an evaluation case.
+ */
 export interface RagV2RelevanceJudgment {
   passageId: string;
   relevance: number;
@@ -6,6 +9,9 @@ export interface RagV2RelevanceJudgment {
   contentSha256?: string;
 }
 
+/**
+ * A stored evaluation case: a query plus per-item relevance judgments.
+ */
 export interface RagV2EvaluationCase {
   id: string;
   category:
@@ -27,6 +33,9 @@ export interface RagV2EvaluationCase {
   forbiddenPassageIds?: string[];
 }
 
+/**
+ * Retrieval quality metrics for one evaluation case.
+ */
 export interface RagV2CaseMetrics {
   caseId: string;
   category: string;
@@ -44,6 +53,9 @@ export interface RagV2CaseMetrics {
   returned: number;
 }
 
+/**
+ * Aggregated metrics across all evaluated cases.
+ */
 export interface RagV2EvaluationMetrics {
   cases: number;
   k: number;
@@ -61,6 +73,9 @@ export interface RagV2EvaluationMetrics {
   caseMetrics: RagV2CaseMetrics[];
 }
 
+/**
+ * An evidence item paired with its judgment during evaluation.
+ */
 export interface RagV2EvaluatedEvidence {
   passageId: string;
   documentVersionId?: string;
@@ -101,6 +116,11 @@ function aggregate(cases: readonly RagV2CaseMetrics[], k: number): Omit<RagV2Eva
   };
 }
 
+/**
+ * Scores retrieval results against a case's relevance judgments.
+ * @param params - The case, its judgments, and the returned hits.
+ * @returns Per-case and aggregate metrics.
+ */
 export function evaluateRagV2Results(
   results: ReadonlyArray<{
     testCase: RagV2EvaluationCase;

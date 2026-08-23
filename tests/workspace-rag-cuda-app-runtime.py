@@ -34,17 +34,40 @@ APP_ENV = (
 
 
 class FakeHttpException(Exception):
+    """Stand-in for ``fastapi.HTTPException`` carrying status code and detail."""
+
     def __init__(self, *, status_code: int, detail: str):
+        """Store the response status and human-readable detail.
+
+        Args:
+            status_code: HTTP status code the exception represents.
+            detail: Error message exposed to clients.
+        """
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
 
 
 class FakeFastApi:
+    """Minimal FastAPI double that records route handlers by method and path."""
+
     def __init__(self, **_kwargs):
+        """Create an empty route registry.
+
+        Args:
+            **_kwargs: Ignored constructor arguments accepted by FastAPI.
+        """
         self.routes: dict[tuple[str, str], object] = {}
 
     def get(self, path: str):
+        """Build a decorator registering a GET handler.
+
+        Args:
+            path: URL path of the route.
+
+        Returns:
+            A decorator that registers the handler under (GET, path).
+        """
         def register(handler):
             self.routes[("GET", path)] = handler
             return handler
@@ -52,6 +75,14 @@ class FakeFastApi:
         return register
 
     def post(self, path: str):
+        """Build a decorator registering a POST handler.
+
+        Args:
+            path: URL path of the route.
+
+        Returns:
+            A decorator that registers the handler under (POST, path).
+        """
         def register(handler):
             self.routes[("POST", path)] = handler
             return handler
@@ -60,61 +91,156 @@ class FakeFastApi:
 
 
 class FakeCuda:
+    """In-memory ``torch.cuda`` double with a configurable availability flag."""
+
     def __init__(self, available: bool):
+        """Configure fake CUDA availability.
+
+        Args:
+            available: Value returned by :meth:`is_available`.
+        """
         self.available = available
         self.empty_cache_calls = 0
 
     def is_available(self) -> bool:
+        """Report whether CUDA is (faked as) available.
+
+        Returns:
+            The availability flag passed to the constructor.
+        """
         return self.available
 
     def get_device_name(self, _index: int) -> str:
+        """Return the fake device name.
+
+        Args:
+            _index: Device index; ignored.
+
+        Returns:
+            A fixed GPU name when available, otherwise ``"cpu"``.
+        """
         return "fake-nvidia" if self.available else "cpu"
 
     def empty_cache(self) -> None:
+        """Record an empty-cache call instead of releasing memory."""
         self.empty_cache_calls += 1
 
     def reset_peak_memory_stats(self) -> None:
+        """No-op replacement for resetting peak memory statistics."""
         pass
 
     def synchronize(self) -> None:
+        """No-op replacement for device synchronization."""
         pass
 
     def memory_allocated(self) -> int:
+        """Return a fixed allocated-memory figure.
+
+        Returns:
+            Always 1024 bytes.
+        """
         return 1024
 
     def max_memory_allocated(self) -> int:
+        """Return a fixed peak-memory figure.
+
+        Returns:
+            Always 2048 bytes.
+        """
         return 2048
 
 
 class FakeMatrix:
+    """Numpy-array double exposing only ``astype`` and ``tolist``."""
+
     def __init__(self, vectors: list[list[float]]):
+        """Wrap precomputed embedding vectors.
+
+        Args:
+            vectors: Embedding rows to expose.
+        """
         self.vectors = vectors
 
     def astype(self, _dtype: str) -> "FakeMatrix":
+        """Pretend to convert the matrix dtype.
+
+        Args:
+            _dtype: Requested dtype; ignored.
+
+        Returns:
+            The same instance.
+        """
         return self
 
     def tolist(self) -> list[list[float]]:
+        """Convert the wrapped vectors to nested lists.
+
+        Returns:
+            The stored embedding rows.
+        """
         return self.vectors
 
 
 class Recorder:
+    """Captures model loads and encode calls made by the app under test."""
+
     def __init__(self, *, raise_oom: bool):
+        """Create a recorder.
+
+        Args:
+            raise_oom: When true, fake encoding raises a CUDA OOM error.
+        """
         self.raise_oom = raise_oom
         self.loads: list[tuple[str, dict[str, object]]] = []
         self.encode_calls: list[dict[str, object]] = []
 
 
 def make_sentence_transformer(recorder: Recorder):
+    """Build a SentenceTransformer double wired to a recorder.
+
+    Args:
+        recorder: Sink for load and encode events.
+
+    Returns:
+        A fake model class that records constructor options and either
+        produces deterministic embeddings or raises a CUDA OOM error.
+    """
     class FakeSentenceTransformer:
+        """SentenceTransformer double with deterministic dimensions."""
+
         def __init__(self, name: str, **options: object):
+            """Record the requested model and options.
+
+            Args:
+                name: Model identifier requested by the app.
+                **options: Keyword options forwarded by the app.
+            """
             self.name = name
             self.max_seq_length = 512
             recorder.loads.append((name, options))
 
         def get_sentence_embedding_dimension(self) -> int:
+            """Derive the embedding dimension from the model name.
+
+            Returns:
+                768 for E5-family models, otherwise 384.
+            """
             return 768 if "e5-" in self.name.lower().replace("_", "-") else 384
 
         def encode(self, texts, **options: object) -> FakeMatrix:
+            """Record the call and return deterministic embeddings.
+
+            Args:
+                texts: Prefixed texts to encode.
+                **options: Encode options such as batch size.
+
+            Returns:
+                A :class:`FakeMatrix` with one row per text.
+
+            Raises:
+                RuntimeError: When the recorder is configured to simulate
+                    CUDA out-of-memory failures.
+            """
             recorder.encode_calls.append({"texts": list(texts), **options})
             if recorder.raise_oom:
                 raise RuntimeError("CUDA out of memory while encoding fixture")
@@ -125,6 +251,15 @@ def make_sentence_transformer(recorder: Recorder):
 
 
 def field(*_args, **kwargs):
+    """Stand-in for ``pydantic.Field`` usable with the plain BaseModel double.
+
+    Args:
+        *_args: Positional arguments; ignored.
+        **kwargs: May contain ``default`` or ``default_factory``.
+
+    Returns:
+        The default value, or the factory result when a factory is given.
+    """
     factory = kwargs.get("default_factory")
     return factory() if factory is not None else kwargs.get("default")
 
@@ -180,10 +315,29 @@ def load_app(*, env: dict[str, str], cuda_available: bool, raise_oom: bool = Fal
 
 
 def request(texts: list[str], input_type: str):
+    """Build a request-like object for the embed endpoint.
+
+    Args:
+        texts: Texts to embed.
+        input_type: Either ``"query"`` or ``"document"``.
+
+    Returns:
+        A namespace exposing ``texts`` and ``inputType``.
+    """
     return types.SimpleNamespace(texts=texts, inputType=input_type)
 
 
 def expect_http_exception(action, *, status: int, detail: str) -> None:
+    """Assert that an action raises the expected fake HTTP exception.
+
+    Args:
+        action: Zero-argument callable expected to raise ``FakeHttpException``.
+        status: Expected status code.
+        detail: Substring required in the exception detail.
+
+    Raises:
+        AssertionError: When no exception is raised or fields do not match.
+    """
     try:
         action()
     except FakeHttpException as error:
@@ -194,6 +348,7 @@ def expect_http_exception(action, *, status: int, detail: str) -> None:
 
 
 def test_cuda_detection_failure() -> None:
+    """Verify CPU-only mode reports health without encoding and rejects embeds."""
     module, recorder, _cuda = load_app(
         env={"EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"},
         cuda_available=False,
@@ -213,6 +368,7 @@ def test_cuda_detection_failure() -> None:
 
 
 def test_e5_prefixes_revision_and_single_model_load() -> None:
+    """Verify E5 profile prefixes, pinned revision, and cached model reuse."""
     module, recorder, _cuda = load_app(
         env={
             "EMBEDDING_MODEL": "intfloat/multilingual-e5-base",
@@ -249,6 +405,7 @@ def test_e5_prefixes_revision_and_single_model_load() -> None:
 
 
 def test_cuda_oom_is_retryable_and_releases_cached_blocks() -> None:
+    """Verify CUDA OOM becomes a retryable 503 and frees cached GPU blocks."""
     module, recorder, cuda = load_app(
         env={"EMBEDDING_BATCH_SIZE": "2"},
         cuda_available=True,

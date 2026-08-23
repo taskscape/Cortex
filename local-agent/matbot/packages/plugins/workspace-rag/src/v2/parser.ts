@@ -29,6 +29,9 @@ interface RawUnit {
   lexicalPrefix?: string;
 }
 
+/**
+ * Front-matter metadata extracted from a parsed document.
+ */
 export interface RagV2ParsedMetadata {
   documentType?: string;
   collectionId?: string;
@@ -41,6 +44,9 @@ export interface RagV2ParsedMetadata {
   validTo?: string;
 }
 
+/**
+ * Identity inputs the parser stamps onto generated records.
+ */
 export interface RagV2ParserIdentity {
   workspaceId: string;
   contextId: string;
@@ -49,12 +55,26 @@ export interface RagV2ParserIdentity {
   sourcePath?: string;
 }
 
+/**
+ * Streaming sink receiving sections and passages as they are produced.
+ */
 export interface RagV2ParserSink {
+  /**
+   * Called once per completed section.
+   * @param section - The section record.
+   */
   onSection(section: RagV2SectionRecord): Promise<void>;
+  /**
+   * Called once per completed passage.
+   * @param passage - The passage record.
+   */
   onPassage(passage: RagV2PassageRecord): Promise<void>;
   onLineCheckpoint?(line: number, byteOffset: number): Promise<void>;
 }
 
+/**
+ * Aggregate statistics returned after a full parse.
+ */
 export interface RagV2ParserResult {
   title: string;
   lineCount: number;
@@ -376,6 +396,16 @@ function splitUnit(unit: RawUnit, hardMaxTokens: number): RawUnit[] {
   return parts;
 }
 
+/**
+ * Streams a Markdown file into sections and passages, emitting each through
+ * `sink` without holding the whole file in memory.
+ * @param filePath - File to parse.
+ * @param identity - Identity stamped onto generated records.
+ * @param policy - Passage sizing and buffering limits.
+ * @param sink - Receiver for sections/passages (and optional checkpoints).
+ * @param signal - Abort signal cancelling the parse.
+ * @returns Parse statistics and extracted metadata.
+ */
 export async function parseMarkdownStream(
   filePath: string,
   identity: RagV2ParserIdentity,

@@ -29,11 +29,17 @@ interface CachedExpertFile extends ExpertFileMetadata {
   haystack: string;
 }
 
+/** Search outcome including non-fatal diagnostics for unreadable or skipped files. */
 export interface ExpertKnowledgeSearchResult {
   sources: ExpertSource[];
   warnings: string[];
 }
 
+/**
+ * Term-frequency knowledge search over an expert's configured file roots. Text files
+ * (known extensions, ≤1 MB) are walked, cached by size/mtime with a short manifest TTL,
+ * scored against tokenized queries, and returned as ranked `ExpertSource`s.
+ */
 export class FileExpertKnowledge {
   private readonly expert: ExpertConfig;
   private readonly cache = new Map<string, CachedExpertFile>();
@@ -41,14 +47,34 @@ export class FileExpertKnowledge {
   private manifestWarnings: string[] = [];
   private manifestExpiresAt = 0;
 
+  /**
+   * @param expert The expert whose knowledge roots are searched.
+   */
   constructor(expert: ExpertConfig) {
     this.expert = expert;
   }
 
+  /**
+   * Search the expert's knowledge files and return only the ranked sources.
+   * @param query Free-text query to tokenize and score against file contents.
+   * @param limit Maximum number of sources to return.
+   * @param signal Cancellation signal; aborts throw through to the caller.
+   * @returns Ranked matching sources, highest score first.
+   * @throws When the signal is aborted.
+   */
   async search(query: string, limit: number, signal: AbortSignal): Promise<ExpertSource[]> {
     return (await this.searchWithDiagnostics(query, limit, signal)).sources;
   }
 
+  /**
+   * Search the expert's knowledge files, also reporting non-fatal warnings
+   * (unreadable files, inaccessible roots, oversized skips).
+   * @param query Free-text query to tokenize and score against file contents.
+   * @param limit Maximum number of sources to return.
+   * @param signal Cancellation signal; aborts throw through to the caller.
+   * @returns Ranked sources plus collected warnings.
+   * @throws When the signal is aborted.
+   */
   async searchWithDiagnostics(query: string, limit: number, signal: AbortSignal): Promise<ExpertKnowledgeSearchResult> {
     const { files, warnings } = await this.listFiles(signal);
     const terms = tokenize(query);

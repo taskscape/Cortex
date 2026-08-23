@@ -14,7 +14,9 @@
  */
 
 type YamlScalar = string | number | boolean | null;
+/** Any value representable in the supported YAML subset: scalars, sequences, or mappings. */
 export type YamlValue = YamlScalar | YamlValue[] | YamlMap;
+/** A string-keyed mapping of {@link YamlValue} — the top-level shape of a parsed YAML document. */
 export type YamlMap   = { [key: string]: YamlValue };
 
 interface Token {
@@ -117,6 +119,14 @@ function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlV
   return { value: parseScalar(first.raw), next: pos + 1 };
 }
 
+/**
+ * Parse a YAML document (the supported subset — nested mappings, block sequences, scalars,
+ * quoted strings, comments, and literal/folded block scalars) into a string-keyed map.
+ *
+ * @param text - The raw YAML source text.
+ * @returns The parsed top-level mapping; an empty map if the document is empty or its root
+ *          is not a mapping.
+ */
 export function parseYaml(text: string): YamlMap {
   const tokens = tokenize(text);
   if (tokens.length === 0) return {};

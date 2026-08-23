@@ -68,6 +68,13 @@ function textOf(msg: Message | undefined): string {
   return msg?.content.filter(c => c.type === 'text').map(c => c.text).join('\n') ?? '';
 }
 
+/**
+ * Constructs the `remember` trigger tool: extracts durable facts from the
+ * message that fired it (via an LLM pass) and writes them to the
+ * remembered_facts store for later dream-time routing.
+ * @param services The matbot machine.
+ * @returns The `remember` tool.
+ */
 export function createRememberFactTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
     async *execute(_input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {

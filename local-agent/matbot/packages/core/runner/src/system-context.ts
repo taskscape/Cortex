@@ -5,19 +5,37 @@ interface TaggedContributor {
   pluginName?: string;
 }
 
+/** In-memory {@link SystemContextRegistry}: contributors run concurrently per build. */
 export class SystemContextRegistryImpl implements SystemContextRegistry {
   private readonly _contributors: TaggedContributor[] = [];
 
+  /**
+   * Register a system-prompt contributor.
+   *
+   * @param contributor - Called once per turn build.
+   * @param pluginName - Owning plugin, used for bulk removal on unload.
+   */
   register(contributor: SystemContextContributor, pluginName?: string): void {
     this._contributors.push({ fn: contributor, ...(pluginName !== undefined ? { pluginName } : {}) });
   }
 
+  /**
+   * Remove all contributors owned by the named plugin.
+   *
+   * @param pluginName - The plugin whose contributors to drop.
+   */
   removeByPlugin(pluginName: string): void {
     for (let i = this._contributors.length - 1; i >= 0; i--) {
       if (this._contributors[i]?.pluginName === pluginName) this._contributors.splice(i, 1);
     }
   }
 
+  /**
+   * Run all contributors concurrently and join their non-empty results.
+   *
+   * @param ctx - The session being run and the abort signal.
+   * @returns The joined system-context text, or `null` when no contributor produced output.
+   */
   async build(ctx: { session: Session; signal: AbortSignal }): Promise<string | null> {
     const parts = (await Promise.all(this._contributors.map(c => c.fn(ctx))))
       .filter((s): s is string => typeof s === 'string' && s.length > 0);

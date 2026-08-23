@@ -1,20 +1,41 @@
 import type { IndexedChunk } from "./store.js";
 
+/** One search hit with score, snippet, and file metadata. */
 export interface SearchResult {
+  /** Native absolute path of the matching file. */
   path: string;
+  /** Path relative to the indexed root, when known. */
   relativePath?: string;
+  /** Term-match score; content matches weigh 2, path matches 3. */
   score: number;
+  /** Whitespace-collapsed excerpt around the first match. */
   snippet: string;
+  /** File-level metadata for display and filtering. */
   metadata: {
+    /** Lowercased file extension (including dot). */
     extension: string;
+    /** ISO mtime captured at index time. */
     modifiedTime: string;
+    /** Zero-based chunk position within the file. */
     chunkIndex: number;
+    /** File size in bytes at index time. */
     size: number;
     /** Present when values were withheld from this chunk, so a gap in the text is explainable. */
     redactions?: number;
   };
 }
 
+/**
+ * Scores every chunk against the query terms (case-insensitive substring
+ * matches in content and path) and returns the top results by descending
+ * score.
+ *
+ * @param chunks - Chunks to search.
+ * @param query - Free-text query tokenised on non-word characters.
+ * @param limit - Maximum number of results to return.
+ * @returns Up to `limit` results sorted by descending score; empty when the
+ * query has no terms or `limit` is not positive.
+ */
 export function searchChunks(chunks: IndexedChunk[], query: string, limit: number): SearchResult[] {
   const terms = tokenize(query);
   const wanted = Math.max(0, Math.floor(limit));

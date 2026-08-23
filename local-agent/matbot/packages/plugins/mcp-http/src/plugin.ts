@@ -70,6 +70,11 @@ SHAPE  (TypeScript)
   };
 }
 
+/**
+ * Build the cross-platform (browser + Node) remote-MCP plugin. On setup it creates a
+ * {@link RemoteMcpManager} backed by the machine's settings, registers it as the
+ * `McpRemoteService`, registers the `mcp_action` tool, and reconnects persisted servers.
+ */
 export function createMcpHttpPlugin(): MatbotPluginSpec {
   let manager: RemoteMcpManager | undefined;
   return {
@@ -87,4 +92,5 @@ export function createMcpHttpPlugin(): MatbotPluginSpec {
   };
 }
 
+/** The default plugin instance produced by {@link createMcpHttpPlugin}. */
 export const plugin: MatbotPluginSpec = createMcpHttpPlugin();

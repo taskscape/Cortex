@@ -5,8 +5,13 @@ import path from 'node:path';
 import process from 'node:process';
 import { watchAndImportSkillDir } from './watcher.js';
 
+/**
+ * Configuration for the node skills plugin.
+ */
 export interface SkillsNodePluginConfig {
+  /** Directory to import and watch for `.md` skill files. */
   skillsDir: string;
+  /** Polling interval (ms) used when filesystem watch is unavailable. Default 5000. */
   pollMs?:   number;
 }
 
@@ -49,6 +54,12 @@ export function createSkillsNodePlugin(config: SkillsNodePluginConfig): MatbotPl
   };
 }
 
+/**
+ * Default plugin instance watching `.data/skills` in the current working
+ * directory.
+ *
+ * @returns The default node skills plugin specification.
+ */
 export const plugin: MatbotPluginSpec = createSkillsNodePlugin({
   skillsDir: path.join(process.cwd(), '.data', 'skills'),
 });

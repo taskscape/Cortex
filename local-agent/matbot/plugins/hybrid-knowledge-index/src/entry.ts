@@ -4,6 +4,10 @@ import type { KnowledgeEntry } from "./types.js";
 // Every optional here is defaulted by makeKnowledgeEntry, so an explicit `undefined` is a valid way
 // to say "absent" — callers extract these from untyped payloads where undefined is the natural miss.
 // Spelled `?: T | undefined` rather than `?: T` so those call sites need no conditional spreads.
+/**
+ * Loose input shape for {@link makeKnowledgeEntry}; every optional field may be
+ * explicitly `undefined` (callers extract from untyped payloads) and is defaulted.
+ */
 export interface EntryInput {
   id?: string | undefined;
   sourceType: string;
@@ -17,10 +21,21 @@ export interface EntryInput {
   updatedAt?: string | undefined;
 }
 
+/**
+ * SHA-256 hash of text, used as a stable content/source identifier.
+ * @param text Text to hash.
+ * @returns Full hex digest.
+ */
 export function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+/**
+ * Build a fully-populated `KnowledgeEntry`, defaulting id/version (content hash),
+ * tags, summary, timestamps, and the source uuid from the given input.
+ * @param input Partial entry data extracted from an untyped backend payload.
+ * @returns A complete knowledge entry with derived defaults filled in.
+ */
 export function makeKnowledgeEntry(input: EntryInput): KnowledgeEntry {
   const contentHash = hashText(input.content);
   const sourceUuid = input.sourceUuid ?? contentHash;

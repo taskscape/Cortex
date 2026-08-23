@@ -190,6 +190,12 @@ const INPUT_SCHEMA = {
   },
 } as const;
 
+/**
+ * The `powershell` tool. Writes the supplied script to a temporary .ps1 file and runs it with
+ * `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <file>`, streaming
+ * stdout/stderr events as they are produced. Timeout, abort, and output-overflow all kill the
+ * process; a non-zero exit yields an error event carrying accumulated output.
+ */
 export const powershellTool: Tool = {
   name:        'powershell',
   description: TOOL_DESCRIPTION,
@@ -225,6 +231,7 @@ export const powershellTool: Tool = {
   },
 };
 
+/** Plugin spec registering the {@link powershellTool}. */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools:      [powershellTool],

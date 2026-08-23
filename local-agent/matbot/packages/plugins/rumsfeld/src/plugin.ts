@@ -171,6 +171,13 @@ async function fetchAllRememberedFacts(store: Store<RememberedFact>): Promise<Re
   return out;
 }
 
+/**
+ * Lexically scores every remembered fact against the search terms and returns
+ * the top matches above the threshold, deduplicated and newest-first among ties.
+ * @param services - Runtime machine (used to open the fact store).
+ * @param terms - Search terms with optional context phrases.
+ * @returns Matching facts with their scores (at most five).
+ */
 export async function searchRememberedFacts(
   services: MatbotMachine,
   terms: readonly SearchTerm[],
@@ -277,6 +284,13 @@ export function createMemoryInjectionHook(services: MatbotMachine): Hook {
   };
 }
 
+/**
+ * Builds the default rumsfeld plugin: registers the `contextual_search` tool
+ * (knowledge index + remembered facts + workspace RAG) and the memory
+ * injection hook.
+ *
+ * @returns The plugin specification.
+ */
 export function createRumsfeldPlugin(): MatbotPluginSpec {
   return {
     apiVersion: PLUGIN_API_VERSION,
@@ -372,4 +386,9 @@ export function createRumsfeldPlugin(): MatbotPluginSpec {
   };
 }
 
+/**
+ * Default instance of the rumsfeld plugin.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = createRumsfeldPlugin();

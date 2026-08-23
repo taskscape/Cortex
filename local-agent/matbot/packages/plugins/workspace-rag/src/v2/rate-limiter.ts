@@ -1,11 +1,22 @@
+/**
+ * Token-bucket rate limiter allowing a fixed number of units per second.
+ */
 export class RagV2RateLimiter {
   private nextAvailableAt = 0;
   private readonly unitsPerSecond: number;
 
+  /**
+   * @param unitsPerSecond - Sustained units permitted per second.
+   */
   constructor(unitsPerSecond: number) {
     this.unitsPerSecond = unitsPerSecond;
   }
 
+  /**
+   * Waits until `units` are available at the configured rate.
+   * @param units - Units to consume.
+   * @param signal - Abort signal cancelling the wait.
+   */
   async consume(units: number, signal?: AbortSignal): Promise<void> {
     if (this.unitsPerSecond <= 0 || units <= 0) return;
     const now = Date.now();

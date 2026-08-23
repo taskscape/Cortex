@@ -51,6 +51,10 @@ interface SourceRegistration {
   sourceVersionId?: string;
 }
 
+/**
+ * Bridge the manager uses to register indexed documents with an external
+ * source-registry-like service.
+ */
 export interface RagV2SourceBridge {
   register(
     workspace: RagV2WorkspaceRef,
@@ -60,12 +64,20 @@ export interface RagV2SourceBridge {
     modifiedAt: string,
     summary: string,
   ): Promise<SourceRegistration>;
+  /**
+   * Records that indexing one source failed.
+   * @param args - Source id, path, and failure description.
+   */
   recordFailure(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
     normalizedPath: string,
     error: unknown,
   ): Promise<void>;
+  /**
+   * Records that a previously indexed source disappeared from disk.
+   * @param args - Workspace/context ids and the removed path.
+   */
   markRemoved(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -80,6 +92,9 @@ export interface RagV2SourceBridge {
   ): Promise<void>;
 }
 
+/**
+ * Aggregate statistics from scanning a context's source roots before ingestion.
+ */
 export interface RagV2Census {
   files: number;
   totalBytes: number;
@@ -133,6 +148,9 @@ export interface RagV2Census {
   }>;
 }
 
+/**
+ * Options controlling census discovery depth and sampling.
+ */
 export interface RagV2CensusOptions {
   deep?: boolean;
   resumeAfter?: string;
@@ -340,6 +358,11 @@ function discoveryPriority(filePath: string): 'authority' | 'current' | 'archive
   return 'current';
 }
 
+/**
+ * The v2 RAG subsystem orchestrator: owns ingestion jobs (discovery,
+ * parsing, indexing, publication), status reporting, retrieval, evaluation,
+ * census scans, and lifecycle (start/stop).
+ */
 export class WorkspaceRagV2Manager {
   private readonly repository: RagV2Repository;
   private readonly embedder: RagV2Embedder;
@@ -390,12 +413,18 @@ export class WorkspaceRagV2Manager {
     this.semanticServices = semanticServices;
   }
 
+  /**
+   * Initialises repositories, vectorizers, and sidecar connections. Idempotent.
+   */
   async initialize(): Promise<void> {
     if (this.initialized) return;
     await this.repository.initialize(this.embedder.info);
     this.initialized = true;
   }
 
+  /**
+   * Stops background work and closes repository connections.
+   */
   async close(): Promise<void> {
     for (const run of this.runs.values()) run.controller.abort(new Error('Workspace RAG V2 manager is closing.'));
     await Promise.allSettled([...this.runs.values()].map(run => run.promise));
@@ -515,10 +544,19 @@ export class WorkspaceRagV2Manager {
     return job;
   }
 
+  /**
+   * Resolves when the context's current job reaches a terminal state.
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   */
   async waitForIngestion(workspaceId: string, contextId: string): Promise<void> {
     await this.runs.get(runKey(workspaceId, contextId))?.promise;
   }
 
+  /**
+   * Requests a pause of the context's running job.
+   * @returns The updated job, or undefined when none is active.
+   */
   async pause(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
     if (!run) return this.repository.currentJob(workspaceId, contextId);
@@ -530,6 +568,10 @@ export class WorkspaceRagV2Manager {
     return run.job;
   }
 
+  /**
+   * Resumes a paused job.
+   * @returns The updated job, or undefined when there is nothing to resume.
+   */
   async resume(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
     if (!run) return this.repository.currentJob(workspaceId, contextId);
@@ -541,6 +583,10 @@ export class WorkspaceRagV2Manager {
     return run.job;
   }
 
+  /**
+   * Requests cancellation of the context's current job.
+   * @returns The updated job, or undefined when none is active.
+   */
   async cancel(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
     if (!run) return this.repository.currentJob(workspaceId, contextId);
@@ -576,6 +622,9 @@ export class WorkspaceRagV2Manager {
     return engine.search(workspace.id, context.id, query, options, signal);
   }
 
+  /**
+   * Resolves when all queued routing-summary tasks have drained.
+   */
   async waitForSummaries(): Promise<void> {
     if (this.summaryQueue.length === 0 && this.summaryActive === 0) return;
     await new Promise<void>(resolve => this.summaryIdleWaiters.push(resolve));
@@ -671,6 +720,11 @@ export class WorkspaceRagV2Manager {
     }], this.embedder.info);
   }
 
+  /**
+   * Reads a byte range from an indexed document's stored object.
+   * @param params - Document/version ids and byte range.
+   * @returns The requested text.
+   */
   async fetchSourceRange(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -698,6 +752,11 @@ export class WorkspaceRagV2Manager {
     };
   }
 
+  /**
+   * Reads a line range from an indexed document via its line index.
+   * @param params - Document/version ids and 1-based line range.
+   * @returns The requested lines joined with newlines.
+   */
   async fetchLines(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -727,6 +786,12 @@ export class WorkspaceRagV2Manager {
     };
   }
 
+  /**
+   * Regex/substring search over indexed documents with authorization scoping
+   * and persisted audit runs.
+   * @param params - Pattern, scope, and match options.
+   * @returns Matched passages with highlighted ranges.
+   */
   async grepDocuments(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -791,6 +856,11 @@ export class WorkspaceRagV2Manager {
     };
   }
 
+  /**
+   * Removes embeddings not touched within the retention window to reclaim space.
+   * @param params - Retention window and batch size.
+   * @returns Number of embeddings evicted.
+   */
   async evictColdPassageEmbeddings(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -823,6 +893,11 @@ export class WorkspaceRagV2Manager {
     return { generationId: publication.generationId, evicted, state };
   }
 
+  /**
+   * Runs retrieval against evaluation cases and scores recall/precision.
+   * @param input - Cases, scope, and options.
+   * @returns Aggregate and per-case evaluation metrics.
+   */
   async evaluate(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -897,6 +972,14 @@ export class WorkspaceRagV2Manager {
     return { runId, generationId: publication.generationId, metrics };
   }
 
+  /**
+   * Scans a context's source roots without ingesting, producing file counts,
+   * byte totals, and cardinality estimates.
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   * @param options - Census options.
+   * @returns The census report.
+   */
   async census(
     paths: readonly string[],
     signal = new AbortController().signal,

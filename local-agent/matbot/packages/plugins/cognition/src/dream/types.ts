@@ -25,9 +25,13 @@
  * can read exactly the same inputs as the LLM ranker.
  */
 export interface SkillCandidate {
+  /** Skill display name. */
   name:     string;
+  /** One-paragraph summary of what the skill covers. */
   summary:  string;
+  /** Entity keywords derived from the skill's prose. */
   entities: string[];
+  /** Tag keywords derived from the skill's prose. */
   tags:     string[];
 }
 
@@ -48,9 +52,13 @@ export interface SkillCandidate {
  * relying on positional order in the returned array (rankers may batch internally and reorder).
  */
 export interface Score {
+  /** Id of the fact being scored. */
   factId:    string;
+  /** Name of the skill the fact was scored against. */
   skill:     string;
+  /** Fit score in [0, 1]; thresholds are applied by the pipeline, not the ranker. */
   score:     number;
+  /** One-line rationale; may be empty for non-verbal rankers. */
   reasoning: string;
 }
 
@@ -75,9 +83,13 @@ export interface Score {
  * through to the run record.
  */
 export interface RouteDecision {
+  /** Terminal routing verdict after thresholding. */
   decision:  'strong' | 'weak' | 'none';
+  /** Top candidate skill name; present only for `strong`/`weak`. */
   skill?:    string;
+  /** Top candidate's score; present only for `strong`/`weak`. */
   score?:    number;
+  /** Rationale carried through from the top score. */
   reasoning: string;
 }
 
@@ -97,7 +109,9 @@ export interface RouteDecision {
  * hint; precision is not required.
  */
 export interface MergeResult {
+  /** Complete updated skill markdown, ready for `SkillManager.save()`. */
   content:        string;
+  /** Structured form of any `(!) Note:` markers inserted into the prose. */
   contradictions: { location: string; note: string }[];
 }
 
@@ -123,9 +137,13 @@ export interface MergeResult {
 export type DreamRunOutcome = 'no-facts' | 'no-match' | 'merged' | 'error';
 
 /** Per-call telemetry: which interface was invoked, how big the input was, how long it took. */
+/** Per-call telemetry: which interface was invoked, how big the input was, how long it took. */
 export interface JudgementCallStat {
+  /** Which pluggable interface was invoked. */
   role:        'rank' | 'merge';
+  /** Input size: facts × skills for rank; 1 for merge. */
   inputSize:   number;   // facts × skills for rank; 1 for merge
+  /** Wall-clock duration of the call in milliseconds. */
   ms:          number;
 }
 
@@ -137,16 +155,27 @@ export interface JudgementCallStat {
  * mutex in the service, so a record always represents a complete, serialised pass.
  */
 export interface DreamRun {
+  /** Run identifier (Store key). */
   id:                  string;
+  /** Store version for CAS. */
   version:             string;
+  /** ISO timestamp when the pass started. */
   startedAt:           string;
+  /** ISO timestamp when the pass ended. */
   endedAt:             string;
+  /** Outcome bucket; determines which other fields are meaningful. */
   outcome:             DreamRunOutcome;
+  /** The fact selected for routing this pass, if any. */
   primaryFact?:        { id: string; preview: string };
+  /** Where the primary fact routed, if a candidate was scored. */
   routedTo?:           { skill: string; decision: RouteDecision['decision']; score: number; reasoning: string };
+  /** Ids of all facts merged into the skill this pass (non-empty iff `merged`). */
   mergedFactIds:       string[];
+  /** Contradiction notes produced by merges, keyed by skill. */
   contradictions:      { skill: string; location: string; note: string }[];
+  /** Count of unassigned facts still in the pool after this pass. */
   unassignedRemaining: number;
+  /** Per-call ranker/merger telemetry. */
   judgementCalls:      JudgementCallStat[];
   /** True if a `none` verdict was reached only after a provenance-enriched re-rank (see
    *  `buildEnrichedFact` in runOnce.ts). Absent/false means the first-pass score already
@@ -176,13 +205,21 @@ export interface DreamRun {
  * from `createdAt` so original capture provenance is never mutated.
  */
 export interface RememberedFact {
+  /** Fact identifier (Store key). */
   id:           string;
+  /** Store version for CAS. */
   version:      string;
+  /** The remembered fact text. */
   fact:         string;
+  /** Session the fact was captured in. */
   sessionId:    string;
+  /** Message the fact was captured from. */
   messageId:    string;
+  /** ISO timestamp of original capture. */
   createdAt:    string;
+  /** Terminal routing marker: a skill name, or the NONE/ERROR sentinels. */
   dreamSkill?:  string;
+  /** ISO timestamp before which the fact is excluded from selection (weak deferral). */
   ignoreUntil?: string;
 }
 
@@ -218,13 +255,19 @@ export const DREAM_SKILL_ERROR = '__error__';
  *                      still giving the skill landscape time to change between looks.
  */
 export interface DreamSettings {
+  /** Minimum score (default 0.75) to trigger a merge. */
   strongThreshold: number;
+  /** Minimum score (default 0.5) to record a weak match; below this, "none". */
   weakThreshold:   number;
+  /** Cap on facts merged in one pass, including the primary (default 5). */
   maxClusterSize:  number;
+  /** Skill names (case-sensitive exact match) never offered to the ranker. */
   blocklist:       string[];
+  /** Milliseconds a weak-routed fact is excluded before reconsideration (default 36h). */
   weakDeferralMs:  number;
 }
 
+/** Factory-fresh settings applied when nothing is persisted. */
 export const DEFAULT_DREAM_SETTINGS: DreamSettings = {
   strongThreshold: 0.75,
   weakThreshold:   0.5,

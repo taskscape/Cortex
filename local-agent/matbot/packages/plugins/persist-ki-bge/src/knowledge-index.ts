@@ -78,15 +78,26 @@ function scoreContent(content: string, terms: Array<{ term: string }>): number {
   return score;
 }
 
+/**
+ * A `Store<KnowledgeEntry>`-backed `KnowledgeIndex` with an optional Cloudflare BGE reranker.
+ * Search proceeds in three steps: exact entity match, content-weighted scoring (headings weighted
+ * above body), then BGE reranking when scores are close. Missing reranker credentials degrade
+ * gracefully; HTTP/auth failures are warned about and also fall back to local scoring.
+ */
 export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
   private readonly store: Store<KnowledgeEntry>;
   private readonly vault: Vault;
 
+  /** @param store The `knowledge` store holding entries. @param vault Vault for reranker credentials. */
   constructor(store: Store<KnowledgeEntry>, vault: Vault) {
     this.store = store;
     this.vault = vault;
   }
 
+  /**
+   * Add or update an entry in the index. Writes only when the content hash changed.
+   * @param entry The entry to index (its `contentHash` is computed here).
+   */
   async index(entry: KnowledgeEntry): Promise<void> {
     const hash     = fnv1a(entry.content);
     const existing = await this.store.get(entry.id);
@@ -94,6 +105,16 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
     await this.store.set(entry.id, { ...entry, contentHash: hash });
   }
 
+  /**
+   * Search indexed entries. Step 1 returns an unambiguous alphanum-normalised entity match;
+   * step 2 scores headings (H1=20/H2=10/H3=5) plus body occurrences; step 3 disambiguates via
+   * the Cloudflare BGE reranker when scores are close, falling back to local ranking when
+   * credentials are missing or the service fails.
+   *
+   * @param terms Search terms with optional context.
+   * @param signal Abort signal forwarded to the reranker request.
+   * @returns Matching entries, best first.
+   */
   async search(
     terms:  Array<{ term: string; context?: string }>,
     signal: AbortSignal,

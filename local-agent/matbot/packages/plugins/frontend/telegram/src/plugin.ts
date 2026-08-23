@@ -38,6 +38,10 @@ async function buildProvider(name: string, services: MatbotMachine): Promise<Act
   return { name, adapter, config };
 }
 
+/**
+ * Telegram frontend plugin: long-polls the Bot API for messages and drives a
+ * session runner per chat, streaming replies back via sendMessage.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 

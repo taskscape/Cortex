@@ -15,6 +15,15 @@ function compareValues(a: unknown, b: unknown): number {
 
 // Sorts by the requested specs, then appends `id` as a final tiebreaker so the order is always
 // total — without which an opaque cursor over the result could not point at a stable boundary.
+/**
+ * Sort documents by the requested specs (missing values last; numbers numerically, everything
+ * else by string codepoint order), appending `id` as a final tiebreaker so the ordering is total
+ * and cursor-stable.
+ *
+ * @param docs - Documents to sort (the input array is not mutated).
+ * @param sort - Sort specs in application order, or `undefined` for id-only ordering.
+ * @returns A new sorted array.
+ */
 export function applySort<T extends { id: string }>(docs: T[], sort: SortSpec[] | undefined): T[] {
   const compiled = [...(sort ?? []), { field: 'id', dir: 'asc' as const }]
     .map(s => ({ seg: pathSegments(s.field), sign: s.dir === 'desc' ? -1 : 1 }));

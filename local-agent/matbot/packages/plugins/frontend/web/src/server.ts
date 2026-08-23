@@ -9,11 +9,17 @@ import { sseComment, sseEvent } from './sse-writer.js';
 import { promises } from "node:fs";
 const { readFile } = promises;
 
+/** Install-scoped UI branding overrides served to the web client. */
 export interface WebBranding {
+  /** Product name shown in the UI. */
   productName: string;
+  /** Browser tab title. */
   title: string;
+  /** Base brand color (CSS color). */
   brand?: string;
+  /** Strong accent color (CSS color). */
   brandStrong?: string;
+  /** Soft accent color (CSS color). */
   brandSoft?: string;
 }
 
@@ -49,6 +55,7 @@ export function parseWebBranding(raw = process.env['CORTEX_WEBUI_BRANDING_JSON']
   }
 }
 
+/** Dependencies injected into the HTTP+SSE chat server. */
 export interface WebServerDeps {
   store:          Store<Session>;
   /** Per-session turn serialiser — submits queue instead of running concurrently. */
@@ -81,12 +88,19 @@ export interface WebServerDeps {
   branding?: WebBranding;
 }
 
+/** Summary of one workspace as reported by the workspace manager. */
 export interface WorkspaceSummary {
+  /** Workspace id. */
   id:         string;
+  /** Human-readable workspace name. */
   name:       string;
+  /** Path of the workspace's matbot.yaml. */
   configPath: string;
+  /** ISO creation timestamp. */
   createdAt:  string;
+  /** ISO last-modified timestamp. */
   updatedAt:  string;
+  /** Whether this is the currently active workspace. */
   active:     boolean;
 }
 
@@ -96,23 +110,55 @@ export interface SessionTitler {
   titleSession(input: { sessionId: string; provider: string; signal?: AbortSignal }): Promise<string | undefined>;
 }
 
+/** Lifecycle operations over the set of workspaces (create/rename/delete/switch). */
 export interface WorkspaceManager {
+  /** Returns the active workspace summary.
+   * @returns The current {@link WorkspaceSummary}. */
   current(): Promise<WorkspaceSummary>;
+  /** Lists all workspaces with the active id.
+   * @returns Active id plus all workspace summaries. */
   list(): Promise<{ active: string; workspaces: WorkspaceSummary[] }>;
+  /** Creates a new workspace.
+   * @param name Workspace name.
+   * @returns The created workspace summary. */
   create(name: string): Promise<WorkspaceSummary>;
+  /** Renames a workspace.
+   * @param id Workspace id.
+   * @param name New name.
+   * @returns The updated workspace summary. */
   rename(id: string, name: string): Promise<WorkspaceSummary>;
+  /** Deletes an inactive workspace.
+   * @param id Workspace id.
+   * @returns The deleted workspace's id. */
   delete(id: string): Promise<{ id: string; deleted: true }>;
+  /** Switches the active workspace (may restart the process).
+   * @param id Workspace id to activate.
+   * @returns The new active id and whether a restart is pending. */
   switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
+/** Indexing lock state for a workspace's RAG pipeline. */
 export interface WorkspaceRagLockStatus {
+  /** True when indexing is running or pending. */
   locked: boolean;
+  /** Why the lock is held. */
   reason?: string;
+  /** Machine-readable lock state. */
   state?: string;
+  /** Human-readable status message. */
   message?: string;
 }
 
+/**
+ * Structural view of the workspace-RAG plugin's service — kept local so
+ * frontend-web carries no dependency on an optional plugin.
+ */
 export interface WorkspaceRagManager {
+  /**
+   * Reports the RAG indexing lock status for a workspace.
+   * @param workspaceId Workspace to query.
+   * @returns The lock status.
+   */
   workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus;
 }
 
@@ -194,6 +240,11 @@ const ANONYMOUS_WEB_USER: Principal = {
 // `WebPrincipalResolver` (e.g. deriving identity from headers) which overrides this entirely; that
 // override is deliberately NOT chained to the boot principal, so it never leaks the operator
 // identity to anonymous visitors.
+/**
+ * Default request identity resolver: the ambient boot principal, falling back
+ * to a fixed anonymous `web-user` when none is established.
+ * @returns The resolved principal for a request.
+ */
 export const defaultWebPrincipal: WebPrincipalResolver = () => tryCurrentPrincipal() ?? ANONYMOUS_WEB_USER;
 
 async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<string> {
@@ -407,6 +458,13 @@ function titleFromQuestion(question: string): string | undefined {
   return words.length > 60 ? `${words.slice(0, 60)}...` : words;
 }
 
+/**
+ * Creates the HTTP + SSE chat server.
+ * @param deps Injected services and registries (see {@link WebServerDeps}).
+ * @returns A Node `http.Server` serving the static UI, session submit/abort,
+ *          prompt round-trips, workspace management, direct tool invocation,
+ *          and multiplexed SSE event streams.
+ */
 export function createWebServer(deps: WebServerDeps) {
   const origin = deps.cors ?? '*';
   const resolvePrincipal = deps.resolvePrincipal ?? defaultWebPrincipal;

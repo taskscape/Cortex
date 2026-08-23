@@ -36,6 +36,11 @@ export class BrowserStorageBackend implements StorageBackend {
   private readonly stores = new Map<string, Store<{ id: string; version: string }>>();
   readonly fileStore: FileStore = new OPFSFileStore();
 
+  /**
+   * Returns (creating and caching if needed) the document store for a namespace.
+   * @param namespace Logical namespace; each gets its own IndexedDB database.
+   * @returns A `Store<T>` backed by IndexedDB for that namespace.
+   */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     let store = this.stores.get(namespace);
     if (store === undefined) {
@@ -48,6 +53,12 @@ export class BrowserStorageBackend implements StorageBackend {
   // IndexedDB connections close with the realm; nothing to flush. OPFS writes are durable on close.
   async close(): Promise<void> {}
 
+  /**
+   * Opens the backend after verifying a browser realm.
+   * @param _dotData Unused in the browser; durable locations are IDB databases and OPFS.
+   * @returns A ready `BrowserStorageBackend` instance.
+   * @throws If the code runs under Node or lacks IndexedDB.
+   */
   static async open(_dotData: string): Promise<BrowserStorageBackend> {
     assertBrowserRealm();
     return new BrowserStorageBackend();

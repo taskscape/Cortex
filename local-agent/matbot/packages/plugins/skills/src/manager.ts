@@ -114,9 +114,15 @@ export async function skillToKnowledgeEntry(
   return { entry: buildEntry(doc, cache, contentHash), cache };
 }
 
+/**
+ * Compact skill descriptor used for listings (no content).
+ */
 export interface SkillSummary {
+  /** Skill id. */
   id:           string;
+  /** Unique skill name. */
   name:         string;
+  /** Tool the skill is bound to, if any. */
   toolBinding?: string;
 }
 
@@ -146,6 +152,10 @@ export class SkillManager {
   // capture-safe forwarding proxy, but resolving it per call keeps that guarantee explicit).
   private get knowledge(): KnowledgeIndex { return this.services.KnowledgeIndex; }
 
+  /**
+   * @param store - Persistent store backing the skill set.
+   * @param services - Runtime machine providing settings, providers and knowledge.
+   */
   constructor(store: Store<SkillDoc>, services: MatbotMachine) {
     this.store    = store;
     this.services = services;
@@ -190,6 +200,11 @@ export class SkillManager {
     }));
   }
 
+  /**
+   * Looks a skill up by name, case-insensitively.
+   * @param name - Skill name.
+   * @returns The skill document, or undefined when absent.
+   */
   get(name: string): SkillDoc | undefined {
     return this.skills.get(name.toLowerCase());
   }
@@ -272,6 +287,10 @@ export class SkillManager {
     return true;
   }
 
+  /**
+   * Drops all in-memory state and aborts in-flight analyses and subscriptions.
+   * Ends the manager's lifecycle (teardown only).
+   */
   clear(): void {
     this.lifecycle.abort();                                // end the mounted-swap subscription
     for (const ac of this.inflight.values()) ac.abort();   // cancel detached analyses on teardown

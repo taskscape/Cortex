@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parseConfig, parseYaml } from '@matatbread/matbot-config';
 import type { MatbotConfig } from '@matatbread/matbot-config';
 
+/** The parsed matbot configuration type, re-exported from the config package. */
 export type { MatbotConfig };
 
 async function loadBase(
@@ -17,6 +18,13 @@ async function loadBase(
   return { baseText, projectDir: path.dirname(basePath) };
 }
 
+/**
+ * Load and parse matbot.yaml from disk, honouring an `extends:` base config whose
+ * directory becomes the project root.
+ * @param configPath Path to the matbot.yaml file.
+ * @returns The parsed config plus the project directory (the base config's dir when `extends:` is used).
+ * @exception Error When the file cannot be read or the YAML fails to parse/validate.
+ */
 export async function loadConfig(
   configPath: string,
 ): Promise<{ config: MatbotConfig; projectDir: string }> {
@@ -26,6 +34,14 @@ export async function loadConfig(
   return { config: parseConfig(text, baseText), projectDir };
 }
 
+/**
+ * Parse config text supplied directly (e.g. piped via stdin), honouring `extends:` the
+ * same way {@link loadConfig} does.
+ * @param text Raw YAML config text.
+ * @param fromDir Directory `extends:` paths resolve against; defaults to the process cwd.
+ * @returns The parsed config plus the project directory.
+ * @exception Error When the base file cannot be read or parsing/validation fails.
+ */
 export async function loadConfigFromText(
   text:    string,
   fromDir: string = process.cwd(),
@@ -58,6 +74,12 @@ function parseDotEnv(text: string): Record<string, string> {
   return out;
 }
 
+/**
+ * Load `<dir>/.env` and apply its entries to `process.env` without clobbering
+ * variables already set in the real environment.
+ * @param dir Directory containing the .env file.
+ * @returns The set of variable names that were newly applied (missing file ⇒ empty set).
+ */
 export async function loadDotEnv(dir: string): Promise<Set<string>> {
   let text: string;
   try {

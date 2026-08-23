@@ -14,6 +14,12 @@ the runtime is acting as right now. Returns { id, type } where type is "user", "
   },
 };
 
+/**
+ * Plugin exposing the `whoami` tool, which reports the security principal
+ * ({ id, type }) under which the current operation is running.
+ *
+ * @returns The plugin specification registering the whoami tool.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools:      [whoamiTool],

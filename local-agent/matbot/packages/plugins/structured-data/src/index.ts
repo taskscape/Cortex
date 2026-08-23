@@ -1,3 +1,12 @@
+/**
+ * Structured-data plugin: a governed semantic data catalog (connections,
+ * tables, columns, metrics), deterministic read-only SQL planning with
+ * approval-gated execution against Postgres, exposed via the `DataCatalog`
+ * and `SqlPlanner` services and the `structured_data_action` tool.
+ *
+ * @packageDocumentation
+ */
+
 import { createHash, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PoolConfig, QueryResult } from 'pg';
@@ -19,12 +28,20 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** SQL dialect of a data connection. */
 export type DataDialect = 'postgres' | 'sqlserver' | 'snowflake' | 'bigquery' | 'duckdb';
+/** Logical type of a catalog column. */
 export type ColumnType = 'string' | 'number' | 'boolean' | 'date' | 'datetime' | 'json' | 'unknown';
+/** Aggregation applied by a metric definition. */
 export type MetricAggregation = 'sum' | 'avg' | 'count' | 'count_distinct' | 'min' | 'max' | 'ratio' | 'custom';
+/** Lifecycle status of a planned query run. */
 export type QueryRunStatus = 'planned' | 'approved' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+/** Comparison operators supported in semantic filters. */
 export type FilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'string_contains';
 
+/**
+ * A registered (read-only) database connection.
+ */
 export interface DataConnection {
   id: string;
   version: string;
@@ -41,6 +58,10 @@ export interface DataConnection {
   defaultSchema?: string;
 }
 
+/**
+ * Input for registering a data connection. Omitted fields are preserved from
+ * the existing record or defaulted.
+ */
 export type DataConnectionInput = {
   id?: string;
   workspaceId: string;
@@ -71,6 +92,7 @@ export interface DataTable {
   updatedAt: string;
 }
 
+/** Input for upserting a table (optionally with its columns). */
 export type DataTableInput = {
   id?: string;
   workspaceId: string;
@@ -115,6 +137,10 @@ export type DataColumnInput = {
   description?: string;
 };
 
+/**
+ * A governed business metric: an aggregation expression over a base table
+ * with approved dimension/filter columns.
+ */
 export interface MetricDefinition {
   id: string;
   version: string;
@@ -154,6 +180,7 @@ export interface SemanticFilter {
   value: string | number | boolean | Array<string | number | boolean>;
 }
 
+/** Input describing the query to plan against a metric. */
 export interface QueryPlanInput {
   workspaceId: string;
   metricId?: string;
@@ -163,6 +190,9 @@ export interface QueryPlanInput {
   limit?: number;
 }
 
+/**
+ * Outcome of validating rendered SQL for read-only safety.
+ */
 export interface SqlValidationResult {
   valid: boolean;
   readOnly: boolean;
@@ -171,6 +201,9 @@ export interface SqlValidationResult {
   sqlHash: string;
 }
 
+/**
+ * Heuristic complexity estimate for a planned query.
+ */
 export interface QueryCostEstimate {
   complexity: 'low' | 'medium' | 'high';
   score: number;
@@ -212,6 +245,9 @@ export interface QueryPlan {
   rowCapWarning?: string;
 }
 
+/**
+ * Result of an executed query run.
+ */
 export interface ExecuteQueryResult {
   run: QueryRun;
   rows: Record<string, unknown>[];
@@ -222,32 +258,133 @@ export interface ExecuteQueryResult {
   };
 }
 
+/**
+ * The semantic catalog service: stable id derivation and CRUD over
+ * connections, tables, columns and metric definitions.
+ */
 export interface DataCatalog {
+  /**
+   * Derives the deterministic id for a connection.
+   */
   stableConnectionId(workspaceId: string, dialect: DataDialect, displayName: string): string;
+  /**
+   * Derives the deterministic id for a table.
+   */
   stableTableId(connectionId: string, schemaName: string, tableName: string): string;
+  /**
+   * Derives the deterministic id for a column.
+   */
   stableColumnId(tableId: string, columnName: string): string;
+  /**
+   * Derives the deterministic id for a metric.
+   */
   stableMetricId(workspaceId: string, name: string): string;
+  /**
+   * Creates or updates a connection (must be read-only, postgres only).
+   * @param input - Connection fields.
+   * @returns The stored connection.
+   * @throws When the connection is not read-only or uses an unsupported dialect.
+   */
   upsertConnection(input: DataConnectionInput): Promise<DataConnection>;
+  /**
+   * Creates or updates a table (and any embedded column definitions), then
+   * registers it as a source-registry source.
+   * @param input - Table fields.
+   * @returns The stored table.
+   */
   upsertTable(input: DataTableInput): Promise<DataTable>;
+  /**
+   * Creates or updates a column of a table.
+   * @param input - Column fields; workspaceId inferred from the table when omitted.
+   * @returns The stored column.
+   * @throws When the workspace cannot be inferred from the table.
+   */
   upsertColumn(input: DataColumnInput): Promise<DataColumn>;
+  /**
+   * Creates or updates a metric definition.
+   * @param input - Metric fields.
+   * @returns The stored metric.
+   */
   upsertMetric(input: MetricDefinitionInput): Promise<MetricDefinition>;
+  /**
+   * Fetches a connection by id.
+   * @returns The connection, or null when absent.
+   */
   getConnection(id: string): Promise<DataConnection | null>;
+  /**
+   * Fetches a table by id.
+   * @returns The table, or null when absent.
+   */
   getTable(id: string): Promise<DataTable | null>;
+  /**
+   * Fetches a column by id.
+   * @returns The column, or null when absent.
+   */
   getColumn(id: string): Promise<DataColumn | null>;
+  /**
+   * Fetches a metric by id.
+   * @returns The metric, or null when absent.
+   */
   getMetric(id: string): Promise<MetricDefinition | null>;
+  /**
+   * Resolves a metric by its normalised name within a workspace.
+   * @returns The metric, or null when unknown.
+   */
   metricByName(workspaceId: string, name: string): Promise<MetricDefinition | null>;
+  /** Queries stored connections. */
   queryConnections(query?: StoreQuery): Promise<DataConnection[]>;
+  /** Queries stored tables. */
   queryTables(query?: StoreQuery): Promise<DataTable[]>;
+  /** Queries stored columns. */
   queryColumns(query?: StoreQuery): Promise<DataColumn[]>;
+  /** Queries stored metrics. */
   queryMetrics(query?: StoreQuery): Promise<MetricDefinition[]>;
 }
 
+/**
+ * The governed SQL planner service: plans deterministic semantic SQL from
+ * metrics/dimensions/filters, validates read-only safety, approves runs with
+ * expiring tokens, and executes approved queries against Postgres.
+ */
 export interface SqlPlanner {
+  /**
+   * Plans a query run from a semantic request.
+   * @param input - Metric, dimensions, filters and row limit.
+   * @returns The persisted plan (run + validation + cost estimate).
+   * @throws When the metric/table/connection is unknown, denied, non-read-only,
+   * or the generated SQL fails validation.
+   */
   planQuery(input: QueryPlanInput): Promise<QueryPlan>;
+  /**
+   * Approves a planned run, minting a one-time approval token with a TTL.
+   * @param queryRunId - The planned run to approve.
+   * @returns The updated run plus the approval token (shown once).
+   * @throws When the run is unknown or not in an approvable status.
+   */
   approveQuery(queryRunId: string): Promise<{ queryRun: QueryRun; approvalToken: string }>;
+  /**
+   * Executes an approved run in a read-only transaction.
+   * @param queryRunId - Approved run id.
+   * @param approvalToken - Token minted at approval time.
+   * @param ctx - Tool context used to resolve credentials.
+   * @returns Rows, fields and the result citation.
+   * @throws When the token is invalid/expired, the principal differs, SQL fails
+   * re-validation, credentials cannot be resolved, or the database errors.
+   */
   executeQuery(queryRunId: string, approvalToken: string, ctx: ToolContext): Promise<ExecuteQueryResult>;
+  /**
+   * Validates raw SQL for read-only safety without executing it.
+   * @param sql - SQL to check.
+   * @param options - `requireLimit` forces an explicit LIMIT clause.
+   * @returns Validation outcome including reasons and a normalised SQL hash.
+   */
   validateSql(sql: string, options?: { requireLimit?: boolean }): SqlValidationResult;
+  /** Queries stored query runs. */
   queryRuns(query?: StoreQuery): Promise<QueryRun[]>;
+  /**
+   * Fetches a query run by id.
+   * @returns The run, or null when absent.
+   */
   getQueryRun(id: string): Promise<QueryRun | null>;
 }
 
@@ -1028,6 +1165,12 @@ function createStructuredDataTool(catalog: DataCatalog, planner: SqlPlanner): To
   };
 }
 
+/**
+ * Builds the store-backed {@link DataCatalog}, optionally wired to a
+ * `SourceRegistry` for provenance registration.
+ * @param services - Runtime machine providing stores.
+ * @returns The catalog instance.
+ */
 export function createDataCatalog(services: MatbotMachine): DataCatalog {
   const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
   return new StoreBackedDataCatalog(
@@ -1039,6 +1182,13 @@ export function createDataCatalog(services: MatbotMachine): DataCatalog {
   );
 }
 
+/**
+ * Builds the store-backed {@link SqlPlanner} over a catalog, optionally wired
+ * to a `SourceRegistry` for result provenance.
+ * @param services - Runtime machine providing stores and vault access.
+ * @param catalog - The catalog resolving metrics/tables/columns/connections.
+ * @returns The planner instance.
+ */
 export function createSqlPlanner(services: MatbotMachine, catalog: DataCatalog): SqlPlanner {
   const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
   return new StoreBackedSqlPlanner(
@@ -1049,6 +1199,12 @@ export function createSqlPlanner(services: MatbotMachine, catalog: DataCatalog):
   );
 }
 
+/**
+ * Default plugin specification registering DataCatalog, SqlPlanner and the
+ * `structured_data_action` tool.
+ *
+ * @returns The plugin specification.
+ */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest: {
