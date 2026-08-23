@@ -54,6 +54,8 @@ const WATCH_DEBOUNCE_MS = 500;
 const MAX_CONTEXT_CHUNKS = 4;
 const DEFAULT_CUDA_EMBEDDING_URL = 'http://localhost:8890';
 const CUDA_EMBED_REQUEST_LIMIT = 256;
+const CUDA_EMBED_TIMEOUT_MS    = 120_000;
+const CUDA_EMBED_MAX_ATTEMPTS  = 3;
 const CPU_VECTOR_BACKEND = 'hash-cpu';
 const CPU_VECTOR_MODEL = 'token-hash-v1';
 
@@ -558,18 +560,32 @@ class CudaHttpVectorizer implements TextVectorizer {
   }
 
   private async embedBatch(texts: readonly string[], purpose: EmbeddingPurpose, offset: number, signal?: AbortSignal): Promise<number[][]> {
-    const request: RequestInit = {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ texts, inputType: purpose }),
-    };
-    if (signal) request.signal = signal;
-    const response = await fetch(`${this.baseUrl}/embed`, request);
+    const body = JSON.stringify({ texts, inputType: purpose });
+    let response: Response | undefined;
+    for (let attempt = 1;; attempt++) {
+      const timeout = AbortSignal.timeout(CUDA_EMBED_TIMEOUT_MS);
+      try {
+        response = await fetch(`${this.baseUrl}/embed`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        });
+      } catch (e) {
+        if (attempt >= CUDA_EMBED_MAX_ATTEMPTS || signal?.aborted) throw e;
+      }
+      if (response !== undefined
+        && response.status !== 429 && response.status < 500) break;
+      // Transient sidecar failure (429/5xx/network): back off and retry the batch.
+      if (signal?.aborted || attempt >= CUDA_EMBED_MAX_ATTEMPTS) break;
+      await new Promise(resolve => setTimeout(resolve, Math.min(1_000 * 2 ** (attempt - 1), 10_000)));
+    }
+    if (response === undefined) throw new Error('CUDA embedding service request failed.');
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw new Error(`CUDA embedding service HTTP ${response.status}: ${detail.slice(0, 300)}`);
     }
-    const body = await response.json() as {
+    const parsed = await response.json() as {
       embeddings?: unknown;
       dimensions?: unknown;
       model?: unknown;

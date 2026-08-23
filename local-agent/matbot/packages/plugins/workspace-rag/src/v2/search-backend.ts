@@ -473,7 +473,9 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     const url = new URL(pathname, this.baseUrl);
     const headers = new Headers(init.headers);
     if (this.authorization) headers.set('authorization', this.authorization);
-    const response = await fetch(url, { ...init, headers });
+    const timeout = AbortSignal.timeout(30_000);
+    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    const response = await fetch(url, { ...init, headers, signal });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 1_000);
       throw new Error(`OpenSearch HTTP ${response.status}: ${detail}`);

@@ -1,5 +1,7 @@
 // Parses a Server-Sent Events stream into data payloads.
 // Uses only Web APIs (ReadableStream, TextDecoder) — works in Node 24+ and browsers.
+const MAX_BUFFER_CHARS = 1_048_576;
+
 export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
   const reader  = body.getReader();
   const decoder = new TextDecoder();
@@ -21,8 +23,13 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncIterable
           if (data !== '[DONE]') yield data;
         }
       }
+      // A stream that never emits a newline would otherwise grow memory without bound.
+      if (buffer.length > MAX_BUFFER_CHARS) {
+        throw new Error(`SSE stream exceeded ${MAX_BUFFER_CHARS} buffered characters without a newline`);
+      }
     }
   } finally {
+    await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }

@@ -25,3 +25,4 @@ test-results
 /playwright/.auth/
 local-agent/matbot/workspaces/default-2
 local-agent/matbot/workspaces/private
+.zed

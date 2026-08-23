@@ -14,6 +14,18 @@ interface PowerShellInput {
   timeout?: number;
 }
 
+// setTimeout wraps delays > 2^31-1 (and < 1) down to ~1ms, so an unsanitized LLM-supplied
+// timeout of e.g. 99999999999 would kill the script instantly.
+const MAX_TIMEOUT_MS   = 2_147_000_000;
+const KILL_GRACE_MS    = 5_000;
+const MAX_OUTPUT_BYTES = 1_000_000;
+
+function sanitizeTimeout(timeout: number | undefined): number | undefined {
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+    ? Math.min(Math.trunc(timeout), MAX_TIMEOUT_MS)
+    : undefined;
+}
+
 function powershellExecutable(): string {
   return process.platform === 'win32' ? 'powershell.exe' : 'powershell';
 }
@@ -44,14 +56,17 @@ function spawnAndStream(
 
   const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, shell: false });
 
+  const timeoutMs = sanitizeTimeout(opts.timeout);
+
   let stdoutAcc = '';
   let stderrAcc = '';
   let finalized = false;
   let stopped = false;
-  let stopReason: 'timeout' | 'aborted' | undefined;
+  let stopReason: 'timeout' | 'aborted' | 'overflow' | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const stop = (reason: 'timeout' | 'aborted'): void => {
+  const stop = (reason: 'timeout' | 'aborted' | 'overflow'): void => {
     if (stopped || finalized) return;
     stopped = true;
     stopReason = reason;
@@ -59,20 +74,36 @@ function spawnAndStream(
     // rather than using a shell command so timeout and abort input cannot alter
     // what is executed.
     child.kill('SIGTERM');
+    // A child ignoring SIGTERM must not outlive its deadline — escalate.
+    killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
   };
   const killOnAbort = (): void => { stop('aborted'); };
   opts.signal.addEventListener('abort', killOnAbort, { once: true });
 
-  child.stdout?.on('data', (d: Buffer) => {
-    const chunk = d.toString();
-    stdoutAcc += chunk;
-    push({ type: 'stdout', chunk });
-  });
-  child.stderr?.on('data', (d: Buffer) => {
-    const chunk = d.toString();
-    stderrAcc += chunk;
-    push({ type: 'stderr', chunk });
-  });
+  let totalBytes = 0;
+  const onData = (d: Buffer, kind: 'stdout' | 'stderr'): void => {
+    if (finalized) return;
+    const remaining = MAX_OUTPUT_BYTES - totalBytes;
+    const slice = d.length > remaining ? d.subarray(0, Math.max(0, remaining)) : d;
+    const chunk = slice.toString();
+    if (chunk) {
+      if (kind === 'stdout') stdoutAcc += chunk; else stderrAcc += chunk;
+      totalBytes += slice.length;
+      push({ type: kind, chunk });
+    }
+    if (d.length > remaining) {
+      stop('overflow');
+      finalized = true;
+      push({ type: 'error', message: `Output exceeded the ${MAX_OUTPUT_BYTES}-byte limit; process killed.`,
+        ...(stdoutAcc ? { stdout: stdoutAcc } : {}),
+        ...(stderrAcc ? { stderr: stderrAcc } : {}),
+      });
+      push(null);
+    }
+  };
+
+  child.stdout?.on('data', (d: Buffer) => onData(d, 'stdout'));
+  child.stderr?.on('data', (d: Buffer) => onData(d, 'stderr'));
   child.on('error', (e: Error) => {
     if (finalized) return;
     finalized = true;
@@ -80,12 +111,13 @@ function spawnAndStream(
     push(null);
   });
   child.on('close', (code: number | null) => {
+    if (timer !== undefined) clearTimeout(timer);
+    if (killTimer !== undefined) clearTimeout(killTimer);
     if (finalized) return;
     finalized = true;
-    if (timer !== undefined) clearTimeout(timer);
-    if (stopReason !== undefined) {
+    if (stopReason === 'timeout' || stopReason === 'aborted') {
       const why = stopReason === 'timeout'
-        ? `timed out after ${opts.timeout ?? 0}ms`
+        ? `timed out after ${timeoutMs ?? 0}ms`
         : 'was aborted';
       push({ type: 'error', message: `Process ${why} and was killed.`,
         ...(stdoutAcc ? { stdout: stdoutAcc } : {}),
@@ -102,14 +134,15 @@ function spawnAndStream(
     push(null);
   });
 
-  if (opts.timeout !== undefined) {
-    timer = setTimeout(() => stop('timeout'), opts.timeout);
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => stop('timeout'), timeoutMs);
   }
 
   async function finish(): Promise<void> {
     if (done) return;
     done = true;
     if (timer !== undefined) clearTimeout(timer);
+    if (killTimer !== undefined) clearTimeout(killTimer);
     opts.signal.removeEventListener('abort', killOnAbort);
     await opts.cleanup();
   }

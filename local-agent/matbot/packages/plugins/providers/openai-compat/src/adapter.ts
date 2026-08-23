@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderConfig, Message, Tool, CompletionEvent, HealthStatus } from '@matatbread/matbot-plugin-api';
-import { parseSSE } from '@matatbread/matbot-providers-base';
+import { parseSSE, fetchWithRetry } from '@matatbread/matbot-providers-base';
 import { toOAIMessages, toOAITools } from './convert.js';
 
 const DEFAULT_ENDPOINT   = 'https://api.openai.com/v1/chat/completions';
@@ -117,7 +117,7 @@ export class OpenAICompatAdapter implements ProviderAdapter {
       body['temperature'] = config.parameters.temperature;
     }
 
-    const res = await fetch(endpointUrl, {
+    const res = await fetchWithRetry(endpointUrl, {
       method:  'POST',
       headers: {
         'content-type':  'application/json',

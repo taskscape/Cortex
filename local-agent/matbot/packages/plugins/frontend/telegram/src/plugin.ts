@@ -220,7 +220,7 @@ export const plugin: MatbotPluginSpec = {
 
         // Keep the typing indicator alive; Telegram expires it after ~5 s.
         const typingInterval = setInterval(
-          () => { void sendChatAction(botToken, chatId, 'typing'); },
+          () => { sendChatAction(botToken, chatId, 'typing').catch(() => {}); },
           4_000,
         );
 

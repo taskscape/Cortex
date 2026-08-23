@@ -50,6 +50,16 @@ const CONTAINER: ContainerConfig = {
 /** Settings key for user-configurable overrides. */
 const SETTINGS_KEY = 'configOverrides';
 
+// setTimeout wraps delays > 2^31-1 (and < 1) down to ~1ms, so an unsanitized LLM-supplied
+// timeout of e.g. 99999999999 would kill the command instantly.
+const MAX_TIMEOUT_MS = 2_147_000_000;
+
+function sanitizeTimeout(timeout: number | undefined): number | undefined {
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+    ? Math.min(Math.trunc(timeout), MAX_TIMEOUT_MS)
+    : undefined;
+}
+
 /** Fields that are safe for the user to override at runtime. */
 type BashConfigOverrides = Partial<Pick<ContainerConfig, 'dns' | 'name' | 'maxOutputBytes'>>;
 
@@ -357,7 +367,7 @@ function spawnAndStream(
     if (finalized) return;
     finalized = true;
     if (stopReason === 'timeout' || stopReason === 'aborted') {
-      const why = stopReason === 'timeout' ? `timed out after ${opts.timeout}ms` : 'aborted';
+      const why = stopReason === 'timeout' ? `timed out after ${sanitizeTimeout(opts.timeout)}ms` : 'aborted';
       push({ type: 'error', message: `Process ${why} and was killed.`,
         ...(stdoutAcc ? { stdout: stdoutAcc } : {}),
         ...(stderrAcc ? { stderr: stderrAcc } : {}),
@@ -373,9 +383,10 @@ function spawnAndStream(
     push(null);
   });
 
+  const timeoutMs = sanitizeTimeout(opts.timeout);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  if (opts.timeout !== undefined) {
-    timer = setTimeout(() => stop('timeout'), opts.timeout);
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => stop('timeout'), timeoutMs);
   }
 
   return {

@@ -8,6 +8,18 @@ const API    = 'https://www.googleapis.com/drive/v3';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 
+const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_ATTEMPTS       = 4;
+const MAX_LIST_PAGES     = 100;
+
+function isTransient(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export interface DriveFile {
   id:        string;
   name:      string;
@@ -29,12 +41,24 @@ export class DriveClient {
     const token = await this.auth.token();
     const headers = new Headers(init.headers);
     headers.set('Authorization', `Bearer ${token}`);
-    const res = await fetch(url, { ...init, headers });
-    if (res.status === 401 && retryOn401) {
-      this.auth.invalidate();
-      return this.fetch(url, init, false);
+
+    for (let attempt = 1;; attempt++) {
+      const res = await fetch(url, { ...init, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (!isTransient(res.status) || attempt >= MAX_ATTEMPTS) {
+        if (res.status === 401 && retryOn401) {
+          this.auth.invalidate();
+          return this.fetch(url, init, false);
+        }
+        return res;
+      }
+      // Drive rate-limits aggressively; honor Retry-After, else exponential backoff.
+      const retryAfter = Number(res.headers.get('retry-after'));
+      await sleep(
+        Number.isFinite(retryAfter) && retryAfter >= 0
+          ? Math.min(retryAfter * 1000, 30_000)
+          : Math.min(500 * 2 ** (attempt - 1), 8_000),
+      );
     }
-    return res;
   }
 
   private async json<T>(res: Response): Promise<T> {
@@ -55,7 +79,11 @@ export class DriveClient {
 
     const out: DriveFile[] = [];
     let pageToken: string | undefined;
+    let pages = 0;
     do {
+      if (++pages > MAX_LIST_PAGES) {
+        throw new Error(`Google Drive listing exceeded ${MAX_LIST_PAGES} pages for parent ${parentId}`);
+      }
       const params = new URLSearchParams({
         q,
         fields:   'nextPageToken,files(id,name,mimeType)',

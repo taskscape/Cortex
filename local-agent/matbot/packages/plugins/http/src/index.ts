@@ -9,6 +9,12 @@ interface HttpInput {
   responseType?: 'text' | 'json';
 }
 
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 const executor = {
   async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
     const { url, method = 'GET', headers = {}, body, responseType = 'text' } = input as HttpInput;
@@ -19,10 +25,10 @@ const executor = {
         method,
         headers,
         ...(body !== undefined ? { body } : {}),
-        signal: ctx.signal,
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(DEFAULT_TIMEOUT_MS)]),
       });
     } catch (e) {
-      yield { type: 'error', message: String(e) };
+      yield { type: 'error', message: errorMessage(e) };
       return;
     }
 
@@ -30,7 +36,7 @@ const executor = {
     try {
       text = await res.text();
     } catch (e) {
-      yield { type: 'error', message: `Failed to read response: ${String(e)}` };
+      yield { type: 'error', message: `Failed to read response: ${errorMessage(e)}` };
       return;
     }
 

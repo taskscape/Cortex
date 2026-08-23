@@ -1,5 +1,5 @@
 import type { ProviderAdapter, ProviderConfig, Message, Tool, CompletionEvent, HealthStatus } from '@matatbread/matbot-plugin-api';
-import { parseSSE } from '@matatbread/matbot-providers-base';
+import { parseSSE, fetchWithRetry } from '@matatbread/matbot-providers-base';
 import { toAnthropicMessages, toAnthropicSystem, toAnthropicTools } from './convert.js';
 
 const DEFAULT_ENDPOINT   = 'https://api.anthropic.com';
@@ -58,7 +58,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     if (config.parameters?.['thinking']) betas.push('interleaved-thinking-2025-05-14');
     headers['anthropic-beta'] = betas.join(',');
 
-    const res = await fetch(`${endpoint}/v1/messages`, {
+    const res = await fetchWithRetry(`${endpoint}/v1/messages`, {
       method: 'POST',
       headers,
       body:   JSON.stringify(body),

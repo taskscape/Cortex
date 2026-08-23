@@ -127,8 +127,11 @@ function resolveExportsEntry(exports: unknown): string | undefined {
 
 const manifestCache = new Map<string, RemoteManifest>();
 
+// A stalled connection must not block a plugin install/refresh forever.
+const FETCH_TIMEOUT_MS = 30_000;
+
 async function fetchText(url: string): Promise<{ ok: boolean; status: number; text: string }> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   return { ok: res.ok, status: res.status, text: res.ok ? await res.text() : '' };
 }
 

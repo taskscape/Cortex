@@ -149,7 +149,7 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
           'Content-Type': 'application/json',
         },
         body:   JSON.stringify({ query, contexts }),
-        signal,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
       },
     );
 
@@ -170,12 +170,16 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
       messages: Array<unknown>;
       result:   { response: Array<{ id: number; score: number }> };
     };
-    const ranking = (await response.json()) as RerankResult;
-    if (!ranking.success) {
+    let ranking: RerankResult | undefined;
+    try {
+      ranking = await response.json() as RerankResult;
+    } catch { /* non-JSON body (e.g. an error page served with 200) */ }
+    if (!ranking?.success) {
       console.warn(
-        `[persist-ki-bge] BGE reranker returned success:false: ` +
-        `${JSON.stringify(ranking.errors).slice(0, 300)}. Falling back to heading scoring.`,
+        `[persist-ki-bge] BGE reranker returned ${ranking === undefined ? 'a non-JSON body' : 'success:false'}: ` +
+        `${ranking === undefined ? '' : JSON.stringify(ranking.errors).slice(0, 300)}. Falling back to heading scoring.`,
       );
+      return first ? [first.entry] : [];
     }
     const ranked = ranking.success
       ? ranking.result.response
