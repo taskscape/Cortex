@@ -86,6 +86,15 @@ Useful Windows service switches:
 | `npm run eval:cortex -- <suite-id> [--candidate <version>] [--provider <provider>] [--url <base-url>] [--junit <path>]` | Run a persisted regression suite through the Cortex tool endpoint, print the gate result, optionally write JUnit XML, and return a failing process status when the gate fails. |
 | `npm run verify:openai` | Verify the current OpenAI API key with the configured test script. |
 
+The Workspace RAG V2 PostgreSQL tests are opt-in because they need a live
+database. They create and drop their own `workspace_rag_v2_*_<pid>` schemas and
+never touch the configured schema. They cover atomic publication, RLS, and
+interrupted-scan recovery (resumption, checkpoint publication, and pruning):
+
+```powershell
+$env:CORTEX_RAG_V2_POSTGRES_INTEGRATION = "1"; node --test tests\workspace-rag-v2-postgres.integration.test.mjs
+```
+
 First Playwright setup on a machine:
 
 ```powershell

@@ -95,6 +95,10 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
   assert.equal(status.job.addedFiles, 1);
   assert.equal(status.job.discoveryComplete, true);
   assert.equal(status.watcher.state, "active");
+  assert.equal(status.indexedDocuments, 1, "status reports the documents held in the database");
+  assert.equal(status.job.totalFiles, 1, "the denominator is counted before the scan starts");
+  assert.equal(status.job.resumedFiles, 0);
+  assert.equal(status.job.publishedCheckpoints, 0, "a corpus below the checkpoint interval publishes once");
 
   const missingRoot = path.join(root, "missing-root");
   await execute(tool, { action: "configure", contextName: "Contracts", paths: [docs, missingRoot] });

@@ -163,7 +163,9 @@ let workspaceRagStatus = {
     state: "active_hybrid_complete", totalFiles: 2, processedFiles: 2,
     addedFiles: 2, changedFiles: 0, unchangedFiles: 0, removedFiles: 0,
     discoveryComplete: true, deletionsDeferred: false,
+    resumedFiles: 0, publishedCheckpoints: 0,
   },
+  indexedDocuments: 2,
   lastSuccessfulReconcileAt: now(),
   summaries: { enabled: false, queued: 0, active: 0, completed: 0, failed: 0 },
   watcher: { state: "active", watchedRoots: 1, pendingChanges: false, reconcileQueued: false },
@@ -2235,8 +2237,11 @@ async function handleTool(res, name, rawInput) {
           unchangedFiles: 0,
           removedFiles: 0,
           discoveryComplete: !context.paths.length,
+          resumedFiles: context.paths.length ? 5 : 0,
+          publishedCheckpoints: context.paths.length ? 1 : 0,
           ...(context.paths.length ? { currentPath: "C:\\Projects\\Cortex\\docs\\retrieval-probe.md" } : {}),
         },
+        indexedDocuments: context.paths.length ? 7 : 0,
         watcher: { state: "active", watchedRoots: context.paths.length, pendingChanges: context.paths.length > 0, reconcileQueued: false },
         message: context.paths.length ? "Workspace RAG V2 reconciliation is running." : "Workspace RAG V2 published an empty context."
       });

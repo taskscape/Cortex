@@ -80,9 +80,9 @@ function quoteRole(value: string): string {
 function settingsFromEnv(): PostgresSettings {
   const connectionString = process.env['CORTEX_RAG_POSTGRES_URL']?.trim();
   const poolConfig: PoolConfig = {
-    max: 8,
+    max: Number(process.env['CORTEX_RAG_V2_POOL_MAX'] ?? 8),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 3_000,
+    connectionTimeoutMillis: Number(process.env['CORTEX_RAG_V2_POOL_CONNECTION_TIMEOUT_MS'] ?? 30_000),
   };
   if (connectionString) poolConfig.connectionString = connectionString;
   else {
@@ -137,9 +137,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
 
   constructor(settings = settingsFromEnv()) {
     this.pool = new Pool(settings.poolConfig);
+    this.pool.on('error', error => {
+      console.warn(`[workspace-rag-v2] idle postgres client error: ${error instanceof Error ? error.message : String(error)}`);
+    });
     this.migrationPool = settings.migrationPoolConfig
       ? new Pool({ ...settings.migrationPoolConfig, max: 2 })
       : undefined;
+    this.migrationPool?.on('error', error => {
+      console.warn(`[workspace-rag-v2] idle postgres migration client error: ${error instanceof Error ? error.message : String(error)}`);
+    });
     this.schema = settings.schema;
     this.schemaSql = quoteIdentifier(settings.schema);
     const indexMode = process.env['CORTEX_RAG_V2_VECTOR_INDEX_MODE'];

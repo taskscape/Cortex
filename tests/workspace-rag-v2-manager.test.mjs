@@ -425,6 +425,13 @@ test("workspace RAG V2 resumes the generation an interrupted run left behind", a
   assert.equal(interrupted.status.activeGenerationId, undefined, "an interrupted scan publishes nothing");
   assert.equal(interrupted.status.indexedDocuments, 0);
 
+  const held = await repository.listFingerprints(workspace.id, context.id, interrupted.generationId);
+  assert.deepEqual(
+    held.map(value => path.basename(value.path)).sort(),
+    ["a.md", "b.md", "c.md"],
+    "only files ingested end to end join the generation; the in-flight file does not",
+  );
+
   const restarted = new WorkspaceRagV2Manager(repository, testEmbedder());
   t.after(() => restarted.close());
   const resumedJob = restarted.startIngestion(workspace, context, "startup");

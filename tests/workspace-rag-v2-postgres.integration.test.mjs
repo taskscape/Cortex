@@ -239,10 +239,22 @@ integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes 
     "the interrupted scan leaves a published generation behind",
   );
   assert.ok(interruptedStatus.indexedDocuments >= 2);
+  const held = await repository.listFingerprints(
+    workspace.id, context.id, interruptedJob.generationId,
+  );
   assert.equal(
-    (await repository.listFingerprints(workspace.id, context.id, interruptedJob.generationId)).length,
+    held.length,
     interruptedStatus.indexedDocuments,
     "generation-scoped fingerprints match the documents the generation holds",
+  );
+  assert.equal(
+    held.length,
+    interruptedStatus.job.processedFiles,
+    "the file that was mid-ingest when the run died never joined the generation",
+  );
+  assert.ok(
+    held.every(value => typeof value.modifiedAt === "string"),
+    "stored mtimes come back as ISO strings so the unchanged check can compare them",
   );
 
   const resumedJob = restarted.startIngestion(workspace, context, "startup");

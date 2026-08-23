@@ -879,7 +879,14 @@ class WorkspaceRagManager {
           );
           state.currentJob = job;
           await this.v2!.waitForIngestion(workspace.id, context.id);
-          const status = await this.v2!.status(this.v2Mode, this.v2Workspace(workspace), latestContext);
+          let status: RagV2Status;
+          try {
+            status = await this.v2!.status(this.v2Mode, this.v2Workspace(workspace), latestContext);
+          } catch (error) {
+            state.lastError = errorMessage(error);
+            console.warn(`[workspace-rag-v2] status check failed for ${workspace.id}/${context.id}: ${errorMessage(error)}`);
+            continue;
+          }
           const terminal = status.job;
           if (terminal?.state === 'retryable_failure' || terminal?.state === 'permanent_failure') {
             state.lastError = terminal.message ?? `Workspace RAG V2 reconciliation ended in ${terminal.state}.`;
@@ -887,7 +894,10 @@ class WorkspaceRagManager {
             delete state.lastError;
           }
         }
-      })().finally(() => {
+      })().catch(error => {
+        state.lastError = errorMessage(error);
+        console.warn(`[workspace-rag-v2] reconciliation loop failed for ${workspace.id}/${context.id}: ${errorMessage(error)}`);
+      }).finally(() => {
         delete state.promise;
         if (state.pending && !this.disposed) {
           void this.requestV2Reconcile(workspace, context, 'retry', false).catch(error => {

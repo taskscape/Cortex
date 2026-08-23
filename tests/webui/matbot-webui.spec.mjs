@@ -957,6 +957,9 @@ test("MISSING-03/MISSING-12 workspace RAG configuration panel saves paths and sh
   await expect(page.locator("#workspace-rag-status")).toContainText("embedding");
   await expect(page.locator("#workspace-rag-status")).toContainText("67%");
   await expect(page.locator("#workspace-rag-status")).toContainText("2/3 files");
+  await expect(page.locator("#workspace-rag-status")).toContainText("7 indexed in database");
+  await expect(page.locator("#workspace-rag-status")).toContainText("resumed 5 from interrupted run");
+  await expect(page.locator("#workspace-rag-status")).toContainText("1 checkpoint published");
   await expect(page.locator("#workspace-rag-status")).toContainText("watcher active (pending)");
   await expect(page.locator("#workspace-rag-current-file")).toContainText("retrieval-probe.md");
 
