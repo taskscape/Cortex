@@ -186,8 +186,13 @@ rebuilds them automatically during each affected workspace's next scan. Set
 restore full precision for every workspace.
 
 For large workspaces, Cortex streams each Markdown file within a bounded parser
-budget, rate-limits derivative and source-registry work, and stores
-high-cardinality source/graph metadata in WAL-mode SQLite.
+budget, keeps embedding batches in flight while Postgres writes and parsing
+continue (`CORTEX_RAG_V2_EMBED_PIPELINE_DEPTH`), ingests bulk backlogs several
+files at once with adaptive file concurrency that drops back to sequential for
+small incremental scans (`CORTEX_RAG_V2_FILE_CONCURRENCY`), rate-limits
+derivative and source-registry work, and stores high-cardinality
+source/graph metadata in WAL-mode SQLite. See
+`docs\configuration.md` for the full tuning surface.
 
 1. Stop Cortex before changing the model:
 

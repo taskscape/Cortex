@@ -1,14 +1,16 @@
 /**
  * File-index HTTP service entry point. Exposes `/health`, `/index` (re-index a
  * configured workspace root, serialised through an internal queue), and
- * `/search` (scored keyword search over the persisted store). This module has
- * no exports; it loads any existing store, then listens on `FILE_INDEX_PORT`
- * (default 8877) when run directly.
+ * `/search` (scored keyword search over the persisted store). Requests from
+ * non-loopback `Host` headers are rejected, and an optional shared-secret
+ * header (`x-cortex-token`, enabled via `CORTEX_FILE_INDEX_TOKEN`) guards every
+ * route except `/health`. This module has no exports; it loads any existing
+ * store, then listens on `FILE_INDEX_PORT` (default 8877) when run directly.
  */
 
 import http from "node:http";
 import path from "node:path";
-import { isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
+import { assertLoopbackRequest, assertSharedToken, isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from "@local-agent/http-utils";
 import { indexExclusions, loadSecurityPolicy, loadWorkspaceConfig } from "@local-agent/paths";
 import { resolveIndexRoot } from "./index-root.js";
 import { indexRoot, summarize } from "./indexer.js";
@@ -16,6 +18,8 @@ import { searchChunks } from "./search.js";
 import { loadStore, saveStore } from "./store.js";
 
 const port = Number(process.env.FILE_INDEX_PORT ?? 8877);
+const host = process.env.CORTEX_FILE_INDEX_HOST ?? "127.0.0.1";
+const token = process.env.CORTEX_FILE_INDEX_TOKEN;
 const storePath = path.resolve(process.env.FILE_INDEX_STORE ?? "local-agent/file-index/data/index.json");
 const workspaceConfigPath = path.resolve(process.env.WORKSPACES_CONFIG ?? "local-agent/config/workspaces.json");
 const securityPolicyPath = path.resolve(process.env.SECURITY_POLICY_CONFIG ?? "local-agent/config/security-policy.json");
@@ -25,6 +29,7 @@ let indexQueue: Promise<void> = Promise.resolve();
 
 const server = http.createServer(async (request, response) => {
   try {
+    assertLoopbackRequest(request);
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
     const signal = requestAbortSignal(request);
 
@@ -34,6 +39,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    assertSharedToken(request, token);
     if (request.method === "POST" && url.pathname === "/index") {
       const body = await readJsonBody<{ root?: string }>(request, { validate: isIndexRequest });
       const [config, policy] = await Promise.all([
@@ -89,8 +95,8 @@ async function enqueueIndex(build: (current: Awaited<typeof storeSnapshot>) => P
   return result;
 }
 
-server.listen(port, () => {
-  console.log(`file-index listening on http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`file-index listening on http://${host}:${port}`);
 });
 
 function isIndexRequest(value: unknown): value is { root?: string } {

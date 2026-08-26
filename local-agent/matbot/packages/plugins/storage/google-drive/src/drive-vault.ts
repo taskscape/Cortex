@@ -16,8 +16,10 @@ interface VaultDoc {
  * live in Drive and follow the user across machines). Secrets are held in memory for synchronous
  * `hasKey`/`findByValue`/`resolve`; every `writeSecret` flushes the whole map back to the store.
  *
- * Stored in plaintext, matching the localStorage vault's posture — adequate for a single-user realm,
- * not for shared storage. (WebCryptoVault's AES-GCM helpers are the eventual upgrade path.)
+ * Stored in plaintext (in memory and in the Drive document), matching the
+ * localStorage vault's posture — adequate for a single-user realm, not for
+ * shared storage. No encryption is wired in today; WebCryptoVault exports
+ * standalone AES-GCM helpers as a possible future upgrade path.
  */
 /**
  * A {@link Vault} storing secrets in a single Drive document, with

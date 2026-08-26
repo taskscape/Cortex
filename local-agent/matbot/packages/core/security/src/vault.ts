@@ -111,10 +111,11 @@ export class VaultImpl implements Vault {
    */
   scrub(text: string): string {
     let result = text;
-    for (const value of this.store.values()) {
-      if (value.length >= 4) {
-        result = result.split(value).join('[REDACTED]');
-      }
+    // Longest first: a shorter secret that is a substring of a longer one must not pre-redact
+    // (and so mask) the longer value's occurrences.
+    const values = [...this.store.values()].filter(v => v.length >= 4).sort((a, b) => b.length - a.length);
+    for (const value of values) {
+      result = result.split(value).join('[REDACTED]');
     }
     return result;
   }

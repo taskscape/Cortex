@@ -6,11 +6,16 @@
  *   - Block sequences (- item)
  *   - Scalar types: string, number, boolean, null
  *   - Quoted strings (single and double)
- *   - Comments (# ...)
+ *   - Comments (# ...), ignored inside quoted scalars
+ *   - Sequences of mappings (- name: x)
  *
  * Does NOT support anchors, aliases, flow syntax, or ${NAME} expansion.
  * ${NAME} placeholders are left intact for the Vault to resolve.
- * Supports literal block scalars (|) and folded block scalars (>).
+ * Supports literal block scalars (|) and folded block scalars (>), with
+ * clip/strip/keep chomping indicators. Explicit-indentation digits are accepted
+ * but indentation is always inferred from the first content line. Because the
+ * tokenizer drops blank lines before block collection, `|+` cannot preserve
+ * trailing blank lines beyond the final newline.
  */
 
 type YamlScalar = string | number | boolean | null;
@@ -24,10 +29,30 @@ interface Token {
   raw:    string;
 }
 
+function stripComment(line: string): string {
+  let quote: '"' | "'" | undefined;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (quote !== undefined) {
+      if (quote === '"') {
+        if (ch === '\\') i++;
+        else if (ch === '"') quote = undefined;
+      } else if (ch === "'") {
+        quote = undefined;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '#') {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
 function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
   for (const line of text.split('\n')) {
-    const stripped = line.replace(/#.*$/, '').trimEnd();
+    const stripped = stripComment(line).trimEnd();
     if (stripped.trim() === '') continue;
     const indent = stripped.length - stripped.trimStart().length;
     tokens.push({ indent, raw: stripped.trimStart() });
@@ -51,6 +76,21 @@ function parseScalar(raw: string): YamlScalar {
   return raw;
 }
 
+function blockScalarHeader(rest: string): { folded: boolean; chomp: 'clip' | 'strip' | 'keep' } | undefined {
+  if (rest === '') return undefined;
+  const style = rest[0];
+  if (style !== '|' && style !== '>') return undefined;
+  let digits = '';
+  let chomp: 'clip' | 'strip' | 'keep' = 'clip';
+  for (const c of rest.slice(1)) {
+    if (c === '-') chomp = 'strip';
+    else if (c === '+') chomp = 'keep';
+    else if (c >= '1' && c <= '9' && digits === '') digits = c;
+    else return undefined;
+  }
+  return { folded: style === '>', chomp };
+}
+
 function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlValue; next: number } {
   if (pos >= tokens.length) return { value: null, next: pos };
 
@@ -66,6 +106,13 @@ function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlV
         const itemRaw = tok.raw.slice(2).trim();
         if (itemRaw === '') {
           const sub = parse(tokens, i + 1, tok.indent + 2);
+          items.push(sub.value);
+          i = sub.next;
+        } else if (itemRaw.includes(': ') || itemRaw.endsWith(':')) {
+          // Re-anchor the inline mapping start past the "- " prefix and reuse the
+          // block-mapping parser, so continuation lines bind to the same record.
+          tokens[i] = { indent: tok.indent + 2, raw: itemRaw };
+          const sub = parse(tokens, i, tok.indent + 2);
           items.push(sub.value);
           i = sub.next;
         } else {
@@ -91,7 +138,8 @@ function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlV
       const key      = tok.raw.slice(0, colonIdx).trim();
       const rest     = tok.raw.slice(colonIdx + 1).trimStart();
 
-      if (rest === '|' || rest === '>') {
+      const header = blockScalarHeader(rest);
+      if (header !== undefined) {
         const blockIndent = tok.indent + 2;
         const lines: string[] = [];
         let j = i + 1;
@@ -100,9 +148,10 @@ function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlV
           lines.push(' '.repeat(t.indent - blockIndent) + t.raw);
           j++;
         }
-        map[key] = rest === '|'
-          ? lines.join('\n') + (lines.length > 0 ? '\n' : '')
-          : lines.join(' ');
+        const joined = header.folded ? lines.join(' ') : lines.join('\n');
+        map[key] = header.chomp === 'strip'
+          ? joined
+          : joined + (lines.length > 0 ? '\n' : '');
         i = j;
       } else if (rest === '') {
         const sub = parse(tokens, i + 1, tok.indent + 2);

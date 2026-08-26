@@ -151,33 +151,52 @@ async function removeContainer(name: string): Promise<void> {
   }
 }
 
-async function ensureContainerRunning(cfg: ContainerConfig): Promise<void> {
-  let running: string;
+// Concurrent exec calls must not both observe "container missing" and race duplicate `docker run`
+// creates under the same --name. One chain per container name; failures never poison the chain.
+const provisionLocks = new Map<string, Promise<unknown>>();
+
+/** Serialize async work keyed by name — later callers queue behind earlier ones even across failures. */
+export async function withContainerLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const tail    = provisionLocks.get(name) ?? Promise.resolve();
+  const result  = tail.then(fn, fn);
+  const settled = result.catch(() => {});
+  provisionLocks.set(name, settled);
   try {
-    running = await dockerExec(['inspect', '--format', '{{.State.Running}}', cfg.name]);
-  } catch {
-    // Container doesn't exist — create and start it.
-    const dataPath = `${cfg.projectRoot}/${cfg.dataSubdir}`;
-    await mkdir(dataPath, { recursive: true });
+    return await result;
+  } finally {
+    if (provisionLocks.get(name) === settled) provisionLocks.delete(name);
+  }
+}
 
-    const args = ['run', '-d', '--name', cfg.name];
-    if (cfg.network !== undefined) args.push('--network', cfg.network);
-    for (const server of resolveDnsServers(cfg.dns)) {
-      args.push('--dns', server);
+async function ensureContainerRunning(cfg: ContainerConfig): Promise<void> {
+  await withContainerLock(cfg.name, async () => {
+    let running: string;
+    try {
+      running = await dockerExec(['inspect', '--format', '{{.State.Running}}', cfg.name]);
+    } catch {
+      // Container doesn't exist — create and start it.
+      const dataPath = `${cfg.projectRoot}/${cfg.dataSubdir}`;
+      await mkdir(dataPath, { recursive: true });
+
+      const args = ['run', '-d', '--name', cfg.name];
+      if (cfg.network !== undefined) args.push('--network', cfg.network);
+      for (const server of resolveDnsServers(cfg.dns)) {
+        args.push('--dns', server);
+      }
+      args.push(
+        '-v', `${cfg.projectRoot}:${cfg.mountPoint}:ro`,
+        '-v', `${dataPath}:${cfg.mountPoint}/${cfg.dataSubdir}`,
+        cfg.image,
+        'sleep', 'infinity',
+      );
+      await dockerExec(args);
+      return;
     }
-    args.push(
-      '-v', `${cfg.projectRoot}:${cfg.mountPoint}:ro`,
-      '-v', `${dataPath}:${cfg.mountPoint}/${cfg.dataSubdir}`,
-      cfg.image,
-      'sleep', 'infinity',
-    );
-    await dockerExec(args);
-    return;
-  }
 
-  if (running !== 'true') {
-    await dockerExec(['start', cfg.name]);
-  }
+    if (running !== 'true') {
+      await dockerExec(['start', cfg.name]);
+    }
+  });
 }
 
 // ── Management tool ────────────────────────────────────────────────────────────
@@ -200,24 +219,57 @@ function containerAffectingChange(a: ContainerConfig, b: ContainerConfig): boole
   return a.name !== b.name || !sameStrings(a.dns, b.dns);
 }
 
-type BashConfigInput = { action: string } & BashConfigOverrides;
+/** Docker container names: letters/digits first, then letters, digits, `_`, `.`, `-`. */
+const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+function describeValue(v: unknown): string {
+  const s = JSON.stringify(v);
+  return s ?? String(v);
+}
 
 async function* bashConfigExecutor(
   input: unknown,
   settings: PluginSettings,
 ): AsyncIterable<ToolEvent> {
-  const { action, dns, name, maxOutputBytes } = input as BashConfigInput;
+  // Validate at the boundary instead of trusting the input cast — direct invocations (e.g. over
+  // HTTP) bypass the opt-in json-validation hook entirely. Unknown fields are ignored.
+  const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {};
+
+  const action = args['action'];
+  if (action !== 'get' && action !== 'set' && action !== 'restart') {
+    yield { type: 'error', message: `"action" must be "get", "set", or "restart"; got ${describeValue(action)}.` };
+    return;
+  }
 
   if (action === 'set') {
-    if (maxOutputBytes !== undefined && (!Number.isFinite(maxOutputBytes) || maxOutputBytes < 1)) {
-      yield { type: 'error', message: '"maxOutputBytes" must be a positive number.' };
-      return;
+    const overrides: BashConfigOverrides = {};
+
+    if ('dns' in args) {
+      const v = args['dns'];
+      if (!Array.isArray(v) || !v.every(x => typeof x === 'string' && x.length > 0)) {
+        yield { type: 'error', message: '"dns" must be an array of non-empty strings (DNS server IPs, or the token "host").' };
+        return;
+      }
+      overrides.dns = v;
     }
 
-    const overrides: BashConfigOverrides = {};
-    if (dns !== undefined) overrides.dns = dns;
-    if (name !== undefined) overrides.name = name;
-    if (maxOutputBytes !== undefined) overrides.maxOutputBytes = maxOutputBytes;
+    if ('name' in args) {
+      const v = args['name'];
+      if (typeof v !== 'string' || v.length > 128 || !CONTAINER_NAME_PATTERN.test(v)) {
+        yield { type: 'error', message: '"name" must start with a letter or digit and use only letters, digits, "_", ".", or "-" (max 128 chars).' };
+        return;
+      }
+      overrides.name = v;
+    }
+
+    if ('maxOutputBytes' in args) {
+      const v = args['maxOutputBytes'];
+      if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < 1) {
+        yield { type: 'error', message: '"maxOutputBytes" must be an integer >= 1.' };
+        return;
+      }
+      overrides.maxOutputBytes = v;
+    }
 
     if (Object.keys(overrides).length === 0) {
       yield { type: 'error', message: 'At least one of "dns", "name", or "maxOutputBytes" must be provided when action is "set".' };
@@ -299,6 +351,8 @@ function spawnAndStream(
     timeout?:   number;
     signal:     AbortSignal;
     maxBytes:   number;
+    /** Payload written to the child's stdin before closing it (e.g. the script to execute). */
+    stdin?:     string;
     /** Best-effort kill of the in-container process group (docker exec won't propagate our kill). */
     terminate?: () => void;
   },
@@ -313,6 +367,12 @@ function spawnAndStream(
   };
 
   const child = spawn(command, args, { env: opts.env, shell: false });
+
+  if (opts.stdin !== undefined) {
+    // EPIPE if the child dies before consuming stdin — the close handler reports the failure.
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(opts.stdin);
+  }
 
   // docker exec won't forward a signal to the in-container process, so stopping means both killing
   // the process group inside the container (terminate) and detaching the local client (child.kill).
@@ -453,11 +513,12 @@ function createContainerExecutor(settings: PluginSettings) {
       const containerPidfile  = `${containerPidDir}/${execId}.pid`;
       const hostPidfile       = `${hostPidDir}/${execId}.pid`;
 
-      // Pass the script and pidfile path by env to avoid quoting; run under setsid so the script
-      // bash leads a fresh process group (pgid == its pid), record that pid, then exec the script.
-      // On timeout/abort the host kills the negative pid — the whole group, children included.
+      // Pass the pidfile path by env and the SCRIPT VIA STDIN (never as an argv/env value: it
+      // fails past ~32 KB on Windows and is visible in process listings). Run under setsid so the
+      // script bash leads a fresh process group (pgid == its pid), record that pid, then read the
+      // script from stdin (`bash -s`). On timeout/abort the host kills the negative pid — the
+      // whole group, children included.
       const args = ['exec', '-i', '-w', cfg.execCwd,
-        '-e', `MATBOT_SCRIPT=${script}`,
         '-e', `MATBOT_PIDFILE=${containerPidfile}`,
       ];
       for (const [k, v] of Object.entries(env ?? {})) {
@@ -465,7 +526,7 @@ function createContainerExecutor(settings: PluginSettings) {
       }
       // setsid -w: -w keeps the setsid parent waiting so docker exec stays attached for streaming;
       // without it setsid detaches and the exec returns immediately, orphaning the script.
-      args.push(cfg.name, 'setsid', '-w', 'bash', '-c', 'echo $$ > "$MATBOT_PIDFILE"; exec bash -c "$MATBOT_SCRIPT"');
+      args.push(cfg.name, 'setsid', '-w', 'bash', '-c', 'echo $$ > "$MATBOT_PIDFILE"; exec bash -s');
 
       // terminate fires the group-kill; capture its promise so cleanup waits for the PID to be read
       // before deleting the pidfile (otherwise rm could win the race and killGroup reads ENOENT).
@@ -476,6 +537,7 @@ function createContainerExecutor(settings: PluginSettings) {
           env: {},
           signal: ctx.signal,
           maxBytes: cfg.maxOutputBytes,
+          stdin: script,
           terminate: () => { killPromise = killGroup(cfg.name, hostPidfile); },
         });
       } finally {

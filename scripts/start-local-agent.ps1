@@ -3,13 +3,18 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipCudaIngestion,
     [switch]$NoRestartMatbot,
-    [string]$MatbotCommand = $env:MATBOT_COMMAND
+    [string]$MatbotCommand = $env:MATBOT_COMMAND,
+    [string]$MatbotWorkingDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ComposeFile = Join-Path $Root "local-agent\docker\mem0\docker-compose.yml"
 $DockerEnvFile = Join-Path (Split-Path $ComposeFile) ".env"
+
+if (-not $MatbotWorkingDirectory) {
+    $MatbotWorkingDirectory = $Root
+}
 
 Set-Location $Root
 
@@ -19,11 +24,29 @@ function Test-PortListening($Port) {
     return $null -ne $listener
 }
 
+# Native commands ignore $ErrorActionPreference = "Stop"; fail on their exit codes.
+function Invoke-CheckedCommand($Command, $Arguments) {
+    Write-Host "> $Command $($Arguments -join ' ')"
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Command exited with code $LASTEXITCODE."
+    }
+}
+
 function Stop-PortListeners($Port, $Name) {
+    # Port-based stopping must never force-kill an unrelated application that
+    # happens to own the port: verify the image name first.
+    $expectedNames = @("node", "powershell", "pwsh", "docker-compose")
     $processIds = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($processId in $processIds) {
         if (-not $processId) { continue }
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if (-not $process) { continue }
+        if ($expectedNames -notcontains $process.ProcessName.ToLowerInvariant()) {
+            Write-Warning "Skipping $Name listener on port $Port (PID $processId runs '$($process.ProcessName)', not a recognized Cortex process)."
+            continue
+        }
         Write-Host "Stopping $Name listener on port $Port (PID $processId)"
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -150,14 +173,14 @@ function Wait-PostgresReady($HostName, $Port, $TimeoutSec) {
 Set-PostgresRagEnv
 
 if (-not $SkipBuild) {
-    npm run build
+    Invoke-CheckedCommand npm @("run", "build")
 }
 
 if (-not $SkipDocker) {
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         if (Test-CudaIngestionAvailable) {
             Write-Host "CUDA-capable Docker runtime detected. Starting Mem0 stack with workspace-rag CUDA embeddings."
-            docker compose -f $ComposeFile --profile cuda up -d
+            Invoke-CheckedCommand docker @("compose", "-f", $ComposeFile, "--profile", "cuda", "up", "-d")
             Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
@@ -169,7 +192,7 @@ if (-not $SkipDocker) {
         }
         else {
             Write-Host "CUDA-capable Docker runtime not detected. Starting Mem0 stack without CUDA ingestion."
-            docker compose -f $ComposeFile up -d
+            Invoke-CheckedCommand docker @("compose", "-f", $ComposeFile, "up", "-d")
             Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
                 $env:CORTEX_RAG_DISABLE_CUDA = "1"
@@ -237,10 +260,15 @@ if ($MatbotCommand) {
         if (Test-PortListening $matbotMemoryPort) {
             Stop-PortListeners $matbotMemoryPort "Matbot memory browser"
         }
-        $interactiveMatbotCommand = "Remove-Item Env:CORTEX_SERVICE_SUPERVISED -ErrorAction SilentlyContinue; $MatbotCommand"
+        # The service wrapper marks supervised children with CORTEX_SERVICE_SUPERVISED;
+        # an interactively launched Matbot must not inherit it. Clearing it here means
+        # the child no longer needs a shell prefix for that, and $MatbotCommand is
+        # passed to the child verbatim: nothing is interpolated into the -Command
+        # string, so repository paths containing quotes cannot break quoting.
+        Remove-Item Env:CORTEX_SERVICE_SUPERVISED -ErrorAction SilentlyContinue
         Start-Process -FilePath "powershell" `
-            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $interactiveMatbotCommand `
-            -WorkingDirectory $Root `
+            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $MatbotCommand `
+            -WorkingDirectory $MatbotWorkingDirectory `
             -WindowStyle Hidden `
             -RedirectStandardOutput "local-agent\logs\matbot.out.log" `
             -RedirectStandardError "local-agent\logs\matbot.err.log"

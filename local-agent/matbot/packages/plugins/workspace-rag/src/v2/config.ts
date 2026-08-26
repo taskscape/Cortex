@@ -2,7 +2,7 @@ import type { RagV2IngestionPolicy, RagV2Mode } from './types.js';
 
 const MIB = 1024 * 1024;
 
-function positiveInteger(value: string | undefined, fallback: number): number {
+export function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
@@ -20,7 +20,7 @@ function boundedInteger(value: string | undefined, fallback: number, min: number
 
 /**
  * Reads the v2 mode from the environment.
- * @returns The configured {@link RagV2Mode} (default 'off').
+ * @returns The configured {@link RagV2Mode} (default 'primary').
  */
 export function ragV2ModeFromEnv(): RagV2Mode {
   const value = String(process.env['CORTEX_RAG_V2_MODE'] ?? 'primary').trim().toLowerCase();
@@ -50,10 +50,9 @@ export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
   };
 }
 
-/** Files ingested between checkpoint publications; 0 publishes only when the whole scan completes. */
 /**
  * Reads the checkpoint publication interval (files) from the environment.
- * @returns Number of files between checkpoints (0 disables).
+ * @returns Number of files between checkpoints (0 publishes only when the whole scan completes).
  */
 export function ragV2CheckpointFilesFromEnv(): number {
   return nonNegativeInteger(process.env['CORTEX_RAG_V2_CHECKPOINT_FILES'], 250);
@@ -119,4 +118,36 @@ export function ragV2ObjectRetentionFromEnv(): {
 export function ragV2ColbertUrlFromEnv(): string | undefined {
   const value = process.env['CORTEX_RAG_V2_COLBERT_URL']?.trim();
   return value || undefined;
+}
+
+/**
+ * Reads the object-store root override from the environment.
+ * @returns The configured root, or undefined when per-workspace defaults apply.
+ */
+export function ragV2ObjectRootFromEnv(): string | undefined {
+  return process.env['CORTEX_RAG_V2_OBJECT_ROOT']?.trim() || undefined;
+}
+
+/**
+ * Reads the routing-summary concurrency cap from the environment.
+ * @returns Concurrent summarizer calls permitted (clamped 1..8, default 4).
+ */
+export function ragV2SummaryConcurrencyFromEnv(): number {
+  return boundedInteger(process.env['CORTEX_RAG_V2_SUMMARY_CONCURRENCY'], 4, 1, 8);
+}
+
+/**
+ * Reads the routing-summary queue bound from the environment.
+ * @returns Maximum queued summary tasks (clamped 16..4096, default 256).
+ */
+export function ragV2SummaryQueueLimitFromEnv(): number {
+  return boundedInteger(process.env['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT'], 256, 16, 4_096);
+}
+
+/**
+ * Reads the audit-record retention window from the environment.
+ * @returns Days to retain retrieval/regex audit rows (0 disables pruning).
+ */
+export function ragV2AuditRetentionDaysFromEnv(): number {
+  return nonNegativeInteger(process.env['CORTEX_RAG_V2_AUDIT_RETENTION_DAYS'], 30);
 }

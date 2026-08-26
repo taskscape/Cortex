@@ -4,11 +4,15 @@ import path from 'node:path';
 import { analyzeCensusFile, RagV2HyperLogLog } from './census.js';
 import {
   ragV2ObjectRetentionFromEnv,
+  ragV2AuditRetentionDaysFromEnv,
   ragV2CheckpointFilesFromEnv,
   ragV2ColbertUrlFromEnv,
+  ragV2ObjectRootFromEnv,
   ragV2PolicyFromEnv,
   ragV2RerankerUrlFromEnv,
   ragV2RrfFromEnv,
+  ragV2SummaryConcurrencyFromEnv,
+  ragV2SummaryQueueLimitFromEnv,
 } from './config.js';
 import {
   evaluateRagV2Results,
@@ -18,6 +22,7 @@ import {
 import { RagV2ObjectStore } from './object-store.js';
 import { parseMarkdownStream } from './parser.js';
 import { RagV2RateLimiter } from './rate-limiter.js';
+import { assertSafeRegex } from './regex-evaluator.js';
 import type { RagV2DocumentFingerprint, RagV2EmbeddingRecord, RagV2Repository } from './repository.js';
 import { RagV2RetrievalEngine } from './retrieval.js';
 import type { RagV2SemanticServices, RagV2SummaryInput } from './semantic.js';
@@ -383,6 +388,7 @@ export class WorkspaceRagV2Manager {
     priorityPassageId?: string;
   }>();
   private lazyWorker: Promise<void> | undefined;
+  private readonly lazyWorkerController = new AbortController();
   private readonly retrieval: Map<string, RagV2RetrievalEngine> = new Map();
   private readonly lastSuccessfulReconcile = new Map<string, string>();
   private readonly policy = ragV2PolicyFromEnv();
@@ -399,8 +405,8 @@ export class WorkspaceRagV2Manager {
   private readonly summarySpaceWaiters: Array<() => void> = [];
   private readonly summaryIdleWaiters: Array<() => void> = [];
   private readonly summaryController = new AbortController();
-  private readonly summaryConcurrency = Math.max(1, Math.min(8, Number(process.env['CORTEX_RAG_V2_SUMMARY_CONCURRENCY'] ?? 4) || 4));
-  private readonly summaryQueueLimit = Math.max(16, Math.min(4_096, Number(process.env['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT'] ?? 256) || 256));
+  private readonly summaryConcurrency = ragV2SummaryConcurrencyFromEnv();
+  private readonly summaryQueueLimit = ragV2SummaryQueueLimitFromEnv();
   private summaryActive = 0;
   private summaryCompleted = 0;
   private summaryFailed = 0;
@@ -436,6 +442,8 @@ export class WorkspaceRagV2Manager {
     this.summaryController.abort(new Error('Workspace RAG V2 manager is closing.'));
     this.summaryQueue.splice(0);
     await this.waitForSummaries();
+    this.lazyWorkerController.abort(new Error('Workspace RAG V2 manager is closing.'));
+    await this.lazyWorker?.catch(() => undefined);
     await this.repository.close();
   }
 
@@ -809,7 +817,7 @@ export class WorkspaceRagV2Manager {
     if (documentVersionIds.length === 0 || documentVersionIds.length > 50) {
       throw new Error('Workspace RAG V2 regex requires between 1 and 50 authorized document versions.');
     }
-    this.assertSafeRegex(pattern);
+    assertSafeRegex(pattern);
     const publication = await this.repository.activePublication(workspace.id, context.id);
     if (!publication) throw new Error('Workspace RAG V2 has no active publication for this context.');
     const startedAt = Date.now();
@@ -918,6 +926,9 @@ export class WorkspaceRagV2Manager {
     if (!publication) throw new Error('Workspace RAG V2 has no active publication for evaluation.');
     const runId = randomUUID();
     const createdAt = now();
+    // Search depth is capped at 25; metrics must report the k actually
+    // searched, not a requested k the corpus never produced.
+    const searchedK = Math.max(1, Math.min(k, 25));
     const results: Array<{
       testCase: RagV2EvaluationCase;
       evidence: Array<{
@@ -938,7 +949,7 @@ export class WorkspaceRagV2Manager {
         workspace,
         context,
         testCase.query,
-        { limit: Math.max(1, Math.min(k, 25)), variant },
+        { limit: searchedK, variant },
         signal,
       );
       results.push({
@@ -956,7 +967,7 @@ export class WorkspaceRagV2Manager {
         routedSectionIds: search.diagnostics.routedSectionIds,
       });
     }
-    const metrics = evaluateRagV2Results(results, k);
+    const metrics = evaluateRagV2Results(results, searchedK);
     const completedAt = now();
     await this.repository.saveEvaluationRun({
       id: runId,
@@ -966,7 +977,7 @@ export class WorkspaceRagV2Manager {
       embeddingSignature: this.embedder.info.signature,
       ...(this.rerankerUrl ? { rerankerModel: this.rerankerUrl } : {}),
       configuration: {
-        k,
+        k: searchedK,
         variant,
         cases: cases.map(value => ({ id: value.id, category: value.category })),
       },
@@ -1896,9 +1907,14 @@ export class WorkspaceRagV2Manager {
   }
 
   private objectStore(workspace: RagV2WorkspaceRef): RagV2ObjectStore {
+    if (!/^[A-Za-z0-9_-]{1,128}$/u.test(workspace.id)) {
+      throw new Error(
+        `Workspace RAG V2 workspace id must contain only [A-Za-z0-9_-] to root its object store safely: ${workspace.id}`,
+      );
+    }
     let store = this.objectStores.get(workspace.id);
     if (!store) {
-      const configured = process.env['CORTEX_RAG_V2_OBJECT_ROOT']?.trim();
+      const configured = ragV2ObjectRootFromEnv();
       const root = configured
         ? path.join(path.resolve(configured), workspace.id)
         : path.join(workspace.configDir, '.data', 'workspace-rag-v2');
@@ -1923,20 +1939,6 @@ export class WorkspaceRagV2Manager {
       `user:${principalId}`,
       ...groupIds.map(value => `group:${value}`),
     ];
-  }
-
-  private assertSafeRegex(pattern: string): void {
-    if (!pattern || pattern.length > 256) {
-      throw new Error('Workspace RAG V2 regex must contain between 1 and 256 characters.');
-    }
-    if (/\\[1-9]|\(\?<([=!])|\(\?P<|\([^)]*[+*][^)]*\)\s*[+*{]/u.test(pattern)) {
-      throw new Error('Workspace RAG V2 regex contains a prohibited backreference, lookbehind, or nested quantifier.');
-    }
-    try {
-      new RegExp(pattern, 'u');
-    } catch (error) {
-      throw new Error(`Workspace RAG V2 regex is invalid: ${error instanceof Error ? error.message : String(error)}`);
-    }
   }
 
   private retrievalEngine(workspace: RagV2WorkspaceRef): RagV2RetrievalEngine {
@@ -1982,16 +1984,21 @@ export class WorkspaceRagV2Manager {
   private startLazyWorker(): void {
     if (this.lazyWorker || this.lazySections.size === 0) return;
     this.lazyWorker = this.runLazyWorker()
-      .catch(error => console.warn(`[workspace-rag-v2] lazy embedding worker failed: ${error instanceof Error ? error.message : String(error)}`))
+      .catch(error => {
+        if (!this.lazyWorkerController.signal.aborted) {
+          console.warn(`[workspace-rag-v2] lazy embedding worker failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })
       .finally(() => {
         this.lazyWorker = undefined;
-        if (this.lazySections.size > 0) this.startLazyWorker();
+        if (!this.lazyWorkerController.signal.aborted && this.lazySections.size > 0) this.startLazyWorker();
       });
   }
 
   private async runLazyWorker(): Promise<void> {
+    const signal = this.lazyWorkerController.signal;
     const completedScopes = new Map<string, { workspaceId: string; contextId: string; generationId: string }>();
-    while (this.lazySections.size > 0) {
+    while (this.lazySections.size > 0 && !signal.aborted) {
       const next = this.lazySections.entries().next().value as [
         string,
         {
@@ -2031,9 +2038,9 @@ export class WorkspaceRagV2Manager {
           }));
           const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
           const pending = batch.filter(passage => !reused.has(passage.passageId));
-          await this.embeddingLimiter.consume(pending.length);
+          await this.embeddingLimiter.consume(pending.length, signal);
           const vectors = pending.length > 0
-            ? await this.embedder.embed(pending.map(passage => passage.text), 'document')
+            ? await this.embedder.embed(pending.map(passage => passage.text), 'document', signal)
             : [];
           const records: RagV2EmbeddingRecord[] = pending.map((passage, index) => ({
             level: 'passage' as const,
@@ -2046,7 +2053,9 @@ export class WorkspaceRagV2Manager {
             vector: vectors[index] ?? [],
           })).filter(record => record.vector.length === this.embedder.info.dimensions);
           await this.repository.putEmbeddings(records, this.embedder.info);
-        } catch {
+        } catch (error) {
+          if (signal.aborted) throw error;
+          console.warn(`[workspace-rag-v2] lazy embedding batch failed for section ${sectionId}: ${error instanceof Error ? error.message : String(error)}`);
           for (const passage of batch) passage.embeddingState = 'failed';
           await this.repository.appendPassages(batch);
           break;

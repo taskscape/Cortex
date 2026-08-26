@@ -1,6 +1,8 @@
+import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 const DEFAULT_MAX_JSON_BYTES = 1_000_000;
+const DEFAULT_TOKEN_HEADER = "x-cortex-token";
 
 /**
  * An error carrying an HTTP status code, thrown by request-handling helpers so
@@ -71,7 +73,9 @@ export async function readJsonBody<T>(request: IncomingMessage, options: ReadJso
 
 /**
  * Creates an {@link AbortSignal} that aborts when the HTTP client disconnects
- * before the request completes, so in-flight work can be cancelled.
+ * before the request completes, so in-flight work can be cancelled. The
+ * internal listeners are removed once the request closes, including on normal
+ * completion, so keep-alive connections do not accumulate listeners.
  *
  * @param request - The incoming request to observe.
  * @returns A signal that is aborted with a disconnect error if the client goes away.
@@ -79,13 +83,26 @@ export async function readJsonBody<T>(request: IncomingMessage, options: ReadJso
 export function requestAbortSignal(request: IncomingMessage): AbortSignal {
   const controller = new AbortController();
   const abort = (): void => {
+    cleanup();
     if (!controller.signal.aborted) controller.abort(new Error("HTTP client disconnected."));
   };
-  if (request.aborted) abort();
+  const onClose = (): void => {
+    if (!request.complete) {
+      abort();
+      return;
+    }
+    cleanup();
+  };
+  const cleanup = (): void => {
+    request.removeListener("aborted", abort);
+    request.removeListener("close", onClose);
+  };
+  if (request.aborted) {
+    abort();
+    return controller.signal;
+  }
   request.once("aborted", abort);
-  request.once("close", () => {
-    if (!request.complete) abort();
-  });
+  request.once("close", onClose);
   return controller.signal;
 }
 
@@ -108,15 +125,68 @@ export function sendJson(response: ServerResponse, status: number, payload: unkn
 
 /**
  * Sends a JSON error body derived from an unknown thrown value: uses the
- * status from an {@link HttpError}, otherwise 500.
+ * message and status from an {@link HttpError}; anything else is logged
+ * server-side (it may contain absolute paths or other internal detail) and
+ * reported to the client with a generic 500 message.
  *
  * @param response - The server response to write to.
- * @param error - The thrown value to report; its message (or string form) is
- * returned as the `error` field of the JSON payload.
+ * @param error - The thrown value to report; only {@link HttpError} messages
+ * are returned to the client in the `error` field of the JSON payload.
  */
 export function sendJsonError(response: ServerResponse, error: unknown): void {
-  const status = error instanceof HttpError ? error.status : 500;
-  sendJson(response, status, { error: error instanceof Error ? error.message : String(error) });
+  if (error instanceof HttpError) {
+    sendJson(response, error.status, { error: error.message });
+    return;
+  }
+  console.error("[http-utils] request failed:", error);
+  sendJson(response, 500, { error: "Internal server error." });
+}
+
+/**
+ * Checks that the request's `Host` header names the loopback origin
+ * (`127.0.0.1`, `localhost`, or `[::1]`, each with an optional port), as a
+ * defense against DNS-rebinding attacks against localhost-only services.
+ *
+ * @param request - The incoming HTTP request whose Host header is inspected.
+ * @throws HttpError 403 when the Host header is missing or foreign.
+ */
+export function assertLoopbackRequest(request: IncomingMessage): void {
+  const header = request.headers.host;
+  if (header === undefined || !isLoopbackHost(header)) {
+    throw new HttpError(403, "Forbidden.");
+  }
+}
+
+/**
+ * Checks that the request carries the configured shared secret. When no token
+ * is configured (undefined or empty), every request is accepted so existing
+ * local workflows keep working without configuration.
+ *
+ * @param request - The incoming HTTP request whose token header is inspected.
+ * @param token - The required shared secret, or undefined to disable checks.
+ * @param headerName - Header carrying the secret; defaults to `x-cortex-token`.
+ * @throws HttpError 401 when a token is configured but missing or mismatched.
+ */
+export function assertSharedToken(request: IncomingMessage, token: string | undefined, headerName = DEFAULT_TOKEN_HEADER): void {
+  if (!token) return;
+  const presented = request.headers[headerName];
+  if (typeof presented !== "string" || !tokensEqual(presented, token)) {
+    throw new HttpError(401, "Unauthorized.");
+  }
+}
+
+function isLoopbackHost(hostHeader: string): boolean {
+  const host = hostHeader.trim().toLowerCase();
+  const name = host.startsWith("[")
+    ? host.slice(0, host.indexOf("]") + 1)
+    : host.includes(":") ? host.slice(0, host.lastIndexOf(":")) : host;
+  return name === "localhost" || name === "127.0.0.1" || name === "[::1]";
+}
+
+function tokensEqual(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /**

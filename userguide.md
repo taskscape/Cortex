@@ -213,7 +213,9 @@ the explicit attachment takes precedence for that turn.
 
 1. Open the workspace gear.
 2. Enter the folders containing the Markdown documentation.
-3. Save the settings.
+3. Save the settings. Saving rejects a configuration whose paths are all
+   inaccessible; if at least one path exists, unavailable roots are skipped
+   gracefully and reported through the ingestion status.
 4. Wait until the status shows an `active_*` publication and no pending watcher
    or queued reconciliation.
 5. Ask a question that depends on the indexed documentation.

@@ -637,6 +637,18 @@ $env:CORTEX_RAG_V2_STORAGE = "memory"
 .\scripts\run.ps1
 ```
 
+### Publication performance on large corpora
+
+Checkpoint and final publications validate a generation by joining
+`publication_documents` to `sections` and `passages` on document membership.
+Startup migrations create btree indexes on
+`sections (document_version_id)` and `passages (document_version_id)` for
+exactly these joins; without them, every publication degrades to full-table
+scans once a corpus reaches hundreds of thousands of documents. Re-publishing
+the same generation also skips document rows already in the target
+publication state, so repeated checkpoints stay cheap. On very large corpora,
+raise `CORTEX_RAG_V2_CHECKPOINT_FILES` so checkpoints occur less often.
+
 ## Expert Panel Configuration
 
 Expert configuration lives in `local-agent\config\experts.json`:

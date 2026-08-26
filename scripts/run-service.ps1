@@ -24,12 +24,30 @@ function Test-PortListening($Port) {
     return $null -ne $listener
 }
 
+# Native commands ignore $ErrorActionPreference = "Stop"; fail on their exit codes.
+function Invoke-CheckedCommand($Command, $Arguments) {
+    Write-ServiceLog "> $Command $($Arguments -join ' ')"
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Command exited with code $LASTEXITCODE."
+    }
+}
+
 function Stop-PortListeners($Port, $Name) {
+    # Port-based stopping must never force-kill an unrelated application that
+    # happens to own the port: verify the image name first.
+    $expectedNames = @("node", "powershell", "pwsh", "docker-compose")
     $processIds = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique
 
     foreach ($processId in $processIds) {
         if (-not $processId) { continue }
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if (-not $process) { continue }
+        if ($expectedNames -notcontains $process.ProcessName.ToLowerInvariant()) {
+            Write-Warning "Skipping stale $Name listener on port $Port (PID $processId runs '$($process.ProcessName)', not a recognized Cortex process)."
+            continue
+        }
         Write-ServiceLog "Stopping stale $Name listener on port $Port (PID $processId)"
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -199,7 +217,7 @@ if (-not $SkipDocker) {
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         if (Test-CudaIngestionAvailable) {
             Write-ServiceLog "Starting Mem0 Docker stack with workspace-rag CUDA embeddings"
-            docker compose -f $ComposeFile --profile cuda up -d
+            Invoke-CheckedCommand docker @("compose", "-f", $ComposeFile, "--profile", "cuda", "up", "-d")
             Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
                 $env:CORTEX_RAG_CUDA_EMBEDDING_URL = "http://localhost:8890"
@@ -211,7 +229,7 @@ if (-not $SkipDocker) {
         }
         else {
             Write-ServiceLog "Starting Mem0 Docker stack without CUDA ingestion"
-            docker compose -f $ComposeFile up -d
+            Invoke-CheckedCommand docker @("compose", "-f", $ComposeFile, "up", "-d")
             Wait-PostgresReady $env:CORTEX_RAG_POSTGRES_HOST $env:CORTEX_RAG_POSTGRES_PORT 120 | Out-Null
             if (-not $env:CORTEX_RAG_DISABLE_CUDA) {
                 $env:CORTEX_RAG_DISABLE_CUDA = "1"

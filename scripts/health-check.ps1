@@ -1,3 +1,9 @@
+param(
+    # Response bodies can contain model names, revisions and counts; they are
+    # omitted unless explicitly requested.
+    [switch]$ShowBody
+)
+
 $ErrorActionPreference = "Stop"
 
 $checks = @(
@@ -35,9 +41,11 @@ foreach ($check in $checks) {
     try {
         $response = Invoke-WebRequest -Method Get -Uri $check.Url -TimeoutSec 5 -UseBasicParsing
         $detail = ""
-        $contentType = $response.Headers["Content-Type"]
-        if ($contentType -and $contentType -match "application/json") {
-            $detail = " " + $response.Content
+        if ($ShowBody -or $env:SHOW_BODIES) {
+            $contentType = $response.Headers["Content-Type"]
+            if ($contentType -and $contentType -match "application/json") {
+                $detail = " " + $response.Content
+            }
         }
         Write-Host "$($check.Name): ok (HTTP $($response.StatusCode))$detail"
     }

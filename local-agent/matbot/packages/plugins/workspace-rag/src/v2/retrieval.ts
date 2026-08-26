@@ -262,47 +262,40 @@ async function rerank(
   url: string,
   query: string,
   hits: readonly RagV2RankedHit[],
-  signal?: AbortSignal,
+  callerSignal?: AbortSignal,
 ): Promise<RerankResponse> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('Workspace RAG V2 reranker timed out.')), 5_000);
-  const abort = () => controller.abort(signal?.reason);
-  signal?.addEventListener('abort', abort, { once: true });
-  try {
-    const response = await fetch(new URL('/rerank', url), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ query, texts: hits.map(hit => hit.text), truncate: true }),
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`Workspace RAG V2 reranker returned HTTP ${response.status}.`);
-    const body = await response.json() as unknown;
-    if (Array.isArray(body)) {
-      const scores = new Array<number>(hits.length).fill(0);
-      for (const value of body) {
-        if (!value || typeof value !== 'object') continue;
-        const item = value as Record<string, unknown>;
-        const index = Number(item['index']);
-        const score = Number(item['score']);
-        if (Number.isInteger(index) && index >= 0 && index < scores.length && Number.isFinite(score)) scores[index] = score;
-      }
-      return { scores };
+  const timeout = AbortSignal.timeout(5_000);
+  const signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;
+  const response = await fetch(new URL('/rerank', url), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query, texts: hits.map(hit => hit.text), truncate: true }),
+    signal,
+  });
+  if (!response.ok) throw new Error(`Workspace RAG V2 reranker returned HTTP ${response.status}.`);
+  const body = await response.json() as unknown;
+  if (Array.isArray(body)) {
+    const scores = new Array<number>(hits.length).fill(0);
+    for (const value of body) {
+      if (!value || typeof value !== 'object') continue;
+      const item = value as Record<string, unknown>;
+      const index = Number(item['index']);
+      const score = Number(item['score']);
+      if (Number.isInteger(index) && index >= 0 && index < scores.length && Number.isFinite(score)) scores[index] = score;
     }
-    if (body && typeof body === 'object') {
-      const value = body as Record<string, unknown>;
-      const scores = Array.isArray(value['scores']) ? value['scores'].map(Number) : [];
-      if (scores.length === hits.length && scores.every(Number.isFinite)) {
-        return {
-          ...(typeof value['model'] === 'string' ? { model: value['model'] } : {}),
-          scores,
-        };
-      }
-    }
-    throw new Error('Workspace RAG V2 reranker returned an unsupported response.');
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener('abort', abort);
+    return { scores };
   }
+  if (body && typeof body === 'object') {
+    const value = body as Record<string, unknown>;
+    const scores = Array.isArray(value['scores']) ? value['scores'].map(Number) : [];
+    if (scores.length === hits.length && scores.every(Number.isFinite)) {
+      return {
+        ...(typeof value['model'] === 'string' ? { model: value['model'] } : {}),
+        scores,
+      };
+    }
+  }
+  throw new Error('Workspace RAG V2 reranker returned an unsupported response.');
 }
 
 function needsNeighbour(text: string): boolean {
@@ -848,10 +841,14 @@ export class RagV2RetrievalEngine {
             degraded.push(`authorization or version recheck failed for passage ${hit.passageId}`);
             continue;
           }
-          const raw = await this.objectStore.fetchRange(hit.documentVersionId.includes(':')
-            ? hit.documentVersionId.split(':').at(-1)!
-            : this.contentHashFromObjectPath(hit.objectPath) ?? hit.documentVersionId,
-          hit.startByte, hit.endByte);
+          // The stored object is addressed by the re-authorized document's
+          // content hash; the fetched range must rehash exactly to the
+          // passage hash that was ranked.
+          const raw = await this.objectStore.fetchRange(
+            authorizedDocument.contentSha256,
+            hit.startByte,
+            hit.endByte,
+          );
           const rangeHash = sha256(raw);
           if (rangeHash !== hit.contentSha256) {
             degraded.push(`range hash mismatch for passage ${hit.passageId}`);
@@ -984,9 +981,5 @@ export class RagV2RetrievalEngine {
       }
     }
     return result;
-  }
-
-  private contentHashFromObjectPath(objectPath: string | undefined): string | undefined {
-    return objectPath?.match(/[\\/](?<hash>[a-f0-9]{64})[\\/]source\.md$/u)?.groups?.['hash'];
   }
 }

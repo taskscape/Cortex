@@ -205,44 +205,44 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
           s.replay.push({ type: 'queued', content, queued: 0, concatQueue: false, traceId: head.traceId, rootTraceId: head.rootTraceId });
         }
 
-        let session = await deps.store.get(id);
-        if (session === null) {
-          emit(s, { type: 'error', error: `Session "${id}" not found`, traceId: head.traceId });
-          continue;
-        }
-
-        // A redo re-runs the existing committed user turn — no title derivation, no new user message.
-        if (head.redo === undefined) {
-          if (!session.title && !session.messages.some(m => m.role === 'user')) {
-            const text = content
-              .filter((c): c is Extract<MessageContent, { type: 'text' }> => c.type === 'text')
-              .map(c => c.text).join(' ').trim();
-            if (text) {
-              const words = text.split(/\s+/).slice(0, 8).join(' ');
-              session = { ...session, title: words.length > 60 ? `${words.slice(0, 60)}…` : words };
-            }
+        const ac = new AbortController();
+        try {
+          let session = await deps.store.get(id);
+          if (session === null) {
+            emit(s, { type: 'error', error: `Session "${id}" not found`, traceId: head.traceId });
+            continue;
           }
 
-          // Persist-at-turn-start: the user message only hits the store when its turn begins, never
-          // while queued. That is what stops a mid-turn submit from clobbering session state. A robo
-          // resubmission's blocks already carry `origin: 'robo'` (stamped where it was enqueued).
-          session = appendMessage(session, createMessage({ role: 'user', content, traceId: head.traceId, providerName: head.provider }));
-          await deps.store.set(session.id, session);
-        }
+          // A redo re-runs the existing committed user turn — no title derivation, no new user message.
+          if (head.redo === undefined) {
+            if (!session.title && !session.messages.some(m => m.role === 'user')) {
+              const text = content
+                .filter((c): c is Extract<MessageContent, { type: 'text' }> => c.type === 'text')
+                .map(c => c.text).join(' ').trim();
+              if (text) {
+                const words = text.split(/\s+/).slice(0, 8).join(' ');
+                session = { ...session, title: words.length > 60 ? `${words.slice(0, 60)}…` : words };
+              }
+            }
 
-        const resolved = await deps.resolveProvider(head.provider);
-        if (resolved === null) {
-          emit(s, { type: 'error', error: `Unknown provider "${head.provider}"`, traceId: head.traceId });
-          continue;
-        }
+            // Persist-at-turn-start: the user message only hits the store when its turn begins, never
+            // while queued. That is what stops a mid-turn submit from clobbering session state. A robo
+            // resubmission's blocks already carry `origin: 'robo'` (stamped where it was enqueued).
+            session = appendMessage(session, createMessage({ role: 'user', content, traceId: head.traceId, providerName: head.provider }));
+            await deps.store.set(session.id, session);
+          }
 
-        const ac = new AbortController();
-        s.ac = ac;
-        const toolMap = deps.tools !== undefined
-          ? new Map<string, Tool>(deps.tools.list().map(t => [t.name, t]))
-          : undefined;
+          const resolved = await deps.resolveProvider(head.provider);
+          if (resolved === null) {
+            emit(s, { type: 'error', error: `Unknown provider "${head.provider}"`, traceId: head.traceId });
+            continue;
+          }
 
-        try {
+          s.ac = ac;
+          const toolMap = deps.tools !== undefined
+            ? new Map<string, Tool>(deps.tools.list().map(t => [t.name, t]))
+            : undefined;
+
           // Establish the submitter's principal for the whole turn here, not inside runSession:
           // pump runs detached (`void pump`), so this scope — not the request that enqueued — is the
           // turn's async root. Everything downstream (hooks, tools, and any Store/FileStore/Vault

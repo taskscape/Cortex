@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { Pool as PgPool, PoolClient, PoolConfig } from 'pg';
+import { positiveInteger, ragV2AuditRetentionDaysFromEnv } from './config.js';
 import type {
   RagV2CollectionRecord,
   RagV2DocumentRecord,
@@ -67,7 +68,12 @@ function sanitizeIdentifier(value: string): string {
   return /^[0-9]/u.test(result) ? `_${result}` : result;
 }
 
-function quoteIdentifier(value: string): string {
+/**
+ * Quote a SQL identifier after gating it against the safe-identifier charset. Exported for
+ * tests: the DO-block policy statements interpolate identifiers into string literals where
+ * bind parameters cannot go, so every such name must pass this gate first.
+ */
+export function quoteIdentifier(value: string): string {
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/u.test(value)) throw new Error(`Unsafe SQL identifier: ${value}`);
   return `"${value}"`;
 }
@@ -80,16 +86,22 @@ function quoteRole(value: string): string {
 function settingsFromEnv(): PostgresSettings {
   const connectionString = process.env['CORTEX_RAG_POSTGRES_URL']?.trim();
   const poolConfig: PoolConfig = {
-    max: Number(process.env['CORTEX_RAG_V2_POOL_MAX'] ?? 8),
+    max: positiveInteger(process.env['CORTEX_RAG_V2_POOL_MAX'], 8),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: Number(process.env['CORTEX_RAG_V2_POOL_CONNECTION_TIMEOUT_MS'] ?? 30_000),
+    connectionTimeoutMillis: positiveInteger(
+      process.env['CORTEX_RAG_V2_POOL_CONNECTION_TIMEOUT_MS'],
+      30_000,
+    ),
   };
   if (connectionString) poolConfig.connectionString = connectionString;
   else {
     poolConfig.host = process.env['CORTEX_RAG_POSTGRES_HOST']?.trim()
       || process.env['POSTGRES_HOST']?.trim()
       || 'localhost';
-    poolConfig.port = Number(process.env['CORTEX_RAG_POSTGRES_PORT'] ?? process.env['POSTGRES_PORT'] ?? 5432);
+    poolConfig.port = positiveInteger(
+      process.env['CORTEX_RAG_POSTGRES_PORT'] ?? process.env['POSTGRES_PORT'],
+      5432,
+    );
     poolConfig.database = process.env['CORTEX_RAG_POSTGRES_DB']?.trim()
       || process.env['POSTGRES_DB']?.trim()
       || 'mem0';
@@ -175,6 +187,32 @@ export class PostgresRagV2Repository implements RagV2Repository {
     await this.createIndexes(vectorizer);
     await this.enableRowSecurity();
     await this.grantApplicationRole();
+    await this.pruneExpiredAuditRecords().catch(error => {
+      console.warn(`[workspace-rag-v2] audit retention pruning skipped: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * Opportunistic startup pruning of audit payloads past the configured
+   * retention window. Retrieval hits, query variants, and evidence cascade
+   * from their run row.
+   */
+  private async pruneExpiredAuditRecords(): Promise<void> {
+    const retentionDays = ragV2AuditRetentionDaysFromEnv();
+    if (retentionDays <= 0) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query(`
+        DELETE FROM ${this.table('retrieval_runs')}
+        WHERE started_at < now() - make_interval(days => $1::int)
+      `, [retentionDays]);
+      await client.query(`
+        DELETE FROM ${this.table('regex_runs')}
+        WHERE created_at < now() - make_interval(days => $1::int)
+      `, [retentionDays]);
+    } finally {
+      client.release();
+    }
   }
 
   async close(): Promise<void> {
@@ -1874,6 +1912,12 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]) {
       await this.ddlPool().query(`ALTER TABLE ${this.table(name)} ENABLE ROW LEVEL SECURITY`);
       const policyName = `rag_v2_${name}_workspace`;
+      // The DO block interpolates these into quoted string literals (bind parameters are not
+      // possible there), so re-validate each at the interpolation point rather than trusting
+      // upstream sanitization — quoteIdentifier throws on any character outside the safe set.
+      quoteIdentifier(this.schema);
+      quoteIdentifier(name);
+      quoteIdentifier(policyName);
       await this.ddlPool().query(`
         DO $policy$
         BEGIN
@@ -1890,6 +1934,9 @@ export class PostgresRagV2Repository implements RagV2Repository {
       `);
     }
     const embeddingsPolicy = `rag_v2_embeddings_${this.vectorizer?.dimensions ?? 0}_workspace`;
+    // Same DO-block interpolation guard as the per-table loop above.
+    quoteIdentifier(this.schema);
+    quoteIdentifier(embeddingsPolicy);
     await this.ddlPool().query(`ALTER TABLE ${this.getEmbeddingsTable()} ENABLE ROW LEVEL SECURITY`);
     await this.ddlPool().query(`
       DO $policy$

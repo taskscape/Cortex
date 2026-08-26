@@ -30,6 +30,32 @@ const state = {
 const pluginEvents = createBroadcaster<PluginRegistryEvent>();
 
 /**
+ * Plugin-scoped hook surface handed to a plugin's setup(): registrations are stamped with the
+ * owning plugin and removal is delegated to the host registry. Subclasses the real registry so
+ * the full public contract holds without a boundary cast — dispatch always runs against the
+ * host instance, so hooks registered during setup() are visible to every later turn.
+ */
+class ScopedHookRegistry extends HookRegistry {
+  private readonly owner: string;
+  private readonly host: HookRegistry;
+
+  constructor(owner: string, host: HookRegistry) {
+    super();
+    this.owner = owner;
+    this.host = host;
+  }
+
+  register(hook: Hook): void {
+    state.hookPlugins.add(this.owner);
+    this.host.register({ ...hook, pluginName: this.owner } as Hook);
+  }
+
+  removeByPlugin(pluginName: string): void {
+    this.host.removeByPlugin(pluginName);
+  }
+}
+
+/**
  * Observe plugin load/unload events for the registry's lifetime.
  *
  * @param signal - Optional abort signal; aborting ends the iteration.
@@ -52,9 +78,11 @@ const OVERWRITE_TOOLS_KEY = 'overwriteToolsOnCollision';
  * existing one and drop the incoming registration.
  *
  * Resolution order: a persisted "overwrite all (this install)" choice short-circuits to
- * true; otherwise the user is prompted [n / Y / all] with Y (overwrite) as the default.
- * 'all' persists the choice. With no prompt available (non-interactive host) we overwrite —
- * the default — preserving matbot's historical last-registration-wins behaviour.
+ * true; otherwise the user is prompted [n / Y / all] where only an explicit "Overwrite"
+ * or "Always overwrite" answer overwrites — any other or unrecognized answer keeps the
+ * existing tool. 'Always overwrite' persists the choice. With no prompt available
+ * (non-interactive host) we overwrite — the default — preserving matbot's historical
+ * last-registration-wins behaviour.
  */
 async function resolveToolCollision(
   services:      MatbotMachine,
@@ -90,23 +118,44 @@ async function resolveToolCollision(
     await coreSettings.set(OVERWRITE_TOOLS_KEY, true);
     return true;
   }
-  return !answer.startsWith('k');  // "Keep existing" → false; "Overwrite"/default → true
+  // Fail closed: only an explicit "Overwrite" answer replaces the existing tool. Anything
+  // else — empty input, a stray keystroke, free text — keeps the incumbent rather than
+  // interpreting it as consent to clobber.
+  return answer === 'overwrite';
 }
 
 // ── Version check ─────────────────────────────────────────────────────────────
 
-function checkApiVersion(plugin: MatbotPlugin): void {
-  const [rMajor = '0', rMinor = '0'] = PLUGIN_API_VERSION.split('.');
-  const [pMajor = '0', pMinor = '0'] = plugin.apiVersion.split('.');
+/**
+ * Strictly parse a `major.minor` version string. Returns undefined for anything else —
+ * a malformed version must never silently become NaN and slip past the comparisons below.
+ */
+function parseApiVersion(version: string): { major: number; minor: number } | undefined {
+  const m = /^(\d+)\.(\d+)$/.exec(version.trim());
+  if (m === null) return undefined;
+  return { major: Number(m[1]!), minor: Number(m[2]!) };
+}
 
-  if (pMajor !== rMajor) {
+function checkApiVersion(plugin: MatbotPlugin): void {
+  const runtime = parseApiVersion(PLUGIN_API_VERSION)!;  // repo-internal constant
+  const target  = parseApiVersion(plugin.apiVersion);
+
+  if (target === undefined) {
+    console.warn(
+      `[matbot] Plugin "${plugin.name}" declares unparseable apiVersion "${plugin.apiVersion}" ` +
+      `(runtime API is ${PLUGIN_API_VERSION}); skipping the compatibility check.`,
+    );
+    return;
+  }
+
+  if (target.major !== runtime.major) {
     throw new Error(
-      `Plugin "${plugin.name}" requires API ${plugin.apiVersion} (major ${pMajor}) ` +
+      `Plugin "${plugin.name}" requires API ${plugin.apiVersion} (major ${target.major}) ` +
       `but runtime provides ${PLUGIN_API_VERSION}. ` +
       `Update the plugin or the runtime.`,
     );
   }
-  if (Number(pMinor) > Number(rMinor)) {
+  if (target.minor > runtime.minor) {
     console.warn(
       `[matbot] Plugin "${plugin.name}" targets API ${plugin.apiVersion} ` +
       `but runtime is ${PLUGIN_API_VERSION}. Some features may not be available.`,
@@ -307,13 +356,7 @@ export async function setupPlugin(plugin: MatbotPlugin, services: MatbotMachine,
       removeByPlugin:(name: string) => services.tools.removeByPlugin(name),
       watch:         (signal?: AbortSignal) => services.tools.watch(signal),
     },
-    hooks: {
-      register(hook: Hook) {
-        state.hookPlugins.add(plugin.name);
-        services.hooks.register({ ...hook, pluginName: plugin.name } as Hook);
-      },
-      removeByPlugin: (name: string) => services.hooks.removeByPlugin(name),
-    } as unknown as HookRegistry,
+    hooks: new ScopedHookRegistry(plugin.name, services.hooks),
     systemContext: {
       register(contributor) {
         state.systemContextPlugins.add(plugin.name);
@@ -365,19 +408,27 @@ export async function unloadPlugin(pluginName: string, services: MatbotMachine):
 
   state.plugins.splice(idx, 1);
   pluginEvents.emit({ type: 'unloaded', name: pluginName });
-  await Promise.race([
-    plugin.teardown?.(),
-    new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`Teardown timeout for plugin ${pluginName}`)), 10000))
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      plugin.teardown?.(),
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Teardown timeout for plugin ${pluginName}`)), 10000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
   return true;
 }
 
 /** Run each plugin's teardown() in reverse-registration order. Errors are logged, not thrown. */
 export async function teardownPlugins(): Promise<void> {
-  const results = await Promise.allSettled([...state.plugins].reverse().map(plugin => plugin.teardown?.()));
+  const teardownOrder = [...state.plugins].reverse();
+  const results = await Promise.allSettled(teardownOrder.map(plugin => plugin.teardown?.()));
   results.forEach((result, i) => {
     if (result.status === 'rejected') {
-      console.error(`[matbot] teardown error in plugin "${state.plugins[i]?.name}":`, result.reason);
+      console.error(`[matbot] teardown error in plugin "${teardownOrder[i]?.name}":`, result.reason);
     }
   });
 }

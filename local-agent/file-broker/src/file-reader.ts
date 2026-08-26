@@ -18,19 +18,42 @@ export async function readTextFile(filePath: string, maxBytes: number): Promise<
     throw new Error("Path is not a file.");
   }
 
-  const bytesToRead = Math.min(stats.size, maxBytes);
   const handle = await fs.open(filePath, "r");
   try {
-    const buffer = Buffer.alloc(bytesToRead);
-    const result = await handle.read(buffer, 0, bytesToRead, 0);
-    return {
-      content: buffer.subarray(0, result.bytesRead).toString("utf8"),
-      truncated: stats.size > maxBytes,
-      size: stats.size
-    };
+    return await readCappedText(handle, stats.size, maxBytes);
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Reads up to `maxBytes` from an already-open handle as UTF-8 text, reporting
+ * whether the content was truncated and the total file size.
+ *
+ * @param handle - Handle positioned at the start of the file.
+ * @param size - Total file size in bytes (from the same handle).
+ * @param maxBytes - Maximum number of bytes to read.
+ * @returns The decoded content, truncation flag, and total size in bytes.
+ */
+export async function readCappedText(handle: fs.FileHandle, size: number, maxBytes: number): Promise<{ content: string; truncated: boolean; size: number }> {
+  const bytesToRead = Math.min(size, maxBytes);
+  const buffer = Buffer.alloc(bytesToRead);
+  const result = await handle.read(buffer, 0, bytesToRead, 0);
+  return {
+    content: buffer.subarray(0, result.bytesRead).toString("utf8"),
+    truncated: size > maxBytes,
+    size
+  };
+}
+
+/**
+ * Reads the entire remaining content of an already-open handle as UTF-8 text.
+ *
+ * @param handle - The handle to drain from its current position.
+ * @returns The decoded full content.
+ */
+export async function readHandleText(handle: fs.FileHandle): Promise<string> {
+  return (await handle.readFile()).toString("utf8");
 }
 
 /**

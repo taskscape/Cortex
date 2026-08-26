@@ -2,6 +2,7 @@ import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
 import process from 'node:process';
 
 /** Configuration for running scripts inside a Docker container instead of the local shell. */
@@ -29,6 +30,39 @@ function sanitizeTimeout(timeout: number | undefined): number | undefined {
   return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
     ? Math.min(Math.trunc(timeout), MAX_TIMEOUT_MS)
     : undefined;
+}
+
+// Only these variables reach LLM-initiated commands. Never spread process.env: matbot loads
+// vault-resolved credentials into it, and every extra variable is one `env` command away
+// from exfiltration.
+const SAFE_ENV_KEYS = [
+  'PATH', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR',
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+  'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES',
+] as const;
+
+/** Minimal safe default environment built from an explicit allowlist (case-insensitive lookup). */
+export function safeDefaultEnv(): Record<string, string> {
+  const available = new Map(Object.entries(process.env).map(([k, v]) => [k.toUpperCase(), v]));
+  const out: Record<string, string> = {};
+  for (const key of SAFE_ENV_KEYS) {
+    const v = available.get(key);
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
+/**
+ * Resolve a requested working directory against the tool's base directory and refuse anything
+ * that escapes it — including sibling paths that merely share a prefix (`/base` vs `/base-x`).
+ */
+export function confineWorkspaceCwd(requested: string | undefined, base: string): string {
+  const resolvedBase = resolve(base);
+  const resolved     = resolve(resolvedBase, requested ?? '.');
+  if (resolved !== resolvedBase && !resolved.startsWith(resolvedBase + sep)) {
+    throw new Error(`Requested cwd "${requested}" is outside the session workspace.`);
+  }
+  return resolved;
 }
 
 // Bridge event-emitter callbacks to an AsyncIterable<ToolEvent>.
@@ -158,19 +192,21 @@ function createLocalExecutor() {
   return {
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       const { script, cwd: cwdInput, env, timeout } = input as BashInput;
-      const cwd = cwdInput ?? ctx.workdir;
-      if (cwd !== undefined) await mkdir(cwd, { recursive: true });
 
-      const mergedEnv: Record<string, string> = {};
-      for (const [k, v] of Object.entries(process.env)) {
-        if (v !== undefined) mergedEnv[k] = v;
+      let cwd: string;
+      try {
+        cwd = confineWorkspaceCwd(cwdInput, ctx.workdir ?? process.cwd());
+      } catch (e) {
+        yield { type: 'error', message: e instanceof Error ? e.message : String(e) };
+        return;
       }
-      if (env) Object.assign(mergedEnv, env);
+      await mkdir(cwd, { recursive: true });
+
+      const mergedEnv = { ...safeDefaultEnv(), ...(env ?? {}) };
 
       yield* spawnAndStream('bash', ['-c', script], {
-        ...(cwd     !== undefined ? { cwd }     : {}),
         ...(timeout !== undefined ? { timeout } : {}),
-        env: mergedEnv, signal: ctx.signal,
+        env: mergedEnv, signal: ctx.signal, cwd,
       });
     },
   };
@@ -220,7 +256,7 @@ const INPUT_SCHEMA = {
   required:   ['script'],
   properties: {
     script:  { type: 'string', description: 'Bash script or command to run (passed to `bash -c`).' },
-    cwd:     { type: 'string', description: 'Working directory. Defaults to the session workspace.' },
+    cwd:     { type: 'string', description: 'Working directory, resolved against and confined to the session workspace. Defaults to the session workspace.' },
     env:     { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables to set.' },
     timeout: { type: 'number', description: 'Kill the process after this many milliseconds.' },
   },

@@ -2,7 +2,10 @@
 // so the conservative behaviour is right for them.
 const FILE_LEVEL_SECRETS: ReadonlyArray<{ name: string; pattern: RegExp }> = [
   { name: "api-key-literal", pattern: /sk-[A-Za-z0-9_-]{20,}/ },
-  { name: "private-key-block", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ }
+  { name: "private-key-block", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { name: "aws-access-key-id", pattern: /AKIA[0-9A-Z]{16}/ },
+  { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/ },
+  { name: "google-api-key", pattern: /AIza[0-9A-Za-z_-]{35}/ }
 ];
 
 // Lower precision: an assignment whose *name* suggests a credential. The name alone says nothing —

@@ -37,8 +37,17 @@ export class SystemContextRegistryImpl implements SystemContextRegistry {
    * @returns The joined system-context text, or `null` when no contributor produced output.
    */
   async build(ctx: { session: Session; signal: AbortSignal }): Promise<string | null> {
-    const parts = (await Promise.all(this._contributors.map(c => c.fn(ctx))))
-      .filter((s): s is string => typeof s === 'string' && s.length > 0);
+    const results = await Promise.allSettled(this._contributors.map(c => c.fn(ctx)));
+    const parts: string[] = [];
+    for (const [i, result] of results.entries()) {
+      if (result.status === 'rejected') {
+        const owner = this._contributors[i]?.pluginName ?? 'anonymous';
+        console.warn(`[runner] system-context contributor "${owner}" failed; skipping it: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+        continue;
+      }
+      const s = result.value;
+      if (typeof s === 'string' && s.length > 0) parts.push(s);
+    }
     return parts.length > 0 ? parts.join('\n\n') : null;
   }
 }

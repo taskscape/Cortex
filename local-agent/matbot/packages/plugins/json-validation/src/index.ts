@@ -50,6 +50,15 @@ function matches(type: string, value: unknown): boolean {
   }
 }
 
+// Tool-authored regex is compiled and executed synchronously on the main loop; JavaScript offers no
+// native way to bound a .test() call, so a crafted catastrophic-backtracking pattern remains a
+// residual ReDoS risk. Mitigations here are deliberately cheap: absurdly long patterns are rejected
+// and an invalid pattern fails closed as a validation error instead of throwing out of the hook.
+// Exposure note: the `pattern` keyword flows only from `tool.inputSchema`, which today is authored
+// exclusively by first-party in-repo tools — the risk becomes real only if third-party tool
+// schemas are ever trusted.
+const MAX_PATTERN_LENGTH = 1000;
+
 function validate(schema: JSONSchema, value: unknown, path: string, errs: string[]): void {
   const at = path || '/';
   const type = schema['type'];
@@ -69,8 +78,16 @@ function validate(schema: JSONSchema, value: unknown, path: string, errs: string
   }
 
   const pattern = schema['pattern'];
-  if (typeof pattern === 'string' && typeof value === 'string' && !new RegExp(pattern).test(value)) {
-    errs.push(`${at}: does not match pattern ${pattern}`);
+  if (typeof pattern === 'string' && typeof value === 'string') {
+    if (pattern.length > MAX_PATTERN_LENGTH) {
+      errs.push(`${at}: pattern exceeds ${MAX_PATTERN_LENGTH} characters — rejected`);
+    } else {
+      try {
+        if (!new RegExp(pattern).test(value)) errs.push(`${at}: does not match pattern ${pattern}`);
+      } catch {
+        errs.push(`${at}: pattern is not a valid regular expression`);
+      }
+    }
   }
 
   if (matches('object', value)) {

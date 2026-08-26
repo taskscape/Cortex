@@ -162,18 +162,20 @@ export async function loadPlugins(
 
     if (result.status === 'rejected') {
       const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
-      if (typeof window !== 'undefined') {
-        // Browser: warn and skip — browser environments have no node_modules fallback.
-        console.warn(`[matbot] Could not load plugin "${spec}" (browser: use a URL path or configure an import map): ${reason}`);
-        continue;
-      }
-      console.error(`[matbot] Failed to load plugin "${spec}":`, result.reason);
-      failLoad(spec, `Could not load plugin "${spec}": ${reason}`);
+      // One funnel for node *and* browser: an onLoadError policy of 'throw' must hold on both
+      // platforms (the browser hint stays, but it no longer bypasses the documented contract).
+      failLoad(spec, `Could not load plugin${typeof window !== 'undefined' ? ' (browser: use a URL path or configure an import map)' : ''}: ${reason}`);
       continue;
     }
 
-    const mod  = result.value;
-    const spec_obj = (mod['plugin'] ?? (mod['default'] as Record<string, unknown> | undefined)?.['plugin']) as MatbotPluginSpec | undefined;
+    const mod = result.value;
+    // Boundary guard before the record cast: a module whose `default` is not a plain-ish object
+    // (a function class export, an array, a primitive) must not be dereferenced as one.
+    const def = mod['default'];
+    const defaultExports = typeof def === 'object' && def !== null && !Array.isArray(def)
+      ? (def as Record<string, unknown>)
+      : undefined;
+    const spec_obj = (mod['plugin'] ?? defaultExports?.['plugin']) as MatbotPluginSpec | undefined;
 
     // Shape verification: a loaded module is a matbot plugin only if it exports a `plugin` object
     // carrying `apiVersion`, and any lifecycle members it declares are functions. This is the

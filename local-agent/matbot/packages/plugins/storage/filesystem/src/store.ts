@@ -27,8 +27,8 @@ function encodeName(id: string): string {
  * A {@link Store} implementation persisting each document as a pretty-printed
  * JSON file in a directory. Ids that are not filesystem-safe are percent-
  * encoded per UTF-8 byte; over-long names fall back to a `%h%<sha256>` digest.
- * Writes are atomic (tmp file + rename) and `cas`/`delete` serialise per id
- * with an in-process promise-chain mutex (single-process safety only).
+ * Writes are atomic (tmp file + rename) and `set`/`cas`/`delete` serialise
+ * per id with an in-process promise-chain mutex (single-process safety only).
  */
 export class FilesystemStore<T extends { id: string; version: string }> implements Store<T> {
   private initPromise: Promise<void> | undefined;
@@ -97,12 +97,20 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
   }
 
   /**
-   * Unconditionally writes a document under `id`.
+   * Unconditionally writes a document under `id`. Serialised per id with the
+   * same promise-chain mutex as `cas`/`delete` so it cannot interleave with a
+   * CAS window.
    * @param id - Record identifier.
    * @param value - Document to persist.
    * @throws Any error raised while writing or renaming the file.
    */
   async set(id: string, value: T): Promise<void> {
+    return this.withLock(id, () => this.writeDoc(id, value));
+  }
+
+  // Unlocked write primitive — callers that already hold the id's lock
+  // (`cas`) must use this, or they would queue behind themselves and deadlock.
+  private async writeDoc(id: string, value: T): Promise<void> {
     await this.init();
     await this.writeAtomic(this.filePath(id), JSON.stringify(value, null, 2));
   }
@@ -121,7 +129,7 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
       if (current === null || current.version !== expected) {
         return { ok: false, current } satisfies CASResult<T>;
       }
-      await this.set(id, next);
+      await this.writeDoc(id, next);
       return { ok: true, doc: next } satisfies CASResult<T>;
     });
   }

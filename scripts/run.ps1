@@ -192,10 +192,14 @@ if (-not $NoStart) {
     # titles — persist to .data instead of a MemoryStore that dies with the process. The WebUI is a
     # long-lived server, so ephemeral-by-default is wrong for it. Filtered form so the flag reaches the
     # cli entry unambiguously through the single -- boundary.
-    $matbotCommand = "Set-Location -LiteralPath '$MatbotRoot'; `$env:MATBOT_WEB_PORT='$WebPort'; pnpm --filter '@matatbread/matbot-cli' start -- --session create"
+    # Nothing is interpolated into this command string: the Matbot working directory travels via
+    # -MatbotWorkingDirectory and MATBOT_WEB_PORT is already exported above, so a repository path
+    # containing quotes cannot break child-process quoting.
+    $matbotCommand = "pnpm --filter '@matatbread/matbot-cli' start -- --session create"
     $startArgs = @{
         SkipBuild = $true
         MatbotCommand = $matbotCommand
+        MatbotWorkingDirectory = $MatbotRoot
     }
     if ($SkipDocker) {
         $startArgs.SkipDocker = $true

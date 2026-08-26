@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { evaluateRegexMatchesBounded } from './regex-evaluator.js';
 import type {
   RagV2CollectionRecord,
   RagV2DocumentRecord,
@@ -495,8 +496,7 @@ export class MemoryRagV2Repository implements RagV2Repository {
     authorizationTokens: readonly string[],
     limit: number,
   ): Promise<RagV2RankedHit[]> {
-    const expression = new RegExp(pattern, 'giu');
-    return this.searchRecords('passage', {
+    const candidates = this.searchRecords('passage', {
       workspaceId,
       contextId,
       generationId,
@@ -505,11 +505,10 @@ export class MemoryRagV2Repository implements RagV2Repository {
         .filter(document => documentVersionIds.includes(document.documentVersionId))
         .map(document => document.documentId),
       limit,
-    })
-      .filter(record => {
-        expression.lastIndex = 0;
-        return expression.test(record.text);
-      })
+    });
+    const matched = await evaluateRegexMatchesBounded(pattern, candidates.map(record => record.text));
+    return candidates
+      .filter((_record, index) => matched.has(index))
       .slice(0, limit)
       .map((record, index) => this.toHit(record, 'narrowed_regex', index + 1, 1));
   }

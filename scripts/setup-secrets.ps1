@@ -9,9 +9,19 @@ $ErrorActionPreference = "Stop"
 
 function New-Secret([int]$Length = 28) {
     $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    $bytes = New-Object 'System.Byte[]' $Length
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
+    # GetInt32 samples the full alphabet uniformly; byte % length would bias
+    # the first characters of the alphabet (256 % 62 != 0).
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $indexes = New-Object 'System.Int32[]' $Length
+        for ($i = 0; $i -lt $Length; $i++) {
+            $indexes[$i] = [System.Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $chars.Length)
+        }
+        return -join ($indexes | ForEach-Object { $chars[$_] })
+    }
+    finally {
+        $rng.Dispose()
+    }
 }
 
 function Resolve-Secret($Name, [int]$Length) {
@@ -59,6 +69,11 @@ $envPath = Join-Path $PSScriptRoot "..\local-agent\docker\mem0\.env"
     "NEO4J_AUTH=$neoAuth",
     "OPENAI_API_KEY=$OpenAiKey"
 ) | Set-Content -Path $envPath -Encoding ascii
+
+# Restrict the .env to the current user: strip inherited ACLs, then grant only
+# the invoking account full control. The file holds every generated secret.
+$identity = "$env:USERDOMAIN\$env:USERNAME"
+icacls $envPath /inheritance:r /grant:r "${identity}:F" | Out-Null
 
 Write-Host "Secrets configured (values hidden)."
 Write-Host "  OPENAI_API_KEY, POSTGRES_PASSWORD, NEO4J_PASSWORD, NEO4J_AUTH, MEM0_API_KEY set at User scope."

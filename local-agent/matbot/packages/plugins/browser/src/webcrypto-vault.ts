@@ -3,15 +3,25 @@ import { MissingSecretError, applyCreateSecret } from '@matatbread/matbot-core';
 
 const REF_RE = /\$\{([^}]+)\}/g;
 
+// String.fromCharCode has an argument-count limit (~64k in some engines and stack-bound via
+// spread), so base64 encoding goes through fixed 32 KiB chunks.
+const BASE64_CHUNK = 0x8000;
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += BASE64_CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + BASE64_CHUNK));
+  }
+  return btoa(binary);
+}
+
 /**
- * Browser `Vault` backed by the Web Crypto API.
+ * Browser `Vault` storing secrets **in memory, unencrypted**, in a plain map.
  *
- * Secrets are encrypted with AES-GCM using a key derived from a passphrase
- * (PBKDF2 / SHA-256).  On first access the key is derived and cached in memory
- * for the session lifetime.
- *
- * For simpler use-cases (e.g. local development), pass secrets directly as a
- * plain map — no encryption key required.
+ * Despite the name, no encryption is applied to stored secrets today — the
+ * AES-GCM/PBKDF2 static helpers below are exported for a future encrypted
+ * mode but are not wired into this class. Treat anything reachable by the
+ * page (localStorage included) as plaintext.
  */
 export class WebCryptoVault implements Vault {
   private readonly plain = new Map<string, string>();
@@ -100,7 +110,8 @@ export class WebCryptoVault implements Vault {
     return result;
   }
 
-  // ── Encryption helpers (optional; call to store/load secrets via IndexedDB) ──
+  // ── Encryption helpers (standalone; not used by this class — see the class
+  // doc. Available for a future encrypted mode, e.g. persisting via IndexedDB.) ──
 
   private static async deriveKey(passphrase: string, salt: ArrayBuffer): Promise<CryptoKey> {
     const base = await crypto.subtle.importKey(
@@ -137,7 +148,7 @@ export class WebCryptoVault implements Vault {
     combined.set(new Uint8Array(saltBuf), 0);
     combined.set(new Uint8Array(ivBuf), 16);
     combined.set(new Uint8Array(ct), 28);
-    return btoa(String.fromCharCode(...combined));
+    return toBase64(combined);
   }
 
   /**

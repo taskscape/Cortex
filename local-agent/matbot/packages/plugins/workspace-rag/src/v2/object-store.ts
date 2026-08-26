@@ -30,9 +30,15 @@ async function exists(filePath: string): Promise<boolean> {
 export class RagV2LineIndexWriter {
   private readonly stream: ReturnType<typeof createWriteStream>;
   private closed = false;
+  private streamError: Error | undefined;
 
   constructor(filePath: string) {
     this.stream = createWriteStream(filePath, { flags: 'wx', encoding: 'utf8' });
+    // A standing listener keeps a mid-stream failure from crashing the
+    // process; the error is surfaced from add()/close() instead.
+    this.stream.on('error', error => {
+      this.streamError ??= error instanceof Error ? error : new Error(String(error));
+    });
   }
 
   /**
@@ -42,19 +48,29 @@ export class RagV2LineIndexWriter {
    */
   async add(line: number, byteOffset: number): Promise<void> {
     if (this.closed) throw new Error('Workspace RAG V2 line index is already closed.');
+    if (this.streamError) throw this.streamError;
     if (!this.stream.write(`${line}\t${byteOffset}\n`)) {
       await new Promise<void>((resolve, reject) => {
         this.stream.once('drain', resolve);
         this.stream.once('error', reject);
       });
+      if (this.streamError) throw this.streamError;
     }
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) {
+      if (this.streamError) throw this.streamError;
+      return;
+    }
     this.closed = true;
     this.stream.end();
-    await finished(this.stream);
+    try {
+      await finished(this.stream);
+    } catch (error) {
+      throw this.streamError ?? (error instanceof Error ? error : new Error(String(error)));
+    }
+    if (this.streamError) throw this.streamError;
   }
 }
 

@@ -8,7 +8,9 @@ through ``POST /embed`` with query/document prefixes and CUDA OOM handling.
 import hashlib
 import json
 import os
+import threading
 import time
+import warnings
 from typing import List
 
 import torch
@@ -19,8 +21,45 @@ from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 MODEL_REVISION = os.getenv("EMBEDDING_MODEL_REVISION", "").strip() or None
-BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "128"))
+DEFAULT_BATCH_SIZE = 128
+# Total characters accepted per /embed request; larger requests are rejected so a
+# single client cannot monopolize GPU memory for an unbounded batch.
+MAX_REQUEST_CHARACTERS = 2_000_000
+
+
+def resolve_batch_size() -> int:
+    """Parse EMBEDDING_BATCH_SIZE, falling back to the default on bad values.
+
+    Returns:
+        The configured batch size, clamped to at least 1; invalid or
+        non-positive configuration falls back to ``DEFAULT_BATCH_SIZE`` with a
+        warning instead of crashing the container at import time.
+    """
+    configured = os.getenv("EMBEDDING_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)).strip()
+    try:
+        value = int(configured)
+    except ValueError:
+        warnings.warn(
+            f"Invalid EMBEDDING_BATCH_SIZE '{configured}'; "
+            f"falling back to {DEFAULT_BATCH_SIZE}."
+        )
+        return DEFAULT_BATCH_SIZE
+    if value < 1:
+        warnings.warn(
+            f"EMBEDDING_BATCH_SIZE must be >= 1 (got {value}); "
+            f"falling back to {DEFAULT_BATCH_SIZE}."
+        )
+        return DEFAULT_BATCH_SIZE
+    return value
+
+
+BATCH_SIZE = resolve_batch_size()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# FastAPI runs sync endpoints on a thread pool, so concurrent /embed requests can
+# otherwise enter model.encode simultaneously — a known source of spurious CUDA
+# OOM failures. Serialize all encode work behind one process-wide lock.
+ENCODE_LOCK = threading.Lock()
 
 # Reduced-precision inference is the default: float16 roughly doubles
 # throughput and halves GPU memory on tensor-core GPUs (all RTX cards). Set
@@ -164,17 +203,27 @@ def embed(request: EmbedRequest):
 
     prefix = QUERY_PREFIX if request.inputType == "query" else DOCUMENT_PREFIX
     prepared_texts = [f"{prefix}{text}" for text in request.texts]
+    total_characters = sum(len(text) for text in prepared_texts)
+    if total_characters > MAX_REQUEST_CHARACTERS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Embedding request exceeds the {MAX_REQUEST_CHARACTERS} "
+                f"character limit (got {total_characters}). Split the batch."
+            ),
+        )
     try:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         started_at = time.perf_counter()
-        embeddings = model.encode(
-            prepared_texts,
-            batch_size=BATCH_SIZE,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+        with ENCODE_LOCK:
+            embeddings = model.encode(
+                prepared_texts,
+                batch_size=BATCH_SIZE,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
         torch.cuda.synchronize()
         duration_ms = (time.perf_counter() - started_at) * 1000
         gpu_memory_allocated_bytes = int(torch.cuda.memory_allocated())

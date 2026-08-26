@@ -1,7 +1,13 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { FileStore, FileHandle, FileMetaData, FileEvent, FileFilter, MimeType } from '@matatbread/matbot-plugin-api';
 
 const file_table_name = 'file_meta';
+
+// Puts buffer whole files in memory before insert; the cap bounds a hostile or
+// oversized stream before it can OOM the process. Checked per chunk so the
+// failure happens as soon as the limit is crossed.
+const DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024;
 
 /**
  * A {@link FileStore} persisting file metadata and blobs in the shared SQLite
@@ -9,15 +15,18 @@ const file_table_name = 'file_meta';
  * watchers are notified of every write in-process.
  */
 export class SQLiteFileStore implements FileStore {
-  private readonly db:       DatabaseSync;
+  private readonly db:      DatabaseSync;
+  private readonly maxBytes: number;
   private readonly watchers = new Set<(event: FileEvent) => void>();
 
   /**
    * Creates the metadata table and indexes if absent.
    * @param db - Shared SQLite database connection.
+   * @param opts - Optional settings; `maxBytes` caps the buffered size of a single put (default 256 MiB).
    */
-  constructor(db: DatabaseSync) {
-    this.db = db;
+  constructor(db: DatabaseSync, opts?: { maxBytes?: number }) {
+    this.db       = db;
+    this.maxBytes = opts?.maxBytes ?? DEFAULT_MAX_FILE_BYTES;
     db.exec(`CREATE TABLE IF NOT EXISTS ${file_table_name} (
       id          TEXT    PRIMARY KEY NOT NULL,
       name        TEXT    NOT NULL,
@@ -33,8 +42,9 @@ export class SQLiteFileStore implements FileStore {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_${file_table_name}_name      ON ${file_table_name} (name)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_${file_table_name}_namespace ON ${file_table_name} (namespace)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_${file_table_name}_session   ON ${file_table_name} (session_id)`);
-    // Add `allowed` to tables created before this column existed; ignore the error if already present.
+    // Add `allowed`/`version` to tables created before these columns existed; ignore the error if already present.
     try { db.exec(`ALTER TABLE ${file_table_name} ADD COLUMN allowed INTEGER`); } catch { /* column exists */ }
+    try { db.exec(`ALTER TABLE ${file_table_name} ADD COLUMN version TEXT`);   } catch { /* column exists */ }
   }
 
   /**
@@ -45,7 +55,8 @@ export class SQLiteFileStore implements FileStore {
    * @param data - Byte chunks making up the file.
    * @param opts - Optional namespace, session/message linkage and allowed flag.
    * @returns The handle for the stored file.
-   * @throws Re-throws SQLite errors after rolling back the transaction.
+   * @throws When the stream exceeds the configured maximum size, or re-throws
+   *         SQLite errors after rolling back the transaction.
    */
   async put(
     name:     string | undefined,
@@ -54,7 +65,14 @@ export class SQLiteFileStore implements FileStore {
     opts?:    { sessionId?: string; messageId?: string; namespace?: string; allowed?: boolean },
   ): Promise<FileHandle> {
     const chunks: Uint8Array[] = [];
-    for await (const chunk of data) chunks.push(chunk);
+    let total = 0;
+    for await (const chunk of data) {
+      total += chunk.byteLength;
+      if (total > this.maxBytes) {
+        throw new Error(`File exceeds the store's maximum size of ${this.maxBytes} bytes (aborted after ${total} bytes).`);
+      }
+      chunks.push(chunk);
+    }
     const blob = Buffer.concat(chunks);
     const size = blob.length;
     const id   = name ?? crypto.randomUUID();
@@ -62,16 +80,17 @@ export class SQLiteFileStore implements FileStore {
 
     let createdAt: string;
     let prevMeta:  MetaRow | undefined;
+    const version = versionFor(blob, size);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       prevMeta  = this.db.prepare(META_SELECT + ` WHERE id = ?`).get(id) as unknown as MetaRow | undefined;
       createdAt = prevMeta?.created_at ?? now;
       this.db.prepare(`
-        INSERT OR REPLACE INTO ${file_table_name} (id, name, mime_type, size, created_at, namespace, session_id, message_id, allowed, data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO ${file_table_name} (id, name, mime_type, size, created_at, namespace, session_id, message_id, allowed, data, version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(id, id, mimeType, size, createdAt,
              opts?.namespace ?? null, opts?.sessionId ?? null, opts?.messageId ?? null,
-             opts?.allowed ? 1 : null, blob);
+             opts?.allowed ? 1 : null, blob, version);
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
@@ -79,14 +98,14 @@ export class SQLiteFileStore implements FileStore {
     }
 
     const nextRow: MetaRow = {
-      id, name: id, mime_type: mimeType, size, created_at: createdAt,
+      id, name: id, mime_type: mimeType, size, created_at: createdAt, version,
       namespace:  opts?.namespace  ?? null,
       session_id: opts?.sessionId  ?? null,
       message_id: opts?.messageId  ?? null,
       allowed:    opts?.allowed ? 1 : null,
     };
     const handle = this.buildHandle(nextRow);
-    this.emit(buildFileEvent(handle, prevMeta !== undefined ? metaFromRow(prevMeta) : undefined));
+    this.emit(buildFileEvent(nextRow, prevMeta !== undefined ? metaFromRow(prevMeta) : undefined));
     return handle;
   }
 
@@ -138,6 +157,7 @@ export class SQLiteFileStore implements FileStore {
    * @returns Change events describing each write (fields changed vs. prior state).
    */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
+    if (signal?.aborted) return;
     const queue: FileEvent[] = [];
     let notify: (() => void) | undefined;
     let done = false;
@@ -169,7 +189,7 @@ export class SQLiteFileStore implements FileStore {
     const db = this.db;
     const meta: FileMetaData = {
       id:        row.id,
-      version:   row.size.toString(),
+      version:   row.version ?? row.size.toString(),
       name:      row.name,
       mimeType:  row.mime_type,
       size:      row.size,
@@ -193,7 +213,7 @@ export class SQLiteFileStore implements FileStore {
 }
 
 // Selects all metadata columns except the blob — data is fetched lazily in stream().
-const META_SELECT = `SELECT id, name, mime_type, size, created_at, namespace, session_id, message_id, allowed FROM ${file_table_name}`;
+const META_SELECT = `SELECT id, name, mime_type, size, created_at, namespace, session_id, message_id, allowed, version FROM ${file_table_name}`;
 
 const META_KEYS: ReadonlyArray<keyof FileMetaData> = [
   'id', 'version', 'name', 'mimeType', 'size', 'createdAt',
@@ -210,12 +230,21 @@ interface MetaRow {
   session_id: string | null;
   message_id: string | null;
   allowed:    number | null;
+  // Rows written before the column existed carry null; those fall back to the
+  // legacy size-derived version until their next write.
+  version:    string | null;
+}
+
+// Content-addressed revision: distinct content at equal size yields distinct
+// versions, so a stale handle's version never matches a newer write.
+function versionFor(blob: Buffer, size: number): string {
+  return `${createHash('sha256').update(blob).digest('hex')}:${size}`;
 }
 
 function metaFromRow(row: MetaRow): FileMetaData {
   return {
     id:        row.id,
-    version:   row.size.toString(),
+    version:   row.version ?? row.size.toString(),
     name:      row.name,
     mimeType:  row.mime_type,
     size:      row.size,
@@ -227,18 +256,8 @@ function metaFromRow(row: MetaRow): FileMetaData {
   };
 }
 
-function buildFileEvent(handle: FileHandle, prev: FileMetaData | undefined): FileEvent {
-  const meta = metaFromRow({
-    id:         handle.id,
-    name:       handle.name,
-    mime_type:  handle.mimeType,
-    size:       handle.size,
-    created_at: handle.createdAt,
-    namespace:  handle.namespace  ?? null,
-    session_id: handle.sessionId  ?? null,
-    message_id: handle.messageId  ?? null,
-    allowed:    handle.allowed ? 1 : null,
-  });
+function buildFileEvent(row: MetaRow, prev: FileMetaData | undefined): FileEvent {
+  const meta = metaFromRow(row);
   const a = meta as unknown as Record<string, unknown>;
   const b = prev as unknown as Record<string, unknown> | undefined;
   const changed = b === undefined

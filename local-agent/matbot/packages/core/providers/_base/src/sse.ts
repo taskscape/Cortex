@@ -27,8 +27,10 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncIterable
       while ((nl = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, nl).trimEnd();
         buffer = buffer.slice(nl + 1);
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
+        // SSE spec: the field value starts after a single colon; the following optional
+        // space is stripped — so both `data: x` and `data:x` carry payload "x".
+        if (line.startsWith('data:')) {
+          const data = line[5] === ' ' ? line.slice(6) : line.slice(5);
           if (data !== '[DONE]') yield data;
         }
       }

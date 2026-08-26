@@ -100,7 +100,6 @@ function loadCachedToken(): { token: string; expiresAt: number } | undefined {
 export class DriveAuth {
   private readonly clientId: string;
   private readonly scope:    string;
-  private client?:   TokenClient;
   private accessToken: string | undefined;
   private expiresAt = 0;            // epoch ms; 0 ⇒ no token
   private pending:   Promise<string> | undefined;
@@ -122,17 +121,6 @@ export class DriveAuth {
     return this.accessToken !== undefined && Date.now() < this.expiresAt - 30_000;
   }
 
-  private ensureClient(oauth2: GisOAuth2): TokenClient {
-    if (this.client === undefined) {
-      this.client = oauth2.initTokenClient({
-        client_id: this.clientId,
-        scope:     this.scope,
-        callback:  () => {},   // replaced per-request
-      });
-    }
-    return this.client;
-  }
-
   /**
    * Open the Google consent/account popup and resolve with the token. **Must be called from within a
    * user gesture (a click), after `preloadGsi()` has resolved.** It opens the popup synchronously
@@ -141,7 +129,7 @@ export class DriveAuth {
    */
   requestInteractive(): Promise<string> {
     if (gsiReady === undefined) throw new Error('preloadGsi() must resolve before requestInteractive()');
-    return this.awaitToken(this.ensureClient(gsiReady), '');
+    return this.awaitToken(gsiReady, '');
   }
 
   /**
@@ -159,7 +147,7 @@ export class DriveAuth {
     if (this.pending !== undefined) return this.pending;
     this.pending = (async () => {
       const oauth2 = await loadGsi();
-      return this.awaitToken(this.ensureClient(oauth2), '');
+      return this.awaitToken(oauth2, '');
     })();
     try { return await this.pending; }
     finally { this.pending = undefined; }
@@ -175,23 +163,30 @@ export class DriveAuth {
     try { globalThis.localStorage?.removeItem(TOKEN_CACHE_KEY); } catch { /* unavailable */ }
   }
 
-  private awaitToken(client: TokenClient, prompt: string): Promise<string> {
+  // A fresh TokenClient per request: GIS routes the response through the
+  // client's single callback slot, so reusing one client across overlapping
+  // awaits lets the second `callback =` clobber the first and wedge it forever.
+  private awaitToken(oauth2: GisOAuth2, prompt: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-      client.callback = (resp: TokenResponse) => {
-        if (resp.error !== undefined || resp.access_token === undefined) {
-          reject(new Error(`Google authorisation failed: ${resp.error ?? 'no access_token returned'}`));
-          return;
-        }
-        this.accessToken = resp.access_token;
-        this.expiresAt   = Date.now() + (resp.expires_in ?? 3600) * 1000;
-        try {
-          globalThis.localStorage?.setItem(
-            TOKEN_CACHE_KEY,
-            JSON.stringify({ token: this.accessToken, expiresAt: this.expiresAt }),
-          );
-        } catch { /* unavailable */ }
-        resolve(resp.access_token);
-      };
+      const client = oauth2.initTokenClient({
+        client_id: this.clientId,
+        scope:     this.scope,
+        callback: (resp: TokenResponse) => {
+          if (resp.error !== undefined || resp.access_token === undefined) {
+            reject(new Error(`Google authorisation failed: ${resp.error ?? 'no access_token returned'}`));
+            return;
+          }
+          this.accessToken = resp.access_token;
+          this.expiresAt   = Date.now() + (resp.expires_in ?? 3600) * 1000;
+          try {
+            globalThis.localStorage?.setItem(
+              TOKEN_CACHE_KEY,
+              JSON.stringify({ token: this.accessToken, expiresAt: this.expiresAt }),
+            );
+          } catch { /* unavailable */ }
+          resolve(resp.access_token);
+        },
+      });
       // Empty prompt: silent if a prior grant + live session allow it, otherwise GIS shows the popup.
       client.requestAccessToken({ prompt });
     });

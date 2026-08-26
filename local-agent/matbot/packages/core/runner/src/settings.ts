@@ -32,6 +32,20 @@ export function slugSettingsNamespace(name: string): string {
   return name.replace(/[^\w-]+/g, '_');
 }
 
+// Millisecond timestamps collide under burst writes, so each version carries a same-ms sequence
+// number — unique and monotonic across the process. CAS retries are bounded: a perpetually
+// contended document fails loudly instead of livelocking the loop.
+const MAX_CAS_ATTEMPTS = 8;
+
+let versionMs  = 0;
+let versionSeq = 0;
+function nextVersion(): string {
+  const ms = Date.now();
+  if (ms === versionMs) versionSeq++;
+  else { versionMs = ms; versionSeq = 0; }
+  return `${ms}.${versionSeq}`;
+}
+
 /**
  * Build a PluginSettings facade over the shared settings store, scoped to one document id.
  * Writes use compare-and-swap with retry; a pre-Store flat-object document is migrated on read.
@@ -48,7 +62,12 @@ export function makePluginSettings(store: Store<SettingsDoc>, namespace: string)
     const raw = await store.get(id);
     if (raw === null) return null;
     if (isSettingsDoc(raw)) return raw;
-    // Old format: flat { key: value } — wrap it so subsequent writes upgrade the file.
+    // Old format: flat { key: value } — wrap it so subsequent writes upgrade the file. Guarded:
+    // a corrupted non-object document fails loudly here instead of flowing through as an
+    // empty payload.
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`Settings document "${id}" has unexpected shape (${Array.isArray(raw) ? 'array' : typeof raw}); refusing to treat it as a flat settings record`);
+    }
     return { id, version: '0', data: raw as unknown as Record<string, unknown> };
   };
 
@@ -57,26 +76,34 @@ export function makePluginSettings(store: Store<SettingsDoc>, namespace: string)
       return (await getDoc())?.data[key] as T | undefined;
     },
     async set<T>(key: string, value: T): Promise<void> {
-      for (;;) {
+      for (let attempt = 0; ; attempt++) {
         const doc  = await getDoc();
         const data = { ...(doc?.data ?? {}), [key]: value as unknown };
-        const next: SettingsDoc = { id, version: Date.now().toString(), data };
+        const next: SettingsDoc = { id, version: nextVersion(), data };
         // version '0' means migrated-but-not-yet-written — use set to upgrade the file.
         if (doc === null || doc.version === '0') { await store.set(id, next); return; }
         const r = await store.cas(id, doc.version, next);
         if (r.ok) return;
+        if (attempt + 1 >= MAX_CAS_ATTEMPTS) {
+          throw new Error(`Settings write for "${id}" failed after ${MAX_CAS_ATTEMPTS} concurrent attempts`);
+        }
+        await new Promise(resolve => setTimeout(resolve, attempt * 5));
       }
     },
     async delete(key: string): Promise<void> {
-      for (;;) {
+      for (let attempt = 0; ; attempt++) {
         const doc = await getDoc();
         if (doc === null) return;
         const data = { ...doc.data };
         delete data[key];
-        const next: SettingsDoc = { id, version: Date.now().toString(), data };
+        const next: SettingsDoc = { id, version: nextVersion(), data };
         if (doc.version === '0') { await store.set(id, next); return; }
         const r = await store.cas(id, doc.version, next);
         if (r.ok) return;
+        if (attempt + 1 >= MAX_CAS_ATTEMPTS) {
+          throw new Error(`Settings delete for "${id}" failed after ${MAX_CAS_ATTEMPTS} concurrent attempts`);
+        }
+        await new Promise(resolve => setTimeout(resolve, attempt * 5));
       }
     },
   };

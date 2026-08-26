@@ -88,7 +88,9 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
       // High-risk files (.env, .pem, .key, ...) are readable through the broker only behind an explicit
       // approval. Nothing approves an index run, and a chunk in the store is readable by anyone who can
       // reach /search — so they are never indexed. The redaction pass below is a content backstop for
-      // ordinary files, not a substitute for this: it misses `TOKEN=...` shapes entirely.
+      // ordinary files, not a substitute for this: it covers credential-shaped assignments whose name
+      // suggests a secret (including `TOKEN=...`), and `fileLevelSecret` withholds files carrying
+      // high-confidence key/token shapes outright — but both are heuristics with gaps.
       if (decision.highRisk) {
         skipped.push({ path: filePath, reason: "high-risk-file" });
         continue;

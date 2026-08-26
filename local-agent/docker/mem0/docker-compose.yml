@@ -28,12 +28,14 @@ services:
       # writable, and persists the SQLite history across restarts.
       - mem0-history:/app/history
     ports:
-      - "8888:8000"
+      # Loopback-only publication: these services hold secrets and must not be
+      # reachable from the LAN.
+      - "127.0.0.1:8888:8000"
     depends_on:
       postgres:
         condition: service_healthy
       neo4j:
-        condition: service_started
+        condition: service_healthy
 
   workspace-rag-cuda:
     profiles: ["cuda"]
@@ -52,7 +54,7 @@ services:
     volumes:
       - workspace-rag-models:/models
     ports:
-      - "8890:8000"
+      - "127.0.0.1:8890:8000"
 
   workspace-rag-reranker:
     profiles: ["reranker"]
@@ -72,7 +74,7 @@ services:
     volumes:
       - workspace-rag-models:/models
     ports:
-      - "8891:8000"
+      - "127.0.0.1:8891:8000"
 
   postgres:
     # PostgreSQL 16.14 + pgvector 0.8.3, pinned to the tested multi-arch image.
@@ -82,7 +84,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-mem0}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - mem0-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -96,10 +98,19 @@ services:
     environment:
       NEO4J_AUTH: ${NEO4J_AUTH:?NEO4J_AUTH is required (format neo4j/<password>)}
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     volumes:
       - mem0-neo4j:/data
+    healthcheck:
+      # The unauthenticated HTTP endpoint at 7474 answers once the database is
+      # accepting connections; bolt (7687) comes up in the same startup phase,
+      # so this avoids mem0-api crash-looping against a still-initializing Neo4j.
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
 
 volumes:
   mem0-postgres:

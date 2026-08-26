@@ -33,15 +33,17 @@ export class ReloadingConfig<T> {
 
   /**
    * Returns the current value, re-reading the file only when its size or
-   * modification time has changed since the cached load.
+   * modification time has changed since the cached load. The fingerprint uses
+   * bigint stat (`mtimeNs`) so sub-millisecond rapid edits are detected where a
+   * millisecond-resolution fingerprint would miss them.
    *
    * @returns A promise resolving to the freshest parsed configuration.
    * @throws Any error from stat-ing or loading the file; concurrent callers of
    * the same pending load share its rejection.
    */
   async get(): Promise<T> {
-    const info = await stat(this.filePath);
-    const fingerprint = `${info.size}:${info.mtimeMs}`;
+    const info = await stat(this.filePath, { bigint: true });
+    const fingerprint = `${info.size}:${info.mtimeNs}`;
     if (this.cached?.fingerprint === fingerprint) return this.cached.value;
     if (this.loading?.fingerprint === fingerprint) return this.loading.promise;
 

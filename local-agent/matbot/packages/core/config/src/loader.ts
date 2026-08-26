@@ -28,10 +28,32 @@ function asRecord(v: YamlValue | undefined, label: string): YamlMap {
   throw new Error(`Config: expected mapping for "${label}", got ${v === undefined ? 'undefined' : typeof v}`);
 }
 
+const NUMERIC_PARAMETER_NAMES = new Set([
+  'temperature',
+  'maxTokens',
+  'topP',
+  'maxContextTokens',
+  'maxOutputTokens',
+  'maxCompletionTokens',
+]);
+
 function toModelParameters(raw: YamlMap): ModelParameters {
   const params: ModelParameters = {};
   for (const [k, v] of Object.entries(raw)) {
-    params[k] = v as ModelParameters[string];
+    if (typeof v === 'number' || typeof v === 'boolean') {
+      params[k] = v;
+    } else if (typeof v === 'string') {
+      if (NUMERIC_PARAMETER_NAMES.has(k)) {
+        const n = Number(v.trim());
+        params[k] = v.trim() !== '' && !Number.isNaN(n) ? n : v;
+      } else {
+        params[k] = v;
+      }
+    } else {
+      console.warn(
+        `Config: provider parameter "${k}" must be a number, string, or boolean; got ${Array.isArray(v) ? 'a sequence' : 'a mapping'} — skipping`,
+      );
+    }
   }
   return params;
 }
@@ -72,6 +94,13 @@ function providerNameForModel(groupName: string, models: YamlValue[], modelName:
   return models.length === 1 ? groupName : `${groupName}-${modelName}`;
 }
 
+function setProvider(providers: Map<string, ProviderConfig>, name: string, config: ProviderConfig): void {
+  if (providers.has(name)) {
+    console.warn(`Config: provider "${name}" is defined more than once; the later definition replaces the earlier one`);
+  }
+  providers.set(name, config);
+}
+
 function toOpenAICompatibleProviderConfigs(raw: YamlValue | undefined): Map<string, ProviderConfig> {
   const providers = new Map<string, ProviderConfig>();
   if (raw === undefined) return providers;
@@ -106,7 +135,7 @@ function toOpenAICompatibleProviderConfigs(raw: YamlValue | undefined): Map<stri
       if (completionTokens !== undefined) parameters['maxCompletionTokens'] = completionTokens;
       if (capabilities !== undefined) parameters['capabilities'] = capabilities;
 
-      providers.set(providerName, {
+      setProvider(providers, providerName, {
         name: providerName,
         module: './packages/plugins/providers/openai-compat',
         endpoint: apiUrl,
@@ -157,14 +186,14 @@ export function parseConfig(
   if (languageModels !== undefined) {
     const languageModelsMap = asRecord(languageModels, 'language_models');
     for (const [name, config] of toOpenAICompatibleProviderConfigs(languageModelsMap['openai_compatible'])) {
-      providers.set(name, config);
+      setProvider(providers, name, config);
     }
   }
 
   if (providersRaw !== undefined) {
     const providersMap = asRecord(providersRaw, 'providers');
     for (const [name, raw] of Object.entries(providersMap)) {
-      providers.set(name, toProviderConfig(name, asRecord(raw, `providers.${name}`)));
+      setProvider(providers, name, toProviderConfig(name, asRecord(raw, `providers.${name}`)));
     }
   }
 

@@ -1,8 +1,8 @@
 import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import { spawn } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import process from 'node:process';
@@ -26,23 +26,58 @@ function sanitizeTimeout(timeout: number | undefined): number | undefined {
     : undefined;
 }
 
+// Only these variables reach LLM-initiated commands. Never spread process.env: matbot loads
+// vault-resolved credentials into it, and every extra variable is one `$env:` read away
+// from exfiltration.
+const SAFE_ENV_KEYS = [
+  'PATH', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR',
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+  'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES',
+] as const;
+
+/** Minimal safe default environment built from an explicit allowlist (case-insensitive lookup). */
+export function safeDefaultEnv(): Record<string, string> {
+  const available = new Map(Object.entries(process.env).map(([k, v]) => [k.toUpperCase(), v]));
+  const out: Record<string, string> = {};
+  for (const key of SAFE_ENV_KEYS) {
+    const v = available.get(key);
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
+/**
+ * Resolve a requested working directory against the tool's base directory and refuse anything
+ * that escapes it — including sibling paths that merely share a prefix (`/base` vs `/base-x`).
+ */
+export function confineWorkspaceCwd(requested: string | undefined, base: string): string {
+  const resolvedBase = resolve(base);
+  const resolved     = resolve(resolvedBase, requested ?? '.');
+  if (resolved !== resolvedBase && !resolved.startsWith(resolvedBase + sep)) {
+    throw new Error(`Requested cwd "${requested}" is outside the session workspace.`);
+  }
+  return resolved;
+}
+
 function powershellExecutable(): string {
   return process.platform === 'win32' ? 'powershell.exe' : 'powershell';
 }
 
-async function writeScriptFile(script: string): Promise<string> {
-  const dir = join(tmpdir(), 'matbot-powershell');
-  await mkdir(dir, { recursive: true });
-  const path = join(dir, `${randomUUID()}.ps1`);
-  await writeFile(path, script, 'utf8');
-  return path;
+async function createScriptRun(script: string): Promise<{ dir: string; scriptPath: string }> {
+  const base = join(tmpdir(), 'matbot-powershell');
+  await mkdir(base, { recursive: true });
+  // Per-run mkdtemp: scripts never share one stable, predictable directory across runs.
+  const dir        = await mkdtemp(join(base, 'run-'));
+  const scriptPath = join(dir, `${randomUUID()}.ps1`);
+  await writeFile(scriptPath, script, 'utf8');
+  return { dir, scriptPath };
 }
 
 // Bridge event-emitter callbacks to an AsyncIterable<ToolEvent>.
 function spawnAndStream(
   command: string,
   args:    string[],
-  opts:    { cwd?: string; env: Record<string, string>; timeout?: number; signal: AbortSignal; cleanup: () => Promise<void> },
+  opts:    { cwd?: string; env: Record<string, string>; timeout?: number; signal: AbortSignal },
 ): AsyncIterable<ToolEvent> {
   const queue: Array<ToolEvent | null> = [];
   let wakeup: (() => void) | null = null;
@@ -144,7 +179,6 @@ function spawnAndStream(
     if (timer !== undefined) clearTimeout(timer);
     if (killTimer !== undefined) clearTimeout(killTimer);
     opts.signal.removeEventListener('abort', killOnAbort);
-    await opts.cleanup();
   }
 
   return {
@@ -184,7 +218,7 @@ const INPUT_SCHEMA = {
   required:   ['script'],
   properties: {
     script:  { type: 'string', description: 'PowerShell script or command to run from a temporary .ps1 file.' },
-    cwd:     { type: 'string', description: 'Working directory. Defaults to the session workspace.' },
+    cwd:     { type: 'string', description: 'Working directory, resolved against and confined to the session workspace. Defaults to the session workspace.' },
     env:     { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables to set.' },
     timeout: { type: 'number', description: 'Kill the process after this many milliseconds.' },
   },
@@ -203,30 +237,37 @@ export const powershellTool: Tool = {
   executor: {
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       const { script, cwd: cwdInput, env, timeout } = input as PowerShellInput;
-      const cwd = cwdInput ?? ctx.workdir;
-      if (cwd !== undefined) await mkdir(cwd, { recursive: true });
 
-      const mergedEnv: Record<string, string> = {};
-      for (const [k, v] of Object.entries(process.env)) {
-        if (v !== undefined) mergedEnv[k] = v;
+      let cwd: string;
+      try {
+        cwd = confineWorkspaceCwd(cwdInput, ctx.workdir ?? process.cwd());
+      } catch (e) {
+        yield { type: 'error', message: e instanceof Error ? e.message : String(e) };
+        return;
       }
-      if (env) Object.assign(mergedEnv, env);
+      await mkdir(cwd, { recursive: true });
 
-      const scriptPath = await writeScriptFile(script);
-      yield* spawnAndStream(powershellExecutable(), [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        scriptPath,
-      ], {
-        ...(cwd     !== undefined ? { cwd }     : {}),
-        ...(timeout !== undefined ? { timeout } : {}),
-        env: mergedEnv,
-        signal: ctx.signal,
-        cleanup: () => rm(scriptPath, { force: true }),
-      });
+      const mergedEnv = { ...safeDefaultEnv(), ...(env ?? {}) };
+
+      const { dir, scriptPath } = await createScriptRun(script);
+      try {
+        yield* spawnAndStream(powershellExecutable(), [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          scriptPath,
+        ], {
+          ...(timeout !== undefined ? { timeout } : {}),
+          env: mergedEnv,
+          signal: ctx.signal,
+          cwd,
+        });
+      } finally {
+        // Runs on completion, abort, timeout, overflow, and consumer abandonment alike.
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
     },
   },
 };

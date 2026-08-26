@@ -7,7 +7,16 @@ param(
     [switch]$Start,
     [switch]$Force,
     [string]$WinSWExe,
-    [string]$WinSWDownloadUrl = "https://github.com/winsw/winsw/releases/latest/download/WinSW-x64.exe"
+    # Pinned release: the wrapper runs as LocalSystem, so a moving `latest`
+    # download without integrity verification would turn any upstream/CDN
+    # compromise into SYSTEM code execution.
+    [string]$WinSWDownloadUrl = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe",
+    # SHA256 of the downloaded WinSW executable. The WinSW project does not
+    # publish hashes on its release page, so the caller MUST supply the value
+    # they independently verified (e.g. by building v2.12.0 from the tagged
+    # source or via an internal mirror). Pass -ExpectedSha256 or set
+    # CORTEX_WINSW_SHA256; downloads fail closed when it is absent.
+    [string]$ExpectedSha256 = $env:CORTEX_WINSW_SHA256
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,11 +78,31 @@ if ($WinSWExe) {
     if (-not (Test-Path -LiteralPath $WinSWExe)) {
         throw "WinSW executable not found: $WinSWExe"
     }
+    if ($ExpectedSha256) {
+        $actualHash = (Get-FileHash -LiteralPath $WinSWExe -Algorithm SHA256).Hash
+        if ($actualHash -ne $ExpectedSha256.ToUpperInvariant()) {
+            throw "Supplied WinSW executable failed SHA256 verification (expected $($ExpectedSha256.ToUpperInvariant()), got $actualHash)."
+        }
+    }
     Copy-Item -LiteralPath $WinSWExe -Destination $WrapperExe -Force
 }
 elseif (-not (Test-Path -LiteralPath $WrapperExe)) {
+    if (-not $ExpectedSha256) {
+        throw (
+            "Refusing to download WinSW without integrity verification. " +
+            "Provide the published hash via -ExpectedSha256 <sha256> (or the CORTEX_WINSW_SHA256 environment variable), " +
+            "or pass a pre-vetted binary with -WinSWExe."
+        )
+    }
     Write-Host "Downloading WinSW service wrapper..."
-    Invoke-WebRequest -Uri $WinSWDownloadUrl -OutFile $WrapperExe
+    $downloadPath = "$WrapperExe.download"
+    Invoke-WebRequest -Uri $WinSWDownloadUrl -OutFile $downloadPath
+    $actualHash = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $ExpectedSha256.ToUpperInvariant()) {
+        Remove-Item -LiteralPath $downloadPath -Force -ErrorAction SilentlyContinue
+        throw "Downloaded WinSW failed SHA256 verification (expected $($ExpectedSha256.ToUpperInvariant()), got $actualHash). Download discarded."
+    }
+    Move-Item -LiteralPath $downloadPath -Destination $WrapperExe -Force
 }
 
 Unblock-File -LiteralPath $WrapperExe -ErrorAction SilentlyContinue

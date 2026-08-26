@@ -6,5 +6,10 @@
 #   - psycopg: required by the pgvector vector store
 #   - langchain-neo4j: required by the neo4j graph store (enabled via NEO4J_* env)
 #   - rank-bm25: required by the neo4j graph store for BM25 reranking
-FROM mem0/mem0-api-server:latest
+# Upstream publishes no version tags for this image (only `latest`), so we pin
+# the multi-arch manifest digest, matching the pgvector pinning style below.
+# Keep this digest in sync with the upstream release that the pinned pip
+# dependencies (psycopg / langchain-neo4j / rank-bm25) were tested against;
+# bump it deliberately when updating mem0 or its requirements.
+FROM mem0/mem0-api-server@sha256:2fcf4bb713cfc584d454bf06993cc7e2fe51540695995bd3aa9c7008b7065c75
 RUN pip install --no-cache-dir "psycopg[binary,pool]" langchain-neo4j rank-bm25

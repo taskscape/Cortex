@@ -49,16 +49,23 @@ async function writeMeta(dir: FileSystemDirectoryHandle, meta: OPFSMeta): Promis
 async function writeData(dir: FileSystemDirectoryHandle, id: string, data: AsyncIterable<Uint8Array>): Promise<number> {
   const dataFh   = await dir.getFileHandle(`${id}.data`, { create: true });
   const writable = await dataFh.createWritable();
-  let size = 0;
-  for await (const chunk of data) {
-    // Copy into a fresh Uint8Array<ArrayBuffer> — OPFS writable requires ArrayBuffer-backed views
-    const safe = new Uint8Array(chunk.byteLength);
-    safe.set(chunk);
-    await writable.write(safe);
-    size += chunk.byteLength;
+  try {
+    let size = 0;
+    for await (const chunk of data) {
+      // Copy into a fresh Uint8Array<ArrayBuffer> — OPFS writable requires ArrayBuffer-backed views
+      const safe = new Uint8Array(chunk.byteLength);
+      safe.set(chunk);
+      await writable.write(safe);
+      size += chunk.byteLength;
+    }
+    await writable.close();
+    return size;
+  } catch (e) {
+    // Abandoning the writable without closing/aborting leaks it and can leave
+    // the swap-to-file pending forever.
+    await writable.abort().catch(() => undefined);
+    throw e;
   }
-  await writable.close();
-  return size;
 }
 
 /**
@@ -66,6 +73,11 @@ async function writeData(dir: FileSystemDirectoryHandle, id: string, data: Async
  * Requires a browser environment with `navigator.storage.getDirectory()`.
  */
 export class OPFSFileStore implements FileStore {
+  // Promise-chain mutex keyed by (name, namespace): the get→write→meta sequence
+  // in a named put is not atomic, so concurrent puts of the same name would
+  // otherwise race and mint duplicate entries.
+  private inFlight = new Map<string, Promise<unknown>>();
+
   /**
    * Writes a file to OPFS, creating a new entry or upserting by name.
    * @param name File name; when provided and an entry with the same name (+namespace) exists, its content is replaced in place.
@@ -75,6 +87,20 @@ export class OPFSFileStore implements FileStore {
    * @returns A handle for reading the stored file's metadata and content.
    */
   async put(
+    name:     string | undefined,
+    mimeType: MimeType,
+    data:     AsyncIterable<Uint8Array>,
+    meta?:    { sessionId?: string; messageId?: string; namespace?: string; allowed?: boolean },
+  ): Promise<FileHandle> {
+    if (name === undefined) return this.putNow(name, mimeType, data, meta);
+    const key  = JSON.stringify([meta?.namespace ?? null, name]);
+    const tail = (this.inFlight.get(key) ?? Promise.resolve())
+      .then(() => this.putNow(name, mimeType, data, meta));
+    this.inFlight.set(key, tail.then(() => undefined, () => undefined));
+    return tail;
+  }
+
+  private async putNow(
     name:     string | undefined,
     mimeType: MimeType,
     data:     AsyncIterable<Uint8Array>,
@@ -160,10 +186,18 @@ export class OPFSFileStore implements FileStore {
    */
   async delete(id: string): Promise<void> {
     const dir = await filesDir();
-    await Promise.allSettled([
+    const results = await Promise.allSettled([
       dir.removeEntry(`${id}.data`),
       dir.removeEntry(`${id}.meta.json`),
     ]);
+    // Removal failures (absent entries, quota/permission errors) must not vanish: log each one.
+    for (const [i, result] of results.entries()) {
+      if (result.status === 'rejected') {
+        const file  = i === 0 ? `${id}.data` : `${id}.meta.json`;
+        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        console.warn(`[opfs-file-store] Failed to remove "${file}": ${error}`);
+      }
+    }
   }
 
   /**

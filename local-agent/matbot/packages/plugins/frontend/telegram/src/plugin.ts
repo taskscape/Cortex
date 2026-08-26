@@ -186,7 +186,7 @@ export const plugin: MatbotPluginSpec = {
     const ac   = new AbortController();
     teardownAc = ac;
 
-    async function handleMessage(chatId: number, text: string, senderName?: string): Promise<void> {
+    async function handleMessage(chatId: number, text: string, senderName?: string, senderId?: number): Promise<void> {
       if (!knownChats.has(chatId)) {
         // A new user. Admit them only as the first-ever chat, or while the door is open.
         if (knownChats.size === 0 || (openDoor && (Date.now() - openDoor) < 30_000)) {
@@ -201,7 +201,9 @@ export const plugin: MatbotPluginSpec = {
       // Snapshot the active provider name so a mid-run switch doesn't affect this call. The runner
       // resolves the adapter from the name, so we no longer build it here.
       const providerName = activeProvider.name;
-      const principal: Principal = { id: `telegram-${senderName ?? chatId}`, type: 'user'};
+      // Principal identity comes from the immutable numeric sender id (falling back to the chat id);
+      // the display name is spoofable and must never determine identity.
+      const principal: Principal = { id: `telegram-${senderId ?? chatId}`, type: 'user'};
       try {
         sendChatAction(botToken, chatId, 'typing').catch(() => {});
 
@@ -328,9 +330,10 @@ export const plugin: MatbotPluginSpec = {
               // Establish this message's principal at the dispatch entry so the session/settings
               // store access inside handleMessage runs under it (the turn itself is scoped by pump).
               const senderName = msg.from?.first_name || msg.from?.username;
-              const principal: Principal = { id: `telegram-${senderName ?? msg.chat.id}`, type: 'user'};
+              // Same derivation as handleMessage: immutable numeric sender id, never the display name.
+              const principal: Principal = { id: `telegram-${msg.from?.id ?? msg.chat.id}`, type: 'user'};
               void runAs(principal,
-                () => handleMessage(msg.chat.id, msg.text!, senderName));
+                () => handleMessage(msg.chat.id, msg.text!, senderName, msg.from?.id));
             }
           }
         } catch (e) {

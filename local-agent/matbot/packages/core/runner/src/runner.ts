@@ -119,6 +119,15 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       status, durationMs: Date.now() - turnStartedAt, ...(attributes !== undefined ? { attributes } : {}),
     });
   };
+  const scrubSpanValue = (value: unknown): unknown => {
+    if (typeof value === 'string') return vault.scrub(value);
+    if (value === null || typeof value !== 'object') return value;
+    try {
+      return JSON.parse(vault.scrub(JSON.stringify(value)));
+    } catch {
+      return '[unserializable]';
+    }
+  };
   await observe({
     phase: 'start', kind: 'agent', name: 'matbot.turn', spanId: turnSpanId, sessionId,
     attributes: { provider: config.provider, persona: config.persona ?? null },
@@ -284,11 +293,24 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
           toolCallCount: pendingCalls.length,
         },
       });
-    } catch (e: any) {
+    } catch (e) {
+      // Unknown-typed catch: extract message/cause/stack via instanceof so an Error's stack
+      // is not flattened to `String(e)` ("Error: msg") and non-Errors still surface.
+      const err     = e instanceof Error ? e : undefined;
+      const message = err !== undefined ? err.message : String(e);
+      const stack   = err?.stack;
+      const cause   = err?.cause;
+      const detail  = cause !== undefined
+        ? `${message} (${cause instanceof Error ? cause.message : String(cause)})`
+        : message;
       await observe({
         phase: 'end', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
         parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - providerStartedAt,
-        attributes: { provider: config.provider, error: String(e) },
+        attributes: {
+          provider: config.provider,
+          error: detail,
+          ...(stack !== undefined ? { errorStack: stack } : {}),
+        },
       });
       if (signal.aborted) {
         // Save whatever the LLM streamed before the abort hit.
@@ -300,11 +322,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         }
         await store.set(session.id, session);
         yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
-        await finishTurn('error', { terminal: 'aborted', reason: String(signal.reason ?? 'user-abort') });
+        await finishTurn('error', { terminal: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort' });
         return;
       }
-      yield { type: 'error', error: String(e) + (('cause' in e && e.cause) ? ' ('+String(e.cause)+')' : '' ), traceId };
-      await finishTurn('error', { terminal: 'error', error: String(e) });
+      yield { type: 'error', error: detail, traceId };
+      await finishTurn('error', { terminal: 'error', error: detail });
       return;
     }
 
@@ -344,7 +366,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       await observe({
         phase: 'start', kind: 'tool', name: tc.name, spanId: toolSpanId,
         parentSpanId: turnSpanId, sessionId,
-        attributes: { callId: tc.id, input: tc.input },
+        attributes: { callId: tc.id, input: scrubSpanValue(tc.input) },
       });
       yield { type: 'tool:start', callId: tc.id, name: tc.name, input: tc.input, traceId };
 
@@ -367,6 +389,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         tool,
       });
       if (decision.abort) {
+        await store.set(session.id, session);
         yield { type: 'aborted', reason: decision.abort, session, traceId };
         const policySpanId = crypto.randomUUID();
         await observe({
@@ -452,7 +475,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       await observe({
         phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
         parentSpanId: turnSpanId, sessionId, status: isError ? 'error' : 'ok', durationMs: Date.now() - toolStartedAt,
-        attributes: { callId: tc.id, result, isError },
+        attributes: { callId: tc.id, result: scrubSpanValue(result), isError },
       });
     }
 

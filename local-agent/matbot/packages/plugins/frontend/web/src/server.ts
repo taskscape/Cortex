@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type {
   MatbotPlugin, Principal, Session, Store, ToolRegistry, FileStore, Vault, Message, MessageContent,
   FormField, PromptFn, SessionRunner, PluginRegistryEvent,
@@ -69,7 +70,10 @@ export interface WebServerDeps {
   // SkillManager *after* frontend-web sets up — load order isn't guaranteed. Returns undefined until
   // then; the watch loop is started on first /events connect, by which point boot is complete.
   skills?:        () => SkillManager | undefined;
-  cors?:          string;  // Access-Control-Allow-Origin value, default '*'
+  // Access-Control-Allow-Origin override. Default (unset): reflect the request Origin only when it
+  // is a loopback origin (http(s)://127.0.0.1|localhost|[::1]:<port>); foreign origins get no ACAO
+  // header, so browsers block the response.
+  cors?:          string;
   workdir?:       string;
   files?:         FileStore;
   configPath?:    string;
@@ -227,6 +231,49 @@ interface ExpertPanelSubmitBody {
 // for an in-flight response to finish, short enough that shutdown stays bounded.
 const CLOSE_GRACE_MS = 1000;
 
+// Header carrying the optional shared secret (env CORTEX_WEBUI_TOKEN) on mutating requests.
+const TOKEN_HEADER = 'x-cortex-token';
+
+// Execution-class tools are denied for direct HTTP invocation by default — the classic
+// localhost-CSRF/DNS-rebinding RCE path. CORTEX_WEBUI_ALLOW_SHELL_TOOLS=1 opts back in.
+const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(['bash', 'powershell', 'docker-bash']);
+
+// CAS retry budget for appendSessionMessages. Contended appends retry with randomized backoff and
+// then fail the request (409) — never a bypassing unconditional write.
+const MAX_CAS_ATTEMPTS = 10;
+
+/** Thrown by {@link appendSessionMessages} when the session stays contended past the CAS retry budget. */
+export class SessionConflictError extends Error {
+  constructor(sessionId: string) {
+    super(`Session "${sessionId}" was concurrently modified; please retry.`);
+    this.name = 'SessionConflictError';
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.byteLength;
+      if (size > maxBytes) {
+        // Stop buffering immediately and tear down the connection: continuing to drain would let an
+        // oversized body consume memory long after the limit was exceeded.
+        req.destroy();
+        reject(new Error('Request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
 // Last-resort anonymous identity, used only when no boot principal is established and no resolver
 // override is registered (e.g. tests, or a realm with no carrier).
 const ANONYMOUS_WEB_USER: Principal = {
@@ -247,20 +294,6 @@ const ANONYMOUS_WEB_USER: Principal = {
  */
 export const defaultWebPrincipal: WebPrincipalResolver = () => tryCurrentPrincipal() ?? ANONYMOUS_WEB_USER;
 
-async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (chunk: Buffer) => {
-      size += chunk.byteLength;
-      if (size > maxBytes) { reject(new Error('Request body too large')); return; }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
-  });
-}
-
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -270,12 +303,44 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-function corsHeaders(origin: string): Record<string, string> {
+function corsHeaders(origin: string | undefined): Record<string, string> {
   return {
-    'access-control-allow-origin':  origin,
-    'access-control-allow-headers': 'content-type, authorization',
+    ...(origin !== undefined ? { 'access-control-allow-origin': origin } : {}),
+    'access-control-allow-headers': 'content-type, authorization, x-cortex-token',
     'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
   };
+}
+
+// DNS-rebinding defense, mirroring http-utils assertLoopbackRequest for file-broker/file-index:
+// only requests whose Host names a loopback origin are served.
+function isLoopbackHost(hostHeader: string): boolean {
+  const host = hostHeader.trim().toLowerCase();
+  const name = host.startsWith('[')
+    ? host.slice(0, host.indexOf(']') + 1)
+    : host.includes(':') ? host.slice(0, host.lastIndexOf(':')) : host;
+  return name === 'localhost' || name === '127.0.0.1' || name === '[::1]';
+}
+
+// CORS allowlist: loopback origins on any port (the UI is served from this same server).
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function tokensEqual(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function decodeToolName(raw: string): string {
+  try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -466,7 +531,17 @@ function titleFromQuestion(question: string): string | undefined {
  *          and multiplexed SSE event streams.
  */
 export function createWebServer(deps: WebServerDeps) {
-  const origin = deps.cors ?? '*';
+  // CORS: an explicit deps.cors value wins; otherwise only loopback origins are reflected.
+  const configuredCors = deps.cors;
+  const resolveCorsOrigin = (req: IncomingMessage): string | undefined => {
+    if (configuredCors !== undefined) return configuredCors;
+    const origin = req.headers.origin;
+    if (origin === undefined || !isLoopbackOrigin(origin)) return undefined;
+    return origin;
+  };
+  // Optional shared secret on mutating routes. Unset/empty → no token required.
+  const requiredToken = process.env['CORTEX_WEBUI_TOKEN'];
+  const shellToolsAllowed = process.env['CORTEX_WEBUI_ALLOW_SHELL_TOOLS'] === '1';
   const resolvePrincipal = deps.resolvePrincipal ?? defaultWebPrincipal;
   const branding = deps.branding ?? DEFAULT_WEB_BRANDING;
 
@@ -592,9 +667,25 @@ export function createWebServer(deps: WebServerDeps) {
     const method = req.method ?? 'GET';
     const url    = req.url ?? '/';
 
-    // Set CORS headers on every response
-    for (const [k, v] of Object.entries(corsHeaders(origin))) {
+    // DNS-rebinding defense: a foreign (or missing) Host header never reaches the routes.
+    const host = req.headers.host;
+    if (host === undefined || !isLoopbackHost(host)) {
+      json(res, 403, { error: 'Forbidden.' });
+      return;
+    }
+
+    // Set CORS headers on every response — the origin only when allowlisted.
+    for (const [k, v] of Object.entries(corsHeaders(resolveCorsOrigin(req)))) {
       res.setHeader(k, v);
+    }
+
+    // Shared-secret gate on mutating routes. GET/OPTIONS stay open so the UI keeps rendering.
+    if ((method === 'POST' || method === 'PUT' || method === 'DELETE') && requiredToken) {
+      const presented = req.headers[TOKEN_HEADER];
+      if (typeof presented !== 'string' || !tokensEqual(presented, requiredToken)) {
+        json(res, 401, { error: 'Unauthorized.' });
+        return;
+      }
     }
 
     if (method === 'OPTIONS') { res.writeHead(204).end(); return; }
@@ -607,7 +698,7 @@ export function createWebServer(deps: WebServerDeps) {
       const principal = await resolvePrincipal(req);
       await runAs(principal, () => handleRequest(req, res, method, url, principal));
     } catch (e) {
-      if (!res.headersSent) json(res, 500, { error: String(e) });
+      if (!res.headersSent) json(res, e instanceof SessionConflictError ? 409 : 500, { error: String(e) });
       else if (res.writable)  res.end();
     }
   });
@@ -678,21 +769,20 @@ export function createWebServer(deps: WebServerDeps) {
     messages: readonly Message[],
     shapeSession?: (session: Session) => Session,
   ): Promise<Session | null> {
-    for (let attempt = 0; attempt < 5; attempt++) {
+    // Never bypass CAS on a shared session document: a contended append retries with randomized
+    // backoff and then fails the request with 409 instead of dropping concurrent messages.
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
       const current = await deps.store.get(sessionId);
       if (!current) return null;
       const shaped = shapeSession ? shapeSession(current) : current;
       const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
       const saved = await deps.store.cas(sessionId, current.version, next);
       if (saved.ok) return saved.doc;
+      // Exponential start, clamped so the whole retry window stays sub-second.
+      await sleep(Math.min(2 ** attempt * 5, 50) + Math.random() * 10);
     }
 
-    const current = await deps.store.get(sessionId);
-    if (!current) return null;
-    const shaped = shapeSession ? shapeSession(current) : current;
-    const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
-    await deps.store.set(sessionId, next);
-    return next;
+    throw new SessionConflictError(sessionId);
   }
 
   function static200(res: ServerResponse, contentType: string, path: string) {
@@ -714,7 +804,7 @@ export function createWebServer(deps: WebServerDeps) {
     // --- Static UI ---
     const staticRoutes: Record<string, () => Promise<void>> = {
       '/': static200(res, 'text/html; charset=utf-8', "../static/index.html"),
-      '/indx.html': static200(res, 'text/html; charset=utf-8', "../static/index.html"),
+      '/index.html': static200(res, 'text/html; charset=utf-8', "../static/index.html"),
       '/app.js': static200(res, 'application/javascript; charset=utf-8', "../static/app.js"),
       '/http-transport.js': static200(res, 'application/javascript; charset=utf-8', "../static/http-transport.js"),
       '/favicon.ico': static200(res, 'image/svg+xml', "../static/favicon.svg"),
@@ -1142,7 +1232,11 @@ export function createWebServer(deps: WebServerDeps) {
     // --- POST /tools/:name (buffered JSON response) ---
     const toolCallMatch = /^\/tools\/([^/]+)$/.exec(url);
     if (method === 'POST' && toolCallMatch) {
-      const toolName = toolCallMatch[1]!;
+      const toolName = decodeToolName(toolCallMatch[1]!);
+      if (!shellToolsAllowed && SHELL_TOOL_NAMES.has(toolName)) {
+        json(res, 403, { error: `Tool "${toolName}" may not be invoked directly over HTTP. Set CORTEX_WEBUI_ALLOW_SHELL_TOOLS=1 to allow it.` });
+        return;
+      }
 
       let raw: string;
       try { raw = await readBody(req); }
@@ -1202,7 +1296,11 @@ export function createWebServer(deps: WebServerDeps) {
     // --- POST /stream/tools/:name (SSE streaming) ---
     const streamToolMatch = /^\/stream\/tools\/([^/]+)$/.exec(url);
     if (method === 'POST' && streamToolMatch) {
-      const toolName = streamToolMatch[1]!;
+      const toolName = decodeToolName(streamToolMatch[1]!);
+      if (!shellToolsAllowed && SHELL_TOOL_NAMES.has(toolName)) {
+        json(res, 403, { error: `Tool "${toolName}" may not be invoked directly over HTTP. Set CORTEX_WEBUI_ALLOW_SHELL_TOOLS=1 to allow it.` });
+        return;
+      }
 
       let raw: string;
       try { raw = await readBody(req); }
@@ -1299,7 +1397,7 @@ export function createWebServer(deps: WebServerDeps) {
       res.writeHead(200, {
         'content-type':  handle.mimeType,
         'cache-control': 'no-cache',
-        ...corsHeaders(origin),
+        ...corsHeaders(resolveCorsOrigin(req)),
       });
       for await (const chunk of handle.stream()) {
         res.write(chunk);

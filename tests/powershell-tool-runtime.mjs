@@ -26,6 +26,8 @@ async function collect(input) {
   for await (const event of powershellTool.executor.execute(input, {
     callId: "powershell-integration-test",
     signal: new AbortController().signal,
+    // cwd confinement resolves requests against the session workspace
+    workdir: tempRoot,
     session: {
       id: "s",
       version: "v",

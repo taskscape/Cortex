@@ -100,7 +100,7 @@ function inspectLine(
   },
 ): void {
   const trimmed = line.trim();
-  if (/^(?:#{1,6}[ \t]+|[^#\r\n].*\r?\n(?:=+|-+)[ \t]*$)/u.test(trimmed)) state.headings++;
+  if (/^#{1,6}[ \t]+/u.test(trimmed)) state.headings++;
   if (/^(?:(?:article|art\.?|chapter|section|clause|annex|appendix|rozdział|artykuł|§)\s+[\w.-]+|\d+(?:\.\d+)+[.)]?\s+)/iu.test(trimmed)) {
     state.clauses++;
   }

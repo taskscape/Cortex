@@ -35,6 +35,29 @@ test("file-index recognizes file-level API-key and private-key shapes without re
 });
 
 /**
+ * Test 1b: Additional high-confidence credential shapes
+ *
+ * Validates the FILE_LEVEL_SECRETS entries added for AWS access key ids,
+ * GitHub tokens, and Google API keys, including near-miss shapes that must
+ * NOT trigger a whole-file withhold.
+ */
+test("file-index recognizes AWS, GitHub, and Google credential shapes without false positives on lookalikes", () => {
+  const awsKey = "AKIAIOSFODNN7EXAMPLE";
+  const githubToken = `ghp_${"a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"}`;
+  const googleKey = `AIza${"aB3_-".repeat(7)}`;
+
+  assert.equal(githubToken.length, 40);
+  assert.equal(fileLevelSecret(`aws_access_key_id = ${awsKey}`), "aws-access-key-id");
+  assert.equal(fileLevelSecret(`token: ${githubToken}`), "github-token");
+  assert.equal(fileLevelSecret(`key=${googleKey}`), "google-api-key");
+
+  // Near-misses stay unflagged.
+  assert.equal(fileLevelSecret(`AKIA short: ${"AKIA123"}`), undefined);
+  assert.equal(fileLevelSecret(`ghp_ too short: ${"ghp_abc123"}`), undefined);
+  assert.equal(fileLevelSecret(`AIza too short: AIza${"a".repeat(34)}`), undefined);
+});
+
+/**
  * Test 2: Credential redaction in content
  *
  * Validates that the redactSecrets() function properly identifies and redacts
