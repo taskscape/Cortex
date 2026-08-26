@@ -69,6 +69,30 @@ interface OAIChunk {
   usage?:   { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
 }
 
+// A tool call whose arguments never parsed (truncated at the token limit, malformed provider
+// output) is surfaced as a failed call instead of aborting the whole turn — the runner feeds a
+// corrective `is_error` result back so the model can retry (spec R4).
+function flushToolCall(
+  call: { id: string; name: string; args: string },
+  finishReason: string | null,
+): { type: 'tool-call'; id: string; name: string; input: unknown; parseError?: string } {
+  try {
+    return { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.args || '{}') };
+  } catch {
+    return {
+      type: 'tool-call',
+      id:   call.id || `unparsed-${crypto.randomUUID()}`,
+      name: call.name,
+      input: call.args,
+      parseError:
+        `${call.args.length} bytes received, finish_reason "${finishReason ?? 'none'}". ` +
+        (finishReason === 'length'
+          ? 'The response hit the token limit mid tool-call; increase the provider\'s maxTokens.'
+          : 'The provider returned malformed tool arguments.'),
+    };
+  }
+}
+
 /**
  * Provider adapter for any OpenAI-compatible chat-completions endpoint (OpenAI, DeepSeek,
  * OpenRouter, vLLM, ollama, …). Streams over SSE via `fetch` (no SDK), handles model-specific
@@ -223,45 +247,18 @@ export class OpenAICompatAdapter implements ProviderAdapter {
           yield { type: 'reasoning-block', reasoning: reasoningAcc };
           reasoningAcc = '';
         }
-        let truncatedTool: { name: string; bytes: number } | undefined;
         for (const [, call] of toolAccum) {
-          try {
-            yield { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.args || '{}') };
-          } catch {
-            truncatedTool ??= { name: call.name, bytes: call.args.length };
-          }
+          yield flushToolCall(call, choice.finish_reason);
         }
         toolAccum.clear();
-        if (truncatedTool) {
-          throw new Error(
-            `Tool "${truncatedTool.name}" arguments could not be parsed — ${truncatedTool.bytes} bytes received, ` +
-            `finish_reason "${choice.finish_reason}". ` +
-            (choice.finish_reason === 'length'
-              ? 'The response hit the token limit mid tool-call; increase the provider\'s maxTokens.'
-              : 'The provider returned malformed tool arguments.'),
-          );
-        }
         yield { type: 'done' };
       }
     }
 
     // Fallback if the stream ended without a finish_reason (e.g. a dropped connection).
     if (reasoningAcc) yield { type: 'reasoning-block', reasoning: reasoningAcc };
-    if (toolAccum.size > 0) {
-      let truncatedTool: { name: string; bytes: number } | undefined;
-      for (const [, call] of toolAccum) {
-        try {
-          yield { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.args || '{}') };
-        } catch {
-          truncatedTool ??= { name: call.name, bytes: call.args.length };
-        }
-      }
-      if (truncatedTool) {
-        throw new Error(
-          `Tool "${truncatedTool.name}" arguments could not be parsed — ${truncatedTool.bytes} bytes received ` +
-          `before the stream ended. The provider returned malformed or truncated tool arguments.`,
-        );
-      }
+    for (const [, call] of toolAccum) {
+      yield flushToolCall(call, lastFinish ?? null);
     }
 
     if (!sawAny) {

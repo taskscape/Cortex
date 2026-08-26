@@ -5,8 +5,33 @@ import type {
   ObservabilityEvent, ObservabilitySink, ObservabilityStatus,
 } from './types.js';
 import type { MatbotPlugin } from './plugin.js';
+import type { ToolOutputLimits } from './truncate.js';
+import { DEFAULT_OUTPUT_LIMITS, truncateToolResult } from './truncate.js';
+import type { PermissionAction, PermissionRule } from './permissions.js';
+import { evaluatePermission } from './permissions.js';
+import { validateAgainstSchema, formatValidationIssues } from './schema-validator.js';
+import { isToolHiddenByRules } from './permissions.js';
 import { HookRegistry } from './hooks.js';
 import { appendMessage, createMessage } from './session.js';
+
+/** Loop budget policy for one agentic turn (spec R1). Absent fields are unlimited. */
+export interface LoopPolicy {
+  /** Maximum provider calls (iterations) per turn. Default unlimited. */
+  maxIterations?:       number;
+  /** Maximum tool calls executed per turn; excess calls receive a budget error result. Default unlimited. */
+  maxToolCallsPerTurn?: number;
+  /** Cumulative input+output token budget across the turn's provider calls. Default unlimited. */
+  tokenBudgetTokens?:   number;
+  /** Consecutive identical (name + input) calls allowed before interception. Default 3; 0 disables. */
+  doomLoopThreshold?:   number;
+}
+
+/** Permission gate configuration (spec R8). Defaults preserve pre-permission behavior (`allow`). */
+export interface PermissionConfig {
+  rules?:         PermissionRule[];
+  /** Action when no rule matches. Default `'allow'`. */
+  defaultAction?: PermissionAction;
+}
 
 /** Everything one agentic turn needs: session, provider wiring, registries, and injection points. */
 export interface RunSessionOpts {
@@ -60,6 +85,12 @@ export interface RunSessionOpts {
   tailEphemeral?: MessageContent[];
   /** Optional durable trace sink for turn/provider/tool spans. */
   observability?: ObservabilitySink;
+  /** Loop budget policy (iterations, tool-call cap, token budget, doom-loop threshold). */
+  loopPolicy?:    LoopPolicy;
+  /** Permission gate rules; when absent every tool call is allowed unchanged. */
+  permissions?:   PermissionConfig;
+  /** Output limits applied to tool results before they enter model context. */
+  toolOutput?:    ToolOutputLimits;
   /** Hot-load a plugin (delegated into tool contexts). */
   loadPlugin:     (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
   /** Hot-unload a plugin (delegated into tool contexts). */
@@ -77,7 +108,13 @@ export interface RunSessionOpts {
  */
 export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineEvent> {
   const { config, provider, providerConfig, store, signal } = opts;
-  const tools   = opts.tools   ?? new Map<string, Tool>();
+  // Tools fully denied by permission rules never reach the model's menu (spec R8) — the gate
+  // below still covers them for direct callers that pass their own snapshot.
+  const declaredTools = opts.tools ?? new Map<string, Tool>();
+  const denyRules = opts.permissions?.rules;
+  const tools   = denyRules !== undefined && denyRules.length > 0
+    ? new Map([...declaredTools].filter(([name]) => !isToolHiddenByRules(denyRules, name)))
+    : declaredTools;
   const hookReg = opts.hooks   ?? new HookRegistry();
   const promptFn: PromptFn = opts.prompt ?? (((p: string | FormField, def?: string): Promise<string> => {
     const fallback = typeof p === 'string' ? def : p.default;
@@ -128,6 +165,66 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       return '[unserializable]';
     }
   };
+
+  // ── Loop policy state ─────────────────────────────────────────────────────
+  const policy = opts.loopPolicy ?? {};
+  const doomThreshold = policy.doomLoopThreshold === undefined ? 3 : Math.max(0, Math.trunc(policy.doomLoopThreshold));
+  const outputLimits: ToolOutputLimits = opts.toolOutput ?? DEFAULT_OUTPUT_LIMITS;
+  let iteration = 0;
+  let executedToolCalls = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  // Attempted executions per distinct (name + input) call this turn — deterministic under
+  // parallel execution, where "consecutive" is ill-defined.
+  const turnCallCounts = new Map<string, number>();
+  // Serializes permission-gate entry across a parallel batch so mid-batch "always allow"
+  // answers are visible to sibling calls before they prompt.
+  let permissionGateChain: Promise<void> = Promise.resolve();
+  const approvedPermissionRules: PermissionRule[] = [];
+  // A permission 'always' answer or a later config rule may approve a subject mid-turn; approved
+  // session rules are appended AFTER configured rules so they win under last-match evaluation.
+  const permissionRules = (): PermissionRule[] => [...(opts.permissions?.rules ?? []), ...approvedPermissionRules];
+
+  // Append isError tool results for any assistant tool-call block that never received one — an
+  // aborted turn must persist paired calls/results so provider submissions stay valid (spec R19).
+  const finalizeOrphanToolCalls = (target: Session, errorText: string): Session => {
+    const answered = new Set<string>();
+    for (const m of target.messages) {
+      for (const c of m.content) if (c.type === 'tool-result') answered.add(c.id);
+    }
+    const orphans: MessageContent[] = [];
+    for (const m of target.messages) {
+      if (m.role !== 'assistant') continue;
+      for (const c of m.content) {
+        if (c.type === 'tool-call' && !answered.has(c.id)) {
+          orphans.push({ type: 'tool-result', id: c.id, result: { error: errorText, code: 'aborted' }, isError: true });
+        }
+      }
+    }
+    if (orphans.length === 0) return target;
+    return appendMessage(target, createMessage({ role: 'tool', content: orphans, traceId }));
+  };
+
+  // Push-based event queue so concurrent tool executions can stream pipeline events while the
+  // generator yields them in arrival order.
+  function createEventQueue<T>() {
+    const buffer: T[] = [];
+    let ended = false;
+    let wakeup: (() => void) | null = null;
+    const release = (): void => { if (wakeup !== null) { const w = wakeup; wakeup = null; w(); } };
+    return {
+      push(v: T): void { buffer.push(v); release(); },
+      end(): void { ended = true; release(); },
+      async *[Symbol.asyncIterator](): AsyncIterator<T> {
+        for (;;) {
+          if (buffer.length > 0) { yield buffer.shift()!; continue; }
+          if (ended) return;
+          await new Promise<void>(resolve => { wakeup = resolve; });
+        }
+      },
+    };
+  }
+
   await observe({
     phase: 'start', kind: 'agent', name: 'matbot.turn', spanId: turnSpanId, sessionId,
     attributes: { provider: config.provider, persona: config.persona ?? null },
@@ -197,13 +294,33 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   for (;;) {
     // Respect an abort that arrived between turns (e.g. during tool execution).
     if (signal.aborted) {
+      session = finalizeOrphanToolCalls(session, typeof signal.reason === 'string' ? `aborted: ${signal.reason}` : 'turn aborted');
       await store.set(session.id, session);
       yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
       await finishTurn('error', { terminal: 'aborted', reason: String(signal.reason ?? 'user-abort') });
       return;
     }
 
-    const pendingCalls: Array<{ id: string; name: string; input: unknown }> = [];
+    // Loop budget checks — enforced before the next provider call so a graceful stop lands after
+    // the last complete tool round-trip (spec R1).
+    const budgetReason =
+      (policy.maxIterations   !== undefined && iteration >= policy.maxIterations)   ? 'max-iterations' as const :
+      (policy.tokenBudgetTokens !== undefined && totalInputTokens + totalOutputTokens >= policy.tokenBudgetTokens)
+                                                                            ? 'token-budget' as const :
+      undefined;
+    if (budgetReason !== undefined) {
+      yield { type: 'loop:limit', reason: budgetReason, iterations: iteration, toolCalls: executedToolCalls, traceId };
+      session = appendMessage(session, createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: `[Turn stopped by loop policy: ${budgetReason}. Summarize progress and results so far in your final answer.]` }],
+        traceId,
+        providerName: config.provider,
+        metadata: { loopLimit: budgetReason },
+      }));
+      break;
+    }
+
+    const pendingCalls: Array<{ id: string; name: string; input: unknown; parseError?: string }> = [];
     const assistantParts: MessageContent[] = [];
     let textAcc = '';
 
@@ -260,11 +377,13 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
             assistantParts.push({ type: 'reasoning', reasoning: ev.reasoning });
             break;
           case 'tool-call':
-            pendingCalls.push({ id: ev.id, name: ev.name, input: ev.input });
+            pendingCalls.push({ id: ev.id, name: ev.name, input: ev.input, ...(ev.parseError !== undefined ? { parseError: ev.parseError } : {}) });
             break;
           case 'usage':
             providerInputTokens += ev.inputTokens;
             providerOutputTokens += ev.outputTokens;
+            totalInputTokens += ev.inputTokens;
+            totalOutputTokens += ev.outputTokens;
             providerCostUsd += ev.costUsd ?? 0;
             providerCacheReadTokens += ev.cacheReadTokens ?? 0;
             providerCacheCreationTokens += ev.cacheCreationTokens ?? 0;
@@ -354,130 +473,282 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
 
     // No tool calls → done
     if (pendingCalls.length === 0) break;
+    iteration++;
 
-    // ── 3. Execute tool calls ────────────────────────────────────────────────
+    // ── 3. Execute tool calls (parallel with serial fallback — spec R2) ──────
 
-    const toolResults: MessageContent[] = [];
+    const toolResults: MessageContent[] = new Array<MessageContent>(pendingCalls.length);
     const toolMarkers: MessageContent[] = [];
+    let abortReason: string | undefined;
 
-    for (const tc of pendingCalls) {
-      const toolSpanId = crypto.randomUUID();
-      const toolStartedAt = Date.now();
-      await observe({
-        phase: 'start', kind: 'tool', name: tc.name, spanId: toolSpanId,
-        parentSpanId: turnSpanId, sessionId,
-        attributes: { callId: tc.id, input: scrubSpanValue(tc.input) },
-      });
-      yield { type: 'tool:start', callId: tc.id, name: tc.name, input: tc.input, traceId };
+    // Tool-call budget: calls beyond the cap receive a budget error result without executing.
+    const callBudget = policy.maxToolCallsPerTurn !== undefined
+      ? Math.max(0, Math.trunc(policy.maxToolCallsPerTurn) - executedToolCalls)
+      : pendingCalls.length;
+    executedToolCalls += pendingCalls.length;
+    const budgetExceeded = callBudget < pendingCalls.length;
 
-      const tool = opts.toolRegistry !== undefined ? opts.toolRegistry.resolve(tc.name) : tools.get(tc.name);
-      if (!tool) {
-        const err = { error: `Unknown tool: ${tc.name}` };
-        toolResults.push({ type: 'tool-result', id: tc.id, result: err, isError: true });
-        yield { type: 'tool:end', callId: tc.id, result: err, isError: true, traceId };
-        await observe({
-          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
-          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
-          attributes: { callId: tc.id, error: `Unknown tool: ${tc.name}` },
-        });
-        continue;
-      }
+    const serialBatch = pendingCalls.some(tc => tools.get(tc.name)?.serial === true);
 
-      const decision = await hookReg.runToolCall({
-        session, config, signal,
-        toolCall: { id: tc.id, name: tc.name, input: tc.input },
-        tool,
-      });
-      if (decision.abort) {
-        await store.set(session.id, session);
-        yield { type: 'aborted', reason: decision.abort, session, traceId };
-        const policySpanId = crypto.randomUUID();
-        await observe({
-          phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
-          parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
-          attributes: { callId: tc.id, policyOutcome: 'aborted', reason: decision.abort },
-        });
-        await observe({
-          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
-          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
-          attributes: { callId: tc.id, isError: true, policyOutcome: 'aborted', error: decision.abort },
-        });
-        await finishTurn('error', { terminal: 'aborted', reason: decision.abort });
-        return;
-      }
-      if (decision.rejectTool) {
-        const err = { error: decision.rejectTool.message };
-        toolResults.push({ type: 'tool-result', id: tc.id, result: err, isError: true });
-        yield { type: 'tool:end', callId: tc.id, result: err, isError: true, traceId };
-        const policySpanId = crypto.randomUUID();
-        await observe({
-          phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
-          parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
-          attributes: { callId: tc.id, policyOutcome: 'denied', reason: decision.rejectTool.message },
-        });
-        await observe({
-          phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
-          parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - toolStartedAt,
-          attributes: { callId: tc.id, result: err, isError: true, policyOutcome: 'denied' },
-        });
-        continue;
-      }
-
-      let result: unknown;
-      let isError = false;
-      const startedAt = Date.now();
-
-      const toolCtx: ToolContext = {
-        callId: tc.id, session, signal, vault,
-        provider:     config.provider,
-        traceId,
-        rootTraceId,
-        parentSpanId: toolSpanId,
-        prompt:       promptFn,
-        loadPlugin:   (specifier: string) => opts.loadPlugin(specifier, promptFn),
-        unloadPlugin: opts.unloadPlugin,
-        ...(opts.workdir     !== undefined ? { workdir:     opts.workdir     } : {}),
-        ...(opts.configPath  !== undefined ? { configPath:  opts.configPath  } : {}),
-        ...(opts.files       !== undefined ? { files:       opts.files       } : {}),
-      };
-
+    const queue = createEventQueue<PipelineEvent>();
+    const batch = (async (): Promise<void> => {
       try {
-        for await (const toolEv of tool.executor.execute(tc.input, toolCtx)) {
-          switch (toolEv.type) {
-            case 'stdout':   yield { type: 'tool:stdout', callId: tc.id, chunk: toolEv.chunk, traceId }; break;
-            case 'stderr':   yield { type: 'tool:stderr', callId: tc.id, chunk: toolEv.chunk, traceId }; break;
-            case 'file':     yield { type: 'file', handle: toolEv.handle, traceId }; break;
-            case 'result':   result = toolEv.value; break;
-            case 'marker':   toolMarkers.push({ type: 'marker', creator: toolEv.creator, data: toolEv.data }); break;
-            case 'progress': break;
-            case 'error':    result = {
-              error: toolEv.message,
-              ...(toolEv.stdout !== undefined ? { stdout: toolEv.stdout } : {}),
-              ...(toolEv.stderr !== undefined ? { stderr: toolEv.stderr } : {}),
-            }; isError = true; break;
+        const finishSkipped = (
+          tc: { id: string; name: string },
+          index: number,
+          spanId: string,
+          startedAt: number,
+          result: unknown,
+          push: (ev: PipelineEvent) => void,
+        ): void => {
+          toolResults[index] = { type: 'tool-result', id: tc.id, result, isError: true };
+          push({ type: 'tool:end', callId: tc.id, result, isError: true, traceId });
+          void observe({
+            phase: 'end', kind: 'tool', name: tc.name, spanId,
+            parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - startedAt,
+            attributes: { callId: tc.id, isError: true },
+          });
+        };
+
+        const execOne = async (index: number, push: (ev: PipelineEvent) => void): Promise<void> => {
+          const tc = pendingCalls[index]!;
+          const toolSpanId = crypto.randomUUID();
+          const toolStartedAt = Date.now();
+          await observe({
+            phase: 'start', kind: 'tool', name: tc.name, spanId: toolSpanId,
+            parentSpanId: turnSpanId, sessionId,
+            attributes: { callId: tc.id, input: scrubSpanValue(tc.input) },
+          });
+          push({ type: 'tool:start', callId: tc.id, name: tc.name, input: tc.input, traceId });
+
+          // Calls past the per-turn tool-call budget are answered without executing so pairing holds.
+          if (index >= callBudget) {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt,
+              { error: `Turn reached its tool-call budget (${policy.maxToolCallsPerTurn}); this call was not executed.`, code: 'budget_exceeded' }, push);
+            return;
           }
+
+          // A malformed/truncated argument stream degrades to a corrective failed call (spec R4).
+          if (tc.parseError !== undefined) {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, {
+              error: `The arguments for '${tc.name}' could not be parsed and the call was not executed: ${tc.parseError} Re-issue the call with valid JSON arguments.`,
+              code: 'invalid_input',
+            }, push);
+            return;
+          }
+
+          // Doom-loop interception (spec R6): after `doomLoopThreshold` prior identical attempts,
+          // further identical calls are refused — the strategy is not working.
+          const callKey = JSON.stringify({ name: tc.name, input: tc.input ?? null });
+          const seenCount = turnCallCounts.get(callKey) ?? 0;
+          if (doomThreshold > 0 && seenCount >= doomThreshold && tools.has(tc.name)) {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, {
+              error: `doom_loop: this exact ${tc.name} call has already been made ${seenCount} times this turn with identical input. Change strategy or ask the user for guidance.`,
+              code: 'doom_loop',
+            }, push);
+            return;
+          }
+          turnCallCounts.set(callKey, seenCount + 1);
+
+          const tool = opts.toolRegistry !== undefined ? opts.toolRegistry.resolve(tc.name) : tools.get(tc.name);
+          if (!tool) {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, { error: `Unknown tool: ${tc.name}`, code: 'not_found' }, push);
+            return;
+          }
+
+          // Input validation at the boundary (spec R3): invalid input never reaches the executor.
+          const issues = validateAgainstSchema(tc.input, tool.inputSchema);
+          if (issues.length > 0) {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt,
+              { error: formatValidationIssues(tc.name, issues), code: 'invalid_input' }, push);
+            return;
+          }
+
+          // Permission gate (spec R8/R9). Configured rules first; session-approved ('always') rules
+          // appended later win under last-match evaluation.
+          const permKey   = tool.permission?.action ?? tc.name;
+          const patterns  = tool.permission?.patterns?.(tc.input) ?? ['*'];
+          const permFallback = opts.permissions?.defaultAction ?? 'allow';
+          let gate: PermissionAction = (() => {
+            const d = patterns.map(p => evaluatePermission(permissionRules(), permKey, p, permFallback));
+            return d.includes('deny') ? 'deny' : d.includes('ask') ? 'ask' : 'allow';
+          })();
+          if (gate === 'deny') {
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, {
+              error: `Permission denied by policy: ${permKey} (${patterns.join(', ')}).`,
+              code: 'permission_denied',
+            }, push);
+            return;
+          }
+          if (gate === 'ask') {
+            // The gate slot is held through the whole prompt round-trip: an "always allow" answered
+            // for one call must be visible to sibling calls in the same parallel batch before they
+            // decide to prompt, and prompts are presented one at a time.
+            const prevGate = permissionGateChain;
+            let releaseGate!: () => void;
+            permissionGateChain = new Promise<void>(r => { releaseGate = r; });
+            try {
+              await prevGate;
+              const d = patterns.map(p => evaluatePermission(permissionRules(), permKey, p, permFallback));
+              gate = d.includes('deny') ? 'deny' : d.includes('ask') ? 'ask' : 'allow';
+              if (gate === 'deny') {
+                finishSkipped(tc, index, toolSpanId, toolStartedAt, {
+                  error: `Permission denied by policy: ${permKey} (${patterns.join(', ')}).`,
+                  code: 'permission_denied',
+                }, push);
+                return;
+              }
+              if (gate === 'ask') {
+                const askId = crypto.randomUUID();
+                push({ type: 'permission:ask', askId, callId: tc.id, toolName: tc.name, permission: permKey, patterns, traceId });
+                let answer: string;
+                try {
+                  answer = (await promptFn({
+                    name:       'permission',
+                    label:      `Allow ${tc.name}? (${permKey}: ${patterns.join(', ')})`,
+                    type:       'select',
+                    options:    ['allow', 'always allow', 'deny'],
+                    required:   true,
+                  } satisfies FormField)).trim().toLowerCase();
+                } catch (e) {
+                  push({ type: 'permission:reply', askId, outcome: 'cancelled', traceId });
+                  abortReason = e instanceof Error && e.name === 'PromptCancelledError' ? 'permission prompt cancelled' : String(e);
+                  finishSkipped(tc, index, toolSpanId, toolStartedAt, { error: 'Permission prompt was cancelled.', code: 'aborted' }, push);
+                  return;
+                }
+                if (answer === 'deny' || answer === 'no') {
+                  push({ type: 'permission:reply', askId, outcome: 'deny', traceId });
+                  finishSkipped(tc, index, toolSpanId, toolStartedAt, {
+                    error: `The user denied this request (${permKey}: ${patterns.join(', ')}). Do not retry it without asking first.`,
+                    code: 'permission_denied',
+                  }, push);
+                  return;
+                }
+                if (answer === 'always allow' || answer === 'always') {
+                  for (const p of patterns) approvedPermissionRules.push({ permission: permKey, pattern: p, action: 'allow' });
+                  push({ type: 'permission:reply', askId, outcome: 'always', traceId });
+                } else {
+                  push({ type: 'permission:reply', askId, outcome: 'allow', traceId });
+                }
+              }
+            } finally {
+              releaseGate();
+            }
+          }
+
+          const decision = await hookReg.runToolCall({
+            session, config, signal,
+            toolCall: { id: tc.id, name: tc.name, input: tc.input },
+            tool,
+          });
+          if (decision.abort) {
+            abortReason = decision.abort;
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, { error: decision.abort, code: 'aborted' }, push);
+            const policySpanId = crypto.randomUUID();
+            await observe({
+              phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
+              parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
+              attributes: { callId: tc.id, policyOutcome: 'aborted', reason: decision.abort },
+            });
+            return;
+          }
+          if (decision.rejectTool) {
+            const err = { error: decision.rejectTool.message };
+            finishSkipped(tc, index, toolSpanId, toolStartedAt, err, push);
+            const policySpanId = crypto.randomUUID();
+            await observe({
+              phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
+              parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
+              attributes: { callId: tc.id, policyOutcome: 'denied', reason: decision.rejectTool.message },
+            });
+            return;
+          }
+
+          let result: unknown;
+          let isError = false;
+          const startedAt = Date.now();
+
+          const toolCtx: ToolContext = {
+            callId: tc.id, session, signal, vault,
+            provider:     config.provider,
+            traceId,
+            rootTraceId,
+            parentSpanId: toolSpanId,
+            prompt:       promptFn,
+            loadPlugin:   (specifier: string) => opts.loadPlugin(specifier, promptFn),
+            unloadPlugin: opts.unloadPlugin,
+            ...(opts.workdir     !== undefined ? { workdir:     opts.workdir     } : {}),
+            ...(opts.configPath  !== undefined ? { configPath:  opts.configPath  } : {}),
+            ...(opts.files       !== undefined ? { files:       opts.files       } : {}),
+          };
+
+          try {
+            for await (const toolEv of tool.executor.execute(tc.input, toolCtx)) {
+              switch (toolEv.type) {
+                case 'stdout':   push({ type: 'tool:stdout', callId: tc.id, chunk: toolEv.chunk, traceId }); break;
+                case 'stderr':   push({ type: 'tool:stderr', callId: tc.id, chunk: toolEv.chunk, traceId }); break;
+                case 'file':     push({ type: 'file', handle: toolEv.handle, traceId }); break;
+                case 'result':   result = toolEv.value; break;
+                case 'marker':   toolMarkers.push({ type: 'marker', creator: toolEv.creator, data: toolEv.data }); break;
+                case 'progress': break;
+                case 'error':    result = {
+                  error: toolEv.message,
+                  ...(toolEv.stdout !== undefined ? { stdout: toolEv.stdout } : {}),
+                  ...(toolEv.stderr !== undefined ? { stderr: toolEv.stderr } : {}),
+                }; isError = true; break;
+              }
+            }
+          } catch (e) {
+            result  = { error: String(e) };
+            isError = true;
+          }
+
+          // toolresult — last chance to transform the result before it's recorded/yielded (hard redaction),
+          // or to observe it (auditing: args + result + timing). Owns the LLM-facing + persisted surfaces.
+          result = await hookReg.runToolResult({
+            session, config, signal,
+            toolCall: { id: tc.id, name: tc.name, input: tc.input },
+            tool, result, isError, durationMs: Date.now() - startedAt,
+          });
+
+          // Universal output truncation (spec R16) — applied after hooks so redaction wins.
+          const truncation = await truncateToolResult(result, outputLimits, opts.files, `${sessionId}/${tc.name}`);
+          result = truncation.result;
+
+          toolResults[index] = { type: 'tool-result', id: tc.id, result, isError };
+          push({ type: 'tool:end', callId: tc.id, result, isError, traceId });
+          await observe({
+            phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
+            parentSpanId: turnSpanId, sessionId, status: isError ? 'error' : 'ok', durationMs: Date.now() - toolStartedAt,
+            attributes: { callId: tc.id, result: scrubSpanValue(result), isError },
+          });
+        };
+
+        let nextIndex = 0;
+        const worker = async (): Promise<void> => {
+          for (;;) {
+            const i = nextIndex++;
+            if (i >= pendingCalls.length) break;
+            await execOne(i, ev => queue.push(ev));
+            // An abort (hook or cancelled permission prompt) stops NEW work; in-flight calls finish
+            // so every emitted call still gets a persisted result.
+            if (abortReason !== undefined) break;
+          }
+        };
+        const concurrency = serialBatch ? 1 : Math.min(4, pendingCalls.length);
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      } finally {
+        // Any call that never ran (abort mid-batch) still needs a persisted paired result.
+        for (let i = 0; i < pendingCalls.length; i++) {
+          if (toolResults[i] !== undefined) continue;
+          const tc = pendingCalls[i]!;
+          toolResults[i] = { type: 'tool-result', id: tc.id, result: { error: `Not executed: ${abortReason ?? 'skipped'}.`, code: 'aborted' as const }, isError: true };
         }
-      } catch (e) {
-        result  = { error: String(e) };
-        isError = true;
+        queue.end();
       }
-
-      // toolresult — last chance to transform the result before it's recorded/yielded (hard redaction),
-      // or to observe it (auditing: args + result + timing). Owns the LLM-facing + persisted surfaces.
-      result = await hookReg.runToolResult({
-        session, config, signal,
-        toolCall: { id: tc.id, name: tc.name, input: tc.input },
-        tool, result, isError, durationMs: Date.now() - startedAt,
-      });
-
-      toolResults.push({ type: 'tool-result', id: tc.id, result, isError });
-      yield { type: 'tool:end', callId: tc.id, result, isError, traceId };
-      await observe({
-        phase: 'end', kind: 'tool', name: tc.name, spanId: toolSpanId,
-        parentSpanId: turnSpanId, sessionId, status: isError ? 'error' : 'ok', durationMs: Date.now() - toolStartedAt,
-        attributes: { callId: tc.id, result: scrubSpanValue(result), isError },
-      });
-    }
+    })();
+    for await (const ev of queue) yield ev;
+    await batch;
 
     // Add tool results message, then loop for the next provider call.
     const toolMsg = createMessage({ role: 'tool', content: toolResults, traceId });
@@ -488,6 +759,29 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     if (toolMarkers.length > 0) {
       session = appendMessage(session, createMessage({ role: 'marker', content: toolMarkers, traceId }));
       yield { type: 'marker', content: toolMarkers, traceId };
+    }
+
+    // A hook/cancelled-prompt abort during execution: results are now paired and persisted, so the
+    // turn terminates cleanly with an `aborted` event.
+    if (abortReason !== undefined) {
+      session = finalizeOrphanToolCalls(session, abortReason);
+      await store.set(session.id, session);
+      yield { type: 'aborted', reason: abortReason, session, traceId };
+      await finishTurn('error', { terminal: 'aborted', reason: abortReason });
+      return;
+    }
+
+    // Tool-call budget exhausted: stop gracefully after this complete round-trip.
+    if (budgetExceeded) {
+      yield { type: 'loop:limit', reason: 'max-tool-calls', iterations: iteration, toolCalls: executedToolCalls, traceId };
+      session = appendMessage(session, createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: `[Turn stopped by loop policy: max-tool-calls (${policy.maxToolCallsPerTurn}). Summarize progress and results so far in your final answer.]` }],
+        traceId,
+        providerName: config.provider,
+        metadata: { loopLimit: 'max-tool-calls' },
+      }));
+      break;
     }
   }
 

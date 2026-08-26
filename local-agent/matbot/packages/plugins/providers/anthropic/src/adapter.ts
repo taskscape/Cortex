@@ -86,6 +86,30 @@ export class AnthropicAdapter implements ProviderAdapter {
       throw new Error(`Anthropic ${res.status}: ${text}`);
     }
 
+    // A tool_use block whose argument JSON failed to parse — almost always truncation mid-stream
+    // (max_tokens) or malformed provider output. Surfaced as a failed call (parseError) so the
+    // runner feeds a corrective error back to the model instead of aborting the turn (spec R4).
+    const flushToolCall = (
+      call: { id: string; name: string; json: string },
+      stop: string | undefined,
+    ): { type: 'tool-call'; id: string; name: string; input: unknown; parseError?: string } => {
+      try {
+        return { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.json || '{}') };
+      } catch {
+        return {
+          type: 'tool-call',
+          id:   call.id || `unparsed-${crypto.randomUUID()}`,
+          name: call.name,
+          input: call.json,
+          parseError:
+            `${call.json.length} bytes received${stop ? `, stop_reason "${stop}"` : ''}. ` +
+            (stop === 'max_tokens'
+              ? 'The response hit the token limit mid tool-call; increase the provider\'s maxTokens.'
+              : 'The provider returned malformed tool arguments.'),
+        };
+      }
+    };
+
     // Accumulate content block state per index
     const toolInputs      = new Map<number, { id: string; name: string; json: string }>();
     const thinkingBlocks  = new Map<number, { thinking: string; signature: string }>();
@@ -93,10 +117,6 @@ export class AnthropicAdapter implements ProviderAdapter {
     const unknownBlocks   = new Map<number, { blockType: string; raw: unknown }>();
     let inputTokens = 0;
     let stopReason: string | undefined;
-    // A tool_use block whose argument JSON failed to parse — almost always because the response
-    // was truncated mid-stream (e.g. max_tokens). Surfaced as a hard error at message_stop rather
-    // than silently delivering `{}` to the tool, which crashes downstream with no diagnostic.
-    let truncatedTool: { name: string; bytes: number } | undefined;
 
     for await (const line of parseSSE(res.body)) {
       let ev: AEvent;
@@ -154,11 +174,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           const idx  = ev['index'] as number;
           const call = toolInputs.get(idx);
           if (call) {
-            try {
-              yield { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.json || '{}') };
-            } catch {
-              truncatedTool ??= { name: call.name, bytes: call.json.length };
-            }
+            yield flushToolCall(call, stopReason);
             toolInputs.delete(idx);
           }
           const tb = thinkingBlocks.get(idx);
@@ -194,22 +210,9 @@ export class AnthropicAdapter implements ProviderAdapter {
           // content_block_stop). A complete-but-unclosed block still parses; an incomplete one
           // is recorded as truncated.
           for (const [, call] of toolInputs) {
-            try {
-              yield { type: 'tool-call', id: call.id, name: call.name, input: JSON.parse(call.json || '{}') };
-            } catch {
-              truncatedTool ??= { name: call.name, bytes: call.json.length };
-            }
+            yield flushToolCall(call, stopReason);
           }
           toolInputs.clear();
-          if (truncatedTool) {
-            throw new Error(
-              `Tool "${truncatedTool.name}" arguments could not be parsed — ${truncatedTool.bytes} bytes received` +
-              `${stopReason ? `, stop_reason "${stopReason}"` : ''}. ` +
-              (stopReason === 'max_tokens'
-                ? 'The response hit the token limit mid tool-call; increase the provider\'s maxTokens.'
-                : 'The provider returned malformed tool arguments.'),
-            );
-          }
           yield { type: 'done' };
           break;
         }

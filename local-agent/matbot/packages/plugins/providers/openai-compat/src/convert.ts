@@ -62,6 +62,20 @@ function applyCacheBreakpoints(result: OAIMessage[]): void {
 }
 
 /**
+ * Serialize a matbot tool result for the `tool` role. Error results carry an explicit `is_error`
+ * marker inside the JSON payload so OpenAI-compatible models can distinguish failures from
+ * successful payloads (the wire format itself has no error flag — spec R4).
+ */
+export function serializeToolResult(result: unknown, isError?: boolean): string {
+  if (!isError) return JSON.stringify(result ?? null);
+  const base: Record<string, unknown> = result !== null && typeof result === 'object' && !Array.isArray(result)
+    ? { ...result as Record<string, unknown> }
+    : { result: String(result ?? null) };
+  base['is_error'] = true;
+  return JSON.stringify(base);
+}
+
+/**
  * Convert neutral matbot messages to OpenAI chat-completions format. System messages become a
  * single `system` message; tool results become `tool` messages; provider-native thinking blocks
  * are stripped; images become data/URL content parts; text-only messages collapse to plain
@@ -94,7 +108,7 @@ export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] 
             // `?? null` so a no-result tool (e.g. remember_fact, which yields only a marker) becomes
             // the string "null" rather than `JSON.stringify(undefined)` → undefined (a non-string the
             // API rejects). Every tool message must carry a string content.
-            content:      JSON.stringify(c.result ?? null),
+            content:      serializeToolResult(c.result, c.isError),
           });
         }
       }

@@ -53,7 +53,10 @@ export interface ProviderConfig {
 /** The streaming events a provider adapter yields while producing one completion. */
 export type CompletionEvent =
   | { type: 'text-delta';          delta: string }
-  | { type: 'tool-call';           id: string; name: string; input: unknown }
+  // `parseError` marks a tool call whose arguments could not be parsed (e.g. truncated at the
+  // token limit). The adapter yields it instead of throwing so the runner can feed a corrective
+  // error back to the model; `input` carries whatever raw payload was recoverable.
+  | { type: 'tool-call';           id: string; name: string; input: unknown; parseError?: string }
   | { type: 'tool-result';         id: string; result: unknown }
   | { type: 'thinking';            delta: string }
   | { type: 'thinking-block';      thinking: string; signature: string }
@@ -675,6 +678,17 @@ export interface ToolExecutor {
   execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent>;
 }
 
+/**
+ * Declares what a tool needs the permission system to gate on. `action` is the permission key
+ * (e.g. `'edit'`, `'bash'`, `'webfetch'`); `patterns` derives subject patterns from a call's
+ * input (e.g. file paths, command text, URLs). Tools without a declaration are gated under
+ * their own name with subject `'*'`.
+ */
+export interface ToolPermissionDecl {
+  action: string;
+  patterns?(input: unknown): string[];
+}
+
 /** A tool the model can call: name/description/schema for the LLM plus an executor. */
 export interface Tool {
   /** Unique tool name. */
@@ -687,6 +701,13 @@ export interface Tool {
   executor:     ToolExecutor;
   /** Plugin that registered the tool. */
   pluginName?:  string;
+  /**
+   * When true, calls to this tool run sequentially even inside a parallel tool-call batch —
+   * use for tools whose repeated invocation must preserve ordering (e.g. same-file edits).
+   */
+  serial?:      boolean;
+  /** Permission declaration consulted by the runtime's permission gate before execution. */
+  permission?:  ToolPermissionDecl;
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
@@ -921,7 +942,15 @@ export type PipelineEvent =
   // are already persisted in the session; this event is purely the live-delivery channel.
   | { type: 'marker';         content: MessageContent[]; traceId: string }
   | { type: 'error';          error: string;          traceId: string }
-  | { type: 'system-context'; text: string;           traceId: string };
+  | { type: 'system-context'; text: string;           traceId: string }
+  // The loop policy stopped the turn before the model finished naturally (iteration cap, tool-call
+  // budget, or token budget). Emitted once, right before the graceful stop notice is appended.
+  | { type: 'loop:limit';     reason: 'max-iterations' | 'max-tool-calls' | 'token-budget'; iterations: number; toolCalls: number; traceId: string }
+  // Permission gate lifecycle for one tool call. `ask` is emitted when configured rules require
+  // user approval (resolved via PromptFn); `reply` carries the outcome. Frontends can render a
+  // rich approval dialog from `permission`/`patterns`/`metadata`.
+  | { type: 'permission:ask';   askId: string; callId: string; toolName: string; permission: string; patterns: string[]; traceId: string }
+  | { type: 'permission:reply'; askId: string; outcome: 'allow' | 'always' | 'deny' | 'cancelled'; traceId: string };
 
 // ── Session runner ──────────────────────────────────────────────────────────────
 

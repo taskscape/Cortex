@@ -33,6 +33,16 @@ churn and less likely to affect a consumer who doesn't use them.
 
 ### API gaps filled
 
+- **Harness tool-use layer** (spec: `docs/tool-use-specification.md`, plan: `docs/tool-use-implementation.md` in the Cortex repo):
+  - *Loop budgets.* `runSession` accepts `loopPolicy: { maxIterations, maxToolCallsPerTurn, tokenBudgetTokens, doomLoopThreshold }`; exhausted limits emit a `loop:limit` event, append a graceful stop notice, and end the turn cleanly. Excess tool calls receive paired budget-error results.
+  - *Parallel tool execution.* Multiple calls in one assistant turn execute concurrently (concurrency 4) unless a tool declares `serial: true`; results stay ordered by call id and every emitted call is persisted with a paired result, including on abort (no more orphaned `tool-call` blocks).
+  - *Input validation at the boundary.* Tool inputs are validated against `inputSchema` before execution; invalid calls get corrective `is_error` results (`invalid_input`) without running the executor. New `schema-validator.ts` covers the draft-2020-12 subset (types, required, enum/const, bounds, patterns, items, anyOf/oneOf/allOf, local `$ref`, `additionalProperties`).
+  - *Permission gate.* New `permissions.ts` (wildcard rules, last-match-wins evaluation). `runSession` accepts `permissions: { rules, defaultAction }`; deny produces `permission_denied` results, ask resolves through the session's `PromptFn` (allow / always allow / deny) with new `permission:ask` / `permission:reply` pipeline events, "always" approves for the rest of the turn, and fully denied tools disappear from the advertised menu. Default action `allow` preserves existing behavior when unconfigured.
+  - *Universal output truncation.* `truncate.ts` caps every tool result (default 2000 lines / 50 KB) with head/tail previews; oversized structured results become `{ truncated, preview, hint }` envelopes and, when a `FileStore` is configured, the full output is saved via `putTemp` and referenced by name.
+  - *Doom-loop detection.* After `doomLoopThreshold` (default 3) identical attempts of the same call this turn, further identical calls are refused with a `doom_loop` error result steering the model to change strategy.
+  - *Error fidelity.* `CompletionEvent` tool-calls gained optional `parseError`: both provider adapters now surface truncated/malformed argument streams as failed calls instead of aborting the whole turn, and the openai-compat adapter serializes `isError` results with an explicit `is_error` marker so compatible models can distinguish failures.
+  - Tools may declare `serial?: boolean` and `permission?: ToolPermissionDecl { action, patterns(input) }`.
+
 - **`screen` hooks can now inject *durable* context, the persisted twin of `ephemeral`.** A new
   `ScreenResult.durable?: MessageContent[]`: where `ephemeral` informs only the turn about to run,
   `durable` is folded onto that turn's user message (the runner appends the blocks to the last
@@ -204,6 +214,13 @@ churn and less likely to affect a consumer who doesn't use them.
   the parsed response, so honest responses store their vectors (and lying ones are still rejected).
 
 ### Optional
+
+- **New plugin `@matatbread/matbot-tool-harness`** — workspace-confined coding-harness tools:
+  `read` (line offsets/limits, byte/line caps, continuation hints, binary sniffing, missing-file
+  suggestions), `write` and `edit` (read-before-edit + changed-on-disk enforcement, unique-match
+  replacement, CRLF/BOM preservation, diff summaries), `glob`/`grep`/`list` (ignore-aware walking,
+  regex content search with include filters, capped deterministic results), and `todowrite`
+  (validated per-session task list emitted as durable markers).
 
 - **workspace-rag** — ingestion overlaps its stages so the GPU stays busy. Embedding batches now
   drain through a bounded per-file pipeline (`CORTEX_RAG_V2_EMBED_PIPELINE_DEPTH`, default 2), letting

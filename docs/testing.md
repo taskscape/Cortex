@@ -198,7 +198,18 @@ Node tests cover:
 - expert-panel plugin behavior and isolated retrieval;
 - workspace-rag runtime ingestion flow;
 - end-to-end span capture, redaction, safe replay, deterministic and model-based
-  scorers, model-cost accounting, workflow outcome linkage, and ROI arithmetic.
+  scorers, model-cost accounting, workflow outcome linkage, and ROI arithmetic;
+- harness tool-use runtime behavior — schema validation, loop budgets, parallel
+  execution, doom-loop interception, orphaned tool-call finalization, output
+  truncation, and permission gate flows (`tests\tool-use-runtime.test.mjs`,
+  spec: [Tool Use Specification](tool-use-specification.md));
+- the harness tools `read`/`write`/`edit`/`glob`/`grep`/`list`/`todowrite`
+  end-to-end against temp-directory workspaces, including workspace confinement,
+  read-before-edit enforcement, CRLF preservation, and result caps
+  (`tests\tool-use-harness.test.mjs`);
+- provider adapter error fidelity: `is_error` serialization on the
+  OpenAI-compatible wire and degraded handling of truncated tool-call arguments
+  (`tests\tool-use-adapters.test.mjs`).
 
 Run only the evaluation and ROI backend coverage:
 
