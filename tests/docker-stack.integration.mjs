@@ -170,7 +170,7 @@ test("DCU-1/DCU-2/DCU-3/DCU-4/DCU-6/DCU-7 guarded CUDA sidecar validates hardwar
   const overridePath = path.join(fixture.root, "cuda-override.yml");
   const files = [composePath, overridePath];
   t.after(() => fixture.cleanup(files, envPath, ["cuda"]));
-  const miniLmEnv = batchSize => `WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2\nWORKSPACE_RAG_EMBEDDING_PROFILE=plain-v1\nWORKSPACE_RAG_EMBEDDING_BATCH_SIZE=${batchSize}\nPOSTGRES_PASSWORD=unused\nNEO4J_PASSWORD=unused\nNEO4J_AUTH=neo4j/unused\n`;
+  const miniLmEnv = batchSize => `WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2\nWORKSPACE_RAG_EMBEDDING_PROFILE=plain-v1\nWORKSPACE_RAG_EMBEDDING_BATCH_SIZE=${batchSize}\nWORKSPACE_RAG_EMBEDDING_DTYPE=float32\nPOSTGRES_PASSWORD=unused\nNEO4J_PASSWORD=unused\nNEO4J_AUTH=neo4j/unused\n`;
   await fixture.write("cuda.env", miniLmEnv(1));
   await fixture.write("cuda-override.yml", "services:\n  workspace-rag-cuda:\n    ports: !override\n      - \"127.0.0.1::8000\"\n");
   await fixture.run(composeArgs(envPath, files, ["--profile", "cuda", "up", "-d", "--build", "--force-recreate", "workspace-rag-cuda"]), { timeout: 600_000 });
@@ -178,6 +178,7 @@ test("DCU-1/DCU-2/DCU-3/DCU-4/DCU-6/DCU-7 guarded CUDA sidecar validates hardwar
   let endpoint = `http://${stdout.trim().replace(/^0\.0\.0\.0:/, "127.0.0.1:")}`;
   const health = await (await waitFor(`${endpoint}/health`, "CUDA embedding service")).json();
   assertEmbeddingHealth(health, { profile: "plain-v1", dimensions: 384 });
+  assert.equal(health.dtype, "float32", "the parity lane pins full precision explicitly");
   assert.equal(health.cudaAvailable, true, "the guarded lane requires a real NVIDIA CUDA device");
   assert.notEqual(health.device, "cpu");
 

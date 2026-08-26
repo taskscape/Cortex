@@ -155,7 +155,6 @@ export interface RagV2CollectionRecord {
 /**
  * Hierarchy level a routing summary was generated at.
  */
-export
 export type RagV2SummaryLevel = 'collection' | 'document' | 'section';
 
 /**
@@ -262,7 +261,6 @@ export interface RagV2ParsedDocument {
 /**
  * Tunable ingestion limits: passage sizing, parser memory, and rate caps.
  */
-export
 export interface RagV2IngestionPolicy {
   eagerPassageMaxBytes: number;
   asyncPassageMaxBytes: number;
@@ -275,6 +273,14 @@ export interface RagV2IngestionPolicy {
   embeddingTextsPerSecond: number;
   sourceMetadataOpsPerSecond: number;
   contextGraphOpsPerSecond: number;
+  /**
+   * Files ingested concurrently within one context. Unset enables adaptive
+   * concurrency: bulk backlogs run 3-wide and taper to sequential once only a
+   * few files remain. An explicit value overrides (1 keeps strict order).
+   */
+  fileConcurrency?: number;
+  /** Embedding batches kept in flight per file while Postgres writes drain. */
+  embedPipelineDepth: number;
 }
 
 /** Progress record of an ingestion job over one context. */

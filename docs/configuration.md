@@ -70,8 +70,10 @@ Additional runtime environment variables:
 | `CORTEX_RAG_V2_ASYNC_MAX_BYTES` | `262144000` | Largest source eligible for capped asynchronous passage promotion. Larger sources remain lexical with query-triggered lazy promotion. |
 | `CORTEX_RAG_V2_EAGER_PASSAGE_VECTOR_CAP` | `20000` | Per-document cap for eager or planned asynchronous passage vectors. |
 | `CORTEX_RAG_V2_PARSER_MEMORY_BYTES` | `33554432` | Per-file streaming parser budget. |
+| `CORTEX_RAG_V2_FILE_CONCURRENCY` | adaptive | Files ingested concurrently within a context, bounded to 1-8. Unset, bulk backlogs run 3-wide and automatically drop back to sequential once only a few files remain, keeping small incremental scans strictly ordered; an explicit value overrides and stays fixed for the whole scan. Tiers always keep authority-before-archive order. |
+| `CORTEX_RAG_V2_EMBED_PIPELINE_DEPTH` | `2` | Embedding batches kept in flight per file, bounded to 1-8, so GPU encoding overlaps Postgres writes and parsing. |
 | `CORTEX_RAG_V2_SUMMARY_PROVIDER` | unset | Configured Matbot provider used for asynchronous semantic section, document, and collection routing summaries. When unset, deterministic extractive routing text remains available and no model summary calls are made. Generated summaries are versioned derivatives and never citation evidence. |
-| `CORTEX_RAG_V2_SUMMARY_CONCURRENCY` | `2` | Concurrent semantic-summary requests, bounded to 1-8. |
+| `CORTEX_RAG_V2_SUMMARY_CONCURRENCY` | `4` | Concurrent semantic-summary requests, bounded to 1-8. |
 | `CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT` | `256` | In-process semantic-summary queue capacity, bounded to 16-4096. Ingestion applies backpressure when full. Completed summaries are content/signature reusable; interrupted unfinished work is regenerated on the next ingestion. |
 | `CORTEX_RAG_V2_RERANKER_URL` | unset | Optional multilingual reranker base URL, normally `http://127.0.0.1:8891`. |
 | `CORTEX_RAG_V2_RRF_K` | `60` | Reciprocal Rank Fusion rank constant. |
@@ -126,7 +128,9 @@ OPENAI_API_KEY=CHANGE_ME
 WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=46605decb5369335a3847c9f41bb0b896c07dd1a
 WORKSPACE_RAG_EMBEDDING_PROFILE=auto
-WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=128
+# float16 is the default; set float32 to restore full precision.
+WORKSPACE_RAG_EMBEDDING_DTYPE=float16
 
 # Optional multilingual V2 reranker.
 WORKSPACE_RAG_RERANKER_MODEL=Alibaba-NLP/gte-multilingual-reranker-base
@@ -586,14 +590,20 @@ For example, to use the 768-dimensional multilingual E5 base model:
 WORKSPACE_RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-base
 WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=d13f1b27baf31030b7fd040960d60d909913633f
 WORKSPACE_RAG_EMBEDDING_PROFILE=auto
-WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=128
+WORKSPACE_RAG_EMBEDDING_DTYPE=float16
 ```
 
 The service stores downloaded Hugging Face artifacts in the
 `workspace-rag-models` Docker volume so container recreation does not download
-the model again. Changing the model, revision, profile, prefixes, normalization,
-or token limit changes the embedding signature. Cortex then treats existing
-vectors as stale and rebuilds them during the next workspace scan. Postgres
+the model again. Embeddings run in `float16` by default (roughly doubling
+throughput and halving GPU memory on tensor-core GPUs, with TF32 matmuls
+enabled alongside). Changing the model, revision, profile, prefixes,
+normalization, token limit, or `WORKSPACE_RAG_EMBEDDING_DTYPE` (`float16`,
+`bfloat16`, or `float32`) changes the
+embedding signature. Cortex then treats existing vectors as stale and rebuilds
+them during the next workspace scan of every workspace the sidecar serves.
+Postgres
 derivative tables remain dimension-specific, so this model uses
 `unit_embeddings_768`; an earlier `unit_embeddings_384` table is retained until
 deliberately cleaned up.

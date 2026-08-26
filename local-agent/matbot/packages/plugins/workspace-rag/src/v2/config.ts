@@ -12,6 +12,12 @@ function nonNegativeInteger(value: string | undefined, fallback: number): number
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function boundedInteger(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
 /**
  * Reads the v2 mode from the environment.
  * @returns The configured {@link RagV2Mode} (default 'off').
@@ -26,6 +32,7 @@ export function ragV2ModeFromEnv(): RagV2Mode {
  * @returns The resolved {@link RagV2IngestionPolicy}.
  */
 export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
+  const rawFileConcurrency = process.env['CORTEX_RAG_V2_FILE_CONCURRENCY']?.trim();
   return {
     eagerPassageMaxBytes: positiveInteger(process.env['CORTEX_RAG_V2_EAGER_MAX_BYTES'], 20 * MIB),
     asyncPassageMaxBytes: positiveInteger(process.env['CORTEX_RAG_V2_ASYNC_MAX_BYTES'], 250 * MIB),
@@ -38,6 +45,8 @@ export function ragV2PolicyFromEnv(): RagV2IngestionPolicy {
     embeddingTextsPerSecond: nonNegativeInteger(process.env['CORTEX_RAG_V2_EMBEDDING_TEXTS_PER_SECOND'], 0),
     sourceMetadataOpsPerSecond: nonNegativeInteger(process.env['CORTEX_RAG_V2_SOURCE_METADATA_OPS_PER_SECOND'], 0),
     contextGraphOpsPerSecond: nonNegativeInteger(process.env['CORTEX_RAG_V2_CONTEXT_GRAPH_OPS_PER_SECOND'], 0),
+    ...(rawFileConcurrency ? { fileConcurrency: boundedInteger(rawFileConcurrency, 1, 1, 8) } : {}),
+    embedPipelineDepth: boundedInteger(process.env['CORTEX_RAG_V2_EMBED_PIPELINE_DEPTH'], 2, 1, 8),
   };
 }
 

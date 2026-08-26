@@ -44,8 +44,7 @@ async function postWithRetry(
       ]),
     });
     if (res.status === 429 && attempt < SEND_MAX_ATTEMPTS) {
-      const body = await res.json().catch(() => undefined)
-        as { parameters?: { retry_after?: number } } | undefined;
+      const body = await res.json().catch(() => undefined) as { parameters?: { retry_after?: number } } | undefined;
       await sleep(Math.min(Math.max(body?.parameters?.retry_after ?? 1, 1), 30) * 1000);
       continue;
     }

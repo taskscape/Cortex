@@ -7,7 +7,9 @@ of the ordinary Node test lane while exercising the actual health and embed code
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -30,6 +32,7 @@ APP_ENV = (
     "EMBEDDING_BATCH_SIZE",
     "EMBEDDING_QUERY_PREFIX",
     "EMBEDDING_DOCUMENT_PREFIX",
+    "EMBEDDING_DTYPE",
 )
 
 
@@ -181,6 +184,14 @@ class FakeMatrix:
         return self.vectors
 
 
+class FakeBackends:
+    """In-memory ``torch.backends`` double recording TF32 toggles."""
+
+    def __init__(self) -> None:
+        self.cuda = types.SimpleNamespace(matmul=types.SimpleNamespace(allow_tf32=False))
+        self.cudnn = types.SimpleNamespace(allow_tf32=False)
+
+
 class Recorder:
     """Captures model loads and encode calls made by the app under test."""
 
@@ -193,6 +204,8 @@ class Recorder:
         self.raise_oom = raise_oom
         self.loads: list[tuple[str, dict[str, object]]] = []
         self.encode_calls: list[dict[str, object]] = []
+        self.dtype_calls: list[object] = []
+        self.backends = FakeBackends()
 
 
 def make_sentence_transformer(recorder: Recorder):
@@ -218,6 +231,19 @@ def make_sentence_transformer(recorder: Recorder):
             self.name = name
             self.max_seq_length = 512
             recorder.loads.append((name, options))
+
+        def to(self, *, dtype: object = None, **_kwargs: object) -> "FakeSentenceTransformer":
+            """Record a dtype conversion instead of moving parameters.
+
+            Args:
+                dtype: Torch dtype requested by the app.
+                **_kwargs: Ignored keyword arguments accepted by ``Module.to``.
+
+            Returns:
+                The same instance, mirroring ``Module.to`` semantics.
+            """
+            recorder.dtype_calls.append(dtype)
+            return self
 
         def get_sentence_embedding_dimension(self) -> int:
             """Derive the embedding dimension from the model name.
@@ -271,6 +297,9 @@ def load_app(*, env: dict[str, str], cuda_available: bool, raise_oom: bool = Fal
     fake_cuda = FakeCuda(cuda_available)
     fake_torch = types.ModuleType("torch")
     fake_torch.cuda = fake_cuda
+    fake_torch.backends = recorder.backends
+    fake_torch.float16 = "torch.float16"
+    fake_torch.bfloat16 = "torch.bfloat16"
     fake_fastapi = types.ModuleType("fastapi")
     fake_fastapi.FastAPI = FakeFastApi
     fake_fastapi.HTTPException = FakeHttpException
@@ -420,8 +449,72 @@ def test_cuda_oom_is_retryable_and_releases_cached_blocks() -> None:
     assert cuda.empty_cache_calls == 1
 
 
+def test_default_dtype_is_float16_with_conversion_and_signature() -> None:
+    """Verify reduced precision is on by default for every workspace."""
+    module, recorder, _cuda = load_app(
+        env={"EMBEDDING_BATCH_SIZE": "2"},
+        cuda_available=True,
+    )
+    assert module.DTYPE_ENV == "float16"
+    assert recorder.dtype_calls == ["torch.float16"]
+    assert recorder.backends.cuda.matmul.allow_tf32 is True
+    assert recorder.backends.cudnn.allow_tf32 is True
+    fp16_payload = {
+        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "default",
+        "profile": "plain-v1",
+        "queryPrefix": "",
+        "documentPrefix": "",
+        "normalize": True,
+        "maxTokens": 512,
+        "dtype": "float16",
+    }
+    expected = hashlib.sha256(
+        json.dumps(fp16_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    assert module.signature == expected
+    assert module.health()["dtype"] == "float16"
+
+
+def test_float32_keeps_legacy_signature_and_skips_conversion() -> None:
+    """Verify opting out of fp16 restores byte-identical float32 signatures."""
+    module, recorder, _cuda = load_app(
+        env={"EMBEDDING_BATCH_SIZE": "2", "EMBEDDING_DTYPE": "float32"},
+        cuda_available=True,
+    )
+    legacy_payload = {
+        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "default",
+        "profile": "plain-v1",
+        "queryPrefix": "",
+        "documentPrefix": "",
+        "normalize": True,
+        "maxTokens": 512,
+    }
+    expected = hashlib.sha256(
+        json.dumps(legacy_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    assert module.DTYPE_ENV == "float32"
+    assert recorder.dtype_calls == []
+    assert module.signature == expected
+    assert module.health()["dtype"] == "float32"
+
+
+def test_invalid_dtype_fails_fast_at_startup() -> None:
+    """Verify an unsupported dtype refuses to start instead of mis-signing vectors."""
+    try:
+        load_app(env={"EMBEDDING_DTYPE": "int8"}, cuda_available=True)
+    except RuntimeError as error:
+        assert "EMBEDDING_DTYPE" in str(error)
+    else:
+        raise AssertionError("expected unsupported EMBEDDING_DTYPE rejection")
+
+
 if __name__ == "__main__":
     test_cuda_detection_failure()
     test_e5_prefixes_revision_and_single_model_load()
     test_cuda_oom_is_retryable_and_releases_cached_blocks()
+    test_default_dtype_is_float16_with_conversion_and_signature()
+    test_float32_keeps_legacy_signature_and_skips_conversion()
+    test_invalid_dtype_fails_fast_at_startup()
     print("workspace-rag CUDA app mock integration passes")

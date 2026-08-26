@@ -13,7 +13,7 @@ export function isTransientStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
+function delay(ms: number, signal?: AbortSignal | null): Promise<void> {
   return new Promise(resolve => {
     const timer = setTimeout(resolve, ms);
     signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });

@@ -19,8 +19,27 @@ from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 MODEL_REVISION = os.getenv("EMBEDDING_MODEL_REVISION", "").strip() or None
-BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "128"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Reduced-precision inference is the default: float16 roughly doubles
+# throughput and halves GPU memory on tensor-core GPUs (all RTX cards). Set
+# EMBEDDING_DTYPE=float32 to restore full-precision vectors. Changing the dtype
+# changes embedding values, so it is folded into the preprocessing signature: a
+# sidecar restarted with a different dtype can never mix vectors into an
+# existing index; Cortex rebuilds affected derivatives on the next scan.
+DTYPE_ENV = os.getenv("EMBEDDING_DTYPE", "float16").strip().lower()
+TORCH_DTYPES = {
+    "float32": None,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+if DTYPE_ENV not in TORCH_DTYPES:
+    raise RuntimeError(
+        f"Unsupported EMBEDDING_DTYPE '{DTYPE_ENV}' "
+        "(expected float32, float16, or bfloat16)."
+    )
+DTYPE = TORCH_DTYPES[DTYPE_ENV]
 
 
 def resolve_profile(model_name: str) -> str:
@@ -52,6 +71,12 @@ model_options = {"device": DEVICE}
 if MODEL_REVISION:
     model_options["revision"] = MODEL_REVISION
 model = SentenceTransformer(MODEL_NAME, **model_options)
+if DTYPE is not None:
+    model = model.to(dtype=DTYPE)
+    if DEVICE == "cuda":
+        # TF32 matmuls pair with reduced-precision weights on Ampere+ GPUs.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 dimensions = int(model.get_sentence_embedding_dimension() or 0)
 max_tokens = int(model.max_seq_length or 0)
 signature_payload = {
@@ -63,6 +88,8 @@ signature_payload = {
     "normalize": True,
     "maxTokens": max_tokens,
 }
+if DTYPE_ENV != "float32":
+    signature_payload["dtype"] = DTYPE_ENV
 signature = hashlib.sha256(
     json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
 ).hexdigest()
@@ -103,6 +130,7 @@ def health():
         "normalized": True,
         "queryPrefix": QUERY_PREFIX,
         "documentPrefix": DOCUMENT_PREFIX,
+        "dtype": DTYPE_ENV,
         "message": "CUDA available." if cuda_available else "CUDA is not available to PyTorch.",
     }
 

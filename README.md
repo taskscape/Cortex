@@ -175,6 +175,16 @@ job must be cancelled; the prior complete generation remains published. Do not p
 when stopping services because the declared volumes contain Postgres data and
 the downloaded model cache.
 
+Embeddings run in `float16` by default on the CUDA sidecar, which roughly
+doubles throughput and halves GPU memory on tensor-core GPUs (every GeForce
+RTX card, including the RTX 3060) and enables TF32 matmuls alongside it.
+Because reduced precision changes vector values, the dtype is part of the
+embedding signature: switching `WORKSPACE_RAG_EMBEDDING_DTYPE` between
+`float16`, `bfloat16`, and `float32` invalidates existing vectors and Cortex
+rebuilds them automatically during each affected workspace's next scan. Set
+`WORKSPACE_RAG_EMBEDDING_DTYPE=float32` in `local-agent\docker\mem0\.env` to
+restore full precision for every workspace.
+
 For large workspaces, Cortex streams each Markdown file within a bounded parser
 budget, rate-limits derivative and source-registry work, and stores
 high-cardinality source/graph metadata in WAL-mode SQLite.
@@ -192,7 +202,8 @@ high-cardinality source/graph metadata in WAL-mode SQLite.
    WORKSPACE_RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-base
    WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=d13f1b27baf31030b7fd040960d60d909913633f
    WORKSPACE_RAG_EMBEDDING_PROFILE=auto
-   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=128
+   WORKSPACE_RAG_EMBEDDING_DTYPE=float16
    ```
 
    To switch back to MiniLM, use:
@@ -201,7 +212,8 @@ high-cardinality source/graph metadata in WAL-mode SQLite.
    WORKSPACE_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
    WORKSPACE_RAG_EMBEDDING_MODEL_REVISION=46605decb5369335a3847c9f41bb0b896c07dd1a
    WORKSPACE_RAG_EMBEDDING_PROFILE=auto
-   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=32
+   WORKSPACE_RAG_EMBEDDING_BATCH_SIZE=128
+   WORKSPACE_RAG_EMBEDDING_DTYPE=float16
    ```
 
    Reduce the batch size if the CUDA worker runs out of GPU memory.
@@ -224,7 +236,7 @@ high-cardinality source/graph metadata in WAL-mode SQLite.
    ```powershell
    Invoke-RestMethod http://127.0.0.1:8890/health |
      Select-Object model, profile, dimensions, maxTokens, normalized,
-       queryPrefix, documentPrefix
+       queryPrefix, documentPrefix, dtype
    ```
 
    E5 should report model `intfloat/multilingual-e5-base`, profile

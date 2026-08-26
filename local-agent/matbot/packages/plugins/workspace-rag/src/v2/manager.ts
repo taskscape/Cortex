@@ -18,7 +18,7 @@ import {
 import { RagV2ObjectStore } from './object-store.js';
 import { parseMarkdownStream } from './parser.js';
 import { RagV2RateLimiter } from './rate-limiter.js';
-import type { RagV2EmbeddingRecord, RagV2Repository } from './repository.js';
+import type { RagV2DocumentFingerprint, RagV2EmbeddingRecord, RagV2Repository } from './repository.js';
 import { RagV2RetrievalEngine } from './retrieval.js';
 import type { RagV2SemanticServices, RagV2SummaryInput } from './semantic.js';
 import type {
@@ -186,6 +186,11 @@ function normalizedPath(value: string): string {
 const SKIPPABLE_ROOT_ERROR_CODES = new Set([
   'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
 ]);
+
+/** Files ingested concurrently when a bulk backlog is pending (adaptive mode). */
+const BULK_FILE_CONCURRENCY = 3;
+/** Adaptive mode tapers to sequential once this many files remain to process. */
+const FILE_CONCURRENCY_TAIL_FILES = 4;
 
 function isWithinRoot(filePath: string, root: string): boolean {
   const relative = path.relative(root, filePath);
@@ -394,7 +399,7 @@ export class WorkspaceRagV2Manager {
   private readonly summarySpaceWaiters: Array<() => void> = [];
   private readonly summaryIdleWaiters: Array<() => void> = [];
   private readonly summaryController = new AbortController();
-  private readonly summaryConcurrency = Math.max(1, Math.min(8, Number(process.env['CORTEX_RAG_V2_SUMMARY_CONCURRENCY'] ?? 2) || 2));
+  private readonly summaryConcurrency = Math.max(1, Math.min(8, Number(process.env['CORTEX_RAG_V2_SUMMARY_CONCURRENCY'] ?? 4) || 4));
   private readonly summaryQueueLimit = Math.max(16, Math.min(4_096, Number(process.env['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT'] ?? 256) || 256));
   private summaryActive = 0;
   private summaryCompleted = 0;
@@ -1267,107 +1272,72 @@ export class WorkspaceRagV2Manager {
       console.warn(`[workspace-rag-v2] pruned ${pruned} abandoned staging generation${pruned === 1 ? '' : 's'}.`);
     }
     const seenPaths = new Set<string>();
-    let filesSinceCheckpoint = 0;
+    const checkpointState = { sinceFiles: 0 };
     let removedPaths: string[] = [];
     try {
       for (const priority of ['authority', 'current', 'archive'] as const) {
-        for await (const file of discoverMarkdown(indexContext.paths, signal, priority)) {
-        await this.waitWhilePaused(job, signal);
-        if (signal.aborted) throw abortError(signal);
-        job.discoveredFiles++;
-        job.discoveredBytes += file.size;
-        if (job.discoveredFiles > job.totalFiles) job.totalFiles = job.discoveredFiles;
-        job.currentPath = file.path;
-        job.checkpoint = file.path;
-        seenPaths.add(file.path);
-        job.updatedAt = now();
-        const elapsedSeconds = Math.max(0.001, (Date.now() - Date.parse(job.createdAt)) / 1_000);
-        job.throughputBytesPerSecond = Math.round(job.processedBytes / elapsedSeconds);
-        if (job.throughputBytesPerSecond > 0) {
-          job.estimatedRemainingSeconds = Math.ceil(
-            Math.max(0, job.discoveredBytes - job.processedBytes) / job.throughputBytesPerSecond,
-          );
-        } else {
-          delete job.estimatedRemainingSeconds;
-        }
-        await this.repository.upsertJobItem({
-          jobId: job.id,
-          workspaceId: workspace.id,
-          contextId: context.id,
-          path: file.path,
-          size: file.size,
-          modifiedAt: file.modifiedAt,
-          state: 'discovered',
-        });
-        const existing = fingerprints.get(file.path);
-        const summarySignature = this.semanticServices?.summarizerSignature;
-        if (
-          existing
-          && existing.byteLength === file.size
-          && existing.modifiedAt === file.modifiedAt
-          && existing.embeddingSignature === this.embedder.info.signature
-          && (!summarySignature || existing.summarySignature === summarySignature)
-          && !forceAll
-          && !forcePaths.has(file.path)
-        ) {
-          job.unchangedFiles++;
-          job.processedFiles++;
-          job.processedBytes += file.size;
-          await this.repository.upsertJobItem({
-            jobId: job.id,
-            workspaceId: workspace.id,
-            contextId: context.id,
-            path: file.path,
-            size: file.size,
-            modifiedAt: file.modifiedAt,
-            state: 'active_hybrid_complete',
-            documentId: existing.documentId,
-            documentVersionId: existing.documentVersionId,
-          });
-          await this.repository.updateJob(job);
-          continue;
-        }
+        // Files within a tier run through a bounded worker pool so Postgres
+        // writes, parsing, and GPU embedding overlap across files. Tiers stay
+        // sequential to preserve the authority -> current -> archive order,
+        // and discovery only advances when a worker slot is free so a
+        // concurrency of 1 keeps the exact sequential scan semantics.
+        const iterator = discoverMarkdown(indexContext.paths, signal, priority);
+        const inflight = new Set<Promise<void>>();
+        const failures: unknown[] = [];
         try {
-          await this.ingestFile(workspace, indexContext, job, file, signal);
-          if (existing) job.changedFiles++;
-          else job.addedFiles++;
-          job.processedFiles++;
-          job.processedBytes += file.size;
-          filesSinceCheckpoint++;
-        } catch (error) {
-          if (signal.aborted) throw error;
-          job.failedFiles++;
-          await this.repository.upsertJobItem({
-            jobId: job.id,
-            workspaceId: workspace.id,
-            contextId: context.id,
-            path: file.path,
-            size: file.size,
-            modifiedAt: file.modifiedAt,
-            state: 'retryable_failure',
-            error: error instanceof Error ? error.message : String(error),
-          });
-          await this.sourceBridge?.recordFailure(workspace, context, file.path, error);
+          while (true) {
+            for (;;) {
+              if (failures.length > 0) break;
+              if (inflight.size < this.fileConcurrencyFor(job)) break;
+              await Promise.race(inflight);
+            }
+            if (failures.length > 0) break;
+            if (signal.aborted) throw abortError(signal);
+            const next = await iterator.next();
+            if (next.done) break;
+            const file = next.value;
+            await this.waitWhilePaused(job, signal);
+            if (signal.aborted) throw abortError(signal);
+            job.discoveredFiles++;
+            job.discoveredBytes += file.size;
+            if (job.discoveredFiles > job.totalFiles) job.totalFiles = job.discoveredFiles;
+            job.currentPath = file.path;
+            job.checkpoint = file.path;
+            seenPaths.add(file.path);
+            job.updatedAt = now();
+            const elapsedSeconds = Math.max(0.001, (Date.now() - Date.parse(job.createdAt)) / 1_000);
+            job.throughputBytesPerSecond = Math.round(job.processedBytes / elapsedSeconds);
+            if (job.throughputBytesPerSecond > 0) {
+              job.estimatedRemainingSeconds = Math.ceil(
+                Math.max(0, job.discoveredBytes - job.processedBytes) / job.throughputBytesPerSecond,
+              );
+            } else {
+              delete job.estimatedRemainingSeconds;
+            }
+            await this.repository.upsertJobItem({
+              jobId: job.id,
+              workspaceId: workspace.id,
+              contextId: context.id,
+              path: file.path,
+              size: file.size,
+              modifiedAt: file.modifiedAt,
+              state: 'discovered',
+            });
+            const task = this.processDiscoveredFile(
+              workspace, indexContext, job, file, fingerprints, forceAll, forcePaths, checkpointState, signal,
+            ).catch(error => { failures.push(error); });
+            inflight.add(task);
+            void task.finally(() => inflight.delete(task));
+          }
+        } finally {
+          // Drain before leaving the tier so no file writes race validation,
+          // and so a throwing discovery pull still settles scheduled work.
+          while (inflight.size > 0) {
+            await Promise.race(inflight);
+          }
         }
-        job.updatedAt = now();
-        const completedElapsedSeconds = Math.max(
-          0.001,
-          (Date.now() - Date.parse(job.createdAt)) / 1_000,
-        );
-        job.throughputBytesPerSecond = Math.round(job.processedBytes / completedElapsedSeconds);
-        job.estimatedRemainingSeconds = job.throughputBytesPerSecond > 0
-          ? Math.ceil(
-            Math.max(0, job.discoveredBytes - job.processedBytes)
-            / job.throughputBytesPerSecond,
-          )
-          : 0;
-        job.message = `Processed ${job.processedFiles} of ${job.totalFiles} Markdown files.`;
-        await this.repository.updateJob(job);
-        if (this.checkpointFiles > 0 && filesSinceCheckpoint >= this.checkpointFiles) {
-          filesSinceCheckpoint = 0;
-          await this.publishCheckpoint(workspace, context, job);
-        }
-        }
+        if (signal.aborted) throw abortError(signal);
+        if (failures.length > 0) throw failures[0];
       }
       if (signal.aborted) throw abortError(signal);
       job.discoveryComplete = true;
@@ -1469,6 +1439,109 @@ export class WorkspaceRagV2Manager {
     }
   }
 
+  /**
+   * Effective per-tier file concurrency. An explicit CORTEX_RAG_V2_FILE_CONCURRENCY
+   * always wins; otherwise bulk backlogs run 3-wide and taper to sequential once
+   * only a handful of files remain, so small incremental scans stay strictly
+   * ordered and keep cross-file derivative reuse.
+   */
+  private fileConcurrencyFor(job: RagV2Job): number {
+    const configured = this.policy.fileConcurrency;
+    if (configured !== undefined) return Math.max(1, Math.min(8, configured));
+    return job.totalFiles - job.processedFiles > FILE_CONCURRENCY_TAIL_FILES
+      ? BULK_FILE_CONCURRENCY
+      : 1;
+  }
+
+  /**
+   * Runs one discovered file to completion inside the bounded per-tier pool.
+   * Per-file ingestion failures are recorded against the job so the scan can
+   * continue; every other rejection propagates to the pool feeder, which
+   * fails the scan exactly as the sequential loop did. Checkpoint accounting
+   * is shared for the whole run; the synchronous read-modify-write on the
+   * single-threaded event loop keeps publications serial without locks.
+   */
+  private async processDiscoveredFile(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+    job: RagV2Job,
+    file: { path: string; size: number; modifiedAt: string },
+    fingerprints: Map<string, RagV2DocumentFingerprint>,
+    forceAll: boolean,
+    forcePaths: ReadonlySet<string>,
+    checkpointState: { sinceFiles: number },
+    signal: AbortSignal,
+  ): Promise<void> {
+    const existing = fingerprints.get(file.path);
+    const summarySignature = this.semanticServices?.summarizerSignature;
+    if (
+      existing
+      && existing.byteLength === file.size
+      && existing.modifiedAt === file.modifiedAt
+      && existing.embeddingSignature === this.embedder.info.signature
+      && (!summarySignature || existing.summarySignature === summarySignature)
+      && !forceAll
+      && !forcePaths.has(file.path)
+    ) {
+      job.unchangedFiles++;
+      job.processedFiles++;
+      job.processedBytes += file.size;
+      await this.repository.upsertJobItem({
+        jobId: job.id,
+        workspaceId: workspace.id,
+        contextId: context.id,
+        path: file.path,
+        size: file.size,
+        modifiedAt: file.modifiedAt,
+        state: 'active_hybrid_complete',
+        documentId: existing.documentId,
+        documentVersionId: existing.documentVersionId,
+      });
+      await this.repository.updateJob(job);
+      return;
+    }
+    try {
+      await this.ingestFile(workspace, context, job, file, signal);
+      if (existing) job.changedFiles++;
+      else job.addedFiles++;
+      job.processedFiles++;
+      job.processedBytes += file.size;
+      checkpointState.sinceFiles++;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      job.failedFiles++;
+      await this.repository.upsertJobItem({
+        jobId: job.id,
+        workspaceId: workspace.id,
+        contextId: context.id,
+        path: file.path,
+        size: file.size,
+        modifiedAt: file.modifiedAt,
+        state: 'retryable_failure',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await this.sourceBridge?.recordFailure(workspace, context, file.path, error);
+    }
+    job.updatedAt = now();
+    const completedElapsedSeconds = Math.max(
+      0.001,
+      (Date.now() - Date.parse(job.createdAt)) / 1_000,
+    );
+    job.throughputBytesPerSecond = Math.round(job.processedBytes / completedElapsedSeconds);
+    job.estimatedRemainingSeconds = job.throughputBytesPerSecond > 0
+      ? Math.ceil(
+        Math.max(0, job.discoveredBytes - job.processedBytes)
+        / job.throughputBytesPerSecond,
+      )
+      : 0;
+    job.message = `Processed ${job.processedFiles} of ${job.totalFiles} Markdown files.`;
+    await this.repository.updateJob(job);
+    if (this.checkpointFiles > 0 && checkpointState.sinceFiles >= this.checkpointFiles) {
+      checkpointState.sinceFiles = 0;
+      await this.publishCheckpoint(workspace, context, job);
+    }
+  }
+
   private async ingestFile(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -1519,34 +1592,34 @@ export class WorkspaceRagV2Manager {
     let eagerPassageVectors = 0;
     let asyncPassageVectorsPlanned = 0;
     const lineWriter = await objectStore.createLineIndexWriter(object.contentSha256);
+    // Embedding batches drain through this bounded pipeline so the GPU keeps
+    // working while Postgres writes and markdown parsing continue on the host.
+    const pipeline: Array<Promise<void>> = [];
+    const scheduleEmbeddingWork = async (task: () => Promise<void>): Promise<void> => {
+      while (pipeline.length >= this.policy.embedPipelineDepth) {
+        await Promise.race(pipeline);
+      }
+      const run = task().finally(() => {
+        const index = pipeline.indexOf(run);
+        if (index >= 0) pipeline.splice(index, 1);
+      });
+      void run.catch(() => undefined);
+      pipeline.push(run);
+    };
+    const drainPipeline = async (): Promise<void> => {
+      const pending = pipeline.splice(0);
+      await Promise.all(pending);
+    };
     const flushSections = async (): Promise<void> => {
       if (sectionBatch.length === 0) return;
       const batch = sectionBatch.splice(0);
-      for (const section of batch) section.embeddingState = 'queued';
-      await this.repository.appendSections(batch);
-      try {
-        const embeddingText = (section: RagV2SectionRecord) =>
-          `${section.headingPath.join(' > ')}\n${section.routingSummary}`;
-        const reusable = batch.map(section => ({
-          level: 'section' as const,
-          unitId: section.sectionId,
-          documentVersionId: section.documentVersionId,
-          workspaceId: section.workspaceId,
-          contextId: section.contextId,
-          signature: this.embedder.info.signature,
-          inputSha256: embeddingInputSha256('section', embeddingText(section)),
-        }));
-        const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
-        const pending = batch.filter(section => !reused.has(section.sectionId));
-        job.readyEmbeddings += reused.size;
-        if (pending.length > 0) {
-          await this.embeddingLimiter.consume(pending.length, signal);
-          const vectors = await this.embedder.embed(
-            pending.map(embeddingText),
-            'document',
-            signal,
-          );
-          const records: RagV2EmbeddingRecord[] = pending.map((section, index) => ({
+      await scheduleEmbeddingWork(async () => {
+        for (const section of batch) section.embeddingState = 'queued';
+        await this.repository.appendSections(batch);
+        try {
+          const embeddingText = (section: RagV2SectionRecord) =>
+            `${section.headingPath.join(' > ')}\n${section.routingSummary}`;
+          const reusable = batch.map(section => ({
             level: 'section' as const,
             unitId: section.sectionId,
             documentVersionId: section.documentVersionId,
@@ -1554,30 +1627,50 @@ export class WorkspaceRagV2Manager {
             contextId: section.contextId,
             signature: this.embedder.info.signature,
             inputSha256: embeddingInputSha256('section', embeddingText(section)),
-            vector: vectors[index] ?? [],
-          })).filter(record => record.vector.length === this.embedder.info.dimensions);
-          await this.repository.putEmbeddings(records, this.embedder.info);
-          job.readyEmbeddings += records.length;
+          }));
+          const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
+          const pending = batch.filter(section => !reused.has(section.sectionId));
+          job.readyEmbeddings += reused.size;
+          if (pending.length > 0) {
+            await this.embeddingLimiter.consume(pending.length, signal);
+            const vectors = await this.embedder.embed(
+              pending.map(embeddingText),
+              'document',
+              signal,
+            );
+            const records: RagV2EmbeddingRecord[] = pending.map((section, index) => ({
+              level: 'section' as const,
+              unitId: section.sectionId,
+              documentVersionId: section.documentVersionId,
+              workspaceId: section.workspaceId,
+              contextId: section.contextId,
+              signature: this.embedder.info.signature,
+              inputSha256: embeddingInputSha256('section', embeddingText(section)),
+              vector: vectors[index] ?? [],
+            })).filter(record => record.vector.length === this.embedder.info.dimensions);
+            await this.repository.putEmbeddings(records, this.embedder.info);
+            job.readyEmbeddings += records.length;
+          }
+        } catch (error) {
+          if (signal.aborted) throw error;
+          for (const section of batch) section.embeddingState = 'failed';
+          await this.repository.appendSections(batch);
         }
-      } catch (error) {
-        if (signal.aborted) throw error;
-        for (const section of batch) section.embeddingState = 'failed';
-        await this.repository.appendSections(batch);
-      }
-      for (const section of batch) {
-        await this.enqueueSummary({
-          level: 'section',
-          workspaceId: section.workspaceId,
-          contextId: section.contextId,
-          generationId: job.generationId,
-          unitId: section.sectionId,
-          documentVersionId: section.documentVersionId,
-          sourceContentSha256: section.contentSha256,
-          title: section.headingText,
-          breadcrumb: section.headingPath,
-          text: section.routingSummary,
-        });
-      }
+        for (const section of batch) {
+          await this.enqueueSummary({
+            level: 'section',
+            workspaceId: section.workspaceId,
+            contextId: section.contextId,
+            generationId: job.generationId,
+            unitId: section.sectionId,
+            documentVersionId: section.documentVersionId,
+            sourceContentSha256: section.contentSha256,
+            title: section.headingText,
+            breadcrumb: section.headingPath,
+            text: section.routingSummary,
+          });
+        }
+      });
     };
     const flushPassages = async (): Promise<void> => {
       if (passageBatch.length === 0) return;
@@ -1603,41 +1696,43 @@ export class WorkspaceRagV2Manager {
       await this.repository.appendPassages(batch);
       job.queuedEmbeddings += batch.filter(passage => passage.embeddingState === 'queued').length;
       if (eager.length > 0) {
-        try {
-          const reusable = eager.map(passage => ({
-            level: 'passage' as const,
-            unitId: passage.passageId,
-            documentVersionId: passage.documentVersionId,
-            workspaceId: passage.workspaceId,
-            contextId: passage.contextId,
-            signature: this.embedder.info.signature,
-            inputSha256: embeddingInputSha256('passage', passage.text),
-          }));
-          const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
-          const pending = eager.filter(passage => !reused.has(passage.passageId));
-          job.readyEmbeddings += reused.size;
-          await this.embeddingLimiter.consume(pending.length, signal);
-          const vectors = pending.length > 0
-            ? await this.embedder.embed(pending.map(passage => passage.text), 'document', signal)
-            : [];
-          const records: RagV2EmbeddingRecord[] = pending.map((passage, index) => ({
-            level: 'passage' as const,
-            unitId: passage.passageId,
-            documentVersionId: passage.documentVersionId,
-            workspaceId: passage.workspaceId,
-            contextId: passage.contextId,
-            signature: this.embedder.info.signature,
-            inputSha256: embeddingInputSha256('passage', passage.text),
-            vector: vectors[index] ?? [],
-          })).filter(record => record.vector.length === this.embedder.info.dimensions);
-          await this.repository.putEmbeddings(records, this.embedder.info);
-          job.readyEmbeddings += records.length;
-          eagerPassageVectors += records.length + reused.size;
-        } catch (error) {
-          if (signal.aborted) throw error;
-          for (const passage of eager) passage.embeddingState = 'failed';
-          await this.repository.appendPassages(eager);
-        }
+        await scheduleEmbeddingWork(async () => {
+          try {
+            const reusable = eager.map(passage => ({
+              level: 'passage' as const,
+              unitId: passage.passageId,
+              documentVersionId: passage.documentVersionId,
+              workspaceId: passage.workspaceId,
+              contextId: passage.contextId,
+              signature: this.embedder.info.signature,
+              inputSha256: embeddingInputSha256('passage', passage.text),
+            }));
+            const reused = await this.repository.reuseEmbeddings(reusable, this.embedder.info);
+            const pending = eager.filter(passage => !reused.has(passage.passageId));
+            job.readyEmbeddings += reused.size;
+            await this.embeddingLimiter.consume(pending.length, signal);
+            const vectors = pending.length > 0
+              ? await this.embedder.embed(pending.map(passage => passage.text), 'document', signal)
+              : [];
+            const records: RagV2EmbeddingRecord[] = pending.map((passage, index) => ({
+              level: 'passage' as const,
+              unitId: passage.passageId,
+              documentVersionId: passage.documentVersionId,
+              workspaceId: passage.workspaceId,
+              contextId: passage.contextId,
+              signature: this.embedder.info.signature,
+              inputSha256: embeddingInputSha256('passage', passage.text),
+              vector: vectors[index] ?? [],
+            })).filter(record => record.vector.length === this.embedder.info.dimensions);
+            await this.repository.putEmbeddings(records, this.embedder.info);
+            job.readyEmbeddings += records.length;
+            eagerPassageVectors += records.length + reused.size;
+          } catch (error) {
+            if (signal.aborted) throw error;
+            for (const passage of eager) passage.embeddingState = 'failed';
+            await this.repository.appendPassages(eager);
+          }
+        });
       }
       if (asyncSelected.length > 0) {
         asyncPassageVectorsPlanned += asyncSelected.length;
@@ -1684,6 +1779,7 @@ export class WorkspaceRagV2Manager {
       );
       await flushPassages();
       await flushSections();
+      await drainPipeline();
       await lineWriter?.close();
       job.processedSections += parsed.sectionCount;
       job.processedPassages += parsed.passageCount;
@@ -1790,6 +1886,7 @@ export class WorkspaceRagV2Manager {
         documentVersionId,
       });
     } finally {
+      if (pipeline.length > 0) await Promise.allSettled(pipeline.splice(0));
       await lineWriter?.close().catch(() => undefined);
     }
   }
@@ -1920,8 +2017,8 @@ export class WorkspaceRagV2Manager {
         ? Math.max(0, priorityIndex - Math.floor(scope.maxPassages / 2))
         : 0;
       const passages = sectionPassages.slice(windowStart, windowStart + scope.maxPassages);
-      for (let start = 0; start < passages.length; start += 64) {
-        const batch = passages.slice(start, start + 64);
+      for (let start = 0; start < passages.length; start += 256) {
+        const batch = passages.slice(start, start + 256);
         try {
           const reusable = batch.map(passage => ({
             level: 'passage' as const,

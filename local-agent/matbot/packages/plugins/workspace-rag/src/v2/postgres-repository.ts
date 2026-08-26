@@ -312,6 +312,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
         FROM ${this.table('publication_documents')} pd
         WHERE pd.generation_id = $3 AND pd.document_version_id = d.document_version_id
           AND pd.workspace_id = $1 AND pd.context_id = $2
+          AND d.publication_state IS DISTINCT FROM $4
       `, [workspaceId, contextId, generationId, state]);
     });
   }
@@ -1519,12 +1520,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
   }
 
   private async createIndexes(vectorizer: RagV2VectorizerInfo): Promise<void> {
+    // Generation validation joins sections/passages by document membership alone; without
+    // these, every publication on a large corpus degrades to full-table scans.
     const embeddings = this.getEmbeddingsTable();
     await this.ddlPool().query(`
       CREATE UNIQUE INDEX IF NOT EXISTS ${quoteIdentifier('uq_rag_v2_active_publication')}
         ON ${this.table('publications')} (workspace_id, context_id) WHERE active = TRUE;
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_publication_documents_version')}
         ON ${this.table('publication_documents')} (generation_id, document_version_id);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_sections_document_version')}
+        ON ${this.table('sections')} (document_version_id);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_passages_document_version')}
+        ON ${this.table('passages')} (document_version_id);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_path')}
         ON ${this.table('documents')} (workspace_id, context_id, path);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_documents_collection')}

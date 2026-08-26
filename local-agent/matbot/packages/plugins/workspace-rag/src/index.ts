@@ -298,6 +298,22 @@ async function exists(filePath: string): Promise<boolean> {
   try { await access(filePath); return true; } catch { return false; }
 }
 
+/**
+ * Validates newly supplied context paths. Editing a context tolerates a mix of
+ * available and unavailable roots because ingestion skips unavailable roots
+ * gracefully; creating a context stays strict so typos fail fast.
+ */
+async function assertAccessibleContextPaths(paths: readonly string[], mode: 'all' | 'any'): Promise<void> {
+  const inaccessible: string[] = [];
+  for (const item of paths) {
+    if (!(await exists(item))) inaccessible.push(item);
+  }
+  const rejected = mode === 'all' ? inaccessible.length > 0 : paths.length > 0 && inaccessible.length === paths.length;
+  if (rejected) {
+    throw new Error(`Workspace RAG context path is inaccessible: ${inaccessible[0]}`);
+  }
+}
+
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
@@ -440,6 +456,7 @@ export interface CudaHealthResponse {
   queryPrefix?: string;
   documentPrefix?: string;
   message?: string;
+  dtype?: string;
 }
 
 /**
@@ -524,6 +541,7 @@ async function probeCudaEmbeddingService(baseUrl: string): Promise<CudaHealthRes
     if (typeof body.queryPrefix === 'string') result.queryPrefix = body.queryPrefix;
     if (typeof body.documentPrefix === 'string') result.documentPrefix = body.documentPrefix;
     if (typeof body.message === 'string') result.message = body.message;
+    if (typeof body.dtype === 'string') result.dtype = body.dtype;
     const validationError = validateCudaEmbeddingHealth(result);
     if (validationError !== undefined) return { ...result, ok: false, message: validationError };
     return result;
@@ -595,23 +613,23 @@ class CudaHttpVectorizer implements TextVectorizer {
       signature?: unknown;
       inputType?: unknown;
     };
-    if (body.model !== this.info.model) {
-      throw new Error(`CUDA embedding service model changed from "${this.info.model}" to "${String(body.model)}". Restart Matbot after the sidecar is stable.`);
+    if (parsed.model !== this.info.model) {
+      throw new Error(`CUDA embedding service model changed from "${this.info.model}" to "${String(parsed.model)}". Restart Matbot after the sidecar is stable.`);
     }
-    if (body.signature !== this.info.signature) {
+    if (parsed.signature !== this.info.signature) {
       throw new Error('CUDA embedding service preprocessing signature changed. Restart Matbot and reindex before searching.');
     }
-    if (body.dimensions !== this.info.dimensions) {
-      throw new Error(`CUDA embedding service dimensions changed from ${this.info.dimensions} to ${String(body.dimensions)}.`);
+    if (parsed.dimensions !== this.info.dimensions) {
+      throw new Error(`CUDA embedding service dimensions changed from ${this.info.dimensions} to ${String(parsed.dimensions)}.`);
     }
-    if (body.inputType !== purpose) {
-      throw new Error(`CUDA embedding service returned inputType="${String(body.inputType)}"; expected "${purpose}".`);
+    if (parsed.inputType !== purpose) {
+      throw new Error(`CUDA embedding service returned inputType="${String(parsed.inputType)}"; expected "${purpose}".`);
     }
-    if (!Array.isArray(body.embeddings)) throw new Error('CUDA embedding service returned no embeddings array.');
-    if (body.embeddings.length !== texts.length) {
-      throw new Error(`CUDA embedding service returned ${body.embeddings.length} embeddings for ${texts.length} text(s).`);
+    if (!Array.isArray(parsed.embeddings)) throw new Error('CUDA embedding service returned no embeddings array.');
+    if (parsed.embeddings.length !== texts.length) {
+      throw new Error(`CUDA embedding service returned ${parsed.embeddings.length} embeddings for ${texts.length} text(s).`);
     }
-    return body.embeddings.map((embedding, index) => {
+    return parsed.embeddings.map((embedding, index) => {
       const embeddingIndex = offset + index;
       if (!Array.isArray(embedding)) throw new Error(`CUDA embedding ${embeddingIndex} is not an array.`);
       const vector = embedding.map(value => Number(value));
@@ -1042,6 +1060,7 @@ class WorkspaceRagManager {
     }
     const previousPaths = context.paths;
     const nextPaths = Array.isArray(config.paths) ? normalizeFolderPaths(config.paths) : context.paths;
+    if (Array.isArray(config.paths)) await assertAccessibleContextPaths(nextPaths, 'any');
     const pathsChanged = JSON.stringify(previousPaths) !== JSON.stringify(nextPaths);
     const next: RagConfig = {
       activeContextId: context.id,
@@ -1089,6 +1108,7 @@ class WorkspaceRagManager {
     const seen = new Set(current.contexts.map(context => context.id));
     const id = uniqueContextId(name, seen);
     const nextPaths = normalizeFolderPaths(paths);
+    await assertAccessibleContextPaths(nextPaths, 'all');
     const nextContext: RagContextConfig = {
       id,
       name,

@@ -195,8 +195,33 @@ churn and less likely to affect a consumer who doesn't use them.
   const plugin` text — a code-fix instruction an LLM would try to act on). Transient setup() failures
   (a missing secret) are still left in config to retry.
 
+- **workspace-rag CUDA embeddings are no longer computed and then discarded.** The HTTP vectorizer
+  validated every `/embed` response against the *request* body string instead of the parsed response,
+  so `body.model` et al. read `undefined` off a string and every successful batch threw "embedding
+  service model changed". The sidecar encoded the full batch on the GPU, the client binned the
+  vectors, and sections/passages were recorded as failed — ingestion crawled along at low CPU / medium
+  GPU producing a lexical-only index, and query embedding failed the same way. Validation now reads
+  the parsed response, so honest responses store their vectors (and lying ones are still rejected).
+
 ### Optional
 
+- **workspace-rag** — ingestion overlaps its stages so the GPU stays busy. Embedding batches now
+  drain through a bounded per-file pipeline (`CORTEX_RAG_V2_EMBED_PIPELINE_DEPTH`, default 2), letting
+  the sidecar encode the next batch while Postgres writes and markdown parsing continue on the host;
+  a bounded per-tier file pool (`CORTEX_RAG_V2_FILE_CONCURRENCY`) lets larger scans process
+  several files at once — adaptive by default: bulk backlogs run 3-wide and automatically drop
+  back to sequential once only a few files remain, so small incremental scans keep strict order
+  and cross-file derivative reuse (an explicit value pins the concurrency for the whole scan);
+  the lazy passage worker requests 256 texts per batch instead of 64; and the semantic-summary
+  pool defaults to 4 concurrent requests instead of 2. The CUDA sidecar defaults to
+  `EMBEDDING_BATCH_SIZE=128` and runs reduced-precision `float16` inference by default (roughly
+  doubles throughput and halves GPU memory on tensor-core GPUs; TF32 matmuls are enabled
+  alongside), configurable via `WORKSPACE_RAG_EMBEDDING_DTYPE=float16|bfloat16|float32`. The dtype
+  is folded into the embedding signature, so vectors from mixed precisions can never be indexed
+  together: enabling fp16 changes every workspace's signature once, and Cortex rebuilds affected
+  derivatives automatically on each workspace's next scan. Configuring a workspace RAG context now
+  rejects a fully inaccessible path set up front
+  (editing keeps the graceful skip path when at least one root remains available).
 - **frontend/web** — `GET /workspaces` now also reports the identity of the process that answered
   (`runtime: { id, workspace }`), and the WebUI waits for that id to *change* before treating a
   workspace switch as complete. It previously polled the registry file for the expected active id —
