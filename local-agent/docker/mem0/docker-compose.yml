@@ -79,6 +79,11 @@ services:
   postgres:
     # PostgreSQL 16.14 + pgvector 0.8.3, pinned to the tested multi-arch image.
     image: pgvector/pgvector:0.8.3-pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
+    # PostgreSQL parallel workers allocate POSIX dynamic shared memory in
+    # /dev/shm. Docker's 64 MiB default caused RAG ingestion failures under
+    # concurrent indexing, so provide a headroom ceiling rather than relying
+    # on the container default.
+    shm_size: 512m
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mem0}
       POSTGRES_USER: ${POSTGRES_USER:-mem0}
