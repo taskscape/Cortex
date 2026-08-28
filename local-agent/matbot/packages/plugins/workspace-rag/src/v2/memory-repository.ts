@@ -17,6 +17,7 @@ import type {
 import type {
   RagV2DocumentFingerprint,
   RagV2EmbeddingRecord,
+  RagV2GcResult,
   RagV2Publication,
   RagV2Repository,
   RagV2RegexRunRecord,
@@ -49,6 +50,29 @@ function lexicalScore(query: string, text: string): number {
 
 function key(workspaceId: string, contextId: string): string {
   return `${workspaceId}\0${contextId}`;
+}
+
+const TERMINAL_JOB_STATES = new Set<RagV2Job['state']>([
+  'active_lexical',
+  'active_hybrid_partial',
+  'active_hybrid_complete',
+  'cancelled',
+  'retryable_failure',
+  'permanent_failure',
+  'quarantined',
+]);
+
+function emptyGcResult(deletionsSkipped = false): RagV2GcResult {
+  return {
+    documentsDeleted: 0,
+    passagesDeleted: 0,
+    sectionsDeleted: 0,
+    embeddingsDeleted: 0,
+    collectionsDeleted: 0,
+    routingSummariesDeleted: 0,
+    blobsDeleted: 0,
+    deletionsSkipped,
+  };
 }
 
 /**
@@ -132,6 +156,168 @@ export class MemoryRagV2Repository implements RagV2Repository {
       values.filter(value => !stale.includes(value)),
     );
     return stale.length;
+  }
+
+  async pruneOrphans(
+    workspaceId: string,
+    contextId: string,
+    olderThan: string,
+  ): Promise<RagV2GcResult> {
+    const current = this.jobs.get(key(workspaceId, contextId));
+    if (current && !TERMINAL_JOB_STATES.has(current.state)) return emptyGcResult(true);
+
+    const cutoff = Date.parse(olderThan);
+    const liveGenerations = new Set(
+      (this.publications.get(key(workspaceId, contextId)) ?? [])
+        .filter(publication => publication.state === 'staging' || publication.state.startsWith('active_'))
+        .map(publication => publication.generationId),
+    );
+    const liveVersions = new Set<string>();
+    for (const generationId of liveGenerations) {
+      for (const documentVersionId of this.generationDocuments.get(generationId)?.values() ?? []) {
+        liveVersions.add(documentVersionId);
+      }
+    }
+    const doomed = new Set(
+      [...this.documents.values()]
+        .filter(document => document.workspaceId === workspaceId
+          && document.contextId === contextId
+          && Date.parse(document.modifiedAt) < cutoff
+          && !liveVersions.has(document.documentVersionId))
+        .map(document => document.documentVersionId),
+    );
+    const result = emptyGcResult();
+    result.documentsDeleted = doomed.size;
+    result.sectionsDeleted = [...this.sections.values()]
+      .filter(section => doomed.has(section.documentVersionId)).length;
+    result.passagesDeleted = [...this.passages.values()]
+      .filter(passage => doomed.has(passage.documentVersionId)).length;
+
+    for (const publication of this.publications.get(key(workspaceId, contextId)) ?? []) {
+      if (liveGenerations.has(publication.generationId)) continue;
+      const membership = this.generationDocuments.get(publication.generationId);
+      if (!membership) continue;
+      for (const [documentId, documentVersionId] of membership) {
+        if (doomed.has(documentVersionId)) membership.delete(documentId);
+      }
+    }
+
+    for (const [embeddingKey, embedding] of this.embeddings) {
+      if (embedding.workspaceId !== workspaceId || embedding.contextId !== contextId) continue;
+      if (embedding.level !== 'collection' && doomed.has(embedding.documentVersionId)) {
+        this.embeddings.delete(embeddingKey);
+        result.embeddingsDeleted++;
+      }
+    }
+    for (const [sectionId, section] of this.sections) {
+      if (doomed.has(section.documentVersionId)) this.sections.delete(sectionId);
+    }
+    for (const [passageId, passage] of this.passages) {
+      if (doomed.has(passage.documentVersionId)) this.passages.delete(passageId);
+    }
+    for (const documentVersionId of doomed) this.documents.delete(documentVersionId);
+
+    for (const [summaryId, summary] of this.routingSummaries) {
+      if (summary.workspaceId !== workspaceId || summary.contextId !== contextId) continue;
+      if ((summary.documentVersionId && !this.documents.has(summary.documentVersionId))
+        || !liveGenerations.has(summary.generationId)) {
+        this.routingSummaries.delete(summaryId);
+        result.routingSummariesDeleted++;
+      }
+    }
+    const liveCollections = new Set(
+      [...this.collections.values()]
+        .filter(collection => collection.workspaceId === workspaceId && collection.contextId === contextId)
+        .map(collection => collection.collectionVersionId),
+    );
+    for (const [embeddingKey, embedding] of this.embeddings) {
+      if (embedding.workspaceId === workspaceId && embedding.contextId === contextId
+        && embedding.level === 'collection' && !liveCollections.has(embedding.unitId)) {
+        this.embeddings.delete(embeddingKey);
+        result.embeddingsDeleted++;
+      }
+    }
+
+    if (current && TERMINAL_JOB_STATES.has(current.state) && Date.parse(current.updatedAt) < cutoff) {
+      this.jobs.delete(key(workspaceId, contextId));
+      for (const [itemKey, item] of this.jobItems) {
+        if (item.jobId === current.id) this.jobItems.delete(itemKey);
+      }
+    }
+    return result;
+  }
+
+  async pruneRetiredGenerations(
+    workspaceId: string,
+    contextId: string,
+    olderThan: string,
+  ): Promise<number> {
+    const cutoff = Date.parse(olderThan);
+    const publicationKey = key(workspaceId, contextId);
+    const values = this.publications.get(publicationKey) ?? [];
+    const retired = values.filter(publication => publication.state === 'retired'
+      && publication.publishedAt !== undefined
+      && Date.parse(publication.publishedAt) < cutoff);
+    const generationIds = new Set(retired.map(publication => publication.generationId));
+    const removedCollections = new Set<string>();
+    for (const [collectionVersionId, collection] of this.collections) {
+      if (generationIds.has(collection.generationId)) {
+        removedCollections.add(collectionVersionId);
+        this.collections.delete(collectionVersionId);
+      }
+    }
+    for (const [embeddingKey, embedding] of this.embeddings) {
+      if (embedding.level === 'collection' && removedCollections.has(embedding.unitId)) {
+        this.embeddings.delete(embeddingKey);
+      }
+    }
+    for (const generationId of generationIds) this.generationDocuments.delete(generationId);
+    this.publications.set(publicationKey, values.filter(publication => !generationIds.has(publication.generationId)));
+    return generationIds.size;
+  }
+
+  async purgeContext(workspaceId: string, contextId: string): Promise<void> {
+    const current = this.jobs.get(key(workspaceId, contextId));
+    if (current && !TERMINAL_JOB_STATES.has(current.state)) {
+      throw new Error(`Workspace RAG V2 cannot purge ${workspaceId}/${contextId} while ingestion is ${current.state}.`);
+    }
+    const publicationKey = key(workspaceId, contextId);
+    const generationIds = new Set(
+      (this.publications.get(publicationKey) ?? []).map(publication => publication.generationId),
+    );
+    const documentVersionIds = new Set(
+      [...this.documents.values()]
+        .filter(document => document.workspaceId === workspaceId && document.contextId === contextId)
+        .map(document => document.documentVersionId),
+    );
+    for (const generationId of generationIds) this.generationDocuments.delete(generationId);
+    this.publications.delete(publicationKey);
+    for (const [collectionVersionId, collection] of this.collections) {
+      if (collection.workspaceId === workspaceId && collection.contextId === contextId) {
+        this.collections.delete(collectionVersionId);
+      }
+    }
+    for (const documentVersionId of documentVersionIds) this.documents.delete(documentVersionId);
+    for (const [sectionId, section] of this.sections) {
+      if (section.workspaceId === workspaceId && section.contextId === contextId) this.sections.delete(sectionId);
+    }
+    for (const [passageId, passage] of this.passages) {
+      if (passage.workspaceId === workspaceId && passage.contextId === contextId) this.passages.delete(passageId);
+    }
+    for (const [embeddingKey, embedding] of this.embeddings) {
+      if (embedding.workspaceId === workspaceId && embedding.contextId === contextId) this.embeddings.delete(embeddingKey);
+    }
+    for (const [summaryId, summary] of this.routingSummaries) {
+      if (summary.workspaceId === workspaceId && summary.contextId === contextId) this.routingSummaries.delete(summaryId);
+    }
+    this.jobs.delete(publicationKey);
+    for (const [itemKey, item] of this.jobItems) {
+      if (item.workspaceId === workspaceId && item.contextId === contextId) this.jobItems.delete(itemKey);
+    }
+  }
+
+  async listReferencedContentHashes(): Promise<Set<string>> {
+    return new Set([...this.documents.values()].map(document => document.contentSha256));
   }
 
   async publishGeneration(

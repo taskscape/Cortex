@@ -59,6 +59,12 @@ Additional runtime environment variables:
 | `CORTEX_RAG_V2_MODE` | `primary` | Workspace RAG mode: `primary` or `off`. V2 is the only index; `off` disables ingestion and search without a fallback. |
 | `CORTEX_RAG_V2_STORAGE` | `postgres` | V2 repository backend. Production uses `postgres`; `memory` is available only for isolated tests and loses all publications on restart. |
 | `CORTEX_RAG_RECONCILE_INTERVAL_MS` | `60000` | Periodic safety-reconciliation interval. Values below 10000 are raised to 10000 ms. Filesystem watcher events normally trigger earlier reconciliation. |
+| `CORTEX_RAG_V2_GC_ENABLED` | `true` | Enables automatic orphan sweeps after removal reconciliation and on the independent periodic cleanup timer. Manual `workspace_rag` action `gc` remains available when disabled. |
+| `CORTEX_RAG_V2_GC_INTERVAL_MS` | `21600000` | Jittered periodic orphan-sweep cadence (6 hours by default). |
+| `CORTEX_RAG_V2_GC_GRACE_MS` | `3600000` | Minimum age before an unreferenced document version can be reclaimed. |
+| `CORTEX_RAG_V2_GC_BATCH_SIZE` | `2000` | Maximum document versions deleted in one PostgreSQL GC transaction. |
+| `CORTEX_RAG_V2_RETIRED_GENERATION_TTL_MS` | `604800000` | Minimum age before an empty retired publication shell is deleted. |
+| `CORTEX_RAG_V2_BLOB_GC_ENABLED` | `false` | Enables capped, grace-protected deletion of globally unreferenced content-addressed objects in `managed` stores. External and manifest-only sources are never deleted. |
 | `CORTEX_RAG_V2_POSTGRES_SCHEMA` | `workspace_rag_v2` | Versioned V2 catalog, lexical, vector, job, trace, evidence, and evaluation schema. |
 | `CORTEX_RAG_V2_MIGRATION_POSTGRES_URL` | unset | Optional owner connection used only for V2 migrations and grants. When set, `CORTEX_RAG_POSTGRES_URL` must identify a distinct non-owner application role without `BYPASSRLS`. |
 | `CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES` | `0` | Set to `1` in production to reject owner-bypassed V2 startup. |
@@ -521,6 +527,14 @@ derivative pipeline. Use `{ "action": "reconcile_now" }` for an immediate
 incremental fingerprint reconciliation. Both commands join/coalesce concurrent
 work and return the unified terminal status. Background reconciliation of other
 workspaces remains serialized.
+
+Use `{ "action": "gc" }` to run the orphan sweep for the active context, or
+include `"contextId"` to target another context in the current workspace. The
+sweep keeps every document version reachable from an active or staging
+publication, refuses deletion while ingestion is non-terminal, applies the
+configured grace period, and reports its counts under `lastGc` in status.
+Removing an entire context also purges its non-audit database state; retrieval,
+regex, and evaluation audit records retain their normal TTL-managed lifecycle.
 
 ### Interrupted scans
 

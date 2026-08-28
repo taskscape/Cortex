@@ -118,6 +118,13 @@ churn and less likely to affect a consumer who doesn't use them.
 
 ### Bug fixes
 
+- **Workspace RAG V2 now reclaims orphaned persistence after source removal.** Successful
+  reconciliation sweeps document versions that are no longer reachable from an active or staging
+  publication, including dependent sections, passages, embeddings, summaries, job history, and aged
+  retired generation shells. Context deletion purges its non-audit database state immediately. An
+  opt-in managed-object sweep also removes globally unreferenced source blobs, while grace periods,
+  bounded batches, and ingestion gates protect in-flight and resumable data.
+
 - **A workspace switch no longer leaves two runtimes fighting over one port.** The handoff spawned the
   replacement process immediately and scheduled its own teardown on a timer, betting that 900ms of
   child-side start delay would outlast the shutdown. When it didn't, the incoming process could not

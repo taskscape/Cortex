@@ -118,6 +118,19 @@ export interface RagV2RegexRunRecord {
   createdAt: string;
 }
 
+/** Aggregate result of one bounded orphan garbage-collection cycle. */
+export interface RagV2GcResult {
+  documentsDeleted: number;
+  passagesDeleted: number;
+  sectionsDeleted: number;
+  embeddingsDeleted: number;
+  collectionsDeleted: number;
+  routingSummariesDeleted: number;
+  /** Reserved for the separately gated managed-object-store GC phase. */
+  blobsDeleted: number;
+  deletionsSkipped: boolean;
+}
+
 /**
  * Persistence contract shared by the memory and Postgres repositories:
  * generation lifecycle, job tracking, document/section/passage/embedding
@@ -134,6 +147,18 @@ export interface RagV2Repository {
   generation(workspaceId: string, contextId: string, generationId: string): Promise<RagV2Publication | undefined>;
   /** Drops staging generations abandoned by earlier interrupted runs. Returns how many were removed. */
   pruneStagingGenerations(workspaceId: string, contextId: string, keepGenerationId: string): Promise<number>;
+  /**
+   * Deletes document versions that are protected by no active or staging
+   * publication and are older than `olderThan`. A current non-terminal job is
+   * an unconditional safety gate.
+   */
+  pruneOrphans(workspaceId: string, contextId: string, olderThan: string): Promise<RagV2GcResult>;
+  /** Deletes retired publication shells older than `olderThan`. */
+  pruneRetiredGenerations(workspaceId: string, contextId: string, olderThan: string): Promise<number>;
+  /** Purges non-audit persistence for a deleted context. Idempotent. */
+  purgeContext(workspaceId: string, contextId: string): Promise<void>;
+  /** Content hashes referenced by any document across every workspace/context. */
+  listReferencedContentHashes(): Promise<Set<string>>;
   publishGeneration(
     workspaceId: string,
     contextId: string,

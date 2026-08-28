@@ -79,6 +79,7 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
     "v2_search",
     "backend_gate_evaluate",
     "embedding_evict",
+    "gc",
   ]) {
     assert.ok(tool.inputSchema.properties.action.enum.includes(action), `${action} must be exposed`);
   }
@@ -116,6 +117,9 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
   assert.equal(reconciled.job.trigger, "manual");
   assert.equal(reconciled.job.unchangedFiles, 1, "reconcile_now uses incremental fingerprints");
   assert.equal(reconciled.job.changedFiles, 0);
+  const gc = await execute(tool, { action: "gc" });
+  assert.equal(gc.deletionsSkipped, false);
+  assert.ok((await execute(tool, { action: "status" })).lastGc.completedAt);
 
   const explicit = await execute(tool, {
     action: "v2_search",

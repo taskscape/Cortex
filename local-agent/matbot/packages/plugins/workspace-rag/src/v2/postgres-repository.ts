@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { Pool as PgPool, PoolClient, PoolConfig } from 'pg';
-import { positiveInteger, ragV2AuditRetentionDaysFromEnv } from './config.js';
+import { positiveInteger, ragV2AuditRetentionDaysFromEnv, ragV2GcSettingsFromEnv } from './config.js';
 import type {
   RagV2CollectionRecord,
   RagV2DocumentRecord,
@@ -20,6 +20,7 @@ import type {
 import type {
   RagV2DocumentFingerprint,
   RagV2EmbeddingRecord,
+  RagV2GcResult,
   RagV2Publication,
   RagV2RegexRunRecord,
   RagV2Repository,
@@ -30,6 +31,28 @@ import type {
 
 const DEFAULT_SCHEMA = 'workspace_rag_v2';
 const INSERT_BATCH_SIZE = 128;
+const TERMINAL_JOB_STATES = [
+  'active_lexical',
+  'active_hybrid_partial',
+  'active_hybrid_complete',
+  'cancelled',
+  'retryable_failure',
+  'permanent_failure',
+  'quarantined',
+] as const;
+
+function emptyGcResult(deletionsSkipped = false): RagV2GcResult {
+  return {
+    documentsDeleted: 0,
+    passagesDeleted: 0,
+    sectionsDeleted: 0,
+    embeddingsDeleted: 0,
+    collectionsDeleted: 0,
+    routingSummariesDeleted: 0,
+    blobsDeleted: 0,
+    deletionsSkipped,
+  };
+}
 
 interface PostgresSettings {
   poolConfig: PoolConfig;
@@ -150,6 +173,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
   private vectorizer: RagV2VectorizerInfo | undefined;
   private embeddingsTableSql: string | undefined;
   private readonly vectorIndexMode: 'full' | 'half' | 'binary';
+  private readonly gcBatchSize: number;
 
   /**
    * @param settings - Connection settings (defaults from the environment).
@@ -169,6 +193,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
     this.schemaSql = quoteIdentifier(settings.schema);
     const indexMode = process.env['CORTEX_RAG_V2_VECTOR_INDEX_MODE'];
     this.vectorIndexMode = indexMode === 'half' || indexMode === 'binary' ? indexMode : 'full';
+    this.gcBatchSize = ragV2GcSettingsFromEnv().batchSize;
   }
 
   /**
@@ -292,6 +317,225 @@ export class PostgresRagV2Repository implements RagV2Repository {
         AND state = 'staging' AND generation_id <> $3
     `, [workspaceId, contextId, keepGenerationId]));
     return result.rowCount ?? 0;
+  }
+
+  async pruneOrphans(
+    workspaceId: string,
+    contextId: string,
+    olderThan: string,
+  ): Promise<RagV2GcResult> {
+    const aggregate = emptyGcResult();
+    for (;;) {
+      const batch = await this.withWorkspace(workspaceId, async client => {
+        if (await this.gcBlockedWithClient(client, workspaceId, contextId)) {
+          return { skipped: true, documents: 0, sections: 0, passages: 0, embeddings: 0 };
+        }
+        const doomed = await client.query<{
+          document_version_id: string;
+          sections: string;
+          passages: string;
+        }>(`
+          WITH live AS (
+            SELECT DISTINCT pd.document_version_id
+            FROM ${this.table('publication_documents')} pd
+            JOIN ${this.table('publications')} p ON p.generation_id = pd.generation_id
+            WHERE pd.workspace_id = $1 AND pd.context_id = $2
+              AND p.state IN ('active_lexical', 'active_hybrid_partial', 'active_hybrid_complete', 'staging')
+          )
+          SELECT d.document_version_id,
+            (SELECT COUNT(*)::text FROM ${this.table('sections')} s
+              WHERE s.document_version_id = d.document_version_id) AS sections,
+            (SELECT COUNT(*)::text FROM ${this.table('passages')} passage
+              WHERE passage.document_version_id = d.document_version_id) AS passages
+          FROM ${this.table('documents')} d
+          WHERE d.workspace_id = $1 AND d.context_id = $2
+            AND d.modified_at < $3::timestamptz
+            AND NOT EXISTS (
+              SELECT 1 FROM live WHERE live.document_version_id = d.document_version_id
+            )
+          ORDER BY d.document_version_id
+          LIMIT $4
+        `, [workspaceId, contextId, olderThan, this.gcBatchSize]);
+        const ids = doomed.rows.map(row => row.document_version_id);
+        if (ids.length === 0) {
+          return { skipped: false, documents: 0, sections: 0, passages: 0, embeddings: 0 };
+        }
+        await client.query(`
+          DELETE FROM ${this.table('publication_documents')} membership
+          USING ${this.table('publications')} publication
+          WHERE membership.generation_id = publication.generation_id
+            AND membership.workspace_id = $1 AND membership.context_id = $2
+            AND publication.state NOT IN (
+              'active_lexical', 'active_hybrid_partial', 'active_hybrid_complete', 'staging'
+            )
+            AND membership.document_version_id = ANY($3::text[])
+        `, [workspaceId, contextId, ids]);
+        const embeddings = await client.query(`
+          DELETE FROM ${this.getEmbeddingsTable()}
+          WHERE workspace_id = $1 AND context_id = $2
+            AND level <> 'collection' AND document_version_id = ANY($3::text[])
+        `, [workspaceId, contextId, ids]);
+        const documents = await client.query(`
+          DELETE FROM ${this.table('documents')}
+          WHERE workspace_id = $1 AND context_id = $2
+            AND document_version_id = ANY($3::text[])
+        `, [workspaceId, contextId, ids]);
+        return {
+          skipped: false,
+          documents: documents.rowCount ?? 0,
+          sections: doomed.rows.reduce((sum, row) => sum + Number(row.sections), 0),
+          passages: doomed.rows.reduce((sum, row) => sum + Number(row.passages), 0),
+          embeddings: embeddings.rowCount ?? 0,
+        };
+      });
+      if (batch.skipped) {
+        aggregate.deletionsSkipped = true;
+        return aggregate;
+      }
+      aggregate.documentsDeleted += batch.documents;
+      aggregate.sectionsDeleted += batch.sections;
+      aggregate.passagesDeleted += batch.passages;
+      aggregate.embeddingsDeleted += batch.embeddings;
+      if (batch.documents === 0) break;
+    }
+
+    const cleanup = await this.withWorkspace(workspaceId, async client => {
+      if (await this.gcBlockedWithClient(client, workspaceId, contextId)) return undefined;
+      const collectionEmbeddings = await client.query(`
+        DELETE FROM ${this.getEmbeddingsTable()} embedding
+        WHERE embedding.workspace_id = $1 AND embedding.context_id = $2
+          AND embedding.level = 'collection'
+          AND NOT EXISTS (
+            SELECT 1 FROM ${this.table('collections')} collection
+            WHERE collection.collection_version_id = embedding.unit_id
+              AND collection.workspace_id = $1 AND collection.context_id = $2
+          )
+      `, [workspaceId, contextId]);
+      const routingSummaries = await client.query(`
+        DELETE FROM ${this.table('routing_summaries')} summary
+        WHERE summary.workspace_id = $1 AND summary.context_id = $2
+          AND (
+            (summary.document_version_id IS NOT NULL AND NOT EXISTS (
+              SELECT 1 FROM ${this.table('documents')} document
+              WHERE document.document_version_id = summary.document_version_id
+                AND document.workspace_id = $1 AND document.context_id = $2
+            ))
+            OR NOT EXISTS (
+              SELECT 1 FROM ${this.table('publications')} publication
+              WHERE publication.generation_id = summary.generation_id
+                AND publication.workspace_id = $1 AND publication.context_id = $2
+                AND publication.state IN (
+                  'active_lexical', 'active_hybrid_partial', 'active_hybrid_complete', 'staging'
+                )
+            )
+          )
+      `, [workspaceId, contextId]);
+      await client.query(`
+        DELETE FROM ${this.table('derivative_jobs')} derivative
+        WHERE derivative.workspace_id = $1 AND derivative.context_id = $2
+          AND derivative.updated_at < $3::timestamptz
+          AND (
+            (derivative.level = 'collection' AND NOT EXISTS (
+              SELECT 1 FROM ${this.table('collections')} collection
+              WHERE collection.collection_version_id = derivative.unit_id
+            ))
+            OR (derivative.level = 'document' AND NOT EXISTS (
+              SELECT 1 FROM ${this.table('documents')} document
+              WHERE document.document_version_id = derivative.unit_id
+            ))
+            OR (derivative.level = 'section' AND NOT EXISTS (
+              SELECT 1 FROM ${this.table('sections')} section
+              WHERE section.section_id = derivative.unit_id
+            ))
+            OR (derivative.level = 'passage' AND NOT EXISTS (
+              SELECT 1 FROM ${this.table('passages')} passage
+              WHERE passage.passage_id = derivative.unit_id
+            ))
+          )
+      `, [workspaceId, contextId, olderThan]);
+      await client.query(`
+        DELETE FROM ${this.table('ingestion_job_items')} item
+        WHERE item.workspace_id = $1 AND item.context_id = $2
+          AND item.updated_at < $3::timestamptz
+          AND EXISTS (
+            SELECT 1 FROM ${this.table('ingestion_jobs')} job
+            WHERE job.id = item.job_id AND job.state = ANY($4::text[])
+          )
+      `, [workspaceId, contextId, olderThan, [...TERMINAL_JOB_STATES]]);
+      await client.query(`
+        DELETE FROM ${this.table('ingestion_jobs')}
+        WHERE workspace_id = $1 AND context_id = $2
+          AND updated_at < $3::timestamptz AND state = ANY($4::text[])
+      `, [workspaceId, contextId, olderThan, [...TERMINAL_JOB_STATES]]);
+      return {
+        embeddings: collectionEmbeddings.rowCount ?? 0,
+        summaries: routingSummaries.rowCount ?? 0,
+      };
+    });
+    if (!cleanup) aggregate.deletionsSkipped = true;
+    else {
+      aggregate.embeddingsDeleted += cleanup.embeddings;
+      aggregate.routingSummariesDeleted += cleanup.summaries;
+    }
+    return aggregate;
+  }
+
+  async pruneRetiredGenerations(
+    workspaceId: string,
+    contextId: string,
+    olderThan: string,
+  ): Promise<number> {
+    return this.withWorkspace(workspaceId, async client => {
+      if (await this.gcBlockedWithClient(client, workspaceId, contextId)) return 0;
+      const retired = await client.query<{ generation_id: string }>(`
+        SELECT generation_id FROM ${this.table('publications')}
+        WHERE workspace_id = $1 AND context_id = $2
+          AND state = 'retired' AND published_at < $3::timestamptz
+      `, [workspaceId, contextId, olderThan]);
+      const generationIds = retired.rows.map(row => row.generation_id);
+      if (generationIds.length === 0) return 0;
+      const collections = await client.query<{ collection_version_id: string }>(`
+        SELECT collection_version_id FROM ${this.table('collections')}
+        WHERE workspace_id = $1 AND context_id = $2
+          AND generation_id = ANY($3::text[])
+      `, [workspaceId, contextId, generationIds]);
+      await client.query(`
+        DELETE FROM ${this.table('publications')}
+        WHERE workspace_id = $1 AND context_id = $2
+          AND generation_id = ANY($3::text[])
+      `, [workspaceId, contextId, generationIds]);
+      const collectionIds = collections.rows.map(row => row.collection_version_id);
+      if (collectionIds.length > 0) {
+        await client.query(`
+          DELETE FROM ${this.getEmbeddingsTable()}
+          WHERE workspace_id = $1 AND context_id = $2
+            AND level = 'collection' AND unit_id = ANY($3::text[])
+        `, [workspaceId, contextId, collectionIds]);
+      }
+      return generationIds.length;
+    });
+  }
+
+  async purgeContext(workspaceId: string, contextId: string): Promise<void> {
+    await this.withWorkspace(workspaceId, async client => {
+      if (await this.gcBlockedWithClient(client, workspaceId, contextId)) {
+        throw new Error(`Workspace RAG V2 cannot purge ${workspaceId}/${contextId} while ingestion is running.`);
+      }
+      await client.query(`DELETE FROM ${this.table('publications')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.getEmbeddingsTable()} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.table('documents')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.table('routing_summaries')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.table('derivative_jobs')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.table('ingestion_job_items')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+      await client.query(`DELETE FROM ${this.table('ingestion_jobs')} WHERE workspace_id = $1 AND context_id = $2`, [workspaceId, contextId]);
+    });
+  }
+
+  async listReferencedContentHashes(): Promise<Set<string>> {
+    const result = await this.ddlPool().query<{ content_sha256: string }>(`
+      SELECT DISTINCT content_sha256 FROM ${this.table('documents')}
+    `);
+    return new Set(result.rows.map(row => row.content_sha256));
   }
 
   async activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined> {
@@ -1606,6 +1850,9 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ON ${this.table('passages')} USING GIN (search_vector_de);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_jobs_context')}
         ON ${this.table('ingestion_jobs')} (workspace_id, context_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_retired_publications')}
+        ON ${this.table('publications')} (workspace_id, context_id, published_at)
+        WHERE state = 'retired';
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_retrieval_runs_context')}
         ON ${this.table('retrieval_runs')} (workspace_id, context_id, started_at DESC);
       CREATE INDEX IF NOT EXISTS ${quoteIdentifier('idx_rag_v2_routing_summary_reuse')}
@@ -2019,6 +2266,22 @@ export class PostgresRagV2Repository implements RagV2Repository {
     } finally {
       client.release();
     }
+  }
+
+  private async gcBlockedWithClient(
+    client: PoolClient,
+    workspaceId: string,
+    contextId: string,
+  ): Promise<boolean> {
+    const result = await client.query<{ state: string }>(`
+      SELECT state
+      FROM ${this.table('ingestion_jobs')}
+      WHERE workspace_id = $1 AND context_id = $2
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [workspaceId, contextId]);
+    const state = result.rows[0]?.state;
+    return state !== undefined && !(TERMINAL_JOB_STATES as readonly string[]).includes(state);
   }
 
   private async validateGenerationWithClient(

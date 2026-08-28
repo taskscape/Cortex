@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -86,10 +86,8 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   const job = manager.startIngestion(workspace, context);
   await manager.waitForIngestion(workspace.id, context.id);
   await manager.waitForSummaries();
-  assert.equal(
-    (await repository.listFingerprints(workspace.id, context.id))[0].summarySignature,
-    "test-pg-summary-v1",
-  );
+  const fingerprints = await repository.listFingerprints(workspace.id, context.id);
+  assert.equal(fingerprints[0].summarySignature, "test-pg-summary-v1");
   const status = await manager.status("primary", workspace, context);
   assert.equal(status.job.state, "active_hybrid_complete");
   assert.equal(status.activeGenerationId, job.generationId);
@@ -158,6 +156,48 @@ integration("workspace RAG V2 PostgreSQL publishes lexical and pgvector generati
   assert.ok(Number(counts.rows[0].retrieval_evidence) >= 1);
   assert.equal(Number(counts.rows[0].evaluation_runs), 1);
   assert.equal(Number(counts.rows[0].schema_version), 7);
+  assert.deepEqual(await repository.listReferencedContentHashes(), new Set([fingerprints[0].contentSha256]));
+
+  await unlink(path.join(docs, "supply.md"));
+  manager.startIngestion(workspace, context, "configuration");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const gc = await repository.pruneOrphans(
+    workspace.id,
+    context.id,
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  assert.equal(gc.deletionsSkipped, false);
+  assert.equal(gc.documentsDeleted, 1);
+  assert.ok(gc.sectionsDeleted >= 2);
+  assert.ok(gc.passagesDeleted >= 2);
+  assert.ok(gc.embeddingsDeleted >= 1);
+  assert.ok(await repository.pruneRetiredGenerations(
+    workspace.id,
+    context.id,
+    new Date(Date.now() + 60_000).toISOString(),
+  ) >= 1);
+
+  await repository.purgeContext(workspace.id, context.id);
+  await repository.purgeContext(workspace.id, context.id);
+  const afterPurge = await cleanup.query(`
+    SELECT
+      (SELECT COUNT(*) FROM "${schema}".publications) AS publications,
+      (SELECT COUNT(*) FROM "${schema}".documents) AS documents,
+      (SELECT COUNT(*) FROM "${schema}".sections) AS sections,
+      (SELECT COUNT(*) FROM "${schema}".passages) AS passages,
+      (SELECT COUNT(*) FROM "${schema}".unit_embeddings_32) AS embeddings,
+      (SELECT COUNT(*) FROM "${schema}".ingestion_jobs) AS ingestion_jobs,
+      (SELECT COUNT(*) FROM "${schema}".retrieval_evidence) AS retrieval_evidence,
+      (SELECT COUNT(*) FROM "${schema}".evaluation_runs) AS evaluation_runs
+  `);
+  assert.equal(Number(afterPurge.rows[0].publications), 0);
+  assert.equal(Number(afterPurge.rows[0].documents), 0);
+  assert.equal(Number(afterPurge.rows[0].sections), 0);
+  assert.equal(Number(afterPurge.rows[0].passages), 0);
+  assert.equal(Number(afterPurge.rows[0].embeddings), 0);
+  assert.equal(Number(afterPurge.rows[0].ingestion_jobs), 0);
+  assert.ok(Number(afterPurge.rows[0].retrieval_evidence) >= 1, "retrieval audit evidence is retained");
+  assert.equal(Number(afterPurge.rows[0].evaluation_runs), 1, "evaluation audit history is retained");
 });
 
 integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes abandoned generations", async t => {

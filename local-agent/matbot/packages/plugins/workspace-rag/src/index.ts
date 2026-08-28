@@ -14,7 +14,7 @@ import { execFile } from 'node:child_process';
 import { watch as watchFs, type FSWatcher } from 'node:fs';
 import { access, appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ragV2ModeFromEnv } from './v2/config.js';
+import { ragV2GcSettingsFromEnv, ragV2ModeFromEnv } from './v2/config.js';
 import type { RagV2EvaluationCase } from './v2/evaluation.js';
 import { WorkspaceRagV2Manager, type RagV2SourceBridge } from './v2/manager.js';
 import { MemoryRagV2Repository } from './v2/memory-repository.js';
@@ -787,6 +787,7 @@ class WorkspaceRagManager {
   private readonly watchers: Array<{ watcher: FSWatcher; workspaceId: string; contextId: string; root: string }> = [];
   private readonly watchDebounce = new Map<string, ReturnType<typeof setTimeout>>();
   private reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  private gcTimer: ReturnType<typeof setTimeout> | undefined;
   private watcherState: 'active' | 'degraded' | 'stopped' = 'stopped';
   private watcherError: string | undefined;
   private vectorizer: TextVectorizer = new HashCpuVectorizer();
@@ -800,6 +801,7 @@ class WorkspaceRagManager {
   private readonly contextGraph: ContextGraphLike | undefined;
   private readonly services: MatbotMachine;
   private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
+  private readonly gcSettings = ragV2GcSettingsFromEnv();
   private v2: WorkspaceRagV2Manager | undefined;
   private v2Message = 'Workspace RAG V2 is disabled.';
 
@@ -835,6 +837,7 @@ class WorkspaceRagManager {
         this.watcherError = errorMessage(error);
       });
     }, interval);
+    this.scheduleGcTimer();
     void this.reconcileAll('startup').catch(error => {
       this.watcherState = 'degraded';
       this.watcherError = errorMessage(error);
@@ -844,6 +847,7 @@ class WorkspaceRagManager {
   stop(): void {
     this.disposed = true;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    if (this.gcTimer) clearTimeout(this.gcTimer);
     for (const timer of this.watchDebounce.values()) clearTimeout(timer);
     this.watchDebounce.clear();
     for (const { watcher } of this.watchers.splice(0)) watcher.close();
@@ -967,6 +971,35 @@ class WorkspaceRagManager {
       }
     }
     await Promise.all(scheduled);
+  }
+
+  private scheduleGcTimer(): void {
+    if (this.disposed || !this.gcSettings.enabled || this.v2Mode === 'off' || !this.v2) return;
+    const jitter = 0.9 + Math.random() * 0.2;
+    this.gcTimer = setTimeout(() => {
+      this.gcTimer = undefined;
+      void this.garbageCollectAll().catch(error => {
+        console.warn(`[workspace-rag-v2] periodic orphan GC failed: ${errorMessage(error)}`);
+      }).finally(() => this.scheduleGcTimer());
+    }, Math.max(1, Math.round(this.gcSettings.intervalMs * jitter)));
+    this.gcTimer.unref?.();
+  }
+
+  private async garbageCollectAll(): Promise<void> {
+    if (this.disposed || !this.gcSettings.enabled || !this.v2) return;
+    for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
+      let config: RagConfig;
+      try {
+        config = await this.readConfig(workspace);
+      } catch (error) {
+        console.warn(`[workspace-rag-v2] skipped orphan GC for workspace ${workspace.id}: ${errorMessage(error)}`);
+        continue;
+      }
+      for (const context of config.contexts) {
+        if (this.disposed) return;
+        await this.v2.garbageCollect(this.v2Workspace(workspace), context);
+      }
+    }
   }
 
   private scheduleWatchReconcile(workspaceId: string, contextId: string, changedPath?: string): void {
@@ -1141,6 +1174,20 @@ class WorkspaceRagManager {
       contexts,
     };
     await writeJson(this.configPath(workspace), next);
+    const reconcile = this.reconcileState(workspace.id, context.id);
+    reconcile.pending = false;
+    reconcile.triggers.clear();
+    reconcile.changedPaths.clear();
+    if (this.v2) {
+      await this.v2.purgeContext(this.v2Workspace(workspace), context);
+      await reconcile.promise;
+      this.reconcileStates.delete(this.reconcileKey(workspace.id, context.id));
+      await this.log(workspace, 'gc', {
+        contextId: context.id,
+        contextName: context.name,
+        action: 'purge_context',
+      });
+    }
     await this.log(workspace, 'delete_context', { contextId: context.id, contextName: context.name });
     await this.refreshWatchers();
     return configView(next);
@@ -1300,6 +1347,17 @@ class WorkspaceRagManager {
       context,
       limit,
     );
+  }
+
+  async v2GcCurrent(contextId?: string): Promise<unknown> {
+    if (!this.v2) throw new Error(this.v2Message);
+    const workspace = await this.currentWorkspace();
+    const config = await this.readConfig(workspace);
+    const context = contextId
+      ? config.contexts.find(item => item.id === contextId)
+      : activeContext(config);
+    if (!context) throw new Error(`Unknown workspace RAG context "${contextId}".`);
+    return this.v2.garbageCollect(this.v2Workspace(workspace), context);
   }
 
   async v2CensusCurrent(
@@ -1542,6 +1600,23 @@ class WorkspaceRagManager {
       embedder,
       this.v2SourceBridge(),
       this.v2SemanticServices(),
+      async event => {
+        const workspace: WorkspaceRef = {
+          id: event.workspace.id,
+          name: event.workspace.name,
+          configDir: event.workspace.configDir,
+          configPath: path.join(event.workspace.configDir, 'matbot.yaml'),
+          active: event.workspace.id === this.currentWorkspaceId(),
+        };
+        await this.log(workspace, 'gc', {
+          contextId: event.context.id,
+          contextName: event.context.name,
+          result: event.result,
+          retiredGenerationsDeleted: event.retiredGenerationsDeleted,
+          completedAt: event.completedAt,
+          durationMs: event.durationMs,
+        });
+      },
     );
     try {
       await manager.initialize();
@@ -1910,7 +1985,7 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
       properties: {
         action: {
           type: 'string',
-          description: 'reconcile_now is incremental; reindex_now forces every discovered file through the V2 pipeline.',
+          description: 'reconcile_now is incremental; reindex_now forces every discovered file through the V2 pipeline; gc reclaims orphaned V2 persistence.',
           enum: [
             'status', 'get_config', 'configure', 'select_context', 'create_context', 'delete_context',
             'search', 'reindex_now',
@@ -1918,10 +1993,10 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             'ingestion_retry', 'ingestion_status', 'ingestion_wait', 'reconcile_now',
             'corpus_census', 'v2_search', 'grep_documents', 'fetch_source_range', 'fetch_lines',
             'evaluation_run', 'backend_gate_evaluate',
-            'embedding_evict',
+            'embedding_evict', 'gc',
           ],
         },
-        contextId: { type: 'string', description: 'Workspace RAG context id for select_context, delete_context, or configure.' },
+        contextId: { type: 'string', description: 'Workspace RAG context id for select_context, delete_context, configure, or gc (defaults to active).' },
         contextName: { type: 'string', description: 'Human-facing name for this workspace RAG context.' },
         paths: { type: 'array', items: { type: 'string' }, description: 'Absolute local folder paths or individual Markdown files.' },
         query: { type: 'string', description: 'Search query for action=search.' },
@@ -2061,6 +2136,17 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
               ? value.evictionLimit
               : 1_000;
             yield { type: 'result', value: await manager.v2EvictCurrent(evictionLimit) };
+            return;
+          }
+          if (action === 'gc') {
+            yield {
+              type: 'result',
+              value: await manager.v2GcCurrent(
+                typeof value.contextId === 'string' && value.contextId.trim()
+                  ? value.contextId.trim()
+                  : undefined,
+              ),
+            };
             return;
           }
           if (action === 'ingestion_status') {

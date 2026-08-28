@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { access, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
@@ -342,6 +342,44 @@ export class RagV2ObjectStore {
    */
   lineIndexPath(contentSha256: string): string {
     return path.join(path.dirname(this.objectPath(contentSha256)), 'lines.tsv');
+  }
+
+  /**
+   * Deletes old managed objects absent from the global repository reference
+   * set. External and manifest-only stores are never owned by this collector.
+   */
+  async pruneUnreferenced(
+    referencedHashes: ReadonlySet<string>,
+    olderThan: string,
+    limit = 500,
+  ): Promise<number> {
+    if (this.retentionMode !== 'managed' || limit <= 0) return 0;
+    const cutoff = Date.parse(olderThan);
+    if (!Number.isFinite(cutoff)) throw new Error(`Invalid Workspace RAG V2 blob GC cutoff: ${olderThan}`);
+    const hashRoot = path.join(this.root, 'objects', 'sha256');
+    const firstLevel = await readdir(hashRoot, { withFileTypes: true }).catch(() => []);
+    let deleted = 0;
+    for (const first of firstLevel) {
+      if (deleted >= limit || !first.isDirectory() || !/^[a-f0-9]{2}$/u.test(first.name)) continue;
+      const firstPath = path.join(hashRoot, first.name);
+      const secondLevel = await readdir(firstPath, { withFileTypes: true }).catch(() => []);
+      for (const second of secondLevel) {
+        if (deleted >= limit || !second.isDirectory() || !/^[a-f0-9]{2}$/u.test(second.name)) continue;
+        const secondPath = path.join(firstPath, second.name);
+        const hashEntries = await readdir(secondPath, { withFileTypes: true }).catch(() => []);
+        for (const entry of hashEntries) {
+          if (deleted >= limit || !entry.isDirectory() || !/^[a-f0-9]{64}$/u.test(entry.name)) continue;
+          if (!entry.name.startsWith(`${first.name}${second.name}`) || referencedHashes.has(entry.name)) continue;
+          const objectDirectory = path.join(secondPath, entry.name);
+          assertInsideRoot(this.root, objectDirectory);
+          const source = await stat(path.join(objectDirectory, 'source.md')).catch(() => undefined);
+          if (!source?.isFile() || source.mtimeMs >= cutoff) continue;
+          await rm(objectDirectory, { recursive: true, force: true });
+          deleted++;
+        }
+      }
+    }
+    return deleted;
   }
 
   private contentPath(root: string, contentSha256: string): string {

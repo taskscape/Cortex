@@ -2,6 +2,15 @@ import type { RagV2IngestionPolicy, RagV2Mode } from './types.js';
 
 const MIB = 1024 * 1024;
 
+export interface RagV2GcSettings {
+  enabled: boolean;
+  intervalMs: number;
+  graceMs: number;
+  batchSize: number;
+  retiredGenerationTtlMs: number;
+  blobGcEnabled: boolean;
+}
+
 export function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -16,6 +25,40 @@ function boundedInteger(value: string | undefined, fallback: number, min: number
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 1) return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function gcPositiveInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  console.warn(`[workspace-rag-v2] invalid ${name}=${JSON.stringify(raw)}; using ${fallback}.`);
+  return fallback;
+}
+
+function gcBoolean(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'false' || normalized === '0') return false;
+  console.warn(`[workspace-rag-v2] invalid ${name}=${JSON.stringify(raw)}; using ${fallback}.`);
+  return fallback;
+}
+
+/** Reads orphan-GC cadence, grace, batching, and feature gates. */
+export function ragV2GcSettingsFromEnv(): RagV2GcSettings {
+  return {
+    enabled: gcBoolean('CORTEX_RAG_V2_GC_ENABLED', true),
+    intervalMs: gcPositiveInteger('CORTEX_RAG_V2_GC_INTERVAL_MS', 21_600_000),
+    graceMs: gcPositiveInteger('CORTEX_RAG_V2_GC_GRACE_MS', 3_600_000),
+    batchSize: gcPositiveInteger('CORTEX_RAG_V2_GC_BATCH_SIZE', 2_000),
+    retiredGenerationTtlMs: gcPositiveInteger(
+      'CORTEX_RAG_V2_RETIRED_GENERATION_TTL_MS',
+      604_800_000,
+    ),
+    blobGcEnabled: gcBoolean('CORTEX_RAG_V2_BLOB_GC_ENABLED', false),
+  };
 }
 
 /**

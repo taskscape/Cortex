@@ -483,6 +483,19 @@ export interface RagV2Status {
   /** Documents held in the database for the generation in flight, or the active publication when idle. */
   indexedDocuments: number;
   lastSuccessfulReconcileAt?: string;
+  lastGc?: {
+    completedAt: string;
+    durationMs: number;
+    documentsDeleted: number;
+    passagesDeleted: number;
+    sectionsDeleted: number;
+    embeddingsDeleted: number;
+    collectionsDeleted: number;
+    routingSummariesDeleted: number;
+    blobsDeleted: number;
+    retiredGenerationsDeleted: number;
+    deletionsSkipped: boolean;
+  };
   summaries: {
     enabled: boolean;
     queued: number;

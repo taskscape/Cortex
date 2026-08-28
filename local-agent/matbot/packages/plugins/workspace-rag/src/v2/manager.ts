@@ -7,6 +7,7 @@ import {
   ragV2AuditRetentionDaysFromEnv,
   ragV2CheckpointFilesFromEnv,
   ragV2ColbertUrlFromEnv,
+  ragV2GcSettingsFromEnv,
   ragV2ObjectRootFromEnv,
   ragV2PolicyFromEnv,
   ragV2RerankerUrlFromEnv,
@@ -23,7 +24,12 @@ import { RagV2ObjectStore } from './object-store.js';
 import { parseMarkdownStream } from './parser.js';
 import { RagV2RateLimiter } from './rate-limiter.js';
 import { assertSafeRegex } from './regex-evaluator.js';
-import type { RagV2DocumentFingerprint, RagV2EmbeddingRecord, RagV2Repository } from './repository.js';
+import type {
+  RagV2DocumentFingerprint,
+  RagV2EmbeddingRecord,
+  RagV2GcResult,
+  RagV2Repository,
+} from './repository.js';
 import { RagV2RetrievalEngine } from './retrieval.js';
 import type { RagV2SemanticServices, RagV2SummaryInput } from './semantic.js';
 import type {
@@ -54,6 +60,15 @@ interface SummaryTask extends RagV2SummaryInput {
 interface SourceRegistration {
   sourceId?: string;
   sourceVersionId?: string;
+}
+
+export interface RagV2GcEvent {
+  workspace: RagV2WorkspaceRef;
+  context: RagV2ContextRef;
+  result: RagV2GcResult;
+  retiredGenerationsDeleted: number;
+  completedAt: string;
+  durationMs: number;
 }
 
 /**
@@ -378,6 +393,7 @@ export class WorkspaceRagV2Manager {
   private readonly embedder: RagV2Embedder;
   private readonly sourceBridge: RagV2SourceBridge | undefined;
   private readonly semanticServices: RagV2SemanticServices | undefined;
+  private readonly gcObserver: ((event: RagV2GcEvent) => void | Promise<void>) | undefined;
   private readonly objectStores = new Map<string, RagV2ObjectStore>();
   private readonly runs = new Map<string, ActiveRun>();
   private readonly lazySections = new Map<string, {
@@ -391,12 +407,24 @@ export class WorkspaceRagV2Manager {
   private readonly lazyWorkerController = new AbortController();
   private readonly retrieval: Map<string, RagV2RetrievalEngine> = new Map();
   private readonly lastSuccessfulReconcile = new Map<string, string>();
+  private readonly lastGc = new Map<string, NonNullable<RagV2Status['lastGc']>>();
+  private readonly gcLocks = new Map<string, Promise<RagV2GcResult>>();
+  private readonly gcAfterIngestion = new Map<string, { workspace: RagV2WorkspaceRef; context: RagV2ContextRef }>();
+  private readonly gcQueue = new Map<string, {
+    workspace: RagV2WorkspaceRef;
+    context: RagV2ContextRef;
+    attempt: number;
+    dueAt: number;
+  }>();
+  private gcWorkerTimer: ReturnType<typeof setTimeout> | undefined;
+  private gcWorker: Promise<void> | undefined;
   private readonly policy = ragV2PolicyFromEnv();
   private readonly rerankerUrl = ragV2RerankerUrlFromEnv();
   private readonly rrf = ragV2RrfFromEnv();
   private readonly objectRetention = ragV2ObjectRetentionFromEnv();
   private readonly checkpointFiles = ragV2CheckpointFilesFromEnv();
   private readonly colbertUrl = ragV2ColbertUrlFromEnv();
+  private readonly gcSettings = ragV2GcSettingsFromEnv();
   private readonly storageLimiter = new RagV2RateLimiter(this.policy.storageBytesPerSecond);
   private readonly embeddingLimiter = new RagV2RateLimiter(this.policy.embeddingTextsPerSecond);
   private readonly sourceMetadataLimiter = new RagV2RateLimiter(this.policy.sourceMetadataOpsPerSecond);
@@ -417,11 +445,13 @@ export class WorkspaceRagV2Manager {
     embedder: RagV2Embedder,
     sourceBridge?: RagV2SourceBridge,
     semanticServices?: RagV2SemanticServices,
+    gcObserver?: (event: RagV2GcEvent) => void | Promise<void>,
   ) {
     this.repository = repository;
     this.embedder = embedder;
     this.sourceBridge = sourceBridge;
     this.semanticServices = semanticServices;
+    this.gcObserver = gcObserver;
   }
 
   /**
@@ -444,6 +474,9 @@ export class WorkspaceRagV2Manager {
     await this.waitForSummaries();
     this.lazyWorkerController.abort(new Error('Workspace RAG V2 manager is closing.'));
     await this.lazyWorker?.catch(() => undefined);
+    if (this.gcWorkerTimer) clearTimeout(this.gcWorkerTimer);
+    this.gcQueue.clear();
+    await this.gcWorker?.catch(() => undefined);
     await this.repository.close();
   }
 
@@ -473,6 +506,9 @@ export class WorkspaceRagV2Manager {
       ...(job ? { job } : {}),
       ...(this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))
         ? { lastSuccessfulReconcileAt: this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))! }
+        : {}),
+      ...(this.lastGc.get(runKey(workspace.id, context.id))
+        ? { lastGc: this.lastGc.get(runKey(workspace.id, context.id))! }
         : {}),
       summaries: {
         enabled: Boolean(this.semanticServices?.summarize && this.semanticServices.summarizerSignature),
@@ -552,6 +588,11 @@ export class WorkspaceRagV2Manager {
       })
       .finally(() => {
         if (this.runs.get(key)?.job.id === job.id) this.runs.delete(key);
+        const gc = this.gcAfterIngestion.get(key);
+        if (gc) {
+          this.gcAfterIngestion.delete(key);
+          this.scheduleGarbageCollection(gc.workspace, gc.context);
+        }
       });
     this.runs.set(key, { job, controller, promise });
     return job;
@@ -564,6 +605,41 @@ export class WorkspaceRagV2Manager {
    */
   async waitForIngestion(workspaceId: string, contextId: string): Promise<void> {
     await this.runs.get(runKey(workspaceId, contextId))?.promise;
+  }
+
+  /** Runs one orphan sweep and retired-generation cleanup for a context. */
+  async garbageCollect(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+  ): Promise<RagV2GcResult> {
+    await this.initialize();
+    const key = runKey(workspace.id, context.id);
+    const existing = this.gcLocks.get(key);
+    if (existing) return existing;
+    const operation = this.performGarbageCollection(workspace, context)
+      .finally(() => this.gcLocks.delete(key));
+    this.gcLocks.set(key, operation);
+    return operation;
+  }
+
+  /** Cancels local ingestion if needed, then idempotently purges non-audit context state. */
+  async purgeContext(workspace: RagV2WorkspaceRef, context: RagV2ContextRef): Promise<void> {
+    const key = runKey(workspace.id, context.id);
+    if (this.runs.has(key)) await this.cancel(workspace.id, context.id);
+    await this.gcLocks.get(key)?.catch(() => undefined);
+    this.gcQueue.delete(key);
+    this.gcAfterIngestion.delete(key);
+    await this.waitForSummaries();
+    await this.waitForLazyWorker();
+    await this.repository.purgeContext(workspace.id, context.id);
+    if (this.gcSettings.blobGcEnabled && this.objectRetention.mode === 'managed') {
+      await this.objectStore(workspace).pruneUnreferenced(
+        await this.repository.listReferencedContentHashes(),
+        new Date(Date.now() - this.gcSettings.graceMs).toISOString(),
+      );
+    }
+    this.lastGc.delete(key);
+    this.lastSuccessfulReconcile.delete(key);
   }
 
   /**
@@ -1178,8 +1254,8 @@ export class WorkspaceRagV2Manager {
   private async resumableGeneration(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
+    previous?: RagV2Job,
   ): Promise<{ generationId: string } | undefined> {
-    const previous = await this.repository.currentJob(workspace.id, context.id);
     if (!previous || previous.discoveryComplete) return undefined;
     const generation = await this.repository.generation(
       workspace.id, context.id, previous.generationId,
@@ -1233,7 +1309,9 @@ export class WorkspaceRagV2Manager {
     forceAll: boolean,
   ): Promise<void> {
     await this.initialize();
-    const resumed = await this.resumableGeneration(workspace, context);
+    await this.gcLocks.get(runKey(workspace.id, context.id));
+    const previousJob = await this.repository.currentJob(workspace.id, context.id);
+    const resumed = await this.resumableGeneration(workspace, context, previousJob);
     if (resumed) job.generationId = resumed.generationId;
     await this.repository.createJob(job);
     const fingerprints = new Map(
@@ -1434,6 +1512,9 @@ export class WorkspaceRagV2Manager {
       delete job.currentPath;
       await this.repository.updateJob(job);
       this.lastSuccessfulReconcile.set(runKey(workspace.id, context.id), job.updatedAt);
+      if (this.gcSettings.enabled && (job.removedFiles > 0 || previousJob?.deletionsDeferred === true)) {
+        this.gcAfterIngestion.set(runKey(workspace.id, context.id), { workspace, context });
+      }
       this.startLazyWorker();
     } catch (error) {
       if (signal.aborted || job.cancelRequested) {
@@ -1979,6 +2060,143 @@ export class WorkspaceRagV2Manager {
       ...(priorityPassageId ? { priorityPassageId } : {}),
     });
     this.startLazyWorker();
+  }
+
+  private async performGarbageCollection(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+  ): Promise<RagV2GcResult> {
+    const key = runKey(workspace.id, context.id);
+    const startedAt = Date.now();
+    let retiredGenerationsDeleted = 0;
+    let result: RagV2GcResult;
+    if (this.runs.has(key)) {
+      result = {
+        documentsDeleted: 0,
+        passagesDeleted: 0,
+        sectionsDeleted: 0,
+        embeddingsDeleted: 0,
+        collectionsDeleted: 0,
+        routingSummariesDeleted: 0,
+        blobsDeleted: 0,
+        deletionsSkipped: true,
+      };
+    } else {
+      // Summary and lazy-vector workers can outlive publication. Let them drain
+      // before deciding what is unreachable so they cannot recreate dangling
+      // summaries or embeddings immediately after the sweep.
+      await this.waitForSummaries();
+      await this.waitForLazyWorker();
+      if (this.runs.has(key)) {
+        result = {
+          documentsDeleted: 0,
+          passagesDeleted: 0,
+          sectionsDeleted: 0,
+          embeddingsDeleted: 0,
+          collectionsDeleted: 0,
+          routingSummariesDeleted: 0,
+          blobsDeleted: 0,
+          deletionsSkipped: true,
+        };
+      } else {
+        const olderThan = new Date(Date.now() - this.gcSettings.graceMs).toISOString();
+        result = await this.repository.pruneOrphans(workspace.id, context.id, olderThan);
+        if (!result.deletionsSkipped) {
+          retiredGenerationsDeleted = await this.repository.pruneRetiredGenerations(
+            workspace.id,
+            context.id,
+            new Date(Date.now() - this.gcSettings.retiredGenerationTtlMs).toISOString(),
+          );
+          if (this.gcSettings.blobGcEnabled && this.objectRetention.mode === 'managed') {
+            result.blobsDeleted = await this.objectStore(workspace).pruneUnreferenced(
+              await this.repository.listReferencedContentHashes(),
+              olderThan,
+            );
+          }
+        }
+      }
+    }
+    const completedAt = now();
+    const durationMs = Date.now() - startedAt;
+    const status: NonNullable<RagV2Status['lastGc']> = {
+      completedAt,
+      durationMs,
+      documentsDeleted: result.documentsDeleted,
+      passagesDeleted: result.passagesDeleted,
+      sectionsDeleted: result.sectionsDeleted,
+      embeddingsDeleted: result.embeddingsDeleted,
+      collectionsDeleted: result.collectionsDeleted,
+      routingSummariesDeleted: result.routingSummariesDeleted,
+      blobsDeleted: result.blobsDeleted,
+      retiredGenerationsDeleted,
+      deletionsSkipped: result.deletionsSkipped,
+    };
+    this.lastGc.set(key, status);
+    const message = result.deletionsSkipped
+      ? `[workspace-rag-v2] orphan GC skipped for ${workspace.id}/${context.id} because ingestion is active.`
+      : `[workspace-rag-v2] orphan GC completed for ${workspace.id}/${context.id} in ${durationMs} ms: ${JSON.stringify(status)}`;
+    console.info(message);
+    await Promise.resolve(this.gcObserver?.({
+      workspace,
+      context,
+      result,
+      retiredGenerationsDeleted,
+      completedAt,
+      durationMs,
+    })).catch(error => {
+      console.warn(`[workspace-rag-v2] failed to record orphan GC audit event: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    return result;
+  }
+
+  private scheduleGarbageCollection(
+    workspace: RagV2WorkspaceRef,
+    context: RagV2ContextRef,
+    attempt = 0,
+    delayMs = 0,
+  ): void {
+    if (!this.gcSettings.enabled || this.lazyWorkerController.signal.aborted) return;
+    const key = runKey(workspace.id, context.id);
+    const dueAt = Date.now() + delayMs;
+    const existing = this.gcQueue.get(key);
+    if (!existing || dueAt < existing.dueAt) {
+      this.gcQueue.set(key, { workspace, context, attempt, dueAt });
+    }
+    this.startGcWorker();
+  }
+
+  private startGcWorker(): void {
+    if (this.gcWorker || this.gcWorkerTimer || this.gcQueue.size === 0) return;
+    const next = [...this.gcQueue.values()].sort((left, right) => left.dueAt - right.dueAt)[0]!;
+    this.gcWorkerTimer = setTimeout(() => {
+      this.gcWorkerTimer = undefined;
+      this.gcWorker = this.runGcWorker()
+        .catch(error => {
+          console.warn(`[workspace-rag-v2] orphan GC worker failed: ${error instanceof Error ? error.message : String(error)}`);
+        })
+        .finally(() => {
+          this.gcWorker = undefined;
+          this.startGcWorker();
+        });
+    }, Math.max(0, next.dueAt - Date.now()));
+    this.gcWorkerTimer.unref?.();
+  }
+
+  private async runGcWorker(): Promise<void> {
+    const entry = [...this.gcQueue.entries()].sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+    if (!entry) return;
+    const [key, task] = entry;
+    this.gcQueue.delete(key);
+    const result = await this.garbageCollect(task.workspace, task.context);
+    if (result.deletionsSkipped && !this.lazyWorkerController.signal.aborted) {
+      const attempt = task.attempt + 1;
+      const delayMs = Math.min(3_600_000, 1_000 * (2 ** Math.min(attempt, 12)));
+      this.scheduleGarbageCollection(task.workspace, task.context, attempt, delayMs);
+    }
+  }
+
+  private async waitForLazyWorker(): Promise<void> {
+    while (this.lazyWorker) await this.lazyWorker.catch(() => undefined);
   }
 
   private startLazyWorker(): void {
