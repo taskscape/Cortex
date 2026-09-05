@@ -1,3 +1,5 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
 /**
  * Source-registry plugin: durable provenance records for indexed sources
  * (documents, tables, metrics, dashboards, …) with freshness, health,
@@ -1064,6 +1066,7 @@ export const plugin: MatbotPluginSpec = {
     description: 'Registers SourceRegistry, source_action, and source_health_action for source provenance, freshness, health, citations, and health reports.',
   },
   async setup(services: MatbotMachine) {
+    services.contributions?.register('webui','sources',uiContribution);
     const registry = createSourceRegistry(services);
     await services.register('SourceRegistry', registry);
     services.tools.register(createSourceActionTool(registry));

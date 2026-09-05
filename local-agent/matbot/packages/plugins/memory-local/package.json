@@ -1,0 +1,22 @@
+{
+  "name": "@matatbread/matbot-memory-local",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*",
+    "@matatbread/matbot-workspace-manager-types": "workspace:*",
+    "@matatbread/matbot-knowledge": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

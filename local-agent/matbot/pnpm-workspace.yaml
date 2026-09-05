@@ -3,7 +3,14 @@ packages:
   - 'packages/*/*'
   - 'packages/*/*/*'
   - 'apps/*'
+  - '../file-broker'
+  - '../file-index'
+  - '../paths'
+  - '../http-utils'
+  - 'plugins/*'
 
 catalog:
   typescript: ^5.8.0
   "@types/node": ^22.0.0
+
+linkWorkspacePackages: true

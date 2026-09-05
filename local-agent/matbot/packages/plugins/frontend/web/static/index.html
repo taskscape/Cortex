@@ -4472,6 +4472,7 @@
       word-break: break-word !important;
     }
   }
+.sidebar-section[hidden], .architecture-nav-btn[hidden], .architecture-tab[hidden], .architecture-panel[hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -4507,195 +4508,17 @@
       <div class="sidebar-heading">Skills</div>
       <div id="skill-list" class="sidebar-list"></div>
     </div>
-    <div id="workspace-menu">
-      <div id="workspace-popover" role="menu" aria-label="Workspace selector">
-        <div id="workspace-list"></div>
-        <div class="workspace-actions">
-          <button id="workspace-new-btn" class="workspace-action" type="button">+ New workspace</button>
-          <button id="workspace-rename-btn" class="workspace-action" type="button">Rename workspace</button>
-        </div>
-        <div id="workspace-status" role="status" aria-live="polite"></div>
-      </div>
-      <div id="workspace-controls">
-        <button id="workspace-toggle-btn" type="button" aria-haspopup="menu" aria-expanded="false" title="Switch workspace">
-          <span id="workspace-avatar">C</span>
-          <span id="workspace-name">Default</span>
-          <span id="workspace-chevron">⌃</span>
-        </button>
-        <button id="workspace-config-btn" type="button" aria-expanded="false" title="Configure workspace RAG"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-settings h-5 w-5 text-muted-foreground" aria-hidden="true"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
-      </div>
-    </div>
+    <template data-cortex-feature="workspace" data-fragment="workspace-menu"></template>
     <div id="sidebar-resizer"></div>
   </nav>
 
-  <div id="skill-editor-overlay">
-    <div id="skill-editor">
-      <div id="skill-editor-header">
-        <span id="skill-editor-title"></span>
-        <div id="skill-editor-tabs">
-          <button class="skill-tab active" data-tab="content">Content</button>
-          <button class="skill-tab" data-tab="triggers">Triggers</button>
-          <button class="skill-tab" data-tab="metadata">Metadata</button>
-        </div>
-        <button id="skill-editor-close" title="Close">&times;</button>
-      </div>
-      <div id="skill-editor-body">
-        <div id="skill-editor-pane-content" class="skill-pane active">
-          <textarea id="skill-editor-text" spellcheck="false" placeholder="Skill content (markdown)…"></textarea>
-        </div>
-        <div id="skill-editor-pane-triggers" class="skill-pane">
-          <div id="skill-trigger-list"></div>
-          <button id="skill-trigger-add" class="skill-editor-btn">+ Add trigger</button>
-        </div>
-        <div id="skill-editor-pane-metadata" class="skill-pane">
-          <div id="skill-metadata"></div>
-        </div>
-      </div>
-      <div id="skill-editor-footer">
-        <div id="skill-editor-toolbar"></div>
-        <span id="skill-editor-error"></span>
-        <button id="skill-editor-cancel" class="skill-editor-btn">Cancel</button>
-        <button id="skill-editor-save" class="skill-editor-btn primary">Save</button>
-      </div>
-    </div>
-    <dialog id="skill-trigger-dialog" aria-labelledby="skill-trigger-dialog-title">
-      <div class="skill-trigger-dialog-body">
-        <h2 id="skill-trigger-dialog-title">Add trigger</h2>
-        <label class="skill-trigger-field">Trigger behavior
-          <select id="skill-trigger-dialog-kind">
-            <option value="ephemeral">On user message — load for this turn</option>
-            <option value="contextual">On user message — retain in context</option>
-            <option value="retract">On assistant response — retract and redo</option>
-            <option value="followup">On assistant response — add follow-up</option>
-          </select>
-        </label>
-        <label class="skill-trigger-field">Classifier condition
-          <textarea id="skill-trigger-dialog-rule" placeholder="MATCH when …; DO NOT MATCH when …"></textarea>
-        </label>
-        <label class="skill-trigger-field">Action
-          <input id="skill-trigger-dialog-action" type="text" readonly>
-        </label>
-        <div id="skill-trigger-dialog-error" role="alert" aria-live="polite"></div>
-        <div class="skill-trigger-dialog-actions">
-          <button id="skill-trigger-dialog-cancel" class="skill-editor-btn" type="button">Cancel</button>
-          <button id="skill-trigger-dialog-save" class="skill-editor-btn primary" type="button">Add trigger</button>
-        </div>
-      </div>
-    </dialog>
-  </div>
+  <template data-cortex-feature="skills" data-fragment="skill-editor-overlay"></template>
 
-  <div id="memory-browser-overlay">
-    <div id="memory-browser">
-      <div id="memory-browser-header">
-        <span id="memory-browser-title">Memories</span>
-        <span id="memory-browser-count"></span>
-        <button id="memory-browser-refresh" class="skill-editor-btn" type="button">Refresh</button>
-        <button id="memory-browser-close" type="button" title="Close">&times;</button>
-      </div>
-      <div id="memory-browser-body">
-        <aside id="memory-browser-list-pane">
-          <form id="memory-browser-search-form">
-            <div id="memory-browser-controls">
-              <div class="memory-browser-control-row">
-                <input id="memory-browser-search" type="search" placeholder="Search remembered facts" autocomplete="off">
-                <select id="memory-browser-filter" aria-label="Memory state">
-                  <option value="all">All</option>
-                  <option value="unprocessed">Unprocessed</option>
-                  <option value="processed">Processed</option>
-                  <option value="ignored">Ignored</option>
-                </select>
-              </div>
-            </div>
-          </form>
-          <section id="memory-browser-new">
-            <textarea id="memory-browser-new-fact" rows="3" placeholder="Add a remembered fact manually"></textarea>
-            <button id="memory-browser-add" class="skill-editor-btn" type="button">Add memory</button>
-          </section>
-          <div id="memory-browser-panel-status" role="status"></div>
-          <div id="memory-browser-list"></div>
-          <button id="memory-browser-load-more" class="skill-editor-btn" type="button">Load more</button>
-        </aside>
-        <section id="memory-browser-detail-pane" aria-live="polite">
-          <div id="memory-browser-empty">
-            <h2>Select a memory</h2>
-            <p>Browse, edit, or delete remembered facts stored by Cortex.</p>
-          </div>
-          <form id="memory-browser-detail-form" hidden>
-            <div class="memory-browser-detail-header">
-              <div class="memory-browser-detail-heading">
-                <div id="memory-browser-state"></div>
-                <h2 id="memory-browser-memory-title">Memory</h2>
-              </div>
-              <div class="memory-browser-detail-actions">
-                <button id="memory-browser-delete" class="skill-editor-btn" type="button">Delete</button>
-                <button id="memory-browser-save" class="skill-editor-btn primary" type="submit">Save</button>
-              </div>
-            </div>
-            <label>
-              Fact
-              <textarea id="memory-browser-fact-input" rows="7"></textarea>
-            </label>
-            <div class="memory-browser-field-grid">
-              <label class="memory-browser-field">
-                Session
-                <input id="memory-browser-session-id" type="text" readonly>
-              </label>
-              <label class="memory-browser-field">
-                Message
-                <input id="memory-browser-message-id" type="text" readonly>
-              </label>
-              <label class="memory-browser-field">
-                Created
-                <input id="memory-browser-created-at" type="text" readonly>
-              </label>
-              <label class="memory-browser-field">
-                Version
-                <input id="memory-browser-version" type="text" readonly>
-              </label>
-              <label class="memory-browser-field">
-                Dream skill
-                <input id="memory-browser-dream-skill" type="text" placeholder="Unset">
-              </label>
-              <label class="memory-browser-field">
-                Ignore until
-                <input id="memory-browser-ignore-until" type="text" placeholder="Unset">
-              </label>
-            </div>
-          </form>
-        </section>
-      </div>
-    </div>
-  </div>
+  <template data-cortex-feature="memory" data-fragment="memory-browser-overlay"></template>
 
   <main id="main">
     <div id="chat-header"><button id="burger" aria-label="Open menu">&#9776;</button><span id="chat-title"></span></div>
-    <section id="workspace-settings-screen" aria-label="Workspace settings">
-      <div class="workspace-settings-page">
-        <div class="workspace-settings-header">
-          <div>
-            <div class="workspace-settings-eyebrow">Workspace</div>
-            <h2>Settings</h2>
-          </div>
-        </div>
-        <div class="workspace-settings-panel">
-        <label class="workspace-config-label">
-          Context name
-          <input id="workspace-context-name" type="text" placeholder="Workspace context">
-        </label>
-        <label class="workspace-config-label">
-          Markdown folders
-          <textarea id="workspace-rag-paths" spellcheck="false" placeholder="C:\Projects\Docs&#10;D:\Knowledge\Base"></textarea>
-        </label>
-        <div id="workspace-rag-progress"><div id="workspace-rag-progress-bar"></div></div>
-        <div id="workspace-rag-status" role="status" aria-live="polite"></div>
-        <div id="workspace-rag-current-file" title=""></div>
-        <div class="workspace-config-actions">
-          <button id="workspace-settings-cancel-btn" type="button">Close</button>
-          <button id="workspace-rag-save-btn" class="primary" type="button">Save</button>
-        </div>
-      </div>
-      </div>
-    </section>
+    <template data-cortex-feature="rag" data-fragment="workspace-settings-screen"></template>
     <section id="architecture-screen" aria-label="Architecture control panels">
       <div class="architecture-page">
         <div class="architecture-header">
@@ -4714,315 +4537,19 @@
           </div>
         </div>
 
-        <section id="architecture-panel-sources" class="architecture-panel active" data-architecture-panel="sources" role="tabpanel" aria-labelledby="architecture-tab-sources">
-          <div class="architecture-toolbar">
-            <div id="architecture-source-status" class="architecture-status" role="status"></div>
-            <div class="architecture-actions">
-              <button id="architecture-source-refresh" type="button">Refresh</button>
-            </div>
-          </div>
-          <div id="architecture-source-health-summary" class="source-health-summary" aria-label="Source health counts"></div>
-          <div class="architecture-grid">
-            <div id="architecture-source-list" class="architecture-list" aria-label="Sources"></div>
-            <div id="architecture-source-detail" class="architecture-detail" aria-live="polite"></div>
-          </div>
-          <div id="architecture-source-health-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-source-health-modal-title" hidden>
-            <div class="architecture-health-modal-header">
-              <h3 id="architecture-source-health-modal-title">Source health report</h3>
-              <button id="architecture-source-health-modal-close" type="button">Close</button>
-            </div>
-            <div id="architecture-source-health-modal-content"></div>
-          </div>
-        </section>
+        <template data-cortex-feature="sources" data-fragment="architecture-panel-sources"></template>
 
-        <section id="architecture-panel-sql" class="architecture-panel" data-architecture-panel="sql" role="tabpanel" aria-labelledby="architecture-tab-sql" hidden>
-          <form id="architecture-sql-form" class="architecture-form">
-            <label>
-              Metric
-              <input id="architecture-sql-metric" type="text" value="total_revenue" autocomplete="off">
-            </label>
-            <label>
-              Dimension
-              <input id="architecture-sql-dimension" type="text" value="data-column:orders:order_date" autocomplete="off">
-            </label>
-            <label>
-              Filter column
-              <input id="architecture-sql-filter-column" type="text" value="data-column:orders:status" autocomplete="off">
-            </label>
-            <label>
-              Filter value
-              <input id="architecture-sql-filter-value" type="text" value="paid" autocomplete="off">
-            </label>
-            <label>
-              Limit
-              <input id="architecture-sql-limit" type="number" min="1" max="1000" value="200">
-            </label>
-            <div class="architecture-form-actions">
-              <button id="architecture-sql-plan-btn" class="primary" type="submit">Plan</button>
-              <button id="architecture-sql-approve-btn" type="button" disabled>Approve</button>
-              <button id="architecture-sql-execute-btn" type="button" disabled>Execute</button>
-            </div>
-          </form>
-          <div class="architecture-toolbar">
-            <div id="architecture-sql-status" class="architecture-status" role="status"></div>
-          </div>
-          <div id="architecture-sql-preview" class="architecture-code" aria-label="SQL preview"></div>
-          <form id="architecture-sql-validation-form" class="architecture-form architecture-sql-validation-form">
-            <label class="full">
-              SQL safety check
-              <textarea id="architecture-sql-validation-input" rows="3" spellcheck="false">SELECT o.id FROM public.orders o CROSS JOIN public.orders other LIMIT 10</textarea>
-            </label>
-            <div class="architecture-form-actions">
-              <button id="architecture-sql-validation-btn" type="submit">Validate SQL</button>
-            </div>
-          </form>
-          <div id="architecture-sql-validation-result" class="architecture-sql-validation-result" aria-live="polite"></div>
-          <div id="architecture-sql-results" class="architecture-results" aria-live="polite"></div>
-        </section>
+        <template data-cortex-feature="sql" data-fragment="architecture-panel-sql"></template>
 
-        <section id="architecture-panel-workflows" class="architecture-panel" data-architecture-panel="workflows" role="tabpanel" aria-labelledby="architecture-tab-workflows" hidden>
-          <div class="architecture-toolbar">
-            <div id="architecture-workflow-status" class="architecture-status" role="status"></div>
-            <div class="architecture-actions">
-              <button id="architecture-workflow-refresh" type="button">Refresh</button>
-            </div>
-          </div>
+        <template data-cortex-feature="workflows" data-fragment="architecture-panel-workflows"></template>
 
-          <div class="workflow-ops-summary" aria-label="Workflow operations summary">
-            <button class="workflow-ops-metric" data-workflow-summary-view="library" type="button"><div class="workflow-ops-metric-label">Workflows</div><div id="workflow-ops-workflow-count" class="workflow-ops-metric-value">0</div></button>
-            <button class="workflow-ops-metric" data-workflow-summary-view="runs" type="button"><div class="workflow-ops-metric-label">Runs</div><div id="workflow-ops-run-count" class="workflow-ops-metric-value">0</div></button>
-            <button class="workflow-ops-metric" data-workflow-summary-view="approvals" type="button"><div class="workflow-ops-metric-label">Pending approvals</div><div id="workflow-ops-pending-count" class="workflow-ops-metric-value">0</div></button>
-            <button class="workflow-ops-metric" data-workflow-summary-view="shadow" type="button"><div class="workflow-ops-metric-label">Shadow acceptance</div><div id="workflow-ops-acceptance-rate" class="workflow-ops-metric-value">-</div><div id="workflow-ops-acceptance-trend" class="workflow-ops-metric-trend">Trend: no labels</div></button>
-          </div>
+        <template data-cortex-feature="evaluation" data-fragment="architecture-panel-evaluation"></template>
 
-          <div class="workflow-ops-nav" role="tablist" aria-label="Workflow Operations Center">
-            <button id="workflow-ops-tab-overview" class="workflow-ops-tab active" data-workflow-ops-view="overview" type="button" role="tab" aria-selected="true" aria-controls="workflow-ops-view-overview">Overview</button>
-            <button id="workflow-ops-tab-library" class="workflow-ops-tab" data-workflow-ops-view="library" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-library" tabindex="-1">Library</button>
-            <button id="workflow-ops-tab-runs" class="workflow-ops-tab" data-workflow-ops-view="runs" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-runs" tabindex="-1">Run Ledger</button>
-            <button id="workflow-ops-tab-approvals" class="workflow-ops-tab" data-workflow-ops-view="approvals" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-approvals" tabindex="-1">Approvals</button>
-            <button id="workflow-ops-tab-shadow" class="workflow-ops-tab" data-workflow-ops-view="shadow" type="button" role="tab" aria-selected="false" aria-controls="workflow-ops-view-shadow" tabindex="-1">Shadow Lab</button>
-          </div>
+        <template data-cortex-feature="graph" data-fragment="architecture-panel-graph"></template>
 
-          <section id="workflow-ops-view-overview" class="workflow-ops-view active" data-workflow-ops-panel="overview" role="tabpanel" aria-labelledby="workflow-ops-tab-overview">
-            <div class="workflow-ops-overview-grid">
-              <div class="workflow-ops-section">
-                <h3>Release lifecycle</h3>
-                <p>Compile a repeated business task, validate it, run safely in dry-run or shadow mode, then move to approval-gated execution.</p>
-                <div class="architecture-inline-list"><span class="architecture-badge">Draft</span><span class="architecture-badge">Dry run</span><span class="architecture-badge warn">Shadow</span><span class="architecture-badge good">Approval gated</span></div>
-              </div>
-              <div class="workflow-ops-section">
-                <h3>Operational attention</h3>
-                <div id="workflow-ops-attention"></div>
-              </div>
-              <div class="workflow-ops-section">
-                <h3>Recent runs</h3>
-                <div id="workflow-ops-recent-runs"></div>
-              </div>
-              <div class="workflow-ops-section">
-                <h3>Shadow readiness</h3>
-                <div id="workflow-ops-shadow-readiness"></div>
-              </div>
-            </div>
-          </section>
+        <template data-cortex-feature="experts" data-fragment="architecture-panel-reviews"></template>
 
-          <section id="workflow-ops-view-library" class="workflow-ops-view" data-workflow-ops-panel="library" role="tabpanel" aria-labelledby="workflow-ops-tab-library" hidden>
-            <form id="workflow-ops-compile-form" class="architecture-form">
-              <label>
-                Workflow name
-                <input id="workflow-ops-compile-name" type="text" value="Vendor Invoice Review" autocomplete="off" required>
-              </label>
-              <label>
-                Risk
-                <select id="workflow-ops-compile-risk"><option value="low">Low</option><option value="medium">Medium</option><option value="high" selected>High</option><option value="critical">Critical</option></select>
-              </label>
-              <label class="full">
-                Purpose or selected transcript
-                <textarea id="workflow-ops-compile-transcript" required>Review {{invoiceId}} against approved evidence and propose a governed follow-up.</textarea>
-              </label>
-              <label>
-                Evidence source IDs
-                <input id="workflow-ops-compile-sources" type="text" placeholder="source:contract, source:invoice" autocomplete="off">
-              </label>
-              <label>
-                Allowed tool
-                <input id="workflow-ops-compile-tool" type="text" placeholder="Optional tool name" autocomplete="off">
-              </label>
-              <label>
-                <span>Release options</span>
-                <span><input id="workflow-ops-compile-publish" type="checkbox" checked> Publish immutable version</span>
-              </label>
-              <label>
-                <span>Safety check</span>
-                <span><input id="workflow-ops-compile-dry-run" type="checkbox" checked> Run smoke-test</span>
-              </label>
-              <div class="architecture-form-actions"><button id="workflow-ops-compile-btn" class="primary" type="submit">Compile workflow</button></div>
-            </form>
-            <div class="workflow-ops-filters"><input id="workflow-ops-library-search" type="search" placeholder="Filter workflow library" autocomplete="off"></div>
-            <div class="architecture-grid">
-              <div id="workflow-ops-library-list" class="architecture-list" aria-label="Workflow library"></div>
-              <div id="workflow-ops-library-detail" class="architecture-detail" aria-live="polite"></div>
-            </div>
-          </section>
-
-          <section id="workflow-ops-view-runs" class="workflow-ops-view" data-workflow-ops-panel="runs" role="tabpanel" aria-labelledby="workflow-ops-tab-runs" hidden>
-            <div class="workflow-ops-filters">
-              <input id="workflow-ops-run-search" type="search" placeholder="Filter by workflow or run ID" autocomplete="off">
-              <select id="workflow-ops-run-status" aria-label="Run status"><option value="all">All statuses</option><option value="waiting_for_approval">Waiting for approval</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option></select>
-            </div>
-            <div class="architecture-grid">
-              <div id="workflow-ops-run-list" class="architecture-list" aria-label="Workflow run ledger"></div>
-              <div id="workflow-ops-run-detail" class="architecture-detail" aria-live="polite"></div>
-            </div>
-          </section>
-
-          <section id="workflow-ops-view-approvals" class="workflow-ops-view" data-workflow-ops-panel="approvals" role="tabpanel" aria-labelledby="workflow-ops-tab-approvals" hidden>
-            <div class="architecture-grid">
-              <div id="architecture-approval-list" class="architecture-list" aria-label="Approval queue"></div>
-              <div id="architecture-approval-detail" class="architecture-detail" aria-live="polite"></div>
-            </div>
-          </section>
-
-          <section id="workflow-ops-view-shadow" class="workflow-ops-view" data-workflow-ops-panel="shadow" role="tabpanel" aria-labelledby="workflow-ops-tab-shadow" hidden>
-            <div class="architecture-grid">
-              <div id="workflow-ops-shadow-list" class="architecture-list" aria-label="Shadow comparisons"></div>
-              <div id="workflow-ops-shadow-detail" class="architecture-detail" aria-live="polite"></div>
-            </div>
-          </div>
-          <div id="architecture-high-risk-write-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-high-risk-write-title" hidden>
-            <div class="architecture-health-modal-header">
-              <h3 id="architecture-high-risk-write-title">Review high-risk write</h3>
-              <button id="architecture-high-risk-write-close" type="button">Close</button>
-            </div>
-            <div id="architecture-high-risk-write-content"></div>
-            <div class="architecture-card-actions">
-              <button id="architecture-high-risk-write-reject" class="danger" type="button">Reject write</button>
-              <button id="architecture-high-risk-write-approve" class="primary" type="button">Approve write</button>
-            </div>
-          </div>
-        </section>
-
-        <section id="architecture-panel-evaluation" class="architecture-panel" data-architecture-panel="evaluation" role="tabpanel" aria-labelledby="architecture-tab-evaluation" hidden>
-          <div class="architecture-toolbar">
-            <div id="architecture-evaluation-status" class="architecture-status" role="status"></div>
-            <div class="architecture-actions"><button id="architecture-evaluation-refresh" type="button">Refresh</button></div>
-          </div>
-          <div class="workflow-ops-summary" aria-label="Evaluation and ROI summary">
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Traces</div><div id="evaluation-trace-count" class="workflow-ops-metric-value">0</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Eval pass rate</div><div id="evaluation-pass-rate" class="workflow-ops-metric-value">-</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Verified completion</div><div id="evaluation-completion-rate" class="workflow-ops-metric-value">-</div></div>
-            <div class="workflow-ops-metric"><div class="workflow-ops-metric-label">Net benefit</div><div id="evaluation-net-benefit" class="workflow-ops-metric-value">$0</div></div>
-          </div>
-          <div class="evaluation-observability-grid">
-            <section class="workflow-ops-section">
-              <h3>End-to-end traces</h3>
-              <div id="evaluation-trace-list" class="architecture-list" aria-label="End-to-end traces"></div>
-              <div id="evaluation-trace-detail" class="architecture-detail" aria-live="polite"></div>
-            </section>
-            <section class="workflow-ops-section">
-              <h3>Regression suites</h3>
-              <div id="evaluation-suite-list" class="architecture-list" aria-label="Evaluation suites"></div>
-              <div id="evaluation-suite-detail" class="architecture-detail" aria-live="polite"></div>
-            </section>
-            <section class="workflow-ops-section">
-              <h3>Sponsor evidence</h3>
-              <div id="evaluation-roi-detail" class="architecture-detail" aria-live="polite"></div>
-            </section>
-          </div>
-        </section>
-
-        <section id="architecture-panel-graph" class="architecture-panel" data-architecture-panel="graph" role="tabpanel" aria-labelledby="architecture-tab-graph" hidden>
-          <form id="architecture-graph-form" class="architecture-form">
-            <label>
-              Search
-              <input id="architecture-graph-search" type="search" value="Acme" autocomplete="off">
-            </label>
-            <label>
-              Source
-              <input id="architecture-graph-source" type="text" value="source:playwright-architecture-brief" autocomplete="off">
-            </label>
-            <div class="architecture-form-actions">
-              <button id="architecture-graph-refresh" type="button">Refresh</button>
-              <button id="architecture-graph-retrieve" class="primary" type="submit">Retrieve</button>
-            </div>
-          </form>
-          <div class="architecture-toolbar">
-            <div id="architecture-graph-status" class="architecture-status" role="status"></div>
-          </div>
-          <div class="architecture-grid">
-            <div id="architecture-graph-list" class="architecture-list" aria-label="Graph entities"></div>
-            <div id="architecture-graph-detail" class="architecture-detail" aria-live="polite"></div>
-          </div>
-        </section>
-
-        <section id="architecture-panel-reviews" class="architecture-panel" data-architecture-panel="reviews" role="tabpanel" aria-labelledby="architecture-tab-reviews" hidden>
-          <div class="architecture-toolbar">
-            <div id="architecture-review-status" class="architecture-status" role="status"></div>
-            <div class="architecture-actions">
-              <button id="architecture-review-refresh" type="button">Refresh</button>
-              <button id="architecture-review-open-btn" class="primary" type="button">Create Review</button>
-            </div>
-          </div>
-          <div id="architecture-review-modal" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="architecture-review-modal-title" hidden>
-            <div class="architecture-health-modal-header">
-              <h3 id="architecture-review-modal-title">Create expert review</h3>
-              <button id="architecture-review-close-btn" type="button">Close</button>
-            </div>
-            <form id="architecture-review-form" class="architecture-form">
-              <label class="full">
-                Question
-                <textarea id="architecture-review-question">Should this high-risk workflow be approved?</textarea>
-              </label>
-              <label>
-                Target type
-                <select id="architecture-review-target-type">
-                  <option value="workflow">Workflow</option>
-                  <option value="workflow_run">Workflow run</option>
-                  <option value="alert">Alert</option>
-                  <option value="investigation">Investigation</option>
-                  <option value="chat">Chat</option>
-                  <option value="decision_dossier">Decision dossier</option>
-                  <option value="other">Other</option>
-                </select>
-              </label>
-              <label>
-                Target ID
-                <input id="architecture-review-target-id" type="text" value="workflow:compiled-followup" autocomplete="off">
-              </label>
-              <label>
-                Workflow ID
-                <input id="architecture-review-workflow-id" type="text" value="workflow:compiled-followup" autocomplete="off">
-              </label>
-              <label>
-                Run ID
-                <input id="architecture-review-run-id" type="text" autocomplete="off">
-              </label>
-              <label class="full">
-                Experts
-                <select id="architecture-review-experts" multiple size="3" aria-label="Experts">
-                  <option value="design">Design Expert</option>
-                  <option value="finance" selected>Finance Expert</option>
-                  <option value="engineering" selected>Engineering Expert</option>
-                </select>
-              </label>
-              <div class="architecture-form-actions">
-                <button id="architecture-review-cancel-btn" type="button">Cancel</button>
-                <button id="architecture-review-create-btn" class="primary" type="submit">Create Review</button>
-              </div>
-            </form>
-          </div>
-          <div class="architecture-grid">
-            <div id="architecture-review-list" class="architecture-list" aria-label="Expert review cards"></div>
-            <div id="architecture-review-detail" class="architecture-detail" aria-live="polite"></div>
-          </div>
-        </section>
-
-        <section id="architecture-panel-plugins" class="architecture-panel" data-architecture-panel="plugins" role="tabpanel" aria-labelledby="architecture-tab-plugins" hidden>
-          <div class="workflow-ops-section">
-            <h3>Plugin management</h3>
-            <p>Inspect compatibility, runtime metadata, tools, activation, and removal controls in the Plugins sidebar.</p>
-            <button id="architecture-open-plugin-management" class="primary" type="button">Open plugin management</button>
-          </div>
-        </section>
+        <template data-cortex-feature="runtime" data-fragment="architecture-panel-plugins"></template>
       </div>
     </section>
     <div id="messages"></div>
@@ -5034,40 +4561,9 @@
       <div id="input-meta">
         <span class="input-meta-label">Model:</span>
         <select id="provider-select"></select>
-        <div id="expert-menu" class="input-meta-label">
-          <button id="expert-toggle-btn" type="button" aria-haspopup="dialog" aria-expanded="false" title="Expert panel">Experts</button>
-          <div id="expert-popover" role="dialog" aria-label="Expert panel options">
-            <div id="expert-panel">
-              <label class="expert-option">
-                <input type="checkbox" id="expert-enabled">
-                <span>Use experts</span>
-              </label>
-              <div class="expert-panel-field">
-                <div class="expert-panel-label">Selection</div>
-                <label class="expert-option">
-                  <input type="checkbox" id="expert-all" checked>
-                  <span>All experts</span>
-                </label>
-                <div id="expert-list"></div>
-              </div>
-              <div class="expert-panel-field">
-                <label class="expert-panel-label" for="expert-mode">Mode</label>
-                <select id="expert-mode" aria-label="Expert panel mode">
-                  <option value="parallel">Parallel</option>
-                  <option value="review">Review</option>
-                  <option value="debate">Debate</option>
-                </select>
-              </div>
-              <label class="expert-option">
-                <input type="checkbox" id="expert-synthesize" checked>
-                <span>Synthesize decision</span>
-              </label>
-              <div id="expert-status"></div>
-            </div>
-          </div>
-        </div>
+        <template data-cortex-feature="experts" data-fragment="expert-menu"></template>
       </div>
-      <div id="attachment-tray" aria-label="Files attached to the next message" hidden></div>
+      <template data-cortex-feature="files" data-fragment="attachment-tray"></template>
       <div id="input-row">
         <textarea id="input" rows="1" placeholder="Ask Cortex..."></textarea>
         <button id="send-btn" aria-label="Send"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M9 6v12l9-6z"/></svg></button>
@@ -5077,31 +4573,13 @@
     <button id="scroll-down-btn" style="display:none" title="Scroll to bottom" aria-label="Scroll to bottom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
   </main>
 
-  <div id="core-plugin-removal-dialog" class="architecture-health-modal" role="dialog" aria-modal="true" aria-labelledby="core-plugin-removal-title" hidden>
-    <div class="architecture-health-modal-header">
-      <h2 id="core-plugin-removal-title">Core plugin removal</h2>
-      <button id="core-plugin-removal-close" type="button">Close</button>
-    </div>
-    <p id="core-plugin-removal-message"></p>
-    <p class="architecture-muted">Core plugins are required by the active workspace and cannot be removed while it is running.</p>
-    <div class="architecture-card-actions">
-      <button id="core-plugin-removal-cancel" type="button">Keep plugin</button>
-      <button id="core-plugin-removal-confirm" class="danger" type="button" disabled>Remove core plugin</button>
-    </div>
-  </div>
+  <template data-cortex-feature="runtime" data-fragment="core-plugin-removal-dialog"></template>
 
-  <div id="workspace-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-delete-title" aria-hidden="true">
-    <div class="workspace-delete-panel">
-      <h2 id="workspace-delete-title">Delete workspace?</h2>
-      <p id="workspace-delete-message"></p>
-      <div class="workspace-delete-actions">
-        <button id="workspace-delete-cancel" type="button">Cancel</button>
-        <button id="workspace-delete-confirm" class="danger" type="button">Yes</button>
-      </div>
-    </div>
-  </div>
+  <template data-cortex-feature="workspace" data-fragment="workspace-delete-dialog"></template>
 
   <script src="/http-transport.js"></script>
+  <script src="/feature-fallbacks.js"></script>
+  <script src="/feature-runtime.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

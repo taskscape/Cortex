@@ -1,3 +1,4 @@
+import {uiContribution} from './ui.js';
 import { createHash, randomUUID } from "node:crypto";
 import type {
   ExpertConfig,
@@ -20,8 +21,9 @@ import type {
   ToolContext,
   ToolEvent
 } from "./types.js";
-import { loadExpertConfig } from "./config.js";
-import { FileExpertKnowledge } from "./file-knowledge.js";
+import {FileExpertDefinitionSource,fileExpertKnowledge,RagExpertKnowledge} from './providers.js';
+import type {ExpertDefinitionSource,ExpertKnowledgeFactory,ExpertKnowledgeSource} from './providers.js';
+export * from './providers.js';
 
 interface ExpertPanelInput {
   action?: "list" | "ask" | "review" | "get_review" | "list_reviews";
@@ -43,7 +45,7 @@ interface ExpertPanelInput {
 
 interface ExpertRuntime {
   config: ExpertConfig;
-  knowledge: FileExpertKnowledge;
+  knowledge: ExpertKnowledgeSource;
 }
 
 interface ExpertPanelResult {
@@ -271,26 +273,25 @@ class ExpertPanel {
  * listing experts, running grounded panel asks, and creating/inspecting structured
  * expert review records.
  */
-export const plugin: MatbotPluginSpec = {
-  apiVersion: "0.1",
-  async setup(services) {
-    const config = await loadExpertConfig();
-    const reviewStore = createReviewStore(services);
-    const panel = new ExpertPanel(
-      services,
-      config.experts.map(expert => ({ config: expert, knowledge: new FileExpertKnowledge(expert) })),
-      reviewStore,
-      config.defaultProvider
-    );
-
-    await services.register?.("ExpertPanel", panel);
-    services.tools.register(createExpertPanelTool(panel));
-  }
-};
+export function createExpertPanelPlugin(options:{definitions?:ExpertDefinitionSource;knowledge?:ExpertKnowledgeFactory}={}):MatbotPluginSpec {
+ return {apiVersion:'0.1',async setup(services){
+  const definitions=options.definitions??new FileExpertDefinitionSource();const selected=process.env.CORTEX_EXPERT_KNOWLEDGE??'file';if(!options.knowledge&&!['file','workspace-rag'].includes(selected))throw new Error('Unknown expert knowledge source: '+selected);const knowledge=options.knowledge??(selected==='workspace-rag'?(expert=>new RagExpertKnowledge(expert,()=>services.WorkspaceRagManager)):fileExpertKnowledge);const reviewStore=createReviewStore(services);
+  let current:{version:string;panel:ExpertPanel}|undefined;let refresh:Promise<ExpertPanel>|undefined;
+  const snapshot=async()=>{
+   if(refresh)return refresh;
+   const run=(async()=>{const next=await definitions.snapshot();if(!current||current.version!==next.version)current={version:next.version,panel:new ExpertPanel(services,next.config.experts.map(expert=>({config:expert,knowledge:knowledge(expert)})),reviewStore,next.config.defaultProvider)};return current.panel;})();refresh=run;try{return await run;}finally{if(refresh===run)refresh=undefined;}
+  };
+  await snapshot();
+  services.contributions?.register('webui','experts',uiContribution);
+  await services.register?.('ExpertPanel',{list:async()=>(await snapshot()).list(),askPanel:async(input:Parameters<ExpertPanel['askPanel']>[0],ctx:ToolContext)=>(await snapshot()).askPanel(input,ctx),createReview:async(input:Parameters<ExpertPanel['createReview']>[0],ctx:ToolContext)=>(await snapshot()).createReview(input,ctx),getReview:async(id:string)=>(await snapshot()).getReview(id),listReviews:async(query?:StoreQuery)=>(await snapshot()).listReviews(query)});
+  services.tools.register(createExpertPanelTool(snapshot));
+ }};
+}
+export const plugin=createExpertPanelPlugin();
 
 export default plugin;
 
-function createExpertPanelTool(panel: ExpertPanel): Tool {
+function createExpertPanelTool(snapshot:()=>Promise<ExpertPanel>): Tool {
   return {
     name: "expert_panel",
     description:
@@ -352,6 +353,7 @@ function createExpertPanelTool(panel: ExpertPanel): Tool {
     },
     executor: {
       async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
+        const panel=await snapshot();
         const parsed = parseInput(input);
         if (parsed.action === "list") {
           yield {

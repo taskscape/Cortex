@@ -1,3 +1,5 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { PLUGIN_API_VERSION, tryCurrentPrincipal } from '@matatbread/matbot-plugin-api';
 import type {
@@ -1091,6 +1093,7 @@ export const plugin: MatbotPluginSpec = {
     description: 'Registers ContextGraph and context_graph_action for source-backed entity and relationship retrieval.',
   },
   async setup(services: MatbotMachine) {
+    services.contributions?.register('webui','graph',uiContribution);
     const graph = createContextGraph(services);
     await services.register('ContextGraph', graph);
     services.tools.register(createContextGraphTool(graph));

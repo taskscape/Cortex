@@ -1,6 +1,8 @@
 {
   "name": "@matatbread/matbot-source-registry",
-  "matbotRuntime": ["node"],
+  "matbotRuntime": [
+    "node"
+  ],
   "version": "0.1.0",
   "description": "Workspace-scoped source registry for provenance, freshness, citations, and source health.",
   "type": "module",
@@ -11,7 +13,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-plugin-api": "workspace:*"
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

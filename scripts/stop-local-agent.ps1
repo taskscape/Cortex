@@ -1,10 +1,19 @@
+param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
+    [int]$WebPort = 19778,
+    [switch]$SkipDocker
+)
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 $ErrorActionPreference = "Stop"
 
 # Port-based stopping must never force-kill an unrelated application that
 # happens to own one of these ports: verify the image name first.
 $expectedNames = @("node", "powershell", "pwsh", "docker-compose")
 
-foreach ($port in @(8877, 8878, 19778)) {
+$ports = @($WebPort,19779)
+if ($CapabilityProfile -eq 'compatibility') { $ports += @(8877,8878) }
+foreach ($port in $ports) {
     Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |
         ForEach-Object {
@@ -20,7 +29,7 @@ foreach ($port in @(8877, 8878, 19778)) {
         }
 }
 
-if (Get-Command docker -ErrorAction SilentlyContinue) {
+if (-not $SkipDocker -and $CapabilityProfile -ne 'minimal' -and (Get-Command docker -ErrorAction SilentlyContinue)) {
     $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
     $ComposeFile = Join-Path $Root "local-agent\docker\mem0\docker-compose.yml"
     docker compose -f $ComposeFile down --remove-orphans

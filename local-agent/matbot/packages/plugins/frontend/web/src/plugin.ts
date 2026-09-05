@@ -1,6 +1,6 @@
 import type { MatbotPluginSpec, MatbotMachine, Tool, ToolContext, ToolEvent, ToolRegistry } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION }                from '@matatbread/matbot-plugin-api';
-import { watchPlugins }                      from '@matatbread/matbot-core';
+import { createToolInvoker, watchPlugins }                      from '@matatbread/matbot-core';
 // Type import also brings the `SkillManager` augmentation of MatbotMachine into scope.
 import type { SkillManager }                 from '@matatbread/matbot-skills';
 import { createWebServer, defaultWebPrincipal, parseWebBranding } from './server.js';
@@ -68,10 +68,15 @@ export const plugin: MatbotPluginSpec = {
     if (!sessions) throw new Error('frontend-web requires services.sessions');
     const run = services.run;
     if (!run) throw new Error('frontend-web requires services.run');
-    const workspaceManager = services.get?.('WorkspaceManager' as never) as WorkspaceManager | undefined;
+
 
     webServer = createWebServer({
       store: sessions,
+      listProviders:()=>[...services.providers.values()].map(p=>({name:p.name})),
+      ...(services.contributions?{contributions:services.contributions}:{}),
+      invokeTool: createToolInvoker(services).invoke,
+      attachments:()=>services.AttachmentResolver,
+      expertSessions:()=>services.ExpertSessions,
       run,
       vault: services.Vault,
       loadPlugin:    services.loadPlugin.bind(services),
@@ -89,7 +94,7 @@ export const plugin: MatbotPluginSpec = {
       ...(services.workdir    !== undefined ? { workdir:    services.workdir    } : {}),
       ...(services.files      !== undefined ? { files:      services.files      } : {}),
       ...(services.configPath !== undefined ? { configPath: services.configPath } : {}),
-      ...(workspaceManager    !== undefined ? { workspaceManager } : {}),
+      getWorkspaceManager:()=>services.WorkspaceManager,
       // Per-process identity, minted here rather than derived from the pid so a client can compare it
       // across a restart without caring how the process was launched. The workspace is the config this
       // process actually loaded — not what the registry file claims is active.

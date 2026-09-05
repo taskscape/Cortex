@@ -1,4 +1,5 @@
 interface ToolContext {
+  approval?: { permission: string; patterns: readonly string[] };
   signal: AbortSignal;
 }
 
@@ -11,6 +12,7 @@ interface ToolExecutor {
 }
 
 interface Tool {
+  permission?: { action: string; patterns(input: unknown): string[]; requiresApproval(input: unknown): boolean };
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
@@ -22,6 +24,8 @@ interface ToolRegistry {
 }
 
 interface MatbotMachine {
+  FileAccessSelection?: {mode:"local"|"http"};
+  HostFileAccess?: Pick<FileBrokerClient, "health" | "list" | "read" | "write">;
   tools: ToolRegistry;
 }
 
@@ -42,6 +46,7 @@ type FileBrokerInput =
 export interface FileBrokerClientOptions {
   /** Base URL of the local file-broker service. */
   baseUrl: string;
+  token?: string;
 }
 
 /**
@@ -136,7 +141,8 @@ export class FileBrokerClient {
     try {
       response = await fetch(url, {
         method,
-        ...(options.body !== undefined ? { headers: { "content-type": "application/json" }, body: options.body } : {}),
+        headers:{...(options.body!==undefined?{"content-type":"application/json"}:{}),...(this.options.token?{"x-cortex-token":this.options.token}:{})},
+        ...(options.body !== undefined ? { body: options.body } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {})
       });
     } catch (error) {
@@ -168,9 +174,10 @@ export class FileBrokerClient {
  * @param client Configured client pointing at the local file-broker service.
  * @returns The registered tool descriptor.
  */
-export function createFileBrokerTool(client: FileBrokerClient): Tool {
+export function createFileBrokerTool(client: Pick<FileBrokerClient, "health" | "list" | "read" | "write">): Tool {
   return {
     name: "file_broker_action",
+    permission: { action: "file_broker_action", patterns(input) { const parsed = parseInput(input); return parsed.ok ? [parsed.value.action + ("path" in parsed.value ? ":" + parsed.value.path : "") ] : ["*"]; }, requiresApproval(input) { const parsed = parseInput(input); return parsed.ok && parsed.value.action === "write" && parsed.value.approved === true; } },
     description:
       "List, read, and write host filesystem paths through the local file-broker service. " +
       "Use this for exact host paths inside configured roots. Use contextual_search or file-index-backed retrieval to discover paths before reading them. " +
@@ -196,7 +203,7 @@ export function createFileBrokerTool(client: FileBrokerClient): Tool {
         approved: {
           type: "boolean",
           default: false,
-          description: "Set true only after explicit user approval for high-risk writes."
+          description: "Set true to request interactive approval for high-risk writes. The runtime obtains consent; this flag does not grant it."
         }
       }
     },
@@ -209,7 +216,7 @@ export function createFileBrokerTool(client: FileBrokerClient): Tool {
         }
 
         try {
-          yield { type: "result", value: await runAction(client, parsed.value, ctx.signal) };
+          yield { type: "result", value: await runAction(client, parsed.value, ctx) };
         } catch (error) {
           if (error instanceof FileBrokerRequestError) {
             yield { type: "error", message: error.message, code: error.status };
@@ -231,8 +238,10 @@ export function createFileBrokerTool(client: FileBrokerClient): Tool {
 export const plugin: MatbotPluginSpec = {
   apiVersion: "0.1",
   setup(services) {
-    const client = new FileBrokerClient({ baseUrl: fileBrokerBaseUrl() });
-    services.tools.register(createFileBrokerTool(client));
+    const client = new FileBrokerClient({ baseUrl: fileBrokerBaseUrl(),...(process.env.CORTEX_FILE_BROKER_TOKEN?{token:process.env.CORTEX_FILE_BROKER_TOKEN}:{}) });
+    const mode=services.FileAccessSelection?.mode??(services.HostFileAccess?'local':'http');
+    const backend=()=>{if(mode==='http')return client;const local=services.HostFileAccess;if(!local)throw new Error('Host file access unavailable; selected local adapter has unloaded');return local;};
+    services.tools.register(createFileBrokerTool({health:signal=>backend().health(signal),list:(p,signal)=>backend().list(p,signal),read:(p,signal)=>backend().read(p,signal),write:(p,content,approved,signal)=>backend().write(p,content,approved,signal)}));
   }
 };
 
@@ -242,7 +251,8 @@ function fileBrokerBaseUrl(): string {
   return process.env.FILE_BROKER_BASE_URL ?? `http://localhost:${process.env.FILE_BROKER_PORT ?? "8878"}`;
 }
 
-async function runAction(client: FileBrokerClient, input: FileBrokerInput, signal: AbortSignal): Promise<unknown> {
+async function runAction(client: Pick<FileBrokerClient, "health" | "list" | "read" | "write">, input: FileBrokerInput, ctx: ToolContext): Promise<unknown> {
+  const signal = ctx.signal;
   switch (input.action) {
     case "health":
       return client.health(signal);
@@ -251,7 +261,9 @@ async function runAction(client: FileBrokerClient, input: FileBrokerInput, signa
     case "read":
       return client.read(input.path, signal);
     case "write":
-      return client.write(input.path, input.content, input.approved === true, signal);
+      const approved = input.approved === true && ctx.approval?.permission === 'file_broker_action' && ctx.approval.patterns.includes('write:' + input.path);
+      if (input.approved && !approved) throw new Error('High-risk write requires runtime approval; input approved=true is not consent');
+      return client.write(input.path, input.content, approved, signal);
   }
 }
 

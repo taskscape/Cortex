@@ -1,3 +1,5 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type {
@@ -1095,6 +1097,7 @@ export function createEvaluationObservability(services: MatbotMachine): Evaluati
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   async setup(services) {
+    services.contributions?.register('webui','evaluation',uiContribution);
     const service = createEvaluationObservability(services);
     await services.register('Observability', service);
     services.tools.register(createEvaluationActionTool(service));

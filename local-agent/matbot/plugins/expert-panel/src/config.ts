@@ -11,10 +11,10 @@ import type { ExpertConfig, ExpertPanelConfig } from "./types.js";
  * @throws When the config is missing required fields, defines no experts, contains
  *         duplicate expert ids (case-insensitive), or a knowledge root is inaccessible.
  */
-export async function loadExpertConfig(): Promise<ExpertPanelConfig> {
-  const configPath = expertConfigPath();
+export async function loadExpertConfig(snapshot?: { configPath: string; text: string }): Promise<ExpertPanelConfig> {
+  const configPath = snapshot?.configPath ?? expertConfigPath();
   const configDir = path.dirname(configPath);
-  const parsed = JSON.parse(await readFile(configPath, "utf8")) as ExpertPanelConfig;
+  const parsed = JSON.parse(snapshot?.text ?? await readFile(configPath, "utf8")) as ExpertPanelConfig;
 
   if (!Array.isArray(parsed.experts) || parsed.experts.length === 0) {
     throw new Error(`Expert panel config must define at least one expert: ${configPath}`);
@@ -33,7 +33,7 @@ export async function loadExpertConfig(): Promise<ExpertPanelConfig> {
   };
 }
 
-function expertConfigPath(): string {
+export function expertConfigPath(): string {
   if (process.env.EXPERT_PANEL_CONFIG) {
     return path.resolve(process.env.EXPERT_PANEL_CONFIG);
   }

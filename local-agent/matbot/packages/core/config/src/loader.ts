@@ -3,6 +3,8 @@ import { parseYaml, type YamlMap, type YamlValue } from './yaml.js';
 
 /** Parsed contents of a `matbot.yaml` file (optionally merged over a base document). */
 export interface MatbotConfig {
+  permissions?:NonNullable<import('@matatbread/matbot-plugin-api').MatbotServices['ToolInvocationPolicy']>;
+  capabilityProfile?:'standard'|'minimal'|'compatibility';
   /** Ordered list of plugin specifiers to load at startup (npm names or URL paths) */
   plugins:    readonly string[];
   /** Named provider profiles, keyed by provider name. */
@@ -204,6 +206,8 @@ export function parseConfig(
 
   return {
     plugins,
+    ...(doc['permissions']!==undefined?{permissions:parseInvocationPolicy(doc['permissions'])}:{}),
+    ...(doc['capabilityProfile']!==undefined?{capabilityProfile:parseCapabilityProfile(doc['capabilityProfile'])}:{}),
     providers,
     ...(prompt           !== undefined ? { prompt           } : {}),
     ...(ephemeral        !== undefined ? { ephemeral        } : {}),
@@ -225,3 +229,10 @@ function toPrincipal(v: YamlValue | undefined): Principal | undefined {
   }
   throw new Error('Config: "principal" must be a string id or a mapping with a string "id" (and optional "type").');
 }
+
+function parseInvocationPolicy(value:YamlValue):NonNullable<MatbotConfig['permissions']>{
+ const raw=asRecord(value,'permissions');const action=(v:YamlValue|undefined)=>{if(v!=='allow'&&v!=='ask'&&v!=='deny')throw new Error('Invalid permission action');return v;};
+ const rules=raw['rules'];if(rules!==undefined&&!Array.isArray(rules))throw new Error('permissions.rules must be an array');
+ return {defaultAction:raw['defaultAction']===undefined?'allow':action(raw['defaultAction']),rules:(rules as YamlValue[]??[]).map(row=>{const rule=asRecord(row,'permission rule');return {permission:asString(rule['permission'],'permission'),pattern:asString(rule['pattern'],'pattern'),action:action(rule['action'])};})};
+}
+function parseCapabilityProfile(value:YamlValue):NonNullable<MatbotConfig['capabilityProfile']>{if(value==='standard'||value==='minimal'||value==='compatibility')return value;throw new Error('Unknown capabilityProfile');}

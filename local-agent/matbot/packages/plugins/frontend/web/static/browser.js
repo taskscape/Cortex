@@ -1,3 +1,6 @@
+import {prepareWorkspaceAttachments as resolveAttachments} from '@matatbread/matbot-tool-workspace/attachments';
+
+import { createToolInvoker } from '@matatbread/matbot-core';
 // In-process provider for the matbot web UI (browser bundle side).
 //
 // The browser counterpart of http-transport.js + server.ts: it sets `window.matbotTransport` to an
@@ -36,7 +39,7 @@ function makeInProcessTransport(services) {
   const statusListeners = new Set();
   const busyState = new Map();
   const busyTrackers = new Set();
-  const expertPanelBusySessions = new Set();
+  const expertSessions=()=>{if(!services.ExpertSessions)throw new Error('Expert session service unavailable');return services.ExpertSessions;};
   function updateBusy(sid) {
     const busy = run.status(sid).busy;
     if ((busyState.get(sid) ?? false) === busy) return;
@@ -53,51 +56,6 @@ function makeInProcessTransport(services) {
       : Promise.reject(new Error(`Non-interactive context (use submit for interactive prompts): "${typeof p === 'string' ? p : p.label}"`));
   };
 
-  async function prepareWorkspaceAttachments(rawAttachments) {
-    if (rawAttachments === undefined) return { refs: [], ephemeral: [] };
-    if (!Array.isArray(rawAttachments)) throw new Error('"attachments" must be an array.');
-    if (rawAttachments.length > 20) throw new Error('A message can attach at most 20 workspace files.');
-    if (rawAttachments.length > 0 && !services.files) {
-      throw new Error('Workspace file attachments are unavailable because no file store is configured.');
-    }
-
-    const refs = [];
-    const paths = new Set();
-    for (const raw of rawAttachments) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
-          raw.namespace !== 'workspace' || typeof raw.path !== 'string') {
-        throw new Error('Each attachment must identify a workspace file with { namespace: "workspace", path }.');
-      }
-      const path = raw.path;
-      if (!path.trim() || path.length > 1024) throw new Error('Attachment paths must contain 1 to 1024 characters.');
-      if (paths.has(path)) continue;
-      paths.add(path);
-
-      const handle = await services.files.getByName(path, 'workspace');
-      if (!handle) throw new Error(`Workspace attachment not found: ${JSON.stringify(path)}.`);
-      refs.push({ type: 'file-ref', fileId: handle.id, name: handle.name, mimeType: handle.mimeType });
-    }
-
-    if (!refs.length) return { refs, ephemeral: [] };
-    const calls = refs.map(ref =>
-      `- ${JSON.stringify(ref.name)}: workspace_action ${JSON.stringify({ action: 'read', path: ref.name })}`);
-    return {
-      refs,
-      ephemeral: [{
-        type: 'text',
-        origin: 'robo',
-        text: [
-          '[Explicit Cortex Files attachments]',
-          'The user explicitly attached the workspace files listed below to this message.',
-          'Read them with workspace_action using each exact path. They are imported workspace files, not host filesystem paths.',
-          'Prefer these attachments over same-named paths from Workspace RAG or other retrieved context. Do not use file_broker_action for these attachments.',
-          ...calls,
-          '[End explicit Cortex Files attachments]',
-        ].join('\n'),
-      }],
-    };
-  }
-
   function makeToolCtx(ac, invocation = {}) {
     const now = new Date().toISOString();
     const stubSession = {
@@ -110,7 +68,7 @@ function makeInProcessTransport(services) {
       callId:       crypto.randomUUID(),
       session:      invocation.session ?? stubSession,
       signal:       ac.signal,
-      vault:        services.vault,
+      vault:        services.Vault,
       loadPlugin:   services.loadPlugin.bind(services),
       unloadPlugin: services.unloadPlugin.bind(services),
       prompt:       nonInteractivePrompt,
@@ -121,115 +79,16 @@ function makeInProcessTransport(services) {
     };
   }
 
-  function normaliseExpertPanelBody(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, error: 'Request body must be an object.' };
-    const question = typeof value.question === 'string' ? value.question.trim() : '';
-    if (!question) return { ok: false, error: '"question" is required.' };
-    const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
-    if (!provider) return { ok: false, error: '"provider" is required.' };
-    const mode = value.mode === 'review' || value.mode === 'debate' || value.mode === 'parallel' ? value.mode : 'parallel';
-    let experts;
-    if (Object.prototype.hasOwnProperty.call(value, 'experts')) {
-      if (!Array.isArray(value.experts)) return { ok: false, error: '"experts" must be an array of expert ids.' };
-      experts = value.experts.filter(item => typeof item === 'string').map(item => item.trim()).filter(Boolean);
-    }
-    return {
-      ok: true,
-      body: {
-        question,
-        provider,
-        mode,
-        ...(experts !== undefined ? { experts } : {}),
-        ...(typeof value.synthesize === 'boolean' ? { synthesize: value.synthesize } : {}),
-        ...(typeof value.maxCitationsPerExpert === 'number' ? { maxCitationsPerExpert: value.maxCitationsPerExpert } : {}),
-        ...(typeof value.traceId === 'string' && value.traceId.trim() ? { traceId: value.traceId.trim() } : {}),
-      },
-    };
-  }
-
-  function expertUserSummary(question, selected, mode, synthesize) {
-    return [
-      `Expert panel (${mode})`,
-      `Experts: ${selected && selected.length ? selected.join(', ') : 'all'}`,
-      `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
-      '',
-      question,
-    ].join('\n');
-  }
-
-  function textValue(value, fallback = '') {
-    return typeof value === 'string' ? value : fallback;
-  }
-
-  function formatExpertPanelResult(result) {
-    const record = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
-    const lines = ['## Expert panel', `Mode: ${textValue(record.mode, 'parallel')}`];
-    const opinions = Array.isArray(record.experts) ? record.experts : [];
-    for (const rawOpinion of opinions) {
-      const opinion = rawOpinion && typeof rawOpinion === 'object' && !Array.isArray(rawOpinion) ? rawOpinion : {};
-      lines.push('', `### ${textValue(opinion.title, textValue(opinion.expertId, 'Expert'))}`, textValue(opinion.answer, '(No answer returned.)'));
-      const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
-      if (citations.length) {
-        lines.push('', 'Citations:');
-        for (const rawCitation of citations) {
-          const citation = rawCitation && typeof rawCitation === 'object' && !Array.isArray(rawCitation) ? rawCitation : {};
-          const title = textValue(citation.title, textValue(citation.id, textValue(citation.path, 'source')));
-          const path = typeof citation.path === 'string' && citation.path ? ` - ${citation.path}` : '';
-          lines.push(`- ${title}${path}`);
-        }
-      }
-    }
-    if (typeof record.synthesis === 'string' && record.synthesis) lines.push('', '### Synthesis', record.synthesis);
-    if (!opinions.length && !record.synthesis) lines.push('', 'No expert response was returned.');
-    return lines.join('\n');
-  }
-
-  function expertPanelUsage(result) {
-    const record = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
-    const opinions = Array.isArray(record.experts) ? record.experts : [];
-    let inputTokens = 0;
-    let outputTokens = 0;
-    for (const rawOpinion of opinions) {
-      const opinion = rawOpinion && typeof rawOpinion === 'object' && !Array.isArray(rawOpinion) ? rawOpinion : {};
-      const usage = opinion.usage && typeof opinion.usage === 'object' && !Array.isArray(opinion.usage) ? opinion.usage : {};
-      if (typeof usage.inputTokens === 'number') inputTokens += usage.inputTokens;
-      if (typeof usage.outputTokens === 'number') outputTokens += usage.outputTokens;
-    }
-    return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
-  }
-
-  function titleFromQuestion(question) {
-    const words = question.trim().split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
-    if (!words) return undefined;
-    return words.length > 60 ? `${words.slice(0, 60)}...` : words;
-  }
-
-  async function appendSessionMessages(sessionId, messages, shapeSession) {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const current = await services.sessions.get(sessionId);
-      if (!current) return null;
-      const shaped = shapeSession ? shapeSession(current) : current;
-      const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
-      const saved = await services.sessions.cas(sessionId, current.version, next);
-      if (saved.ok) return saved.doc;
-    }
-    const current = await services.sessions.get(sessionId);
-    if (!current) return null;
-    const shaped = shapeSession ? shapeSession(current) : current;
-    const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
-    await services.sessions.set(sessionId, next);
-    return next;
-  }
-
   // Two failure modes the UI depends on (see the plan's contract):
   //  - tool not installed → throw with "404"/"not found" so app.js offers the install banner.
   //  - any other failure  → throw without those substrings so app.js reports it instead.
-  async function callTool(name, input) {
+  async function callTool(name, input, options = {}) {
     const tool = services.tools.resolve(name);
     if (!tool) throw new Error(`Tool "${name}" not found (404)`);
     const ac = new AbortController();
     const ctx = makeToolCtx(ac);
-    for await (const ev of tool.executor.execute(input, ctx)) {
+    if (options.signal) ctx.signal = AbortSignal.any([ctx.signal, options.signal]);
+    for await (const ev of createToolInvoker(services).invoke(tool, input, ctx)) {
       if (ev.type === 'result') return ev.value;
       if (ev.type === 'error')  throw new Error(ev.message);
     }
@@ -269,7 +128,8 @@ function makeInProcessTransport(services) {
   // owns a tracker that drains its own view to idle, so statusEvents() emits the off transition even
   // when no sessionEvents consumer is attached.
   async function submit(sid, body) {
-    const preparedAttachments = await prepareWorkspaceAttachments(body.attachments);
+    if(!services.AttachmentResolver&&Array.isArray(body.attachments)&&body.attachments.length)throw new Error('Attachment resolver unavailable');
+    const preparedAttachments = await (services.AttachmentResolver?.resolve??resolveAttachments)(services.files,body.attachments);
     const contentArr = typeof body.content === 'string'
       ? [{ type: 'text', text: body.content }]
       : [body.content];
@@ -311,114 +171,7 @@ function makeInProcessTransport(services) {
     }
   }
 
-  async function submitExpertPanel(sid, rawBody) {
-    const normalised = normaliseExpertPanelBody(rawBody);
-    if (!normalised.ok) throw new Error(normalised.error);
-    const body = normalised.body;
-    const session = await services.sessions.get(sid);
-    if (!session) throw new Error('Session not found');
-    if (run.status(sid).busy || expertPanelBusySessions.has(sid)) throw new Error('Session is busy.');
-
-    const tool = services.tools.resolve('expert_panel');
-    if (!tool) throw new Error('Tool "expert_panel" not found (404)');
-
-    const traceId = body.traceId ?? crypto.randomUUID();
-    const synthesize = body.synthesize !== false;
-    const selectedExperts = body.experts && body.experts.length ? body.experts : undefined;
-    const input = {
-      action: 'ask',
-      question: body.question,
-      mode: body.mode ?? 'parallel',
-      synthesize,
-      maxCitationsPerExpert: body.maxCitationsPerExpert ?? 5,
-      ...(selectedExperts !== undefined ? { experts: selectedExperts } : {}),
-    };
-    const userContent = [{
-      type: 'text',
-      text: expertUserSummary(body.question, selectedExperts, input.mode, synthesize),
-    }];
-    const userMessage = createMessage({
-      role: 'user',
-      content: userContent,
-      traceId,
-      providerName: body.provider,
-      metadata: { expertPanel: { mode: input.mode, synthesize, experts: selectedExperts ?? 'all' } },
-    });
-
-    expertPanelBusySessions.add(sid);
-    const ac = new AbortController();
-    try {
-      let committed = await appendSessionMessages(sid, [userMessage], current => {
-        if (current.title || current.messages.some(message => message.role === 'user')) return current;
-        const title = titleFromQuestion(body.question);
-        return title ? { ...current, title } : current;
-      });
-      if (!committed) throw new Error('Session not found');
-
-      for (const inject of hub(sid)) inject({
-        type: 'queued',
-        content: userContent,
-        queued: 0,
-        concatQueue: false,
-        traceId,
-        rootTraceId: traceId,
-      });
-
-      let result;
-      let errorMessage;
-      const markers = [];
-      let stdout = '';
-      let stderr = '';
-
-      try {
-        for await (const ev of tool.executor.execute(input, makeToolCtx(ac, { session: committed, provider: body.provider }))) {
-          if (ev.type === 'result') result = ev.value;
-          else if (ev.type === 'stdout') stdout += ev.chunk;
-          else if (ev.type === 'stderr') stderr += ev.chunk;
-          else if (ev.type === 'marker') markers.push({ type: 'marker', creator: ev.creator, data: ev.data });
-          else if (ev.type === 'error') errorMessage = ev.message;
-        }
-      } catch (e) {
-        errorMessage = e instanceof Error ? e.message : String(e);
-      }
-
-      const assistantText = errorMessage
-        ? `Expert panel failed: ${errorMessage}`
-        : formatExpertPanelResult(result);
-      const assistantMessage = createMessage({
-        role: 'assistant',
-        content: [{ type: 'text', text: assistantText }],
-        traceId,
-        providerName: body.provider,
-        metadata: { expertPanel: { result, ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) } },
-      });
-      const messagesToAppend = [];
-      if (markers.length) messagesToAppend.push(createMessage({ role: 'marker', content: markers, traceId }));
-      messagesToAppend.push(assistantMessage);
-      committed = await appendSessionMessages(sid, messagesToAppend);
-      if (!committed) throw new Error('Session not found');
-
-      if (markers.length) {
-        for (const inject of hub(sid)) inject({ type: 'marker', content: markers, traceId });
-      }
-      for (const inject of hub(sid)) inject({ type: 'text-delta', delta: assistantText, traceId });
-      const usage = expertPanelUsage(result);
-      if (usage) {
-        for (const inject of hub(sid)) inject({ type: 'usage', ...usage, traceId });
-      }
-      for (const inject of hub(sid)) inject({ type: 'done', session: committed, traceId });
-
-      return {
-        traceId,
-        session: committed,
-        ...(result !== undefined ? { result } : {}),
-        ...(errorMessage !== undefined ? { isError: true, error: errorMessage } : { isError: false }),
-      };
-    } finally {
-      expertPanelBusySessions.delete(sid);
-      ac.abort();
-    }
-  }
+  async function submitExpertPanel(sid,rawBody){const ac=new AbortController();try{return await expertSessions().submit(sid,rawBody,makeToolCtx(ac),event=>{for(const inject of hub(sid))inject(event);});}finally{ac.abort();}}
 
   // One persistent per-session stream carrying ALL turn output, exactly like GET /events/sessions/:id:
   // the runner's events merged with the synthetic `prompt` events promptFn injects. `idle` is runner
@@ -570,6 +323,8 @@ function makeInProcessTransport(services) {
 
   return {
     hostRuntime: 'browser',
+    async listProviders(){return {providers:[...services.providers.values()].map(p=>({name:p.name}))};},
+    async uiContributions(){return (services.contributions?.list('webui')??[]).map(({id,owner,value})=>({id,owner,...value}));},
     callTool, createSession: createSessionFn, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
     listWorkspaces, createWorkspace, renameWorkspace, checkWorkspaceDelete, deleteWorkspace, switchWorkspace,
@@ -608,7 +363,7 @@ async function mountUI() {
 
   // 2. Body markup. Drop the Node-only <script src> tags (they'd 404 in the bundle, and innerHTML
   //    scripts don't execute anyway); app.js is injected as a live script below.
-  for (const s of doc.body.querySelectorAll('script[src="/app.js"], script[src="/http-transport.js"]')) s.remove();
+  for (const s of doc.body.querySelectorAll('script[src="/app.js"], script[src="/http-transport.js"], script[src="/feature-runtime.js"], script[src="/feature-fallbacks.js"]')) s.remove();
   document.getElementById('mb-loading')?.remove();
   document.body.innerHTML = doc.body.innerHTML;
 
@@ -617,6 +372,7 @@ async function mountUI() {
   for (const s of doc.head.querySelectorAll('script')) await runScript(s);
 
   // 4. app.js last — DOM, transport global, and libs all in place. It runs top-level and init()s.
+  for(const key of ['featureFallbacks','featureRuntime']){if(!assets[key])throw new Error('Missing browser feature assets: '+key);const script=document.createElement('script');script.textContent=assets[key];document.body.appendChild(script);}
   const appScript = document.createElement('script');
   appScript.textContent = assets.appJs;
   document.body.appendChild(appScript);

@@ -1,3 +1,9 @@
+import {settingsContributor,validateProviderPins} from '@matatbread/matbot-configuration-contributors';
+import {DEFAULT_DREAM_SETTINGS,DREAM_SETTINGS_KEY,validateDreamSettings} from './dream/types.js';
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
+import {searchRememberedFacts} from './recall.js';
+import type {} from '@matatbread/matbot-capabilities-types';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { MatbotPluginSpec, MatbotMachine } from '@matatbread/matbot-plugin-api';
 import { COGNITION_SKILLS, REMEMBER_CONDITIONS } from './skills.js';
@@ -164,7 +170,11 @@ The store is idempotent: a re-seed on restart keeps the existing data.
     },
 
     async setup(services) {
+    services.contributions?.register('webui','memory',uiContribution);
+    const pins=['innerVoiceProvider','dreamRankerProvider','dreamMergerProvider'];
+    services.contributions?.register('configuration','cognition',settingsContributor(services.settings(),{title:'Cognition',keys:[...pins,DREAM_SETTINGS_KEY],schema:{type:'object',properties:{innerVoiceProvider:{type:['string','null']},dreamRankerProvider:{type:['string','null']},dreamMergerProvider:{type:['string','null']},[DREAM_SETTINGS_KEY]:{type:'object'}}},validate(value){validateProviderPins(value,pins,services.providers);const dream=value[DREAM_SETTINGS_KEY];if(dream!==undefined&&(!dream||typeof dream!=='object'||Array.isArray(dream)))throw new Error('Dream settings must be an object');validateDreamSettings({...DEFAULT_DREAM_SETTINGS,...(dream as object??{})});}}));
       captured = services;
+      services.contributions?.register('retrieval','remembered_facts',{title:'Remembered facts',scope:'workspace',async search(query){query.signal.throwIfAborted();const matches=await searchRememberedFacts(services,[{term:query.query}]);query.signal.throwIfAborted();return matches.slice(0,query.limit).map(({fact})=>({id:fact.id,sourceId:'remembered_facts',workspaceId:query.workspaceId,content:'Remembered facts:\n- '+fact.fact,citation:{sessionId:fact.sessionId,messageId:fact.messageId}}));}});
       // Seed the remembered_facts store and its `remembered_facts_action` tool (written to by the
       // remember_fact tool). Idempotent — a re-seed on restart keeps the existing store's data.
       await defineStore(services, {

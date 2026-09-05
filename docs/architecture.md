@@ -2,54 +2,189 @@
 
 > Part of the [Cortex Local Agent documentation](../README.md).
 
-## Architecture At A Glance
+Cortex is a composition of a small host, a portable runtime, and selected capability
+plugins. This page describes the target responsibility boundaries established by
+the C1–C14 migration. The [migration guide](plugin-migration.md) maps each candidate
+to its implementation and documents compatibility, configuration and validation.
 
-Cortex is layered rather than monolithic.
+## Target architecture and boundaries
 
-| Layer | Responsibility | Main files/services |
+A capability belongs in a plugin when it has an independent reason to be enabled,
+a replaceable implementation, a resource lifecycle, or an optional product surface.
+Algorithms that share configuration, persistence and correctness invariants stay
+together under one owner. Supporting libraries and typed internal adapters remain
+appropriate where a separately configured plugin would add no useful boundary.
+
+```mermaid
+flowchart TD
+    Host[Node or browser host bootstrap] --> Boot[Initial workspace, config, storage and vault]
+    Host --> Registry
+    subgraph Runtime[Portable Matbot runtime]
+        Registry[Plugin loader, service and contribution registries]
+        Sessions[Session queue, provider loop, identity and hooks]
+        Invocation[Shared tool invocation and permission gate]
+        Sessions --> Invocation
+    end
+    Registry --> Frontends[CLI, Web, Telegram and DOM frontends]
+    Registry --> Domain[Workspace, files, experts, memory and governance capabilities]
+    Registry --> Adapters[Provider, storage, vault and retrieval adapters]
+    Frontends -->|conversation submissions| Sessions
+    Frontends -->|direct tool calls| Invocation
+    Invocation --> Domain
+    Domain -->|typed service calls| Adapters
+    Domain -->|owned UI and HTTP contributions| Frontends
+    Adapters --> External[Optional broker process, Mem0, PostgreSQL, Neo4j and GPU services]
+```
+
+Arrows describe composition and runtime interactions. Frontends, domain features
+and concrete adapters are all plugin families; the diagram does not require a
+separate process for each box. External service installation and supervision belong
+to the deployment scripts or Windows service host.
+
+### Responsibility boundaries
+
+| Owner | Responsibilities | Boundary |
 | --- | --- | --- |
-| Browser UI | Chat, provider picker, expert controls, files, skills, workspace switcher, workspace settings. | `local-agent\matbot\packages\plugins\frontend\web` |
-| Matbot runtime | Loads config, providers, plugins, stores, sessions, tools, hooks, and the WebUI server. | `local-agent\matbot`, active `matbot.yaml` |
-| Workspace manager | Selects, creates, renames, and switches Cortex workspaces. | `cortex-workspaces.json`, `workspaces\<id>` |
-| Provider layer | Converts Matbot messages/tools into model API requests. | `providers.openai-compat` |
-| Plugin layer | Adds capabilities such as sessions, skills, triggers, memory, RAG, expert panel, and workspace files. | `plugins:` in `matbot.yaml` |
-| Retrieval layer | Pulls context from remembered facts, KnowledgeIndex, Mem0, file-index, workspace RAG, and expert files. | `contextual_search`, `workspace_rag`, `expert_panel` |
-| Source/provenance layer | Tracks durable source ids, source versions, freshness, health, citation policy, and source access events. | `source-registry`, `source_action`, `SourceRegistry` |
-| Local services | Host-side indexing, host file access, and Mem0. | ports `8877`, `8878`, `8888` |
-| Persistence layer | Stores sessions, files, skills, facts, RAG indexes, and service data. | `.data`, Docker volumes, JSON stores |
+| Host bootstrap (`apps/cli`, `apps/web-bundle`) | Initial argv/env/config loading, workspace selection, provider/module resolution, boot defaults, runtime construction, restart and shutdown. | May construct a plugin package's boot helper before general plugin loading. Ongoing workspace CRUD, settings administration and conversation rendering belong to plugins. |
+| Portable runtime (`packages/core`) | Session queue, provider/tool loop, identity, cancellation, streaming, schema/permission enforcement, hooks, loading, service/contribution registries, settings/store facades and quiescence. | Supplies mechanisms and contracts. Domain policy, business workflows and concrete backends have capability owners. |
+| Capability plugins | Workspace lifecycle, host files/indexing, skills, cognition, sources/connectors, structured data, workflows, evaluation, graph, experts, configuration and diagnostics. | Own domain validation, state, resources, tools and optional presentation. Depend on typed services instead of importing the executable host. |
+| Frontend plugins | Conversation input/output, navigation, provider selection, transport, HTTP/SSE serving and mounting capability UI. | Delegate expert submissions to `ExpertSessions`, attachment interpretation to `AttachmentResolver`, and domain operations to the shared invocation path. HTTP inside the Web frontend remains valid. |
+| Concrete adapters and supporting libraries | LLM protocols, file services, persistence, vaults, memory sources, embeddings, reranking, source acquisition and semantic assistance. | Implement portable contracts using declared platform capabilities. Shared parsing/path/HTTP helpers do not need their own plugin lifecycle. |
+| Deployment/supervisor | Install/build, Docker startup, Windows service management and external process ownership. | Health contributors report capability availability. They do not acquire general process-control authority. |
 
-Default local endpoints:
+`MatbotRuntime` contains the fixed operations and registries. `MatbotServices`
+contains replaceable services, and `MatbotMachine` combines them for a plugin's
+`setup()`. See the [plugin API](../local-agent/matbot/packages/core/plugin-api/src/plugin.ts)
+and the [Matbot runtime overview](../local-agent/matbot/docs/ARCHITECTURE.md).
 
-| Service | Default URL | Backing code |
+### Contracts and dependency direction
+
+| Boundary | Contract and owner | Consumers |
 | --- | --- | --- |
-| File index | `http://localhost:8877` | `local-agent\file-index` |
-| File broker | `http://localhost:8878` | `local-agent\file-broker` |
-| Mem0 API | `http://localhost:8888` | `local-agent\docker\mem0` |
-| Cortex WebUI | `http://localhost:19778` | `local-agent\matbot\packages\plugins\frontend\web` |
+| Workspace lifecycle | `WorkspaceManager`, immutable `WorkspaceContext`, deletion participants in `workspace-manager-types`; implementation in `workspace-manager-node`. | Host bootstrap, `workspace-admin`, RAG and workspace-scoped memory adapters. |
+| Host files and indexing | `HostFileAccess` and `FileIndex` in `file-services-types`; selected local or remote implementation. | File tools, retrieval contributors and optional HTTP listeners. |
+| Multiple contributions | `ContributionRegistry` in the plugin API; `webui`, `http`, `configuration`, `retrieval` and `health` shapes in `capabilities-types`. | Frontend, configuration, federation and diagnostics plugins enumerate contributions by owner and lifetime. |
+| Retrieval and memory writes | `RetrievalFederation` and one federated `KnowledgeIndex`; a separately selected `MemoryWriteSink`. | `contextual_search`, knowledge consumers and memory producers. Writes go to the selected sink. |
+| Expert and attachment operations | `ExpertSessions`, expert definition/knowledge factories, and workspace `AttachmentResolver`. | HTTP/browser composer flows, expert tools and the runner's ephemeral input support. |
+| Persistence and secrets | Existing `StorageBackend`, `Store`, `FileStore`, `PluginSettings` and `Vault` interfaces. | Capability state owners; configuration administration invokes contributors rather than editing arbitrary namespaces. |
+
+The target dependency direction is host composition → concrete plugin/adapters →
+portable contracts and shared libraries. Consumers use contract packages and fresh
+service lookup, or `mounted.consume()` for derived state. No package may depend on
+`apps/` for its domain implementation. Runtime-neutral modules must stay free of
+Node filesystem/process APIs; platform entry points declare `matbotRuntime` and
+keep Node imports out of the browser graph. Existing Node adapters still accept
+environment configuration at their construction boundary.
+
+Compatibility exports in `core/tool-plugin` and `core/runner/src/single-turn.ts`
+remain for existing callers. The optional `runtime-admin` and `model-consultation`
+plugins own the corresponding product tools. Compatibility exports are not a
+reason to add new domain behavior to the runtime.
+
+### Authorization and lifecycle
+
+Model tool calls and direct HTTP/browser tool calls share
+[`executeToolInvocation`](../local-agent/matbot/packages/core/runner/src/tool-invocation.ts).
+It validates input, evaluates permissions, carries session/provider/principal
+context, applies call/result hooks and output limits, and propagates cancellation.
+The host installs a frozen invocation policy before plugins activate; a missing
+policy fails closed for host-bound direct calls. Noninteractive calls requiring
+consent return `approval_required`. File-tool `approved: true` requests runtime
+consent; the flag itself cannot supply that consent.
+
+Domain services retain their own resource checks: filesystem policy at file
+access, deletion reservations at workspace management, and evidence/publication
+rules inside RAG. Trusted in-process plugins can call services directly; the
+plugin registry is an ownership boundary, not a sandbox. Legacy approval-bearing
+broker HTTP clients remain responsible for obtaining consent, as described in the
+[compatibility contract](plugin-migration.md#invocation-ownership-and-removal).
+
+There is one active owner per singleton service, while multi-provider features
+use contribution collections. Registrations carry an owner, identity and abort
+signal. Failed setup/unload removes contributions and tools, aborts their
+lifetimes and calls teardown. Plugins must close their own watchers, queues,
+requests and other resources. Core swappable proxies follow replacements;
+captured arbitrary service objects require fresh lookup or mount observation.
+Explicit composition order remains necessary; the loader has no dependency solver.
+
+Feature owners supply their UI modules and fragments. The shared frontend mounts
+navigation and panels, removes them and cancels pending UI tool requests on unload,
+and returns to chat if an open feature disappears. Registered HTTP routes are
+restricted to `/api/...` and reject identity/method/path collisions. A plugin route
+that exposes a tool operation delegates to the same invocation gate.
+
+### State and consistency boundaries
+
+The installation workspace registry is separate from workspace data. Workspace
+selection happens before plugin loading, and `WorkspaceContext` describes the
+configuration actually running. A switch requests a host restart. Deletion
+reserves participating resource owners before registry/filesystem mutation; RAG
+purges its own derivatives. Pending cleanup remains visible for operator follow-up.
+
+Workspace files, configured RAG folders and the host file corpus have distinct
+scopes. Uploads are workspace artifacts; attaching one explicitly supplies
+ephemeral prompt context. Host-index results remain subject to current configured
+root/path policy even when the index is accessed in process. Memory and RAG queries
+carry the active workspace identity.
+
+Workspace RAG retains one collection → document → section → passage pipeline.
+Immutable original passages supply evidence; semantic summaries route retrieval.
+Reconciliation retains the prior publication when discovery or ingestion is
+incomplete. Publication and GC share ownership, protecting active/staging references
+and applying global-reference, grace-period and managed-storage rules. Expert
+source factories and RAG embedding/repository/source/semantic adapters are initially
+internal modules: replacing a backend requires coherent generations and a drain or
+restart, rather than an arbitrary mid-query swap.
+
+## Deployment and execution flow
+
+The [capability profile](../local-agent/matbot/apps/cli/src/capability-profiles.ts)
+composes the configured plugin list. `CORTEX_CAPABILITY_PROFILE` overrides YAML
+`capabilityProfile`; the default is `standard`.
+
+| Profile | Capability composition | Process boundary |
+| --- | --- | --- |
+| `standard` | Standard capability set plus configured plugins; local file services and federated retrieval. | File-index and file-broker run in process. External RAG/memory services are separate dependencies when selected. |
+| `compatibility` | Standard product capabilities with explicitly selected remote file adapters. | Launchers retain broker/index HTTP processes for existing clients. |
+| `minimal` | Configured plugins, host workspace bootstrap and the CLI frontend when interactive mode needs it. | No implicit administration tools, capability panels, broker/index processes or Docker startup. Selected plugins can still require external services. |
+
+| Endpoint | Default URL | When present |
+| --- | --- | --- |
+| Cortex WebUI | `http://localhost:19778` | The Node Web frontend is loaded. |
+| File index HTTP | `http://localhost:8877` | Compatibility deployment or an explicitly selected HTTP listener. |
+| File broker HTTP | `http://localhost:8878` | Compatibility deployment or an explicitly selected HTTP listener. |
+| Mem0 API | `http://localhost:8888` | A separately deployed Mem0 service used by its adapter. |
 
 Startup flow:
 
-1. `scripts\run.ps1` checks install/build state.
-2. It starts file-index, file-broker, and the Mem0/Postgres/Neo4j Docker stack unless skipped.
-3. It starts or restarts the Matbot WebUI process.
-4. Matbot finds `matbot.yaml`, then loads `cortex-workspaces.json`.
-5. The active workspace selects the actual `matbot.yaml` and `.env`.
-6. Matbot loads providers first, then plugins in configured order.
-7. Plugins register tools, services, stores, hooks, and the WebUI HTTP/SSE server.
-8. The browser connects to the WebUI and streams turns, tool calls, usage, and
-   timing events.
+1. The launcher checks install/build state and applies the selected process profile.
+   Standard/compatibility retain the external Docker stack unless skipped;
+   compatibility also starts broker/index HTTP services.
+2. The Node host resolves the initial config and installation registry, selects the
+   actual workspace config/secrets, and creates boot storage/vault defaults.
+3. The host installs identity, invocation policy and workspace context/bootstrap,
+   loads provider adapters and composes capability plugins in explicit order.
+4. Each plugin registers its owned tools, services, hooks and contributions.
+   Frontends discover current capabilities; later changes arrive through lifecycle
+   notifications. Choosing a profile does not rewrite every workspace YAML.
+5. The browser mounts the shared chat shell and installed feature contributions.
+   Read-only provider-name discovery works without the administration plugin.
+   Diagnostics enumerate selected capabilities rather than requiring fixed ports.
 
-Per-turn flow:
+Per-turn and direct-operation flow:
 
-1. The user sends a message in the WebUI.
-2. The frontend plugin appends it to the active session.
-3. Hooks and triggers may add context or fire side-effect tools.
-4. Workspace RAG may inject relevant markdown snippets.
-5. The provider adapter sends messages and available tools to the selected model.
-6. Tool calls run inside the Matbot tool layer and can query memory, RAG, files,
-   experts, or local services.
-7. The assistant response streams back to the WebUI with token and elapsed-time
-   summaries.
+1. A frontend submits a conversation to the per-session runner. Selected attachments
+   are resolved by the workspace capability for ephemeral injection.
+2. The runtime applies hooks/system context and calls the chosen provider adapter.
+   RAG and memory capabilities supply their configured context/retrieval behavior.
+3. Model tool requests pass through shared invocation before reaching a capability.
+   Direct UI tool requests enter the same gate without requiring a model decision.
+4. Capability tools call typed services; result hooks, output limits, traces and
+   streamed events apply at the invocation boundary. The runner persists the
+   conversation and continues the provider loop as needed.
+5. Expert composer submissions use `ExpertSessions` for busy-state handling,
+   session appends and shared invocation of `expert_panel`; transports adapt the
+   operation rather than owning expert-review semantics.
 
 Persistence is deliberately split:
 
@@ -62,8 +197,9 @@ Persistence is deliberately split:
 | Source registry records, versions, health events, and access events | One Cortex workspace through Matbot stores | `sources`, `source_versions`, `source_health_events`, `source_access_events` |
 | Traces, spans, evaluation suites/runs/scores, ROI baselines, and verified outcomes | One Cortex workspace through Matbot stores | `observability_traces`, `observability_spans`, `observability_events`, `evaluation_suites`, `evaluation_runs`, `evaluation_scores`, `roi_baselines`, `outcome_events` |
 | Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
-| Workspace RAG V2 catalog, lexical evidence, vectors, jobs, and traces | Cortex local Docker stack | Postgres/pgvector `workspace_rag_v2` schema and dimension-specific derivative tables |
-| File-index data | Host service | `local-agent\file-index\data\index.json` |
+| Workspace RAG V2 catalog, lexical evidence, vectors, jobs, and traces | Workspace/context identities within the shared database | Postgres/pgvector `workspace_rag_v2` schema and dimension-specific derivative tables |
+| File-index data | Configured host corpus, owned by the selected index service | `local-agent\file-index\data\index.json` or `FILE_INDEX_STORE` |
+| Configuration change history | Workspace store, attributed to each contributor | Redacted pre-change records in `configuration_history`; secrets remain in the vault |
 | Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
 
 The implemented scale-out design for million-document corpora and exceptional
@@ -87,26 +223,29 @@ of these things:
 - stores and generated CRUD tools;
 - hooks that observe or modify turn behavior;
 - provider adapters;
-- frontend surfaces such as the WebUI server.
+- frontend surfaces such as the WebUI server;
+- owned UI/HTTP, retrieval, configuration and health contributions.
 
-Plugins are loaded from the active workspace's `plugins:` list. The order matters
-because later plugins can depend on services registered by earlier plugins. In
-the default config, `hybrid-knowledge-index` registers `KnowledgeIndex` before
-`rumsfeld` exposes `contextual_search`, and the frontend loads last so its plugin
-catalog reflects the fully initialized runtime.
+Plugins are selected by the active workspace's `plugins:` list and capability
+profile. Order matters for required dependencies; optional dependencies use fresh
+lookup or mount notifications. Standard composition gives `retrieval-federation`
+ownership of `KnowledgeIndex` and registers file, memory and domain retrieval
+sources separately. The frontend observes installed owners and can handle features
+loading later. Missing required services prevent activation or make the affected
+operation unavailable with an explicit error.
 
 There are three common plugin categories in this repository:
 
 | Category | Examples | Pattern |
 | --- | --- | --- |
 | Capability plugins | `sessions`, `skills`, `triggers`, `cognition`, `workspace` | Add tools, stores, hooks, or runtime services. |
-| Retrieval/access plugins | `hybrid-knowledge-index`, `file-broker`, `source-registry`, `connector-fabric`, `context-graph`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, connector policy/audit, source-backed graph facts, and policy-aware host-file access. |
+| Retrieval/access plugins | `retrieval-federation`, `memory-local`, `memory-mem0`, `file-index`, `file-broker`, `source-registry`, `connector-fabric`, `context-graph`, `workspace-rag`, `rumsfeld`, `expert-panel` | Provide context, grounded answers, source provenance, connector policy/audit, source-backed graph facts, and policy-aware host-file access. |
 | Host/UI plugins | `frontend/web`, `providers/openai-compat` | Connect the runtime to users and models. |
 
-Bundled plugins may exist in the tree without being active. They become active
-only when listed in the active workspace's `matbot.yaml`. That distinction is
-important when debugging errors like `workspace_rag plugin unavailable`: the code
-can exist on disk while the running workspace did not load it.
+Bundled availability and runtime activation are separate. A plugin becomes active
+through profile/configuration selection or explicit runtime loading, and setup can
+fail even when its code is present. Use runtime diagnostics and the plugin catalog
+to distinguish a missing selection, failed setup and an unavailable dependency.
 
 ### Strategic Architecture Progress
 
@@ -633,15 +772,22 @@ problems:
 
 | Pattern | Scope | Best for | Implementation |
 | --- | --- | --- | --- |
-| Host file index | Configured host roots | Broad project file search and metadata. | `file-index`, `hybrid-knowledge-index` |
-| File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `file-broker` service, `file_broker_action` tool |
+| Host file index | Configured host roots | Broad project file search and metadata. | `FileIndex`, `file-index-admin` retrieval contribution, `retrieval-federation` |
+| File broker | Configured host roots | Safe host file reads/writes with policy and backups. | `HostFileAccess` or explicit HTTP adapter, `file_broker_action` tool |
 | Workspace RAG | One Cortex workspace | Grounding every conversation in selected markdown folders. | `workspace-rag` |
 | Source registry | One Cortex workspace | Stable source ids, versions, freshness, health, citations, and retrieval provenance. | `source-registry` |
 | Context graph | One Cortex workspace | Source-backed entity relationships and multi-hop graph retrieval with ACL filtering. | `context-graph` |
 | Remembered facts | One Cortex workspace | Explicit durable memory such as names and preferences. | `cognition` stores |
-| Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills`, `KnowledgeIndex` |
+| Skills as knowledge | One Cortex workspace | Reusable operating procedures and assistant behavior. | `skills` retrieval contribution, federated `KnowledgeIndex` |
 | Expert knowledge roots | One expert definition | Isolated domain expertise. | `expert-panel` |
-| Mem0 | Shared service with workspace-scoped user ids | External memory service integration without cross-workspace recall. | `hybrid-knowledge-index` |
+| Local memory adapter | One Cortex workspace | Persistent knowledge without a remote memory dependency. | `memory-local`, selected `MemoryWriteSink` |
+| Mem0 | Shared service with workspace-scoped user ids | External memory service integration without cross-workspace recall. | `memory-mem0`, selected `MemoryWriteSink` |
+
+Standard/compatibility profiles translate legacy `hybrid-knowledge-index` selection
+into Mem0 plus file retrieval behind federation without changing the existing Mem0
+workspace IDs. The legacy implementation remains available to explicit minimal
+deployments. Federation reports failed sources as partial results and keeps memory
+writes directed to one selected sink.
 
 The high-level rule is:
 

@@ -54,6 +54,8 @@ function nextVersion(): string {
  * @param namespace - The plugin's settings namespace (slugged to a document id).
  * @returns A get/set/delete view scoped to that namespace.
  */
+// Serialize first-write initialization across facades sharing this runtime's store.
+const settingsQueues = new WeakMap<object,Map<string,Promise<unknown>>>();
 export function makePluginSettings(store: Store<SettingsDoc>, namespace: string): PluginSettings {
   const id = slugSettingsNamespace(namespace);
 
@@ -71,11 +73,24 @@ export function makePluginSettings(store: Store<SettingsDoc>, namespace: string)
     return { id, version: '0', data: raw as unknown as Record<string, unknown> };
   };
 
+  const queues = settingsQueues.get(store) ?? new Map<string,Promise<unknown>>(); settingsQueues.set(store,queues);
+  const serial = async <T>(operation:()=>Promise<T>):Promise<T> => {
+    const previous=queues.get(id)??Promise.resolve();const next=previous.catch(()=>{}).then(operation);queues.set(id,next);
+    try{return await next;}finally{if(queues.get(id)===next)queues.delete(id);}
+  };
   return {
+    async snapshot(){return serial(async()=>{const doc=await getDoc();return {version:doc?.version??'absent',data:structuredClone(doc?.data??{})};});},
+    async replace(data,expectedVersion){return serial(async()=>{
+      const doc=await getDoc();if((doc?.version??'absent')!==expectedVersion)throw new Error('Configuration conflict; reload before editing');
+      const next={id,version:crypto.randomUUID(),data:structuredClone(data)};
+      if(doc===null||doc.version==='0')await store.set(id,next);
+      else if(!(await store.cas(id,doc.version,next)).ok)throw new Error('Configuration conflict; reload before editing');
+      return {version:next.version,data:structuredClone(next.data)};
+    });},
     async get<T>(key: string): Promise<T | undefined> {
       return (await getDoc())?.data[key] as T | undefined;
     },
-    async set<T>(key: string, value: T): Promise<void> {
+    async set<T>(key: string, value: T): Promise<void> { return serial(async()=>{
       for (let attempt = 0; ; attempt++) {
         const doc  = await getDoc();
         const data = { ...(doc?.data ?? {}), [key]: value as unknown };
@@ -89,8 +104,8 @@ export function makePluginSettings(store: Store<SettingsDoc>, namespace: string)
         }
         await new Promise(resolve => setTimeout(resolve, attempt * 5));
       }
-    },
-    async delete(key: string): Promise<void> {
+    });},
+    async delete(key: string): Promise<void> { return serial(async()=>{
       for (let attempt = 0; ; attempt++) {
         const doc = await getDoc();
         if (doc === null) return;
@@ -105,6 +120,6 @@ export function makePluginSettings(store: Store<SettingsDoc>, namespace: string)
         }
         await new Promise(resolve => setTimeout(resolve, attempt * 5));
       }
-    },
+    });},
   };
 }

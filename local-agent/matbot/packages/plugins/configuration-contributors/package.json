@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-configuration-contributors",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

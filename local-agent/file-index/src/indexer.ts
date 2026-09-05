@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { evaluateAccess, normalizeWindowsPath, type SecurityPolicy, type WorkspaceConfig } from "@local-agent/paths";
+import { evaluateAccess, evaluateRealAccess, normalizeWindowsPath, type SecurityPolicy, type WorkspaceConfig } from "@local-agent/paths";
 import { isExcluded, isExcludedDirectory } from "./exclusions.js";
 import { chunkText, extractText, isIndexableTextFile } from "./extract.js";
 import { fileLevelSecret, redactSecrets } from "./secrets.js";
@@ -78,7 +78,7 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
         continue;
       }
 
-      const decision = evaluateAccess(filePath, "read", options.workspaces, options.policy);
+      const decision = await evaluateRealAccess(filePath, "read", options.workspaces, options.policy);
 
       if (!decision.allowed) {
         skipped.push({ path: filePath, reason: decision.reason ?? "denied-by-security-policy" });
@@ -164,6 +164,10 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
     }
   }
 
+  // A failed scan does not prove a deletion. Retain prior authorized chunks for unreadable subtrees.
+  const failed=skipped.filter(item=>/^unreadable-(file|directory):/.test(item.reason)).map(item=>normalizeWindowsPath(item.path).canonicalPath);
+  const present=new Set(nextChunks.map(chunk=>chunk.id));
+  for(const chunk of existing.chunks){if(present.has(chunk.id)||!failed.some(root=>isWithinRoot(chunk.canonicalPath,root)))continue;const decision=await evaluateRealAccess(chunk.path,'read',options.workspaces,options.policy);if(decision.allowed&&!decision.highRisk){nextChunks.push(chunk);present.add(chunk.id);}}
   const outsideRoot = existing.chunks.filter(chunk => {
     return !isWithinRoot(chunk.canonicalPath, rootCanonical);
   });

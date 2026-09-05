@@ -1,6 +1,8 @@
 {
   "name": "@matatbread/matbot-workspace-rag",
-  "matbotRuntime": ["node"],
+  "matbotRuntime": [
+    "node"
+  ],
   "version": "0.1.0",
   "description": "Workspace-scoped markdown RAG ingestion, local vector search, and automatic conversation context.",
   "type": "module",
@@ -12,7 +14,9 @@
   },
   "dependencies": {
     "@matatbread/matbot-plugin-api": "workspace:*",
-    "pg": "^8.22.0"
+    "pg": "^8.22.0",
+    "@matatbread/matbot-workspace-manager-types": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

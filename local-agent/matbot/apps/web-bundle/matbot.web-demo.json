@@ -1,10 +1,10 @@
 {
   "_comment": "Demo browser bundle: the minimal 455-line frontend/dom demonstrator (kept untouched). Built via `npm run assemble:demo` -> dist/matbot-demo.html. The rich, full-featured UI is the default matbot.web.json instead.",
-
   "output": "matbot-demo.html",
-
   "plugins": [
     "packages/plugins/browser",
+    "packages/plugins/runtime-admin",
+    "packages/plugins/model-consultation",
     "packages/plugins/frontend/dom",
     "packages/plugins/http",
     "packages/plugins/ask-user",
@@ -14,9 +14,7 @@
     "packages/plugins/rumsfeld",
     "packages/plugins/json-validation"
   ],
-
   "providers": {},
-
   "providerModules": [
     {
       "label": "Anthropic Messages API (Claude, DeepSeek /anthropic)",
@@ -31,6 +29,12 @@
       "modelHint": "deepseek-chat"
     }
   ],
-
-  "defaultProvider": null
+  "defaultProvider": null,
+  "bundledPlugins": [
+    "packages/plugins/configuration-admin",
+    "packages/plugins/runtime-diagnostics",
+    "packages/plugins/expert-panel-session",
+    "packages/plugins/retrieval-federation",
+    "packages/plugins/memory-local"
+  ]
 }

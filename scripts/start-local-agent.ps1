@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
     [switch]$SkipDocker,
     [switch]$SkipBuild,
     [switch]$SkipCudaIngestion,
@@ -8,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ComposeFile = Join-Path $Root "local-agent\docker\mem0\docker-compose.yml"
 $DockerEnvFile = Join-Path (Split-Path $ComposeFile) ".env"
@@ -176,7 +179,7 @@ if (-not $SkipBuild) {
     Invoke-CheckedCommand npm @("run", "build")
 }
 
-if (-not $SkipDocker) {
+if (-not $SkipDocker -and $CapabilityProfile -ne 'minimal') {
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         if (Test-CudaIngestionAvailable) {
             Write-Host "CUDA-capable Docker runtime detected. Starting Mem0 stack with workspace-rag CUDA embeddings."
@@ -221,6 +224,7 @@ if (-not $env:MEM0_BASE_URL) {
 
 New-Item -ItemType Directory -Force -Path "local-agent\logs" | Out-Null
 
+if ($CapabilityProfile -eq 'compatibility') {
 if (Test-PortListening 8877) {
     Write-Host "File index already listening on http://localhost:8877"
 }
@@ -243,6 +247,8 @@ else {
         -WindowStyle Hidden `
         -RedirectStandardOutput "local-agent\logs\file-broker.out.log" `
         -RedirectStandardError "local-agent\logs\file-broker.err.log"
+}
+
 }
 
 if ($MatbotCommand) {
@@ -276,11 +282,13 @@ if ($MatbotCommand) {
 }
 
 Write-Host "Local agent services requested."
-Write-Host "File index:  http://localhost:8877"
-Write-Host "File broker: http://localhost:8878"
+if ($CapabilityProfile -eq 'compatibility') {
+    Write-Host "File index:  $env:FILE_INDEX_BASE_URL"
+    Write-Host "File broker: $env:FILE_BROKER_BASE_URL"
+} else { Write-Host "Host files and indexing use selected in-process plugins ($CapabilityProfile)." }
 Write-Host "Mem0:        $env:MEM0_BASE_URL"
 Write-Host "Postgres:    $($env:CORTEX_RAG_POSTGRES_HOST):$($env:CORTEX_RAG_POSTGRES_PORT)/$($env:CORTEX_RAG_POSTGRES_DB)"
 $ragCudaUrl = if ($env:CORTEX_RAG_CUDA_EMBEDDING_URL) { $env:CORTEX_RAG_CUDA_EMBEDDING_URL } else { "disabled" }
 Write-Host "RAG CUDA:    $ragCudaUrl"
-Write-Host "Hybrid KnowledgeIndex plugin: local-agent\matbot\plugins\hybrid-knowledge-index\dist\index.js"
+Write-Host "Retrieval: selected source plugins and retrieval-federation"
 Write-Host "Workspace policy: local-agent\config\workspaces.json"

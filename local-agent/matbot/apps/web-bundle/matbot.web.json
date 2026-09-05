@@ -1,18 +1,18 @@
 {
   "_comment": "Browser matbot config (the matbot.yaml analogue, as JSON so the node assembler needs no YAML parser). Plugin entries are repo-relative package paths; the assembler resolves them to inlined modules (preferring each package's `browser` export condition). `plugins` is the AUTO-LOAD core (loaded at boot) — kept minimal, mirroring node where only configured plugins load. `bundledPlugins` are baked into the artifact and the import map but NOT auto-loaded: they're offered via the browser `plugin` tool's discover and loaded on demand by package name, which (being baked) persists across reloads with no network. `providers` is intentionally empty — the browser asks for the full provider config at first startup and persists it. `providerModules` are the adapters the wizard offers. `assets` are raw files baked verbatim for the in-process frontend to inject. This is the default, full-featured UI (frontend/web's browser entry, sharing index.html + app.js with the Node server); the minimal demonstrator is matbot.web-demo.json.",
-
   "output": "matbot.html",
-
   "assets": {
     "scaffold": "packages/plugins/frontend/web/static/index.html",
-    "appJs": "packages/plugins/frontend/web/static/app.js"
+    "appJs": "packages/plugins/frontend/web/static/app.js",
+    "featureRuntime": "packages/plugins/frontend/web/static/feature-runtime.js",
+    "featureFallbacks": "packages/plugins/frontend/web/static/feature-fallbacks.js"
   },
-
   "plugins": [
     "packages/plugins/browser",
+    "packages/plugins/runtime-admin",
+    "packages/plugins/model-consultation",
     "packages/plugins/frontend/web"
   ],
-
   "bundledPlugins": [
     "packages/plugins/http",
     "packages/plugins/ask-user",
@@ -29,11 +29,14 @@
     "packages/plugins/json-validation",
     "packages/plugins/tool-store",
     "packages/plugins/cognition",
-    "packages/plugins/storage/google-drive"
+    "packages/plugins/storage/google-drive",
+    "packages/plugins/configuration-admin",
+    "packages/plugins/runtime-diagnostics",
+    "packages/plugins/expert-panel-session",
+    "packages/plugins/retrieval-federation",
+    "packages/plugins/memory-local"
   ],
-
   "providers": {},
-
   "providerModules": [
     {
       "label": "Anthropic Messages API (Claude, DeepSeek /anthropic)",
@@ -54,6 +57,5 @@
       "selfContained": true
     }
   ],
-
   "defaultProvider": null
 }

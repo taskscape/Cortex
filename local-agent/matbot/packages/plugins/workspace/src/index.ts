@@ -1,3 +1,6 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
+import {workspaceAttachmentResolver} from './attachments.js';
 import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 
@@ -205,4 +208,6 @@ const workspaceTool: Tool = {
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   tools: [workspaceTool],
+  async setup(services){
+    services.contributions?.register('webui','files',uiContribution);await services.register('AttachmentResolver',workspaceAttachmentResolver);},
 };

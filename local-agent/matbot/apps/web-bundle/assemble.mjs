@@ -6,7 +6,7 @@
 // module wiring happens in the browser at load time (see src/loader.js). The output runs from a
 // file:// URL or any static host with no server, no build cache, and no network.
 
-import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, access } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -16,7 +16,7 @@ const localRequire = createRequire(import.meta.url);
 // Build-time type stripper: sucrase (pure JS — no native binary, no postinstall, invisible to anyone
 // installing matbot). Used per-module so each stays a separate module the import map wires up.
 const stripTypes = (src, filePath) =>
-  localRequire('sucrase').transform(src, { transforms: ['typescript'], filePath, preserveDynamicImport: true }).code;
+  localRequire('sucrase').transform(src, { transforms: ['typescript'], filePath, preserveDynamicImport: true, disableESTransforms: true }).code;
 
 const here     = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../..');
@@ -59,6 +59,11 @@ async function buildNameMap() {
       const entry = resolveExportsEntry(pkg.exports);
       if (pkg.name && typeof entry === 'string') {
         map[pkg.name] = idOf(path.join(repoRoot, rel, entry));
+        for (const [subpath, target] of Object.entries(typeof pkg.exports === 'object' ? pkg.exports : {})) {
+          if (!subpath.startsWith('./')) continue;
+          const subentry = resolveExportsEntry(target);
+          if (subentry) map[pkg.name + subpath.slice(1)] = idOf(path.join(repoRoot, rel, subentry));
+        }
       }
     } catch { /* no/invalid package.json */ }
   }
@@ -80,13 +85,14 @@ async function entryForPath(rel) {
 const SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"]+)\1/g;
 const isRelative = (s) => s.startsWith('./') || s.startsWith('../');
 
-function resolveRel(importerId, spec, sources) {
+async function resolveRel(importerId, spec, sources) {
   const dir   = importerId.slice(0, importerId.lastIndexOf('/'));
   const parts = (dir + '/' + spec).split('/');
   const out   = [];
   for (const p of parts) { if (p === '' || p === '.') continue; if (p === '..') out.pop(); else out.push(p); }
   let id = '/' + out.join('/');
   if (sources[id] === undefined && id.endsWith('.js')) {
+    try { await access(absOf(id)); return id; } catch {}
     const tsId = id.slice(0, -3) + '.ts';
     return tsId;
   }
@@ -106,13 +112,13 @@ async function collect(rootIds, nameMap) {
 
     let src;
     try { src = await readFile(absOf(id), 'utf8'); }
-    catch { console.warn(`[assemble] missing source: ${id}`); continue; }
+    catch { throw new Error(`[assemble] missing source: ${id}`); }
     sources[id] = src;
 
-    for (const m of src.matchAll(SPEC_RE)) {
+    for (const m of stripTypes(src, id).matchAll(SPEC_RE)) {
       const spec = m[2];
       if (isRelative(spec)) {
-        queue.push(resolveRel(id, spec, sources));
+        queue.push(await resolveRel(id, spec, sources));
       } else if (nameMap[spec] !== undefined) {
         usedNames[spec] = nameMap[spec];
         queue.push(nameMap[spec]);

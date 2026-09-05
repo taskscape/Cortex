@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
     [string]$ServiceName = "CortexLocalAgent",
     [string]$DisplayName = "Cortex Local Agent",
     [string]$Description = "Runs Cortex local-agent services and the Matbot WebUI under a Windows service wrapper.",
@@ -20,6 +22,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ServiceDir = Join-Path $Root "local-agent\service"
@@ -108,7 +111,7 @@ elseif (-not (Test-Path -LiteralPath $WrapperExe)) {
 Unblock-File -LiteralPath $WrapperExe -ErrorAction SilentlyContinue
 
 $powershell = (Get-Command "powershell.exe" -ErrorAction Stop).Source
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Runner`" -WebPort $WebPort"
+$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Runner`" -WebPort $WebPort -CapabilityProfile $CapabilityProfile"
 if ($SkipDocker) {
     $arguments += " -SkipDocker"
 }

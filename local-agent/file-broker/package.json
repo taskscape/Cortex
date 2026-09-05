@@ -11,5 +11,10 @@
   "dependencies": {
     "@local-agent/http-utils": "0.1.0",
     "@local-agent/paths": "0.1.0"
-  }
+  },
+  "exports": {
+    ".": "./dist/service.js",
+    "./http": "./dist/http-server.js"
+  },
+  "types": "./dist/service.d.ts"
 }

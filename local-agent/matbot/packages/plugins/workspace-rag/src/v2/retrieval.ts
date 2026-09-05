@@ -1,3 +1,5 @@
+import {createHttpReranker} from '../adapters/reranker.js';
+import type {RagV2Reranker} from '../adapters/reranker.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { detectPassageLanguage } from './language.js';
 import { RagV2ColbertAdapter } from './late-interaction.js';
@@ -37,16 +39,14 @@ export interface RetrievalOptions {
   iterative?: boolean;
 }
 
-interface RerankResponse {
-  model?: string;
-  scores: number[];
-}
+
 
 interface RetrievalDependencies {
   repository: RagV2Repository;
   objectStore: RagV2ObjectStore;
   embedder: RagV2Embedder;
   rerankerUrl?: string;
+  reranker?: RagV2Reranker;
   rrfK?: number;
   rrfWeights?: Record<string, number>;
   colbertUrl?: string;
@@ -258,45 +258,7 @@ export function reciprocalRankFusion(
     || right.retrieverScore - left.retrieverScore);
 }
 
-async function rerank(
-  url: string,
-  query: string,
-  hits: readonly RagV2RankedHit[],
-  callerSignal?: AbortSignal,
-): Promise<RerankResponse> {
-  const timeout = AbortSignal.timeout(5_000);
-  const signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;
-  const response = await fetch(new URL('/rerank', url), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ query, texts: hits.map(hit => hit.text), truncate: true }),
-    signal,
-  });
-  if (!response.ok) throw new Error(`Workspace RAG V2 reranker returned HTTP ${response.status}.`);
-  const body = await response.json() as unknown;
-  if (Array.isArray(body)) {
-    const scores = new Array<number>(hits.length).fill(0);
-    for (const value of body) {
-      if (!value || typeof value !== 'object') continue;
-      const item = value as Record<string, unknown>;
-      const index = Number(item['index']);
-      const score = Number(item['score']);
-      if (Number.isInteger(index) && index >= 0 && index < scores.length && Number.isFinite(score)) scores[index] = score;
-    }
-    return { scores };
-  }
-  if (body && typeof body === 'object') {
-    const value = body as Record<string, unknown>;
-    const scores = Array.isArray(value['scores']) ? value['scores'].map(Number) : [];
-    if (scores.length === hits.length && scores.every(Number.isFinite)) {
-      return {
-        ...(typeof value['model'] === 'string' ? { model: value['model'] } : {}),
-        scores,
-      };
-    }
-  }
-  throw new Error('Workspace RAG V2 reranker returned an unsupported response.');
-}
+
 
 function needsNeighbour(text: string): boolean {
   const trimmed = text.trim();
@@ -462,6 +424,7 @@ export class RagV2RetrievalEngine {
   private readonly objectStore: RagV2ObjectStore;
   private readonly embedder: RagV2Embedder;
   private readonly rerankerUrl: string | undefined;
+  private readonly reranker: RagV2Reranker | undefined;
   private readonly onLazySection: RetrievalDependencies['onLazySection'];
   private readonly rrfK: number;
   private readonly rrfWeights: Record<string, number>;
@@ -473,6 +436,7 @@ export class RagV2RetrievalEngine {
     this.objectStore = dependencies.objectStore;
     this.embedder = dependencies.embedder;
     this.rerankerUrl = dependencies.rerankerUrl;
+    this.reranker=dependencies.reranker??(dependencies.rerankerUrl?createHttpReranker(dependencies.rerankerUrl):undefined);
     this.onLazySection = dependencies.onLazySection;
     this.rrfK = dependencies.rrfK ?? 60;
     this.rrfWeights = dependencies.rrfWeights ?? {};
@@ -789,11 +753,11 @@ export class RagV2RetrievalEngine {
       timings['candidate_retrieval_ms'] = elapsed(candidateStarted);
 
       let ranked = fused;
-      if (useReranker && this.rerankerUrl && fused.length > 0) {
+      if (useReranker && this.reranker && fused.length > 0) {
         const rerankStarted = Date.now();
         try {
-          const result = await rerank(this.rerankerUrl, retrievalQuery, fused.slice(0, 100), signal);
-          run.rerankerModel = result.model ?? this.rerankerUrl;
+          const result = await this.reranker(retrievalQuery, fused.slice(0, 100), signal);
+          run.rerankerModel = result.model ?? this.rerankerUrl ?? 'custom';
           ranked = fused
             .map((hit, index) => ({
               ...hit,

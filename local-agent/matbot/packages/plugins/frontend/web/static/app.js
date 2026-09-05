@@ -1,15 +1,84 @@
-// Insecure-context Web Crypto shims (crypto.randomUUID / crypto.subtle.digest, for plain-HTTP local
-// hosting) live in the web-bundle loader (apps/web-bundle/src/loader.js), which runs before any module
-// — including this frontend — so they're already in place by the time anything here runs. In
-// server-backed mode the runtime executes in Node, where Web Crypto is always available.
-
-// ── State ─────────────────────────────────────────────────────────────────────
-
-// localStorage keys
-const LS_FONT_SIZE      = 'fontSize';
+// Cortex chat shell. Product panels register their own UI, state and handlers.
+(async()=>{
+const ui=await window.CortexUI.prepare(window.matbotTransport);
+const featureApis={};
+// Provider selection belongs to conversation UI and works without administration tools.
+function createProviderPicker(host){
 const LS_PROVIDER       = 'provider';
+
+function providerStorageKey(workspaceId = host.activeWorkspaceId()) {
+  return `${LS_PROVIDER}:${workspaceId || 'default'}`;
+}
+
+function savedProviderForWorkspace(workspaceId = host.activeWorkspaceId()) {
+  const scoped = localStorage.getItem(providerStorageKey(workspaceId));
+  if (scoped) return scoped;
+  // Migrate the former global preference for the default workspace only.
+  return workspaceId === 'default' ? (localStorage.getItem(LS_PROVIDER) || '') : '';
+}
+
+let providerDiscoveryFailed = false;
+
+const providerSel    = document.getElementById('provider-select');
+
+
+async function apiListProviders() {
+  try {
+    const providers = (await host.transport.listProviders()).providers.map(p => p.name);
+    providerDiscoveryFailed = false;
+    return providers;
+  } catch {
+    providerDiscoveryFailed = true;
+    return [];
+  }
+}
+
+async function refreshProviderSelect() {
+  const generation = host.workspaceGeneration;
+  const workspaceId = host.activeWorkspaceId();
+  const previous = providerSel.value || savedProviderForWorkspace(workspaceId);
+  let providers;
+  try {
+    providers = (await host.transport.listProviders()).providers.map(p => p.name);
+    providerDiscoveryFailed = false;
+  } catch {
+    providerSel.dataset.error = 'Provider list unavailable. Check the active workspace and retry after Cortex restarts.';
+    providerSel.title = providerSel.dataset.error;
+    return false;
+  }
+  if (generation !== host.workspaceGeneration || workspaceId !== host.activeWorkspaceId()) return false;
+  const saved = savedProviderForWorkspace(workspaceId);
+  providerSel.innerHTML = '';
+  delete providerSel.dataset.error;
+  providerSel.title = '';
+  for (const p of providers) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = p;
+    providerSel.appendChild(opt);
+  }
+  providerSel.value = providers.includes(saved)
+    ? saved
+    : (providers.includes(previous) ? previous : (providers[0] ?? ''));
+  localStorage.setItem(providerStorageKey(workspaceId), providerSel.value);
+  return true;
+}
+
+
+return {get LS_PROVIDER(){return LS_PROVIDER},
+get providerStorageKey(){return providerStorageKey},
+get savedProviderForWorkspace(){return savedProviderForWorkspace},
+get providerDiscoveryFailed(){return providerDiscoveryFailed},set providerDiscoveryFailed(value){providerDiscoveryFailed=value},
+get providerSel(){return providerSel},
+get apiListProviders(){return apiListProviders},
+get refreshProviderSelect(){return refreshProviderSelect}};
+}
+const providerPicker=createProviderPicker({transport:window.matbotTransport,activeWorkspaceId:()=>featureApis.workspace?.activeWorkspaceId?.()??'default',get workspaceGeneration(){return workspaceGeneration;}});
+const LS_FONT_SIZE      = 'fontSize';
+
 const LS_SIDEBAR        = 'sidebarSections';
+
 const LS_SIDEBAR_WIDTH  = 'sidebarWidth';
+
 const SIDEBAR_ACCORDION_SECTIONS = new Set(['files', 'architecture', 'plugins', 'skills']);
 
 function applyBranding(value) {
@@ -27,55 +96,24 @@ function applyBranding(value) {
   }
 }
 
-// Branding is install-scoped and fetched before the ordinary UI settles. A missing
-// endpoint is harmless for older servers and preserves the Cortex defaults.
-void fetch('/branding', { cache: 'no-store' }).then(response => response.ok ? response.json() : null).then(applyBranding).catch(() => {});
-
-function providerStorageKey(workspaceId = activeWorkspaceId()) {
-  return `${LS_PROVIDER}:${workspaceId || 'default'}`;
-}
-
-function savedProviderForWorkspace(workspaceId = activeWorkspaceId()) {
-  const scoped = localStorage.getItem(providerStorageKey(workspaceId));
-  if (scoped) return scoped;
-  // Migrate the former global preference for the default workspace only.
-  return workspaceId === 'default' ? (localStorage.getItem(LS_PROVIDER) || '') : '';
-}
-
 let currentSessionId = null;
-let sending = false;          // current session busy? mirrors the server's 'session-busy' status
+
+let sending = false;
+
 const busySessions   = new Set();
+
 const unreadSessions = new Set();
-const updatedFiles   = new Set();
-const selectedWorkspaceFiles = new Map();
-const knownWorkspaceFiles = new Set();
-let selectedWorkspaceOwner = null;
+
 let workspaceGeneration = 0;
-let providerDiscoveryFailed = false;
 
-// ── Scroll control ────────────────────────────────────────────────────────────
-//
-// We want to avoid the "chasing the bottom" scroll behaviour that makes it
-// impossible to read earlier output while the model is still generating.
-//
-// Strategy:
-//   1. On the *first* content token of a turn we scroll so the assistant
-//      wrapper sits at the top of the messages viewport.
-//   2. After that we do NOT auto-scroll — the user can read at their own pace.
-//   3. When the turn finishes, if the bottom of messages is below the fold
-//      we morph the send button into a ▼ down-arrow that scrolls to bottom.
-//   4. Any manual scroll by the user suppresses ALL auto-scrolling for 10 s.
+let scrollSuppressUntil = 0;
 
-let scrollSuppressUntil = 0;    // epoch ms — suppress auto-scroll until this time
-let programmaticScroll = false; // true while *we* are moving scrollTop (so the
-                                // 'scroll' event handler can ignore it)
+let programmaticScroll = false;
 
 function isScrollSuppressed() {
   return Date.now() < scrollSuppressUntil;
 }
 
-// Call this wrapper before any programmatic scroll so the scroll-listener can
-// distinguish user-initiated scrolls from our own.
 function programmaticScrollTo(fn) {
   programmaticScroll = true;
   fn();
@@ -84,18 +122,12 @@ function programmaticScrollTo(fn) {
   requestAnimationFrame(() => { programmaticScroll = false; });
 }
 
-// Listen for user-initiated scrolls on the messages pane.
-// 'wheel' catches mouse wheels and trackpad gestures.
-// 'touchmove' catches finger-drags on touch screens.
-// Together they cover the vast majority of deliberate user scrolls.
 function onUserScroll() {
   if (!programmaticScroll) {
     scrollSuppressUntil = Date.now() + 5000;   // 100ms suppression (temp for testing)
   }
 }
 
-// True when the bottom edge of #messages is at or above the bottom of the
-// viewport (i.e. the user can see the most recent content without scrolling).
 function isMessagesBottomVisible() {
   // True when all content fits in the messages container without scrolling.
   // False when there's overflow — meaning content is hidden off-screen and
@@ -111,30 +143,25 @@ function isMessagesBottomVisible() {
   return fits || atBottom;
 }
 
-// Send-button glyphs (SVG, so they render identically across platforms instead of relying on
-// font-dependent unicode). Play triangle for send; down-chevron when the button morphs into a
-// scroll-to-bottom control.
 const ICON_SEND   = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M9 6v12l9-6z"/></svg>';
+
 const ICON_SCROLL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';
+
 const ICON_STOP   = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>';
+
 const ICON_TRASH  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>';
 
-// Morph the send button into a scroll-down button. Stop is now its own button, and the input
-// stays enabled while a turn runs (so you can type-ahead and queue), so neither is touched here.
 function showScrollDownButton() {
   sendBtn.innerHTML = ICON_SCROLL;
   sendBtn.classList.add('scroll-down-mode');
 }
 
-// Scroll to the very bottom of the messages pane and restore the send button. The Stop button's
-// visibility is driven independently by the server's busy status, so we don't reason about it here.
 function scrollToBottomAndReset() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
   resetSendButton();
   inputEl.focus();
 }
 
-// Restore the send button to its normal (play) state.
 function resetSendButton() {
   sendBtn.innerHTML = ICON_SEND;
   sendBtn.classList.remove('scroll-down-mode', 'stop-mode');
@@ -152,13 +179,7 @@ function showStopButton() {
   sendBtn.disabled = false;
 }
 
-// ── Floating scroll-down button ─────────────────────────────────
-//
-// A separate ▼ button that appears when the current message text is
-// taller than the visible area, letting the user jump to the bottom
-// without conflating scroll and send/stop actions.
-
-let scrollDownBtn = null; // initialised in init()
+let scrollDownBtn = null;
 
 function updateScrollDownButton() {
   if (!scrollDownBtn) return;
@@ -169,233 +190,41 @@ function updateScrollDownButton() {
   }
 }
 
-
-
-// ── Elements ──────────────────────────────────────────────────────────────────
-
 const messagesEl     = document.getElementById('messages');
+
 const sessionsBanner = document.getElementById('sessions-banner');
+
 const sessionListEl  = document.getElementById('session-list');
+
 const chatHeaderEl   = document.getElementById('chat-header');
+
 const chatTitleEl    = document.getElementById('chat-title');
+
 const inputEl        = document.getElementById('input');
-const attachmentTrayEl = document.getElementById('attachment-tray');
+
 const sendBtn        = document.getElementById('send-btn');
+
 const stopBtn        = document.getElementById('stop-btn');
+
 const newBtn         = document.getElementById('new-btn');
-const providerSel    = document.getElementById('provider-select');
+
 const burgerBtn      = document.getElementById('burger');
+
 const sidebarOverlay = document.getElementById('sidebar-overlay');
-const expertMenuEl       = document.getElementById('expert-menu');
-const expertToggleBtn    = document.getElementById('expert-toggle-btn');
-const expertPopoverEl    = document.getElementById('expert-popover');
-const expertEnabledEl    = document.getElementById('expert-enabled');
-const expertAllEl        = document.getElementById('expert-all');
-const expertListEl       = document.getElementById('expert-list');
-const expertModeEl       = document.getElementById('expert-mode');
-const expertSynthesizeEl = document.getElementById('expert-synthesize');
-const expertStatusEl     = document.getElementById('expert-status');
-const workspaceToggleBtn = document.getElementById('workspace-toggle-btn');
-const workspacePopoverEl = document.getElementById('workspace-popover');
-const workspaceListEl    = document.getElementById('workspace-list');
-const workspaceNameEl    = document.getElementById('workspace-name');
-const workspaceAvatarEl  = document.getElementById('workspace-avatar');
-const workspaceStatusEl  = document.getElementById('workspace-status');
-const workspaceNewBtn    = document.getElementById('workspace-new-btn');
-const workspaceRenameBtn = document.getElementById('workspace-rename-btn');
-const workspaceConfigBtn = document.getElementById('workspace-config-btn');
-const workspaceSettingsScreenEl = document.getElementById('workspace-settings-screen');
-const workspaceSettingsCancelBtn = document.getElementById('workspace-settings-cancel-btn');
-const workspaceContextNameEl = document.getElementById('workspace-context-name');
-const workspaceRagPathsEl = document.getElementById('workspace-rag-paths');
-const workspaceRagProgressBarEl = document.getElementById('workspace-rag-progress-bar');
-const workspaceRagStatusEl = document.getElementById('workspace-rag-status');
-const workspaceRagCurrentFileEl = document.getElementById('workspace-rag-current-file');
-const workspaceRagSaveBtn = document.getElementById('workspace-rag-save-btn');
-const workspaceDeleteDialogEl = document.getElementById('workspace-delete-dialog');
-const workspaceDeleteMessageEl = document.getElementById('workspace-delete-message');
-const workspaceDeleteCancelBtn = document.getElementById('workspace-delete-cancel');
-const workspaceDeleteConfirmBtn = document.getElementById('workspace-delete-confirm');
-let memoryBrowserStatusEl = null;
-const memoryBrowserOverlay = document.getElementById('memory-browser-overlay');
-const memoryBrowserCountEl = document.getElementById('memory-browser-count');
-const memoryBrowserRefreshBtn = document.getElementById('memory-browser-refresh');
-const memoryBrowserCloseBtn = document.getElementById('memory-browser-close');
-const memoryBrowserSearchForm = document.getElementById('memory-browser-search-form');
-const memoryBrowserSearchEl = document.getElementById('memory-browser-search');
-const memoryBrowserFilterEl = document.getElementById('memory-browser-filter');
-const memoryBrowserNewFactEl = document.getElementById('memory-browser-new-fact');
-const memoryBrowserAddBtn = document.getElementById('memory-browser-add');
-const memoryBrowserPanelStatusEl = document.getElementById('memory-browser-panel-status');
-const memoryBrowserListEl = document.getElementById('memory-browser-list');
-const memoryBrowserLoadMoreBtn = document.getElementById('memory-browser-load-more');
-const memoryBrowserEmptyEl = document.getElementById('memory-browser-empty');
-const memoryBrowserDetailForm = document.getElementById('memory-browser-detail-form');
-const memoryBrowserStateEl = document.getElementById('memory-browser-state');
-const memoryBrowserMemoryTitleEl = document.getElementById('memory-browser-memory-title');
-const memoryBrowserFactInput = document.getElementById('memory-browser-fact-input');
-const memoryBrowserSessionIdInput = document.getElementById('memory-browser-session-id');
-const memoryBrowserMessageIdInput = document.getElementById('memory-browser-message-id');
-const memoryBrowserCreatedAtInput = document.getElementById('memory-browser-created-at');
-const memoryBrowserVersionInput = document.getElementById('memory-browser-version');
-const memoryBrowserDreamSkillInput = document.getElementById('memory-browser-dream-skill');
-const memoryBrowserIgnoreUntilInput = document.getElementById('memory-browser-ignore-until');
-const memoryBrowserDeleteBtn = document.getElementById('memory-browser-delete');
-const memoryBrowserSaveBtn = document.getElementById('memory-browser-save');
+
 const architectureScreenEl = document.getElementById('architecture-screen');
+
 const architectureTitleEl = document.getElementById('architecture-title');
-const architectureNavBtns = Array.from(document.querySelectorAll('.architecture-nav-btn'));
-const architectureTabBtns = Array.from(document.querySelectorAll('.architecture-tab'));
-const architecturePanelEls = Array.from(document.querySelectorAll('.architecture-panel'));
-const architectureSourceStatusEl = document.getElementById('architecture-source-status');
-const architectureSourceRefreshBtn = document.getElementById('architecture-source-refresh');
-const architectureSourceListEl = document.getElementById('architecture-source-list');
-const architectureSourceDetailEl = document.getElementById('architecture-source-detail');
-const architectureSourceHealthSummaryEl = document.getElementById('architecture-source-health-summary');
-const architectureSourceHealthModalEl = document.getElementById('architecture-source-health-modal');
-const architectureSourceHealthModalContentEl = document.getElementById('architecture-source-health-modal-content');
-const architectureSourceHealthModalCloseBtn = document.getElementById('architecture-source-health-modal-close');
-const architectureSqlForm = document.getElementById('architecture-sql-form');
-const architectureSqlMetricEl = document.getElementById('architecture-sql-metric');
-const architectureSqlDimensionEl = document.getElementById('architecture-sql-dimension');
-const architectureSqlFilterColumnEl = document.getElementById('architecture-sql-filter-column');
-const architectureSqlFilterValueEl = document.getElementById('architecture-sql-filter-value');
-const architectureSqlLimitEl = document.getElementById('architecture-sql-limit');
-const architectureSqlPlanBtn = document.getElementById('architecture-sql-plan-btn');
-const architectureSqlApproveBtn = document.getElementById('architecture-sql-approve-btn');
-const architectureSqlExecuteBtn = document.getElementById('architecture-sql-execute-btn');
-const architectureSqlStatusEl = document.getElementById('architecture-sql-status');
-const architectureSqlPreviewEl = document.getElementById('architecture-sql-preview');
-const architectureSqlResultsEl = document.getElementById('architecture-sql-results');
-const architectureSqlValidationForm = document.getElementById('architecture-sql-validation-form');
-const architectureSqlValidationInputEl = document.getElementById('architecture-sql-validation-input');
-const architectureSqlValidationBtn = document.getElementById('architecture-sql-validation-btn');
-const architectureSqlValidationResultEl = document.getElementById('architecture-sql-validation-result');
-const architectureWorkflowStatusEl = document.getElementById('architecture-workflow-status');
-const architectureWorkflowRefreshBtn = document.getElementById('architecture-workflow-refresh');
-const architectureApprovalListEl = document.getElementById('architecture-approval-list');
-const architectureApprovalDetailEl = document.getElementById('architecture-approval-detail');
-const architectureHighRiskWriteModalEl = document.getElementById('architecture-high-risk-write-modal');
-const architectureHighRiskWriteContentEl = document.getElementById('architecture-high-risk-write-content');
-const architectureHighRiskWriteCloseBtn = document.getElementById('architecture-high-risk-write-close');
-const architectureHighRiskWriteRejectBtn = document.getElementById('architecture-high-risk-write-reject');
-const architectureHighRiskWriteApproveBtn = document.getElementById('architecture-high-risk-write-approve');
-const workflowOpsTabBtns = Array.from(document.querySelectorAll('.workflow-ops-tab'));
-const workflowOpsPanelEls = Array.from(document.querySelectorAll('.workflow-ops-view'));
-const workflowOpsSummaryBtns = Array.from(document.querySelectorAll('[data-workflow-summary-view]'));
-const workflowOpsWorkflowCountEl = document.getElementById('workflow-ops-workflow-count');
-const workflowOpsRunCountEl = document.getElementById('workflow-ops-run-count');
-const workflowOpsPendingCountEl = document.getElementById('workflow-ops-pending-count');
-const workflowOpsAcceptanceRateEl = document.getElementById('workflow-ops-acceptance-rate');
-const workflowOpsAcceptanceTrendEl = document.getElementById('workflow-ops-acceptance-trend');
-const workflowOpsAttentionEl = document.getElementById('workflow-ops-attention');
-const workflowOpsRecentRunsEl = document.getElementById('workflow-ops-recent-runs');
-const workflowOpsShadowReadinessEl = document.getElementById('workflow-ops-shadow-readiness');
-const workflowOpsCompileForm = document.getElementById('workflow-ops-compile-form');
-const workflowOpsCompileNameEl = document.getElementById('workflow-ops-compile-name');
-const workflowOpsCompileRiskEl = document.getElementById('workflow-ops-compile-risk');
-const workflowOpsCompileTranscriptEl = document.getElementById('workflow-ops-compile-transcript');
-const workflowOpsCompileSourcesEl = document.getElementById('workflow-ops-compile-sources');
-const workflowOpsCompileToolEl = document.getElementById('workflow-ops-compile-tool');
-const workflowOpsCompilePublishEl = document.getElementById('workflow-ops-compile-publish');
-const workflowOpsCompileDryRunEl = document.getElementById('workflow-ops-compile-dry-run');
-const workflowOpsCompileBtn = document.getElementById('workflow-ops-compile-btn');
-const workflowOpsLibrarySearchEl = document.getElementById('workflow-ops-library-search');
-const workflowOpsLibraryListEl = document.getElementById('workflow-ops-library-list');
-const workflowOpsLibraryDetailEl = document.getElementById('workflow-ops-library-detail');
-const workflowOpsRunSearchEl = document.getElementById('workflow-ops-run-search');
-const workflowOpsRunStatusEl = document.getElementById('workflow-ops-run-status');
-const workflowOpsRunListEl = document.getElementById('workflow-ops-run-list');
-const workflowOpsRunDetailEl = document.getElementById('workflow-ops-run-detail');
-const workflowOpsShadowListEl = document.getElementById('workflow-ops-shadow-list');
-const workflowOpsShadowDetailEl = document.getElementById('workflow-ops-shadow-detail');
-const architectureEvaluationStatusEl = document.getElementById('architecture-evaluation-status');
-const architectureEvaluationRefreshBtn = document.getElementById('architecture-evaluation-refresh');
-const evaluationTraceCountEl = document.getElementById('evaluation-trace-count');
-const evaluationPassRateEl = document.getElementById('evaluation-pass-rate');
-const evaluationCompletionRateEl = document.getElementById('evaluation-completion-rate');
-const evaluationNetBenefitEl = document.getElementById('evaluation-net-benefit');
-const evaluationTraceListEl = document.getElementById('evaluation-trace-list');
-const evaluationTraceDetailEl = document.getElementById('evaluation-trace-detail');
-const evaluationSuiteListEl = document.getElementById('evaluation-suite-list');
-const evaluationSuiteDetailEl = document.getElementById('evaluation-suite-detail');
-const evaluationRoiDetailEl = document.getElementById('evaluation-roi-detail');
-const architectureGraphForm = document.getElementById('architecture-graph-form');
-const architectureGraphRefreshBtn = document.getElementById('architecture-graph-refresh');
-const architectureGraphRetrieveBtn = document.getElementById('architecture-graph-retrieve');
-const architectureGraphSearchEl = document.getElementById('architecture-graph-search');
-const architectureGraphSourceEl = document.getElementById('architecture-graph-source');
-const architectureGraphStatusEl = document.getElementById('architecture-graph-status');
-const architectureGraphListEl = document.getElementById('architecture-graph-list');
-const architectureGraphDetailEl = document.getElementById('architecture-graph-detail');
-const architectureReviewForm = document.getElementById('architecture-review-form');
-const architectureReviewModalEl = document.getElementById('architecture-review-modal');
-const architectureReviewOpenBtn = document.getElementById('architecture-review-open-btn');
-const architectureReviewCloseBtn = document.getElementById('architecture-review-close-btn');
-const architectureReviewCancelBtn = document.getElementById('architecture-review-cancel-btn');
-const architectureReviewQuestionEl = document.getElementById('architecture-review-question');
-const architectureReviewTargetTypeEl = document.getElementById('architecture-review-target-type');
-const architectureReviewTargetIdEl = document.getElementById('architecture-review-target-id');
-const architectureReviewWorkflowIdEl = document.getElementById('architecture-review-workflow-id');
-const architectureReviewRunIdEl = document.getElementById('architecture-review-run-id');
-const architectureReviewExpertsEl = document.getElementById('architecture-review-experts');
-const architectureReviewRefreshBtn = document.getElementById('architecture-review-refresh');
-const architectureReviewCreateBtn = document.getElementById('architecture-review-create-btn');
-const architectureReviewStatusEl = document.getElementById('architecture-review-status');
-const architectureReviewListEl = document.getElementById('architecture-review-list');
-const architectureReviewDetailEl = document.getElementById('architecture-review-detail');
-const architectureOpenPluginManagementBtn = document.getElementById('architecture-open-plugin-management');
-let expertPanelExperts = [];
-let expertPanelBusy = false;
-let workspaceState = { active: 'default', workspaces: [] };
-let workspaceRagPoll = null;
-let workspaceRagConfig = null;
-let workspaceRagSavedSnapshot = null;
-let workspaceRagSaving = false;
-let workspaceRagLoadSeq = 0;
-let workspaceSwitching = false;
-const WORKSPACE_RESTART_TIMEOUT_MS = 120000;
-const WORKSPACE_RESTART_STATUS_INTERVAL_MS = 5000;
-let memoryBrowserState = { items: [], cursor: undefined, selected: null, loaded: false };
+
+let architectureNavBtns = Array.from(document.querySelectorAll('.architecture-nav-btn'));
+
+let architectureTabBtns = Array.from(document.querySelectorAll('.architecture-tab'));
+
+let architecturePanelEls = Array.from(document.querySelectorAll('.architecture-panel'));
+
 let architectureView = 'sources';
-let architectureSourcesState = { sources: [], selected: null, citation: null, events: null, selectedEvent: null, healthReport: null, loaded: false };
-let architectureSourcesLoadSeq = 0;
-let architectureSqlState = { plan: null, approvalToken: '', executed: null };
-let architectureSqlBusy = '';
-let architectureSqlPlanRequest = 0;
-let architectureSqlValidationState = null;
-let architectureWorkflowState = {
-  view: 'overview',
-  compilations: [],
-  runs: [],
-  approvals: [],
-  comparisons: [],
-  shadowSummary: null,
-  selectedCompilation: null,
-  selectedRun: null,
-  selectedShadowRun: null,
-  selected: null,
-  inspected: null,
-  loaded: false,
-};
-let architectureWorkflowDecision = '';
-let architectureHighRiskWriteContext = null;
-let architectureWorkflowBusy = '';
-let architectureWorkflowLoadRequest = 0;
-let architectureWorkflowRefreshTimer = null;
-const WORKFLOW_OPS_REFRESH_MS = 30000;
-let architectureEvaluationState = { metrics: null, roi: null, traces: [], suites: [], runs: [], selectedTrace: null, traceDetail: null, selectedSuite: null, loaded: false };
-let architectureEvaluationLoadRequest = 0;
-let architectureGraphState = { entities: [], relationships: [], retrieve: null, selected: null, loaded: false };
-let architectureGraphRetrieveRequest = 0;
-let architectureReviewState = { reviews: [], selected: null, loaded: false };
 
 function closeSidebar() { document.body.classList.remove('sidebar-open'); }
-if (burgerBtn)      burgerBtn.onclick      = () => document.body.classList.toggle('sidebar-open');
-if (sidebarOverlay) sidebarOverlay.onclick = closeSidebar;
-
-// ── Sidebar section collapse / expand ──────────────────────────────────────────
-
 
 function loadSidebarState() {
   try {
@@ -424,59 +253,6 @@ function saveSidebarState() {
   }
   localStorage.setItem(LS_SIDEBAR, JSON.stringify(state));
 }
-
-document.getElementById('sidebar').addEventListener('click', (e) => {
-  const heading = e.target.closest('.sidebar-heading');
-  if (!heading) return;
-  const section = heading.closest('.sidebar-section');
-  if (!section) return;
-  if (SIDEBAR_ACCORDION_SECTIONS.has(section.dataset.section) && section.classList.contains('collapsed')) {
-    for (const other of document.querySelectorAll('.sidebar-section[data-section]')) {
-      if (other !== section && SIDEBAR_ACCORDION_SECTIONS.has(other.dataset.section)) {
-        other.classList.add('collapsed');
-      }
-    }
-  }
-  section.classList.toggle('collapsed');
-  saveSidebarState();
-});
-
-loadSidebarState();
-
-// ── Sidebar resize ────────────────────────────────────────────────────────────
-
-{
-  const sidebarEl  = document.getElementById('sidebar');
-  const resizerEl  = document.getElementById('sidebar-resizer');
-  const MIN_W = 160, MAX_W = 600;
-
-  const savedW = parseInt(localStorage.getItem(LS_SIDEBAR_WIDTH) ?? '');
-  if (savedW >= MIN_W && savedW <= MAX_W) sidebarEl.style.width = savedW + 'px';
-
-  resizerEl?.addEventListener('mousedown', e => {
-    e.preventDefault();
-    const startX     = e.clientX;
-    const startWidth = sidebarEl.offsetWidth;
-    resizerEl.classList.add('active');
-    document.body.classList.add('sidebar-resizing');
-
-    function onMove(e) {
-      const w = Math.max(MIN_W, Math.min(MAX_W, startWidth + e.clientX - startX));
-      sidebarEl.style.width = w + 'px';
-    }
-    function onUp() {
-      resizerEl.classList.remove('active');
-      document.body.classList.remove('sidebar-resizing');
-      localStorage.setItem(LS_SIDEBAR_WIDTH, String(sidebarEl.offsetWidth));
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup',   onUp);
-    }
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup',   onUp);
-  });
-}
-
-// ── Markdown ──────────────────────────────────────────────────────────────────
 
 function escHtml(s) {
   return String(s).replace(/[&<>\"']/g, c =>
@@ -521,15 +297,7 @@ function md(text) {
   return template.innerHTML;
 }
 
-// ── Transport ───────────────────────────────────────────────────────────────
-//
-// All server I/O goes through window.matbotTransport, set up before this script runs:
-//   - http-transport.js  (Node-served: fetch + SSE to server.ts)
-//   - browser.js         (in-process bundle: drives services.run directly)
-// This file is byte-identical in both modes; only the transport behind T differs.
 const T = window.matbotTransport;
-
-// ── API ───────────────────────────────────────────────────────────────────────
 
 async function apiListSessions() {
   try {
@@ -541,403 +309,16 @@ async function apiListSessions() {
     return [];
   }
 }
+
 async function apiGetSession(id)  { try { return await callTool('session_action', { action: 'get', sessionId: id }); } catch { return null; } }
+
 async function apiSessionBusy(id) { return T.sessionBusy(id); }
-async function apiListProviders() {
-  try {
-    const providers = (await callTool('provider', { action: 'list' })).providers.map(p => p.name);
-    providerDiscoveryFailed = false;
-    return providers;
-  } catch {
-    providerDiscoveryFailed = true;
-    return [];
-  }
-}
-
-async function refreshProviderSelect() {
-  const generation = workspaceGeneration;
-  const workspaceId = activeWorkspaceId();
-  const previous = providerSel.value || savedProviderForWorkspace(workspaceId);
-  let providers;
-  try {
-    providers = (await callTool('provider', { action: 'list' })).providers.map(p => p.name);
-    providerDiscoveryFailed = false;
-  } catch {
-    providerSel.dataset.error = 'Provider list unavailable. Check the active workspace and retry after Cortex restarts.';
-    providerSel.title = providerSel.dataset.error;
-    return false;
-  }
-  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return false;
-  const saved = savedProviderForWorkspace(workspaceId);
-  providerSel.innerHTML = '';
-  delete providerSel.dataset.error;
-  providerSel.title = '';
-  for (const p of providers) {
-    const opt = document.createElement('option');
-    opt.value = opt.textContent = p;
-    providerSel.appendChild(opt);
-  }
-  providerSel.value = providers.includes(saved)
-    ? saved
-    : (providers.includes(previous) ? previous : (providers[0] ?? ''));
-  localStorage.setItem(providerStorageKey(workspaceId), providerSel.value);
-  return true;
-}
-
-// ── Tool API ──────────────────────────────────────────────────────────────────
 
 async function callTool(toolName, input) {
   return T.callTool(toolName, input);
 }
 
-// ── Memory browser ───────────────────────────────────────────────────────────
-
-function setMemoryBrowserLauncherStatus(text, isError = false) {
-  if (!memoryBrowserStatusEl) return;
-  memoryBrowserStatusEl.textContent = text || '';
-  memoryBrowserStatusEl.hidden = !text;
-  memoryBrowserStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function setMemoryBrowserPanelStatus(text, isError = false) {
-  if (!memoryBrowserPanelStatusEl) return;
-  memoryBrowserPanelStatusEl.textContent = text || '';
-  memoryBrowserPanelStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function formatMemoryBrowserDate(value) {
-  if (!value) return '';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
-}
-
-function getMemoryBrowserState(item) {
-  if (item?.ignoreUntil) return 'ignored';
-  if (item?.dreamSkill) return 'processed';
-  return 'unprocessed';
-}
-
-function memoryBrowserWhere() {
-  const clauses = [];
-  const q = memoryBrowserSearchEl?.value.trim() ?? '';
-  const state = memoryBrowserFilterEl?.value ?? 'all';
-  if (q) clauses.push({ op: 'stringContains', field: 'fact', value: q });
-  if (state === 'unprocessed') clauses.push({ op: 'exists', field: 'dreamSkill', value: false });
-  if (state === 'processed') clauses.push({ op: 'exists', field: 'dreamSkill', value: true });
-  if (state === 'ignored') clauses.push({ op: 'exists', field: 'ignoreUntil', value: true });
-  if (clauses.length === 0) return undefined;
-  return clauses.length === 1 ? clauses[0] : { op: 'and', clauses };
-}
-
-async function callMemoryBrowserAction(input) {
-  return callTool('remembered_facts_action', input);
-}
-
-function renderMemoryBrowserCount(result) {
-  if (!memoryBrowserCountEl) return;
-  const loaded = memoryBrowserState.items.length;
-  memoryBrowserCountEl.textContent = result && result.total !== undefined
-    ? `${loaded} of ${result.total}`
-    : `${loaded} loaded`;
-}
-
-function renderMemoryBrowserList() {
-  if (!memoryBrowserListEl) return;
-  memoryBrowserListEl.innerHTML = '';
-
-  if (!memoryBrowserState.items.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:8px 10px;';
-    empty.textContent = '(none)';
-    memoryBrowserListEl.appendChild(empty);
-    return;
-  }
-
-  for (const item of memoryBrowserState.items) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'memory-browser-item';
-    row.dataset.id = item.id;
-    row.classList.toggle('active', memoryBrowserState.selected?.id === item.id);
-
-    const fact = document.createElement('div');
-    fact.className = 'memory-browser-item-fact';
-    fact.textContent = item.fact || '(empty fact)';
-
-    const meta = document.createElement('div');
-    meta.className = 'memory-browser-item-meta';
-    meta.textContent = `${getMemoryBrowserState(item)} | ${formatMemoryBrowserDate(item.createdAt)}`;
-
-    row.append(fact, meta);
-    row.onclick = () => selectMemoryBrowserMemory(item.id);
-    memoryBrowserListEl.appendChild(row);
-  }
-}
-
-function renderMemoryBrowserDetail() {
-  const item = memoryBrowserState.selected;
-  if (memoryBrowserEmptyEl) memoryBrowserEmptyEl.hidden = Boolean(item);
-  if (memoryBrowserDetailForm) memoryBrowserDetailForm.hidden = !item;
-  if (!item) return;
-
-  if (memoryBrowserStateEl) memoryBrowserStateEl.textContent = getMemoryBrowserState(item);
-  if (memoryBrowserMemoryTitleEl) memoryBrowserMemoryTitleEl.textContent = item.id;
-  if (memoryBrowserFactInput) memoryBrowserFactInput.value = item.fact || '';
-  if (memoryBrowserSessionIdInput) memoryBrowserSessionIdInput.value = item.sessionId || '';
-  if (memoryBrowserMessageIdInput) memoryBrowserMessageIdInput.value = item.messageId || '';
-  if (memoryBrowserCreatedAtInput) memoryBrowserCreatedAtInput.value = item.createdAt || '';
-  if (memoryBrowserVersionInput) memoryBrowserVersionInput.value = item.version || '';
-  if (memoryBrowserDreamSkillInput) memoryBrowserDreamSkillInput.value = item.dreamSkill || '';
-  if (memoryBrowserIgnoreUntilInput) memoryBrowserIgnoreUntilInput.value = item.ignoreUntil || '';
-}
-
-async function selectMemoryBrowserMemory(id) {
-  if (!id) return;
-  setMemoryBrowserPanelStatus('Loading...');
-  try {
-    const item = await callMemoryBrowserAction({ action: 'get', id });
-    if (!item) throw new Error('Memory not found.');
-    memoryBrowserState.selected = item;
-    const idx = memoryBrowserState.items.findIndex(candidate => candidate.id === item.id);
-    if (idx >= 0) memoryBrowserState.items[idx] = item;
-    renderMemoryBrowserList();
-    renderMemoryBrowserDetail();
-    setMemoryBrowserPanelStatus('');
-  } catch (err) {
-    setMemoryBrowserPanelStatus(String(err?.message || err), true);
-  }
-}
-
-async function loadMemoryBrowserMemories(append = false) {
-  setMemoryBrowserPanelStatus('Loading...');
-  if (memoryBrowserRefreshBtn) memoryBrowserRefreshBtn.disabled = true;
-  if (memoryBrowserLoadMoreBtn) memoryBrowserLoadMoreBtn.disabled = true;
-
-  try {
-    const query = {
-      limit: 50,
-      sort: [{ field: 'createdAt', dir: 'desc' }],
-    };
-    const where = memoryBrowserWhere();
-    if (where) query.where = where;
-    if (append && memoryBrowserState.cursor) query.cursor = memoryBrowserState.cursor;
-
-    const result = await callMemoryBrowserAction({ action: 'query', query });
-    const items = Array.isArray(result?.items) ? result.items : [];
-    const previousSelection = memoryBrowserState.selected?.id;
-    memoryBrowserState.items = append ? memoryBrowserState.items.concat(items) : items;
-    memoryBrowserState.cursor = result?.cursor;
-    memoryBrowserState.loaded = true;
-    if (memoryBrowserLoadMoreBtn) memoryBrowserLoadMoreBtn.hidden = !memoryBrowserState.cursor;
-    renderMemoryBrowserCount(result);
-    renderMemoryBrowserList();
-
-    const nextSelection = previousSelection && memoryBrowserState.items.some(item => item.id === previousSelection)
-      ? previousSelection
-      : memoryBrowserState.items[0]?.id;
-    if (nextSelection) await selectMemoryBrowserMemory(nextSelection);
-    else {
-      memoryBrowserState.selected = null;
-      renderMemoryBrowserDetail();
-      setMemoryBrowserPanelStatus('');
-    }
-  } catch (err) {
-    setMemoryBrowserPanelStatus(String(err?.message || err), true);
-  } finally {
-    if (memoryBrowserRefreshBtn) memoryBrowserRefreshBtn.disabled = false;
-    if (memoryBrowserLoadMoreBtn) memoryBrowserLoadMoreBtn.disabled = false;
-  }
-}
-
-function memoryBrowserSelectedData() {
-  const current = memoryBrowserState.selected;
-  if (!current) return null;
-  const fact = memoryBrowserFactInput?.value.trim() ?? '';
-  if (!fact) throw new Error('Fact is required.');
-
-  const data = {
-    ...current,
-    fact,
-    sessionId: current.sessionId || 'manual',
-    messageId: current.messageId || 'manual',
-    createdAt: current.createdAt || new Date().toISOString(),
-  };
-  delete data.id;
-  delete data.version;
-
-  const dreamSkill = memoryBrowserDreamSkillInput?.value.trim() ?? '';
-  const ignoreUntil = memoryBrowserIgnoreUntilInput?.value.trim() ?? '';
-  if (dreamSkill) data.dreamSkill = dreamSkill;
-  else delete data.dreamSkill;
-  if (ignoreUntil) data.ignoreUntil = ignoreUntil;
-  else delete data.ignoreUntil;
-
-  return data;
-}
-
-async function saveMemoryBrowserSelection(event) {
-  event.preventDefault();
-  const selected = memoryBrowserState.selected;
-  if (!selected) return;
-  setMemoryBrowserPanelStatus('Saving...');
-  if (memoryBrowserSaveBtn) memoryBrowserSaveBtn.disabled = true;
-
-  try {
-    const result = await callMemoryBrowserAction({
-      action: 'cas',
-      id: selected.id,
-      expected: selected.version,
-      data: memoryBrowserSelectedData(),
-    });
-    if (result?.ok === false) {
-      if (result.current) {
-        memoryBrowserState.selected = result.current;
-        const idx = memoryBrowserState.items.findIndex(item => item.id === result.current.id);
-        if (idx >= 0) memoryBrowserState.items[idx] = result.current;
-        renderMemoryBrowserList();
-        renderMemoryBrowserDetail();
-      }
-      throw new Error('Version conflict. Reloaded the current memory.');
-    }
-    const saved = result?.doc;
-    if (!saved?.id) throw new Error('Memory save returned no document.');
-    memoryBrowserState.selected = saved;
-    const idx = memoryBrowserState.items.findIndex(item => item.id === saved.id);
-    if (idx >= 0) memoryBrowserState.items[idx] = saved;
-    else memoryBrowserState.items.unshift(saved);
-    renderMemoryBrowserList();
-    renderMemoryBrowserDetail();
-    setMemoryBrowserPanelStatus('Saved.');
-    closeMemoryBrowser();
-  } catch (err) {
-    setMemoryBrowserPanelStatus(String(err?.message || err), true);
-  } finally {
-    if (memoryBrowserSaveBtn) memoryBrowserSaveBtn.disabled = false;
-  }
-}
-
-async function deleteMemoryBrowserSelection() {
-  const selected = memoryBrowserState.selected;
-  if (!selected) return;
-  if (!confirm('Delete this memory?')) return;
-  setMemoryBrowserPanelStatus('Deleting...');
-  if (memoryBrowserDeleteBtn) memoryBrowserDeleteBtn.disabled = true;
-
-  try {
-    const result = await callMemoryBrowserAction({ action: 'delete', id: selected.id, expected: selected.version });
-    if (result?.deleted === false) throw new Error('Delete did not apply. The memory may have changed.');
-    memoryBrowserState.items = memoryBrowserState.items.filter(item => item.id !== selected.id);
-    memoryBrowserState.selected = null;
-    renderMemoryBrowserList();
-    renderMemoryBrowserDetail();
-    renderMemoryBrowserCount();
-    if (memoryBrowserState.items.length) await selectMemoryBrowserMemory(memoryBrowserState.items[0].id);
-    setMemoryBrowserPanelStatus('Deleted.');
-  } catch (err) {
-    setMemoryBrowserPanelStatus(String(err?.message || err), true);
-  } finally {
-    if (memoryBrowserDeleteBtn) memoryBrowserDeleteBtn.disabled = false;
-  }
-}
-
-async function addMemoryBrowserMemory() {
-  const fact = memoryBrowserNewFactEl?.value.trim() ?? '';
-  if (!fact) return;
-  setMemoryBrowserPanelStatus('Adding...');
-  if (memoryBrowserAddBtn) memoryBrowserAddBtn.disabled = true;
-
-  try {
-    const saved = await callMemoryBrowserAction({
-      action: 'set',
-      data: {
-        fact,
-        sessionId: 'manual',
-        messageId: 'manual',
-        createdAt: new Date().toISOString(),
-      },
-    });
-    if (!saved?.id) throw new Error('Memory add returned no document.');
-    if (memoryBrowserNewFactEl) memoryBrowserNewFactEl.value = '';
-    memoryBrowserState.items.unshift(saved);
-    memoryBrowserState.selected = saved;
-    renderMemoryBrowserCount();
-    renderMemoryBrowserList();
-    renderMemoryBrowserDetail();
-    setMemoryBrowserPanelStatus('Added.');
-  } catch (err) {
-    setMemoryBrowserPanelStatus(String(err?.message || err), true);
-  } finally {
-    if (memoryBrowserAddBtn) memoryBrowserAddBtn.disabled = false;
-  }
-}
-
-async function openMemoryBrowser() {
-  if (!memoryBrowserOverlay) return;
-  setWorkspaceSettingsOpen(false);
-  setMemoryBrowserLauncherStatus('');
-  memoryBrowserOverlay.classList.add('open');
-  closeSidebar();
-  if (!memoryBrowserState.loaded) await loadMemoryBrowserMemories(false);
-  else {
-    if (memoryBrowserLoadMoreBtn) memoryBrowserLoadMoreBtn.hidden = !memoryBrowserState.cursor;
-    renderMemoryBrowserCount();
-    renderMemoryBrowserList();
-    renderMemoryBrowserDetail();
-  }
-  setTimeout(() => memoryBrowserSearchEl?.focus(), 0);
-}
-
-function closeMemoryBrowser() {
-  memoryBrowserOverlay?.classList.remove('open');
-}
-
-if (memoryBrowserOverlay) {
-  const activateMemoryBrowserLauncher = async (e) => {
-    e.stopPropagation();
-    try {
-      await openMemoryBrowser();
-    } catch (err) {
-      setMemoryBrowserLauncherStatus(String(err?.message || err), true);
-    }
-  };
-  document.getElementById('skill-list')?.addEventListener('click', (e) => {
-    if (!e.target.closest('#memory-browser-btn')) return;
-    void activateMemoryBrowserLauncher(e);
-  });
-  document.getElementById('skill-list')?.addEventListener('keydown', (e) => {
-    if (!e.target.closest('#memory-browser-btn') || (e.key !== 'Enter' && e.key !== ' ')) return;
-    e.preventDefault();
-    void activateMemoryBrowserLauncher(e);
-  });
-  memoryBrowserOverlay.addEventListener('click', (e) => {
-    if (e.target === memoryBrowserOverlay) closeMemoryBrowser();
-  });
-  memoryBrowserCloseBtn?.addEventListener('click', closeMemoryBrowser);
-  memoryBrowserRefreshBtn?.addEventListener('click', () => loadMemoryBrowserMemories(false));
-  memoryBrowserLoadMoreBtn?.addEventListener('click', () => loadMemoryBrowserMemories(true));
-  memoryBrowserAddBtn?.addEventListener('click', addMemoryBrowserMemory);
-  memoryBrowserFilterEl?.addEventListener('change', () => {
-    memoryBrowserState.selected = null;
-    renderMemoryBrowserDetail();
-    loadMemoryBrowserMemories(false);
-  });
-  memoryBrowserSearchForm?.addEventListener('submit', (event) => {
-    event.preventDefault();
-    memoryBrowserState.selected = null;
-    renderMemoryBrowserDetail();
-    loadMemoryBrowserMemories(false);
-  });
-  memoryBrowserDetailForm?.addEventListener('submit', saveMemoryBrowserSelection);
-  memoryBrowserDeleteBtn?.addEventListener('click', deleteMemoryBrowserSelection);
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && memoryBrowserOverlay.classList.contains('open')) closeMemoryBrowser();
-  });
-}
-
-// ── Architecture panels ─────────────────────────────────────────────────────
-
-const ARCHITECTURE_PANEL_TITLES = {
+let ARCHITECTURE_PANEL_TITLES = {
   sources: 'Sources',
   sql: 'SQL Preview',
   workflows: 'Workflow Operations Center',
@@ -946,7 +327,8 @@ const ARCHITECTURE_PANEL_TITLES = {
   reviews: 'Expert Reviews',
   plugins: 'Plugins',
 };
-const ARCHITECTURE_HASH_VIEWS = new Set(Object.keys(ARCHITECTURE_PANEL_TITLES));
+
+let ARCHITECTURE_HASH_VIEWS = new Set(Object.keys(ARCHITECTURE_PANEL_TITLES));
 
 function architectureString(value, fallback = '-') {
   if (value === undefined || value === null || value === '') return fallback;
@@ -1110,12 +492,12 @@ function architectureJsonBlock(value) {
 
 function setArchitectureOpen(open, view = architectureView, options = {}) {
   if (!architectureScreenEl) return;
-  if (open && !options.skipWorkspace) setWorkspaceSettingsOpen(false);
-  if (open) closeMemoryBrowser();
+  if (open && !options.skipWorkspace) featureApis.rag.setWorkspaceSettingsOpen(false);
+  if (open) featureApis.memory.closeMemoryBrowser();
   architectureScreenEl.classList.toggle('open', Boolean(open));
   document.body.classList.toggle('architecture-open', Boolean(open));
   if (!open) {
-    stopWorkflowOpsAutoRefresh();
+    featureApis.workflows.stopWorkflowOpsAutoRefresh();
     return;
   }
   activateArchitecturePanel(view);
@@ -1126,18 +508,11 @@ function setArchitectureOpen(open, view = architectureView, options = {}) {
   });
 }
 
-function architectureStatusElement(view) {
-  if (view === 'sources') return architectureSourceStatusEl;
-  if (view === 'sql') return architectureSqlStatusEl;
-  if (view === 'workflows') return architectureWorkflowStatusEl;
-  if (view === 'evaluation') return architectureEvaluationStatusEl;
-  if (view === 'graph') return architectureGraphStatusEl;
-  if (view === 'reviews') return architectureReviewStatusEl;
-  return null;
-}
+function architectureStatusElement(view){const id=ui.descriptors.find(d=>d.view===view)?.id;return id?featureApis[id]?.status?.():null;}
 
 function activateArchitecturePanel(view) {
-  architectureView = ARCHITECTURE_PANEL_TITLES[view] ? view : 'sources';
+  architectureView = ARCHITECTURE_PANEL_TITLES[view] ? view : Object.keys(ARCHITECTURE_PANEL_TITLES)[0];
+  if (!architectureView) { setArchitectureOpen(false); return; }
   if (architectureTitleEl) architectureTitleEl.textContent = ARCHITECTURE_PANEL_TITLES[architectureView];
   for (const btn of architectureNavBtns) {
     const active = btn.dataset.architectureView === architectureView;
@@ -1156,2822 +531,16 @@ function activateArchitecturePanel(view) {
     panel.classList.toggle('active', active);
     panel.hidden = !active;
   }
-  if (architectureView === 'workflows') scheduleWorkflowOpsAutoRefresh();
-  else stopWorkflowOpsAutoRefresh();
-  if (architectureView !== 'sources' && architectureSourceHealthModalEl) architectureSourceHealthModalEl.hidden = true;
+  if (architectureView === 'workflows') featureApis.workflows.scheduleWorkflowOpsAutoRefresh();
+  else featureApis.workflows.stopWorkflowOpsAutoRefresh();
+  if (architectureView !== 'sources' && featureApis.sources.architectureSourceHealthModalEl) featureApis.sources.architectureSourceHealthModalEl.hidden = true;
   if (architectureScreenEl?.classList.contains('open')) {
     history.replaceState(null, '', `${location.pathname}#${architectureView}`);
   }
 }
 
-async function loadArchitecturePanel(view, force = false) {
-  if (view === 'sources' && (force || !architectureSourcesState.loaded)) return loadArchitectureSources();
-  if (view === 'workflows' && (force || !architectureWorkflowState.loaded)) return loadArchitectureWorkflowApprovals();
-  if (view === 'evaluation' && (force || !architectureEvaluationState.loaded)) return loadArchitectureEvaluation();
-  if (view === 'graph' && (force || !architectureGraphState.loaded)) return loadArchitectureGraph(force);
-  if (view === 'reviews' && (force || !architectureReviewState.loaded)) return loadArchitectureReviews();
-  if (view === 'plugins') return loadPlugins();
-  if (view === 'sql') renderArchitectureSqlResults();
-  return undefined;
-}
+async function loadArchitecturePanel(view,force=false){const id=ui.descriptors.find(d=>d.view===view)?.id;return id?featureApis[id]?.activate?.(force):undefined;}
 
-function sourceHealthFindings(sourceId) {
-  const findings = Array.isArray(architectureSourcesState.healthReport?.findings)
-    ? architectureSourcesState.healthReport.findings
-    : [];
-  return findings.filter(finding => finding.sourceId === sourceId);
-}
-
-function sourceHealthSeverity(sourceId) {
-  const severities = sourceHealthFindings(sourceId).map(finding => String(finding.severity || '').toLowerCase());
-  if (severities.includes('critical') || severities.includes('error')) return 'critical';
-  if (severities.includes('warning') || severities.includes('warn')) return 'warning';
-  return 'healthy';
-}
-
-function renderArchitectureSourceHealthSummary() {
-  architectureClear(architectureSourceHealthSummaryEl);
-  if (!architectureSourceHealthSummaryEl) return;
-  const report = architectureSourcesState.healthReport;
-  const counts = [
-    ['Healthy', report?.healthySources ?? architectureSourcesState.sources.filter(source => sourceHealthSeverity(source.id) === 'healthy').length, 'good'],
-    ['Warnings', report?.warningCount ?? 0, 'warn'],
-    ['Critical', report?.criticalCount ?? 0, 'bad'],
-  ];
-  for (const [label, value, tone] of counts) {
-    const card = document.createElement('div');
-    card.className = `source-health-count ${tone}`;
-    card.dataset.healthCount = label.toLowerCase();
-    const count = document.createElement('strong');
-    count.textContent = String(value);
-    const text = document.createElement('span');
-    text.textContent = label;
-    card.append(count, text);
-    architectureSourceHealthSummaryEl.appendChild(card);
-  }
-}
-
-function openArchitectureSourceHealthModal(sourceId) {
-  const source = architectureSourcesState.sources.find(item => item.id === sourceId);
-  if (!source || !architectureSourceHealthModalEl || !architectureSourceHealthModalContentEl) return;
-  const report = architectureSourcesState.healthReport || {};
-  const connector = (report.connectorHealth || []).find(item => item.connectorInstanceId === source.connectorInstanceId);
-  architectureClear(architectureSourceHealthModalContentEl);
-  architectureSourceHealthModalContentEl.append(
-    architectureKeyValues([
-      ['Source ID', source.id],
-      ['Version ID', sourceHealthFindings(source.id).find(finding => finding.sourceVersionId)?.sourceVersionId],
-      ['Connector health snapshot', connector ? `${connector.displayName || connector.connectorInstanceId}: ${connector.healthState}` : source.connectorInstanceId],
-      ['Warning count', report.warningCount ?? 0],
-      ['Critical count', report.criticalCount ?? 0],
-      ['Health', source.healthState],
-      ['Freshness', source.stalenessState],
-    ]),
-  );
-  architectureSourceHealthModalEl.hidden = false;
-}
-
-function renderArchitectureSourceList() {
-  architectureClear(architectureSourceListEl);
-  renderArchitectureSourceHealthSummary();
-  const sources = architectureSourcesState.sources;
-  if (!architectureSourceListEl) return;
-  if (!sources.length) {
-    architectureSourceListEl.appendChild(architectureEmpty('No sources'));
-    return;
-  }
-  for (const source of sources) {
-    const status = source.healthState || source.stalenessState || source.sourceKind;
-    const severity = sourceHealthSeverity(source.id);
-    const findings = sourceHealthFindings(source.id);
-    const item = architectureItemButton({
-      title: source.title || source.id,
-      meta: [source.sourceKind, source.uri].filter(Boolean).join(' | '),
-      badge: status,
-      active: architectureSourcesState.selected?.id === source.id,
-      onClick: async () => {
-        await selectArchitectureSource(source.id);
-        openArchitectureSourceHealthModal(source.id);
-      },
-    });
-    item.classList.add('architecture-source-item', `health-${severity}`);
-    item.dataset.sourceId = source.id;
-    if (severity !== 'healthy') {
-      const indicator = document.createElement('span');
-      indicator.className = `source-health-indicator ${severity === 'critical' ? 'bad' : 'warn'}`;
-      indicator.setAttribute('aria-label', `${severity} source`);
-      indicator.textContent = '\u26a0';
-      item.querySelector('.architecture-item-title')?.appendChild(indicator);
-    }
-    const tooltip = document.createElement('span');
-    tooltip.className = 'source-health-tooltip';
-    tooltip.role = 'tooltip';
-    tooltip.textContent = findings.length
-      ? findings.map(finding => finding.issueType || finding.message).join(', ')
-      : `${source.healthState || 'healthy'} / ${source.stalenessState || 'current'}`;
-    item.appendChild(tooltip);
-    architectureSourceListEl.appendChild(item);
-  }
-}
-
-function renderArchitectureSourceDetail() {
-  architectureClear(architectureSourceDetailEl);
-  if (!architectureSourceDetailEl) return;
-  const source = architectureSourcesState.selected;
-  if (!source) {
-    architectureSourceDetailEl.appendChild(architectureEmpty('Select a source'));
-    return;
-  }
-
-  architectureSourceDetailEl.append(
-    architectureHeading(3, source.title || source.id),
-    architectureKeyValues([
-      ['ID', source.id],
-      ['URI', source.uri],
-      ['Kind', source.sourceKind],
-      ['Sensitivity', source.sensitivity],
-      ['Permission', source.permissionState],
-      ['Trust', source.trustLevel],
-      ['Health', source.healthState],
-      ['Freshness', source.stalenessState],
-      ['Connector', source.connectorInstanceId],
-      ['Observed', architectureDate(source.lastObservedAt)],
-      ['Last read', architectureDate(source.lastSuccessfulReadAt)],
-    ])
-  );
-
-  const limitations = Array.isArray(source.knownLimitations) ? source.knownLimitations : [];
-  if (limitations.length) {
-    architectureSourceDetailEl.append(architectureHeading(4, 'Limitations'), architectureInlineBadges(limitations));
-  }
-
-  const citation = architectureSourcesState.citation;
-  architectureSourceDetailEl.append(architectureHeading(4, 'Citation'));
-  architectureSourceDetailEl.appendChild(architectureMuted(citation?.text || citation?.sourceId || 'No citation available'));
-
-  const findings = sourceHealthFindings(source.id);
-  architectureSourceDetailEl.append(architectureHeading(4, 'Health Findings'));
-  if (findings.length) {
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const finding of findings) {
-      grid.appendChild(architectureCard(finding.issueType || finding.id, [finding.message, finding.sourceVersionId], finding.severity));
-    }
-    architectureSourceDetailEl.appendChild(grid);
-  } else {
-    architectureSourceDetailEl.appendChild(architectureEmpty('No findings'));
-  }
-
-  const events = architectureSourcesState.events || {};
-  const access = Array.isArray(events.access) ? events.access : [];
-  const health = Array.isArray(events.health) ? events.health : [];
-  const versions = Array.isArray(events.versions) ? events.versions : [];
-  const timeline = [
-    ...access.map(event => ({ kind: 'access', event, timestamp: event.timestamp })),
-    ...health.map(event => ({ kind: 'health', event, timestamp: event.checkedAt })),
-    ...versions.map(event => ({ kind: 'version', event, timestamp: event.observedAt })),
-  ].sort((left, right) => String(right.timestamp || '').localeCompare(String(left.timestamp || '')));
-  architectureSourceDetailEl.append(architectureHeading(4, 'Events'));
-  if (timeline.length) {
-    const list = document.createElement('div');
-    list.className = 'architecture-list architecture-source-events';
-    for (const entry of timeline.slice(0, 12)) {
-      const event = entry.event;
-      const item = architectureItemButton({
-        title: event.action || event.state || (entry.kind === 'version' ? 'version observed' : event.eventType) || event.id,
-        meta: [event.sourceId || source.id, event.workspaceId || source.workspaceId, architectureDate(entry.timestamp)].filter(Boolean).join(' | '),
-        badge: entry.kind,
-        active: architectureSourcesState.selectedEvent?.event?.id === event.id,
-        onClick: () => {
-          architectureSourcesState.selectedEvent = entry;
-          renderArchitectureSourceDetail();
-        },
-      });
-      item.dataset.sourceEventId = event.id;
-      item.dataset.sourceEventType = entry.kind;
-      list.appendChild(item);
-    }
-    architectureSourceDetailEl.appendChild(list);
-  } else {
-    architectureSourceDetailEl.appendChild(architectureEmpty('No events'));
-  }
-
-  const selectedEvent = architectureSourcesState.selectedEvent;
-  if (selectedEvent) {
-    const event = selectedEvent.event;
-    const detail = document.createElement('div');
-    detail.id = 'architecture-source-event-detail';
-    detail.className = 'architecture-detail-card';
-    detail.append(
-      architectureHeading(4, 'Event details'),
-      architectureKeyValues([
-        ['Event type', selectedEvent.kind],
-        ['Event ID', event.id],
-        ['Timestamp', architectureDate(selectedEvent.timestamp)],
-        ['Source', event.sourceId || source.id],
-        ['Source version', event.sourceVersionId || (selectedEvent.kind === 'version' ? event.id : undefined)],
-        ['Workspace', event.workspaceId || source.workspaceId],
-        ['User', event.principalId || event.effectiveUserId],
-        ['Tool', event.toolName || event.toolCallId],
-        ['Action', event.action || event.state || (selectedEvent.kind === 'version' ? 'observed' : undefined)],
-        ['Allowed', event.allowed],
-        ['Message', event.message],
-        ['Provenance', event.provenance ? JSON.stringify(event.provenance) : undefined],
-        ['Metadata', event.details ? JSON.stringify(event.details) : undefined],
-      ]),
-    );
-    architectureSourceDetailEl.appendChild(detail);
-  }
-}
-
-async function selectArchitectureSource(sourceId) {
-  const source = architectureSourcesState.sources.find(item => item.id === sourceId);
-  if (!source) return;
-  architectureSourcesState.selected = source;
-  architectureSourcesState.selectedEvent = null;
-  renderArchitectureSourceList();
-  renderArchitectureSourceDetail();
-  architectureStatus(architectureSourceStatusEl, 'Loading source details...');
-  try {
-    const [citationResult, eventsResult] = await Promise.allSettled([
-      callTool('source_action', { action: 'citation', sourceId: source.id }),
-      callTool('source_action', { action: 'events', sourceId: source.id }),
-    ]);
-    if (architectureSourcesState.selected?.id !== source.id) return;
-    architectureSourcesState.citation = citationResult.status === 'fulfilled' ? citationResult.value : null;
-    architectureSourcesState.events = eventsResult.status === 'fulfilled' ? eventsResult.value : null;
-    renderArchitectureSourceDetail();
-    architectureStatus(architectureSourceStatusEl, `${architectureSourcesState.sources.length} source(s)`);
-  } catch (err) {
-    architectureStatus(architectureSourceStatusEl, String(err?.message || err), true);
-  }
-}
-
-async function loadArchitectureSources() {
-  const loadSeq = ++architectureSourcesLoadSeq;
-  const workspaceId = activeWorkspaceId();
-  if (architectureSourceRefreshBtn) architectureSourceRefreshBtn.disabled = true;
-  architectureStatus(architectureSourceStatusEl, 'Loading sources...');
-  const healthResultPromise = callTool('source_health_action', {
-    action: 'report',
-    workspaceId,
-  }).then(
-    value => ({ status: 'fulfilled', value }),
-    reason => ({ status: 'rejected', reason }),
-  );
-  try {
-    const sourceResult = await callTool('source_action', {
-      action: 'list',
-      query: { where: { op: 'eq', field: 'workspaceId', value: workspaceId } },
-    });
-    if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
-    architectureSourcesState.sources = Array.isArray(sourceResult?.sources) ? sourceResult.sources : [];
-    architectureSourcesState.healthReport = null;
-    architectureSourcesState.loaded = true;
-    const previousId = architectureSourcesState.selected?.id;
-    const next = architectureSourcesState.sources.find(source => source.id === previousId) || architectureSourcesState.sources[0] || null;
-    architectureSourcesState.selected = next;
-    architectureSourcesState.citation = null;
-    architectureSourcesState.events = null;
-    architectureSourcesState.selectedEvent = null;
-    renderArchitectureSourceList();
-    renderArchitectureSourceDetail();
-    void healthResultPromise.then(healthResult => {
-      if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
-      architectureSourcesState.healthReport = healthResult.status === 'fulfilled' ? healthResult.value : null;
-      renderArchitectureSourceList();
-      renderArchitectureSourceDetail();
-      if (architectureSourceHealthModalEl && !architectureSourceHealthModalEl.hidden && architectureSourcesState.selected) {
-        openArchitectureSourceHealthModal(architectureSourcesState.selected.id);
-      }
-    });
-    if (next) await selectArchitectureSource(next.id);
-    else architectureStatus(architectureSourceStatusEl, 'No sources');
-  } catch (err) {
-    if (loadSeq !== architectureSourcesLoadSeq || workspaceId !== activeWorkspaceId()) return;
-    architectureStatus(architectureSourceStatusEl, String(err?.message || err), true);
-    architectureSourcesState.loaded = true;
-    renderArchitectureSourceList();
-    renderArchitectureSourceDetail();
-  } finally {
-    if (loadSeq === architectureSourcesLoadSeq && architectureSourceRefreshBtn) {
-      architectureSourceRefreshBtn.disabled = false;
-    }
-  }
-}
-
-function architectureSqlPlanInput() {
-  const metricName = architectureSqlMetricEl?.value.trim() || 'total_revenue';
-  const dimensions = (architectureSqlDimensionEl?.value || '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean);
-  const filterColumn = architectureSqlFilterColumnEl?.value.trim() || '';
-  const filterValue = architectureSqlFilterValueEl?.value.trim() || '';
-  const filters = filterColumn ? [{ columnId: filterColumn, op: 'eq', value: filterValue }] : [];
-  const limit = Math.max(1, Number(architectureSqlLimitEl?.value || 50));
-  return { workspaceId: activeWorkspaceId(), metricName, dimensions, filters, limit };
-}
-
-function invalidateArchitectureSqlPlan() {
-  if (!architectureSqlBusy && !architectureSqlState.plan && !architectureSqlState.approvalToken && !architectureSqlState.executed) return;
-  architectureSqlPlanRequest += 1;
-  architectureSqlBusy = '';
-  architectureSqlState = { plan: null, approvalToken: '', executed: null };
-  architectureStatus(architectureSqlStatusEl, 'Query inputs changed. Plan and approve again.');
-  renderArchitectureSqlResults();
-}
-
-function renderArchitectureSqlValidation() {
-  architectureClear(architectureSqlValidationResultEl);
-  if (!architectureSqlValidationResultEl || !architectureSqlValidationState) return;
-  const result = architectureSqlValidationState;
-  architectureSqlValidationResultEl.classList.toggle('error', !result.valid);
-  architectureSqlValidationResultEl.setAttribute('role', result.valid ? 'status' : 'alert');
-  architectureSqlValidationResultEl.appendChild(architectureHeading(4, result.valid ? 'SQL validation passed' : 'SQL validation errors'));
-  if (result.valid) {
-    architectureSqlValidationResultEl.appendChild(architectureMuted('Read-only SELECT with an explicit row limit.'));
-    return;
-  }
-  const list = document.createElement('ul');
-  for (const reason of result.reasons || []) {
-    const item = document.createElement('li');
-    item.textContent = reason;
-    list.appendChild(item);
-  }
-  architectureSqlValidationResultEl.appendChild(list);
-}
-
-async function validateArchitectureSql(event) {
-  event?.preventDefault();
-  if (!architectureSqlValidationInputEl || architectureSqlValidationBtn?.disabled) return;
-  architectureSqlValidationBtn.disabled = true;
-  architectureSqlValidationState = null;
-  renderArchitectureSqlValidation();
-  try {
-    architectureSqlValidationState = await callTool('structured_data_action', {
-      action: 'validate_sql',
-      sql: architectureSqlValidationInputEl.value,
-    });
-  } catch (err) {
-    architectureSqlValidationState = { valid: false, reasons: [String(err?.message || err)] };
-  } finally {
-    architectureSqlValidationBtn.disabled = false;
-    renderArchitectureSqlValidation();
-  }
-}
-
-function renderArchitectureSqlResults() {
-  if (architectureSqlPreviewEl) {
-    architectureSqlPreviewEl.textContent = architectureSqlState.plan?.queryRun?.sql || '';
-  }
-  if (architectureSqlPlanBtn) architectureSqlPlanBtn.disabled = Boolean(architectureSqlBusy);
-  if (architectureSqlApproveBtn) {
-    architectureSqlApproveBtn.disabled = Boolean(architectureSqlBusy) || !architectureSqlState.plan?.queryRun?.id || Boolean(architectureSqlState.approvalToken);
-  }
-  if (architectureSqlExecuteBtn) {
-    architectureSqlExecuteBtn.disabled = Boolean(architectureSqlBusy) || !architectureSqlState.plan?.queryRun?.id || !architectureSqlState.approvalToken || Boolean(architectureSqlState.executed);
-  }
-  architectureClear(architectureSqlResultsEl);
-  if (!architectureSqlResultsEl) return;
-
-  const plan = architectureSqlState.plan;
-  if (!plan) {
-    architectureSqlResultsEl.appendChild(architectureEmpty('No query plan'));
-    return;
-  }
-  const run = architectureSqlState.executed?.run || plan.queryRun;
-  architectureSqlResultsEl.append(
-    architectureHeading(3, 'Query Run'),
-    architectureKeyValues([
-      ['Run', run?.id],
-      ['Status', run?.status],
-      ['Metric', plan.metric?.businessName || plan.metric?.name],
-      ['Table', plan.table?.displayName || plan.table?.tableName],
-      ['Row limit', run?.rowLimit],
-      ['SQL hash', run?.sqlHash],
-      ['Sources', run?.sourceIds],
-      ['Estimated cost', plan.costEstimate ? `${plan.costEstimate.complexity} (score ${plan.costEstimate.score})` : undefined],
-      ['Cost factors', plan.costEstimate?.factors],
-      ['Warning', plan.rowCapWarning],
-    ])
-  );
-
-  if (Array.isArray(plan.validation?.reasons) && plan.validation.reasons.length) {
-    architectureSqlResultsEl.append(architectureHeading(4, 'Validation'), architectureInlineBadges(plan.validation.reasons));
-  }
-
-  const executed = architectureSqlState.executed;
-  if (!executed) return;
-  const rows = Array.isArray(executed.rows) ? executed.rows : [];
-  const fields = Array.isArray(executed.fields) && executed.fields.length
-    ? executed.fields
-    : Array.from(new Set(rows.flatMap(row => Object.keys(row || {}))));
-  architectureSqlResultsEl.append(architectureHeading(4, 'Rows'));
-  architectureSqlResultsEl.appendChild(rows.length && fields.length ? architectureTable(rows, fields) : architectureEmpty('No rows'));
-  if (executed.citation) {
-    architectureSqlResultsEl.append(architectureHeading(4, 'Result Citation'), architectureMuted(executed.citation.text || executed.citation.sourceId));
-  }
-}
-
-async function planArchitectureSql(event) {
-  event?.preventDefault();
-  if (architectureSqlBusy) return;
-  const requestId = ++architectureSqlPlanRequest;
-  architectureSqlBusy = 'plan';
-  architectureStatus(architectureSqlStatusEl, 'Planning query...');
-  architectureSqlState = { plan: null, approvalToken: '', executed: null };
-  renderArchitectureSqlResults();
-  try {
-    const plan = await callTool('structured_data_action', { action: 'plan_query', plan: architectureSqlPlanInput() });
-    if (requestId !== architectureSqlPlanRequest) return;
-    if (!plan?.queryRun?.id) throw new Error('Query planning returned no query run.');
-    architectureSqlState.plan = plan;
-    renderArchitectureSqlResults();
-    architectureStatus(architectureSqlStatusEl, plan.rowCapWarning || 'Query planned.');
-  } catch (err) {
-    if (requestId !== architectureSqlPlanRequest) return;
-    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
-  } finally {
-    if (requestId === architectureSqlPlanRequest) {
-      architectureSqlBusy = '';
-      renderArchitectureSqlResults();
-    }
-  }
-}
-
-async function approveArchitectureSql() {
-  const runId = architectureSqlState.plan?.queryRun?.id;
-  if (!runId || architectureSqlBusy) return;
-  architectureSqlBusy = 'approve';
-  architectureStatus(architectureSqlStatusEl, 'Approving query...');
-  renderArchitectureSqlResults();
-  try {
-    const result = await callTool('structured_data_action', { action: 'approve_query', queryRunId: runId });
-    if (!result?.approvalToken) throw new Error('Query approval returned no approval token.');
-    architectureSqlState.approvalToken = result.approvalToken;
-    if (result?.queryRun && architectureSqlState.plan) architectureSqlState.plan.queryRun = result.queryRun;
-    renderArchitectureSqlResults();
-    architectureStatus(architectureSqlStatusEl, 'Query approved.');
-  } catch (err) {
-    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureSqlBusy = '';
-    renderArchitectureSqlResults();
-  }
-}
-
-async function executeArchitectureSql() {
-  const runId = architectureSqlState.plan?.queryRun?.id;
-  if (!runId || !architectureSqlState.approvalToken || architectureSqlBusy) return;
-  architectureSqlBusy = 'execute';
-  architectureStatus(architectureSqlStatusEl, 'Executing query...');
-  renderArchitectureSqlResults();
-  try {
-    const result = await callTool('structured_data_action', {
-      action: 'execute_query',
-      queryRunId: runId,
-      approvalToken: architectureSqlState.approvalToken,
-    });
-    architectureSqlState.executed = result;
-    renderArchitectureSqlResults();
-    architectureSourcesState.loaded = false;
-    architectureStatus(architectureSqlStatusEl, `Executed ${Array.isArray(result?.rows) ? result.rows.length : 0} row(s).`);
-  } catch (err) {
-    architectureStatus(architectureSqlStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureSqlBusy = '';
-    renderArchitectureSqlResults();
-  }
-}
-
-function workflowOpsWorkspaceQuery() {
-  return { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } };
-}
-
-function workflowOpsSplitValues(value) {
-  return String(value || '')
-    .split(',')
-    .map(item => item.trim())
-    .filter(Boolean);
-}
-
-function workflowOpsAcceptanceText(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return '-';
-  return `${Math.round(numeric * 100)}%`;
-}
-
-function workflowOpsAcceptanceTrend() {
-  const comparisons = [...architectureWorkflowState.comparisons].sort((left, right) =>
-    String(left.comparedAt || left.createdAt || '').localeCompare(String(right.comparedAt || right.createdAt || ''))
-  );
-  if (!comparisons.length) return 'Trend: no labels';
-  if (comparisons.length === 1) return 'Trend: new baseline';
-  const recentSize = Math.ceil(comparisons.length / 2);
-  const previous = comparisons.slice(0, comparisons.length - recentSize);
-  const recent = comparisons.slice(comparisons.length - recentSize);
-  const rate = records => records.filter(record => record.outcome === 'accepted').length / records.length;
-  const delta = Math.round((rate(recent) - rate(previous)) * 100);
-  return `Trend: ${delta > 0 ? '+' : ''}${delta} pp vs prior`;
-}
-
-function stopWorkflowOpsAutoRefresh() {
-  if (architectureWorkflowRefreshTimer !== null) clearTimeout(architectureWorkflowRefreshTimer);
-  architectureWorkflowRefreshTimer = null;
-}
-
-function scheduleWorkflowOpsAutoRefresh() {
-  stopWorkflowOpsAutoRefresh();
-  architectureWorkflowRefreshTimer = setTimeout(async () => {
-    architectureWorkflowRefreshTimer = null;
-    if (!architectureScreenEl?.classList.contains('open') || architectureView !== 'workflows') return;
-    await loadArchitectureWorkflowApprovals();
-    if (architectureScreenEl?.classList.contains('open') && architectureView === 'workflows') scheduleWorkflowOpsAutoRefresh();
-  }, WORKFLOW_OPS_REFRESH_MS);
-}
-
-function activateWorkflowOpsView(view) {
-  const allowed = new Set(['overview', 'library', 'runs', 'approvals', 'shadow']);
-  architectureWorkflowState.view = allowed.has(view) ? view : 'overview';
-  for (const btn of workflowOpsTabBtns) {
-    const active = btn.dataset.workflowOpsView === architectureWorkflowState.view;
-    btn.classList.toggle('active', active);
-    btn.setAttribute('aria-selected', active ? 'true' : 'false');
-    btn.tabIndex = active ? 0 : -1;
-  }
-  for (const panel of workflowOpsPanelEls) {
-    const active = panel.dataset.workflowOpsPanel === architectureWorkflowState.view;
-    panel.classList.toggle('active', active);
-    panel.hidden = !active;
-  }
-}
-
-function renderWorkflowOpsSummary() {
-  if (workflowOpsWorkflowCountEl) workflowOpsWorkflowCountEl.textContent = String(architectureWorkflowState.compilations.length);
-  if (workflowOpsRunCountEl) workflowOpsRunCountEl.textContent = String(architectureWorkflowState.runs.length);
-  const pending = architectureWorkflowState.approvals.filter(approval => approval.status === 'pending').length;
-  if (workflowOpsPendingCountEl) workflowOpsPendingCountEl.textContent = String(pending);
-  if (workflowOpsAcceptanceRateEl) workflowOpsAcceptanceRateEl.textContent = workflowOpsAcceptanceText(architectureWorkflowState.shadowSummary?.acceptanceRate);
-  if (workflowOpsAcceptanceTrendEl) workflowOpsAcceptanceTrendEl.textContent = workflowOpsAcceptanceTrend();
-}
-
-function workflowOpsSortedRuns() {
-  return [...architectureWorkflowState.runs].sort((left, right) =>
-    String(right.updatedAt || right.createdAt || '').localeCompare(String(left.updatedAt || left.createdAt || ''))
-  );
-}
-
-function renderWorkflowOpsOverview() {
-  architectureClear(workflowOpsAttentionEl);
-  architectureClear(workflowOpsRecentRunsEl);
-  architectureClear(workflowOpsShadowReadinessEl);
-
-  const pending = architectureWorkflowState.approvals.filter(approval => approval.status === 'pending');
-  const failed = architectureWorkflowState.runs.filter(run => run.status === 'failed');
-  if (workflowOpsAttentionEl) {
-    if (!pending.length && !failed.length) workflowOpsAttentionEl.appendChild(architectureEmpty('No workflow operations need attention'));
-    else {
-      workflowOpsAttentionEl.appendChild(architectureKeyValues([
-        ['Pending approvals', pending.length],
-        ['Failed runs', failed.length],
-      ]));
-    }
-  }
-
-  if (workflowOpsRecentRunsEl) {
-    const recent = workflowOpsSortedRuns().slice(0, 4);
-    if (!recent.length) workflowOpsRecentRunsEl.appendChild(architectureEmpty('No workflow runs yet'));
-    else {
-      for (const run of recent) {
-        const compilation = architectureWorkflowState.compilations.find(record =>
-          record.workflowId === run.workflowId || record.definition?.id === run.workflowId
-        );
-        const workflowName = run.workflowName || compilation?.definition?.name || run.workflowId;
-        const item = architectureItemButton({
-          title: workflowName,
-          meta: `${run.workflowId} | ${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
-          badge: run.status,
-          onClick: () => {
-            activateWorkflowOpsView('runs');
-            selectWorkflowOpsRun(run.id);
-          },
-        });
-        item.dataset.runId = run.id;
-        workflowOpsRecentRunsEl.appendChild(item);
-      }
-    }
-  }
-
-  if (workflowOpsShadowReadinessEl) {
-    const summary = architectureWorkflowState.shadowSummary;
-    if (!summary?.total) workflowOpsShadowReadinessEl.appendChild(architectureEmpty('No labeled shadow runs'));
-    else {
-      workflowOpsShadowReadinessEl.appendChild(architectureKeyValues([
-        ['Compared runs', summary.total],
-        ['Accepted', summary.accepted],
-        ['Rejected', summary.rejected],
-        ['Mixed', summary.mixed],
-        ['Acceptance', workflowOpsAcceptanceText(summary.acceptanceRate)],
-      ]));
-    }
-  }
-}
-
-function workflowOpsFilteredCompilations() {
-  const term = String(workflowOpsLibrarySearchEl?.value || '').trim().toLowerCase();
-  if (!term) return architectureWorkflowState.compilations;
-  return architectureWorkflowState.compilations.filter(compilation => {
-    const definition = compilation.definition || {};
-    return [definition.name, definition.description, compilation.workflowId, compilation.id, compilation.status]
-      .some(value => String(value || '').toLowerCase().includes(term));
-  });
-}
-
-function renderWorkflowOpsLibraryList() {
-  architectureClear(workflowOpsLibraryListEl);
-  if (!workflowOpsLibraryListEl) return;
-  const compilations = workflowOpsFilteredCompilations();
-  if (!compilations.length) {
-    workflowOpsLibraryListEl.appendChild(architectureEmpty('No compiled workflows'));
-    return;
-  }
-  for (const compilation of compilations) {
-    const definition = compilation.definition || {};
-    const item = architectureItemButton({
-      title: definition.name || compilation.workflowId || compilation.id,
-      meta: [compilation.workflowVersion, definition.riskLevel, architectureDate(compilation.updatedAt || compilation.createdAt)].filter(Boolean).join(' | '),
-      badge: compilation.status,
-      active: architectureWorkflowState.selectedCompilation?.id === compilation.id,
-      onClick: () => selectWorkflowOpsCompilation(compilation.id),
-    });
-    item.dataset.compilationId = compilation.id;
-    if (compilation.workflowId) item.dataset.workflowId = compilation.workflowId;
-    workflowOpsLibraryListEl.appendChild(item);
-  }
-}
-
-function renderWorkflowOpsLibraryDetail() {
-  architectureClear(workflowOpsLibraryDetailEl);
-  if (!workflowOpsLibraryDetailEl) return;
-  const compilation = architectureWorkflowState.selectedCompilation;
-  if (!compilation) {
-    workflowOpsLibraryDetailEl.appendChild(architectureEmpty('Select a compiled workflow'));
-    return;
-  }
-  const definition = compilation.definition || {};
-  workflowOpsLibraryDetailEl.append(
-    architectureHeading(3, definition.name || compilation.workflowId || compilation.id),
-    architectureKeyValues([
-      ['Compilation', compilation.id],
-      ['Status', compilation.status],
-      ['Published workflow', compilation.workflowId],
-      ['Version', compilation.workflowVersion],
-      ['Risk', definition.riskLevel],
-      ['Compiler', compilation.compilerVersion],
-      ['Created', architectureDate(compilation.createdAt)],
-      ['Updated', architectureDate(compilation.updatedAt)],
-    ]),
-    architectureHeading(4, 'Purpose'),
-    architectureMuted(definition.description || 'No purpose recorded'),
-    architectureHeading(4, 'Evidence and permissions'),
-    architectureKeyValues([
-      ['Sources', compilation.sourceIds || definition.allowedSourceIds],
-      ['Tools', compilation.toolNames || definition.allowedTools],
-      ['Approval gates', (definition.approvalGates || []).map(gate => [gate.id, gate.type].filter(Boolean).join(': '))],
-      ['Success metrics', definition.successMetrics],
-    ])
-  );
-  const validation = Array.isArray(compilation.validation) ? compilation.validation : [];
-  const warnings = Array.isArray(compilation.warnings) ? compilation.warnings : [];
-  workflowOpsLibraryDetailEl.appendChild(architectureHeading(4, 'Release checks'));
-  workflowOpsLibraryDetailEl.appendChild(architectureInlineBadges([
-    validation.length ? `${validation.length} validation error(s)` : 'validated',
-    ...validation.map(error => [error?.path, error?.message].filter(Boolean).join(': ')),
-    ...warnings,
-  ]));
-
-  if (compilation.workflowId) {
-    const actions = document.createElement('div');
-    actions.className = 'workflow-ops-actions';
-    for (const [mode, label, primary] of [
-      ['dry_run', 'Start dry run', false],
-      ['shadow', 'Start shadow run', false],
-      ['approval_gated', 'Start approval-gated run', true],
-    ]) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = label;
-      button.classList.toggle('primary', primary);
-      button.disabled = Boolean(architectureWorkflowBusy);
-      button.onclick = () => startWorkflowOpsRun(compilation, mode);
-      actions.appendChild(button);
-    }
-    workflowOpsLibraryDetailEl.appendChild(actions);
-  }
-}
-
-function selectWorkflowOpsCompilation(compilationId) {
-  const compilation = architectureWorkflowState.compilations.find(item => item.id === compilationId);
-  if (!compilation) return;
-  architectureWorkflowState.selectedCompilation = compilation;
-  renderWorkflowOpsLibraryList();
-  renderWorkflowOpsLibraryDetail();
-}
-
-async function compileWorkflowOperation(event) {
-  event?.preventDefault();
-  if (architectureWorkflowBusy) return;
-  const name = workflowOpsCompileNameEl?.value.trim() || '';
-  const transcript = workflowOpsCompileTranscriptEl?.value.trim() || '';
-  if (!name || !transcript) return;
-  const sourceIds = workflowOpsSplitValues(workflowOpsCompileSourcesEl?.value);
-  const toolName = workflowOpsCompileToolEl?.value.trim() || '';
-  architectureWorkflowBusy = 'compile';
-  if (workflowOpsCompileBtn) workflowOpsCompileBtn.disabled = true;
-  architectureStatus(architectureWorkflowStatusEl, 'Compiling governed workflow...');
-  try {
-    const result = await callTool('workflow_action', {
-      action: 'compile',
-      workspaceId: activeWorkspaceId(),
-      name,
-      purpose: transcript,
-      transcript,
-      sourceIds,
-      ...(toolName ? {
-        toolCalls: [{
-          toolName,
-          capability: 'write',
-          sourceIds,
-          reason: 'Compiled in Workflow Operations Center.',
-        }],
-      } : {}),
-      riskLevel: workflowOpsCompileRiskEl?.value || 'medium',
-      successMetrics: ['evidence cited', 'approval decision recorded', 'run completed'],
-      publish: Boolean(workflowOpsCompilePublishEl?.checked),
-      dryRun: Boolean(workflowOpsCompileDryRunEl?.checked),
-      sampleInputs: {},
-    });
-    await loadArchitectureWorkflowApprovals(true);
-    const compilationId = result?.compilation?.id;
-    if (compilationId) selectWorkflowOpsCompilation(compilationId);
-    activateWorkflowOpsView('library');
-    architectureStatus(architectureWorkflowStatusEl, result?.published ? 'Workflow compiled, published, and smoke-tested.' : 'Workflow draft compiled.');
-  } catch (err) {
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureWorkflowBusy = '';
-    if (workflowOpsCompileBtn) workflowOpsCompileBtn.disabled = false;
-    renderWorkflowOpsLibraryDetail();
-  }
-}
-
-async function startWorkflowOpsRun(compilation, mode) {
-  if (!compilation?.workflowId || architectureWorkflowBusy) return;
-  architectureWorkflowBusy = `start:${mode}`;
-  renderWorkflowOpsLibraryDetail();
-  architectureStatus(architectureWorkflowStatusEl, `Starting ${mode.replaceAll('_', ' ')}...`);
-  try {
-    const run = await callTool('workflow_action', {
-      action: mode === 'dry_run' ? 'dry_run' : 'start',
-      workspaceId: activeWorkspaceId(),
-      workflowId: compilation.workflowId,
-      ...(compilation.workflowVersion ? { workflowVersion: compilation.workflowVersion } : {}),
-      mode,
-      inputs: compilation.sampleInputs || {},
-      evidenceSourceIds: compilation.sourceIds || [],
-      proposedActions: compilation.proposedActions || [],
-    });
-    await loadArchitectureWorkflowApprovals(true);
-    activateWorkflowOpsView('runs');
-    if (run?.id) await selectWorkflowOpsRun(run.id);
-    architectureStatus(architectureWorkflowStatusEl, `${mode.replaceAll('_', ' ')} started.`);
-  } catch (err) {
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureWorkflowBusy = '';
-    renderWorkflowOpsLibraryDetail();
-  }
-}
-
-function workflowOpsFilteredRuns() {
-  const term = String(workflowOpsRunSearchEl?.value || '').trim().toLowerCase();
-  const status = workflowOpsRunStatusEl?.value || 'all';
-  return workflowOpsSortedRuns().filter(run => {
-    if (status !== 'all' && run.status !== status) return false;
-    if (!term) return true;
-    return [run.id, run.workflowId, run.workflowVersion, run.mode, run.status]
-      .some(value => String(value || '').toLowerCase().includes(term));
-  });
-}
-
-function renderWorkflowOpsRunList() {
-  architectureClear(workflowOpsRunListEl);
-  if (!workflowOpsRunListEl) return;
-  const runs = workflowOpsFilteredRuns();
-  if (!runs.length) {
-    workflowOpsRunListEl.appendChild(architectureEmpty('No matching workflow runs'));
-    return;
-  }
-  for (const run of runs) {
-    const item = architectureItemButton({
-      title: run.workflowId,
-      meta: [run.id, run.mode, architectureDate(run.updatedAt || run.createdAt)].filter(Boolean).join(' | '),
-      badge: run.status,
-      active: architectureWorkflowState.selectedRun?.id === run.id,
-      onClick: () => selectWorkflowOpsRun(run.id),
-    });
-    item.dataset.runId = run.id;
-    item.dataset.workflowId = run.workflowId;
-    workflowOpsRunListEl.appendChild(item);
-  }
-}
-
-function workflowOpsDisclosure(label, content, open = false) {
-  const details = document.createElement('details');
-  details.className = 'workflow-ops-disclosure';
-  details.open = open;
-  const summary = document.createElement('summary');
-  summary.textContent = label;
-  details.append(summary, content);
-  return details;
-}
-
-async function openWorkflowEvidenceSource(sourceId) {
-  if (!sourceId) return;
-  setArchitectureOpen(true, 'sources');
-  if (!architectureSourcesState.loaded) await loadArchitectureSources();
-  await selectArchitectureSource(sourceId);
-}
-
-function workflowOpsEvidenceLinks(current) {
-  const wrap = document.createElement('div');
-  wrap.className = 'architecture-key-values';
-  const appendLinks = (label, references) => {
-    const row = document.createElement('div');
-    const key = document.createElement('strong');
-    key.textContent = label;
-    const values = document.createElement('span');
-    values.className = 'architecture-inline-list';
-    for (const reference of references) {
-      const sourceId = typeof reference === 'string' ? reference : reference.sourceId;
-      const value = typeof reference === 'string' ? reference : (reference.sourceVersionId || reference.sourceId);
-      const link = document.createElement('button');
-      link.type = 'button';
-      link.className = 'architecture-link-button';
-      link.dataset.sourceId = sourceId || '';
-      link.textContent = value;
-      link.addEventListener('click', () => void openWorkflowEvidenceSource(sourceId));
-      values.appendChild(link);
-    }
-    if (!values.childElementCount) values.appendChild(architectureMuted('-'));
-    row.append(key, values);
-    wrap.appendChild(row);
-  };
-  appendLinks('Source IDs', current.evidenceSourceIds || []);
-  appendLinks('Source versions', current.evidenceSourceVersions || []);
-  return wrap;
-}
-
-function workflowOpsActionCards(actions, emptyText) {
-  const wrap = document.createElement('div');
-  if (!actions.length) {
-    wrap.appendChild(architectureEmpty(emptyText));
-    return wrap;
-  }
-  wrap.className = 'architecture-card-grid';
-  for (const action of actions) {
-    const body = document.createElement('div');
-    body.appendChild(architectureKeyValues([
-      ['Action ID', action.id],
-      ['Tool', action.toolName],
-      ['Status', action.status],
-      ['Approval required', action.requiresApproval === undefined ? undefined : (action.requiresApproval ? 'Yes' : 'No')],
-      ['Reason', action.reason],
-      ['Sources', action.sourceIds],
-      ['Duration', action.durationMs === undefined ? undefined : `${action.durationMs} ms`],
-      ['Error', action.error],
-    ]));
-    body.appendChild(architectureHeading(5, 'Inputs'));
-    body.appendChild(architectureJsonBlock(action.input || {}));
-    if (action.output !== undefined) {
-      body.appendChild(architectureHeading(5, 'Output'));
-      body.appendChild(architectureJsonBlock(action.output));
-    }
-    const disclosure = workflowOpsDisclosure(`${action.toolName || action.id} - ${action.status || 'unknown'}`, body);
-    disclosure.classList.add('workflow-ops-action');
-    disclosure.dataset.actionId = action.id || '';
-    wrap.appendChild(disclosure);
-  }
-  return wrap;
-}
-
-function renderWorkflowOpsRunDetail() {
-  architectureClear(workflowOpsRunDetailEl);
-  if (!workflowOpsRunDetailEl) return;
-  const run = architectureWorkflowState.selectedRun;
-  if (!run) {
-    workflowOpsRunDetailEl.appendChild(architectureEmpty('Select a workflow run'));
-    return;
-  }
-  const inspected = architectureWorkflowState.inspected?.run?.id === run.id ? architectureWorkflowState.inspected : null;
-  const current = inspected?.run || run;
-  workflowOpsRunDetailEl.append(
-    architectureHeading(3, current.id),
-    architectureKeyValues([
-      ['Workflow', current.workflowId],
-      ['Version', current.workflowVersion],
-      ['Mode', current.mode],
-      ['Status', current.status],
-      ['Principal', current.principalId],
-      ['Created', architectureDate(current.createdAt)],
-      ['Updated', architectureDate(current.updatedAt)],
-      ['Error', current.error],
-    ]),
-    workflowOpsDisclosure('Typed inputs', architectureJsonBlock(current.inputs || {})),
-    architectureHeading(4, 'Evidence'),
-    workflowOpsEvidenceLinks(current),
-    architectureHeading(4, 'Proposed Actions'),
-    workflowOpsActionCards(current.proposedActions || [], 'No proposed actions'),
-    architectureHeading(4, 'Executed Actions'),
-    workflowOpsActionCards(current.executedActions || [], 'No actions executed')
-  );
-  const approvals = Array.isArray(inspected?.approvals) ? inspected.approvals : [];
-  workflowOpsRunDetailEl.appendChild(architectureHeading(4, 'Approvals'));
-  if (approvals.length) workflowOpsRunDetailEl.appendChild(architectureTable(approvals, ['gateId', 'status', 'reason', 'decidedAt']));
-  else workflowOpsRunDetailEl.appendChild(architectureEmpty('No approval gates'));
-  const events = Array.isArray(inspected?.events) ? inspected.events : [];
-  workflowOpsRunDetailEl.appendChild(architectureHeading(4, 'Run Ledger'));
-  if (events.length) workflowOpsRunDetailEl.appendChild(architectureTable(events, ['sequence', 'eventType', 'timestamp', 'principalId']));
-  else workflowOpsRunDetailEl.appendChild(architectureEmpty('Loading run events...'));
-}
-
-async function selectWorkflowOpsRun(runId) {
-  const run = architectureWorkflowState.runs.find(item => item.id === runId);
-  if (!run) return;
-  architectureWorkflowState.selectedRun = run;
-  architectureWorkflowState.inspected = null;
-  renderWorkflowOpsRunList();
-  renderWorkflowOpsRunDetail();
-  architectureStatus(architectureWorkflowStatusEl, 'Loading run ledger...');
-  try {
-    const inspected = await callTool('workflow_action', { action: 'inspect_run', runId });
-    if (architectureWorkflowState.selectedRun?.id !== runId) return;
-    architectureWorkflowState.inspected = inspected;
-    if (inspected?.run) {
-      architectureWorkflowState.selectedRun = inspected.run;
-      const index = architectureWorkflowState.runs.findIndex(item => item.id === runId);
-      if (index >= 0) architectureWorkflowState.runs[index] = inspected.run;
-    }
-    renderWorkflowOpsRunList();
-    renderWorkflowOpsRunDetail();
-    architectureStatus(architectureWorkflowStatusEl, `${architectureWorkflowState.runs.length} run(s)`);
-  } catch (err) {
-    if (architectureWorkflowState.selectedRun?.id === runId) architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  }
-}
-
-function workflowOpsComparisonForRun(runId) {
-  return architectureWorkflowState.comparisons.find(comparison => comparison.runId === runId) || null;
-}
-
-function workflowOpsShadowRuns() {
-  return workflowOpsSortedRuns().filter(run => (
-    run.mode === 'shadow' && !workflowOpsComparisonForRun(run.id)
-  ));
-}
-
-function renderWorkflowOpsShadowList() {
-  architectureClear(workflowOpsShadowListEl);
-  if (!workflowOpsShadowListEl) return;
-  const runs = workflowOpsShadowRuns();
-  if (!runs.length) {
-    workflowOpsShadowListEl.appendChild(architectureEmpty('No unlabeled shadow runs'));
-    return;
-  }
-  for (const run of runs) {
-    const item = architectureItemButton({
-      title: run.workflowId,
-      meta: `${run.id} | ${architectureDate(run.updatedAt || run.createdAt)}`,
-      badge: 'unlabeled',
-      active: architectureWorkflowState.selectedShadowRun?.id === run.id,
-      onClick: () => selectWorkflowOpsShadowRun(run.id),
-    });
-    item.dataset.runId = run.id;
-    workflowOpsShadowListEl.appendChild(item);
-  }
-}
-
-function renderWorkflowOpsShadowDetail() {
-  architectureClear(workflowOpsShadowDetailEl);
-  if (!workflowOpsShadowDetailEl) return;
-  const run = architectureWorkflowState.selectedShadowRun;
-  if (!run) {
-    workflowOpsShadowDetailEl.appendChild(architectureEmpty('Select a shadow run'));
-    return;
-  }
-  const comparison = workflowOpsComparisonForRun(run.id);
-  workflowOpsShadowDetailEl.append(
-    architectureHeading(3, run.id),
-    architectureKeyValues([
-      ['Workflow', run.workflowId],
-      ['Version', run.workflowVersion],
-      ['Run status', run.status],
-      ['Outcome', comparison?.outcome || 'unlabeled'],
-      ['Score', comparison?.score],
-      ['Recommendation hash', comparison?.recommendationHash],
-      ['Human labels', comparison?.humanLabels || comparison?.labels],
-      ['Evidence', comparison?.sourceIds || run.evidenceSourceIds],
-    ]),
-    architectureHeading(4, 'Proposed recommendation'),
-    workflowOpsActionCards(run.proposedActions || [], 'No proposed actions')
-  );
-  const actions = document.createElement('div');
-  actions.className = 'workflow-ops-actions';
-  for (const [label, text] of [['accepted', 'Accept'], ['rejected', 'Reject'], ['mixed', 'Mark mixed']]) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = text;
-    button.classList.toggle('primary', label === 'accepted');
-    button.disabled = Boolean(architectureWorkflowBusy);
-    button.onclick = () => labelWorkflowOpsShadow(run.id, label);
-    actions.appendChild(button);
-  }
-  workflowOpsShadowDetailEl.appendChild(actions);
-}
-
-function selectWorkflowOpsShadowRun(runId) {
-  const run = workflowOpsShadowRuns().find(item => item.id === runId);
-  if (!run) return;
-  architectureWorkflowState.selectedShadowRun = run;
-  renderWorkflowOpsShadowList();
-  renderWorkflowOpsShadowDetail();
-}
-
-async function labelWorkflowOpsShadow(runId, label) {
-  if (!runId || architectureWorkflowBusy) return;
-  architectureWorkflowBusy = `shadow:${runId}`;
-  renderWorkflowOpsShadowDetail();
-  architectureStatus(architectureWorkflowStatusEl, `Recording ${label} shadow outcome...`);
-  try {
-    await callTool('workflow_action', {
-      action: 'compare_shadow_result',
-      runId,
-      labels: [label],
-      note: 'Labeled in Workflow Operations Center.',
-    });
-    await loadArchitectureWorkflowApprovals(true);
-    selectWorkflowOpsShadowRun(runId);
-    activateWorkflowOpsView('shadow');
-    architectureStatus(architectureWorkflowStatusEl, `Shadow outcome recorded as ${label}.`);
-  } catch (err) {
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureWorkflowBusy = '';
-    renderWorkflowOpsShadowDetail();
-  }
-}
-
-function renderWorkflowOperationsCenter() {
-  renderWorkflowOpsSummary();
-  renderWorkflowOpsOverview();
-  renderWorkflowOpsLibraryList();
-  renderWorkflowOpsLibraryDetail();
-  renderWorkflowOpsRunList();
-  renderWorkflowOpsRunDetail();
-  renderArchitectureApprovalList();
-  renderArchitectureApprovalDetail();
-  renderWorkflowOpsShadowList();
-  renderWorkflowOpsShadowDetail();
-}
-
-function renderArchitectureApprovalList() {
-  architectureClear(architectureApprovalListEl);
-  if (!architectureApprovalListEl) return;
-  const approvals = architectureWorkflowState.approvals;
-  if (!approvals.length) {
-    architectureApprovalListEl.appendChild(architectureEmpty('No approvals'));
-    return;
-  }
-  for (const approval of approvals) {
-    const item = architectureItemButton({
-      title: approval.gateId || approval.id,
-      meta: [approval.runId, approval.reason].filter(Boolean).join(' | '),
-      badge: approval.status,
-      active: architectureWorkflowState.selected?.id === approval.id && architectureWorkflowState.selected?.runId === approval.runId,
-      onClick: () => selectArchitectureApproval(approval.id, approval.runId),
-    });
-    if (approval.id) item.dataset.approvalId = approval.id;
-    if (approval.runId) item.dataset.runId = approval.runId;
-    architectureApprovalListEl.appendChild(item);
-  }
-}
-
-function highRiskWriteDetails(action) {
-  const input = action?.input || {};
-  const path = String(input.path || action?.path || '');
-  const highRiskPath = /(^|[\\/])(?:\.env(?:\.[^\\/]*)?|config\.json|credentials(?:\.[^\\/]*)?)$/i.test(path);
-  if (!highRiskPath || !['write', 'admin'].includes(action?.capability || 'write')) return null;
-  const before = input.existingContent ?? input.before;
-  const after = input.content ?? input.after;
-  const diff = input.unifiedDiff || input.diff || action.diff || (
-    before !== undefined && after !== undefined
-      ? `--- ${path}\n+++ ${path}\n-${String(before)}\n+${String(after)}`
-      : 'Unified diff unavailable; reject the write until the proposed content can be inspected.'
-  );
-  return {
-    path,
-    diff,
-    warnings: Array.isArray(input.warnings) && input.warnings.length
-      ? input.warnings
-      : ['Sensitive configuration path requires explicit approval.'],
-    backupPath: input.backupPath || action.backupPath,
-  };
-}
-
-function closeHighRiskWriteModal() {
-  if (architectureHighRiskWriteModalEl) architectureHighRiskWriteModalEl.hidden = true;
-  architectureHighRiskWriteContext = null;
-}
-
-function openHighRiskWriteModal(action, approval) {
-  const details = highRiskWriteDetails(action);
-  if (!details || !architectureHighRiskWriteModalEl || !architectureHighRiskWriteContentEl) return;
-  architectureHighRiskWriteContext = { action, approval };
-  architectureClear(architectureHighRiskWriteContentEl);
-  architectureHighRiskWriteContentEl.appendChild(architectureKeyValues([
-    ['Path', details.path],
-    ['Backup path', details.backupPath],
-    ['Warnings', details.warnings],
-  ]));
-  architectureHighRiskWriteContentEl.appendChild(architectureHeading(4, 'Unified diff'));
-  const diff = document.createElement('pre');
-  diff.className = 'architecture-code high-risk-write-diff';
-  diff.textContent = details.diff;
-  architectureHighRiskWriteContentEl.appendChild(diff);
-  architectureHighRiskWriteModalEl.hidden = false;
-  architectureHighRiskWriteRejectBtn?.focus();
-}
-
-function renderArchitectureApprovalDetail() {
-  architectureClear(architectureApprovalDetailEl);
-  if (!architectureApprovalDetailEl) return;
-  const approval = architectureWorkflowState.selected;
-  if (!approval) {
-    architectureApprovalDetailEl.appendChild(architectureEmpty('Select an approval'));
-    return;
-  }
-  const inspected = architectureWorkflowState.inspected || {};
-  const run = inspected.run || null;
-  architectureApprovalDetailEl.append(
-    architectureHeading(3, approval.gateId || approval.id),
-    architectureKeyValues([
-      ['Approval', approval.id],
-      ['Status', approval.status],
-      ['Run', approval.runId],
-      ['Reason', approval.reason],
-      ['Decided', architectureDate(approval.decidedAt)],
-    ])
-  );
-  if (approval.status === 'pending') {
-    const actions = document.createElement('div');
-    actions.className = 'architecture-card-actions';
-    const approve = document.createElement('button');
-    approve.type = 'button';
-    approve.textContent = 'Approve';
-    approve.disabled = Boolean(architectureWorkflowDecision);
-    approve.onclick = () => decideArchitectureApproval('approve', approval);
-    const reject = document.createElement('button');
-    reject.type = 'button';
-    reject.className = 'danger';
-    reject.textContent = 'Reject';
-    reject.disabled = Boolean(architectureWorkflowDecision);
-    reject.onclick = () => decideArchitectureApproval('reject', approval);
-    actions.append(approve, reject);
-    architectureApprovalDetailEl.appendChild(actions);
-  }
-  if (run) {
-    architectureApprovalDetailEl.append(
-      architectureHeading(4, 'Run'),
-      architectureKeyValues([
-        ['Workflow', run.workflowId],
-        ['Mode', run.mode],
-        ['Status', run.status],
-        ['Sources', run.evidenceSourceIds],
-        ['Created', architectureDate(run.createdAt)],
-        ['Updated', architectureDate(run.updatedAt)],
-      ])
-    );
-  }
-  const proposed = Array.isArray(run?.proposedActions) ? run.proposedActions : [];
-  if (proposed.length) {
-    architectureApprovalDetailEl.appendChild(architectureHeading(4, 'Proposed Actions'));
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const action of proposed) {
-      const highRisk = highRiskWriteDetails(action);
-      if (highRisk) {
-        const item = architectureItemButton({
-          title: action.toolName || action.id,
-          meta: [action.id, highRisk.path, `Sources: ${architectureString(action.sourceIds)}`].filter(Boolean).join(' | '),
-          badge: 'high risk',
-          onClick: () => openHighRiskWriteModal(action, approval),
-        });
-        item.dataset.highRiskWrite = action.id || highRisk.path;
-        grid.appendChild(item);
-      } else {
-        grid.appendChild(architectureCard(action.toolName || action.id, [action.id, `Sources: ${architectureString(action.sourceIds)}`], action.status));
-      }
-    }
-    architectureApprovalDetailEl.appendChild(grid);
-  }
-  const events = Array.isArray(inspected.events) ? inspected.events : [];
-  if (events.length) {
-    architectureApprovalDetailEl.appendChild(architectureHeading(4, 'Ledger'));
-    architectureApprovalDetailEl.appendChild(architectureTable(events, ['sequence', 'eventType', 'timestamp']));
-  }
-}
-
-async function selectArchitectureApproval(approvalId, runId) {
-  const approval = architectureWorkflowState.approvals.find(item =>
-    item.id === approvalId && (runId === undefined || item.runId === runId)
-  );
-  if (!approval) return;
-  architectureWorkflowState.selected = approval;
-  architectureWorkflowState.inspected = null;
-  renderArchitectureApprovalList();
-  renderArchitectureApprovalDetail();
-  if (!approval.runId) return;
-  architectureStatus(architectureWorkflowStatusEl, 'Loading run...');
-  try {
-    const inspected = await callTool('workflow_action', { action: 'inspect_run', runId: approval.runId });
-    if (architectureWorkflowState.selected?.id !== approval.id || architectureWorkflowState.selected?.runId !== approval.runId) return;
-    architectureWorkflowState.inspected = inspected;
-    renderArchitectureApprovalDetail();
-    architectureStatus(architectureWorkflowStatusEl, `${architectureWorkflowState.approvals.length} approval(s)`);
-  } catch (err) {
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  }
-}
-
-async function loadArchitectureWorkflowApprovals() {
-  const requestId = ++architectureWorkflowLoadRequest;
-  if (architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = true;
-  architectureStatus(architectureWorkflowStatusEl, 'Loading workflow operations...');
-  try {
-    const query = workflowOpsWorkspaceQuery();
-    const results = await Promise.allSettled([
-      callTool('workflow_action', { action: 'compilations', query }),
-      callTool('workflow_action', { action: 'list_runs', query }),
-      callTool('workflow_action', { action: 'list_approvals' }),
-      callTool('workflow_action', { action: 'shadow_report', query }),
-    ]);
-    if (requestId !== architectureWorkflowLoadRequest) return;
-    const [compilationsResult, runsResult, approvalsResult, shadowResult] = results;
-    if (compilationsResult.status === 'fulfilled') architectureWorkflowState.compilations = Array.isArray(compilationsResult.value?.compilations) ? compilationsResult.value.compilations : [];
-    if (runsResult.status === 'fulfilled') architectureWorkflowState.runs = Array.isArray(runsResult.value?.runs) ? runsResult.value.runs : [];
-    if (approvalsResult.status === 'fulfilled') architectureWorkflowState.approvals = Array.isArray(approvalsResult.value?.approvals) ? approvalsResult.value.approvals : [];
-    if (shadowResult.status === 'fulfilled') {
-      architectureWorkflowState.shadowSummary = shadowResult.value?.summary || null;
-      architectureWorkflowState.comparisons = Array.isArray(shadowResult.value?.comparisons) ? shadowResult.value.comparisons : [];
-    }
-    architectureWorkflowState.loaded = true;
-
-    const previousCompilationId = architectureWorkflowState.selectedCompilation?.id;
-    architectureWorkflowState.selectedCompilation = architectureWorkflowState.compilations.find(item => item.id === previousCompilationId)
-      || architectureWorkflowState.compilations[0]
-      || null;
-    const previousSelectedRunId = architectureWorkflowState.selectedRun?.id;
-    architectureWorkflowState.selectedRun = architectureWorkflowState.runs.find(run => run.id === previousSelectedRunId)
-      || workflowOpsSortedRuns()[0]
-      || null;
-    const previousShadowRunId = architectureWorkflowState.selectedShadowRun?.id;
-    architectureWorkflowState.selectedShadowRun = workflowOpsShadowRuns().find(run => run.id === previousShadowRunId)
-      || workflowOpsShadowRuns()[0]
-      || null;
-    const previousId = architectureWorkflowState.selected?.id;
-    const previousRunId = architectureWorkflowState.selected?.runId;
-    const next = architectureWorkflowState.approvals.find(approval =>
-      approval.id === previousId && approval.runId === previousRunId
-    ) || architectureWorkflowState.approvals[0] || null;
-    architectureWorkflowState.selected = next;
-    architectureWorkflowState.inspected = null;
-    renderWorkflowOperationsCenter();
-    if (next) await selectArchitectureApproval(next.id, next.runId);
-    else if (architectureWorkflowState.selectedRun) await selectWorkflowOpsRun(architectureWorkflowState.selectedRun.id);
-    if (requestId !== architectureWorkflowLoadRequest) return;
-    const failures = results.filter(result => result.status === 'rejected');
-    architectureStatus(
-      architectureWorkflowStatusEl,
-      failures.length
-        ? `Loaded with ${failures.length} unavailable workflow service(s). Refresh to retry.`
-        : `${architectureWorkflowState.compilations.length} workflow(s), ${architectureWorkflowState.runs.length} run(s), ${architectureWorkflowState.approvals.filter(approval => approval.status === 'pending').length} pending approval(s).`,
-      failures.length > 0
-    );
-  } catch (err) {
-    if (requestId !== architectureWorkflowLoadRequest) return;
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-    architectureWorkflowState.loaded = true;
-  } finally {
-    if (requestId === architectureWorkflowLoadRequest && architectureWorkflowRefreshBtn) architectureWorkflowRefreshBtn.disabled = false;
-  }
-}
-
-async function decideArchitectureApproval(action, approval) {
-  if (!approval?.runId || architectureWorkflowDecision) return;
-  architectureWorkflowDecision = `${approval.runId}:${approval.id}`;
-  architectureStatus(architectureWorkflowStatusEl, action === 'approve' ? 'Approving...' : 'Rejecting...');
-  renderArchitectureApprovalDetail();
-  try {
-    await callTool('workflow_action', {
-      action,
-      runId: approval.runId,
-      approvalId: approval.id,
-      reason: action === 'approve' ? 'Approved in architecture UI.' : 'Rejected in architecture UI.',
-    });
-    await loadArchitectureWorkflowApprovals();
-  } catch (err) {
-    architectureStatus(architectureWorkflowStatusEl, String(err?.message || err), true);
-  } finally {
-    architectureWorkflowDecision = '';
-    renderArchitectureApprovalDetail();
-  }
-}
-
-function architectureGraphEntities() {
-  const byId = new Map();
-  for (const entity of architectureGraphState.entities) {
-    if (entity?.id) byId.set(entity.id, entity);
-  }
-  const retrieve = architectureGraphState.retrieve || {};
-  for (const entity of Array.isArray(retrieve.entities) ? retrieve.entities : []) {
-    if (entity?.id) byId.set(entity.id, entity);
-  }
-  for (const fact of Array.isArray(retrieve.facts) ? retrieve.facts : []) {
-    if (fact?.subject?.id) byId.set(fact.subject.id, fact.subject);
-    if (fact?.object?.id) byId.set(fact.object.id, fact.object);
-  }
-  return [...byId.values()];
-}
-
-function architectureGraphRelationships() {
-  const relationships = [...architectureGraphState.relationships];
-  const facts = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts : [];
-  for (const fact of facts) {
-    if (fact?.relationship) relationships.push(fact.relationship);
-  }
-  const entityIds = new Set(architectureGraphEntities().map(entity => entity.id));
-  return relationships.filter(relationship => {
-    if (!relationship?.subjectEntityId || !relationship?.objectEntityId) return false;
-    if (relationship.subjectEntityId === relationship.objectEntityId) return false;
-    if (!entityIds.has(relationship.subjectEntityId) || !entityIds.has(relationship.objectEntityId)) return false;
-    if (relationship.confidence !== undefined) {
-      const confidence = Number(relationship.confidence);
-      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return false;
-    }
-    return true;
-  });
-}
-
-function evaluationPercent(value) {
-  return Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : '-';
-}
-
-function evaluationMoney(value) {
-  return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(Number(value) || 0);
-}
-
-function evaluationDuration(value) {
-  const ms = Number(value) || 0;
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
-}
-
-function renderArchitectureEvaluationSummary() {
-  const metrics = architectureEvaluationState.metrics || {};
-  const roi = architectureEvaluationState.roi || {};
-  if (evaluationTraceCountEl) evaluationTraceCountEl.textContent = String(metrics.traces?.total ?? architectureEvaluationState.traces.length);
-  if (evaluationPassRateEl) evaluationPassRateEl.textContent = evaluationPercent(metrics.evaluations?.passRate);
-  if (evaluationCompletionRateEl) evaluationCompletionRateEl.textContent = evaluationPercent(metrics.workflows?.completionRate);
-  if (evaluationNetBenefitEl) evaluationNetBenefitEl.textContent = evaluationMoney(roi.netBenefitUsd);
-}
-
-function evaluationSortedTraces() {
-  return [...architectureEvaluationState.traces].sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
-}
-
-function renderArchitectureEvaluationTraceList() {
-  architectureClear(evaluationTraceListEl);
-  if (!evaluationTraceListEl) return;
-  const traces = evaluationSortedTraces();
-  if (!traces.length) {
-    evaluationTraceListEl.appendChild(architectureEmpty('No traces recorded yet'));
-    return;
-  }
-  for (const trace of traces.slice(0, 50)) {
-    const item = architectureItemButton({
-      title: trace.traceId,
-      meta: `${architectureDate(trace.updatedAt)} · ${evaluationDuration(trace.durationMs)} · ${evaluationMoney(trace.costUsd)}`,
-      badge: trace.status,
-      active: architectureEvaluationState.selectedTrace?.traceId === trace.traceId,
-      onClick: () => selectArchitectureEvaluationTrace(trace.traceId),
-    });
-    item.dataset.traceId = trace.traceId;
-    evaluationTraceListEl.appendChild(item);
-  }
-}
-
-function renderArchitectureEvaluationTraceDetail() {
-  architectureClear(evaluationTraceDetailEl);
-  if (!evaluationTraceDetailEl) return;
-  const trace = architectureEvaluationState.selectedTrace;
-  if (!trace) {
-    evaluationTraceDetailEl.appendChild(architectureEmpty('Select a trace to inspect spans and replay safely'));
-    return;
-  }
-  evaluationTraceDetailEl.appendChild(architectureHeading(3, trace.traceId));
-  evaluationTraceDetailEl.appendChild(architectureInlineBadges([trace.status, ...(trace.workflowRunIds || [])]));
-  evaluationTraceDetailEl.appendChild(architectureKeyValues([
-    ['Root trace', trace.rootTraceId],
-    ['Session', trace.sessionId],
-    ['Duration', evaluationDuration(trace.durationMs)],
-    ['Tokens', `${Number(trace.inputTokens || 0).toLocaleString()} in / ${Number(trace.outputTokens || 0).toLocaleString()} out`],
-    ['Cost', evaluationMoney(trace.costUsd)],
-    ['Started', architectureDate(trace.startedAt)],
-  ]));
-  const replay = document.createElement('button');
-  replay.type = 'button';
-  replay.textContent = 'Replay trace safely';
-  replay.onclick = () => replayArchitectureEvaluationTrace(trace.traceId);
-  evaluationTraceDetailEl.appendChild(replay);
-  const spans = Array.isArray(architectureEvaluationState.traceDetail?.spans) ? architectureEvaluationState.traceDetail.spans : [];
-  if (spans.length) {
-    evaluationTraceDetailEl.appendChild(architectureHeading(4, 'Span waterfall'));
-    evaluationTraceDetailEl.appendChild(architectureTable(spans.map(span => ({
-      Kind: span.kind,
-      Operation: span.name,
-      Status: span.status,
-      Duration: evaluationDuration(span.durationMs),
-    })), ['Kind', 'Operation', 'Status', 'Duration']));
-  }
-}
-
-async function selectArchitectureEvaluationTrace(traceId) {
-  const trace = architectureEvaluationState.traces.find(item => item.traceId === traceId);
-  if (!trace) return;
-  architectureEvaluationState.selectedTrace = trace;
-  architectureEvaluationState.traceDetail = null;
-  renderArchitectureEvaluationTraceList();
-  renderArchitectureEvaluationTraceDetail();
-  try {
-    const detail = await callTool('evaluation_action', { action: 'inspect_trace', traceId });
-    if (architectureEvaluationState.selectedTrace?.traceId !== traceId) return;
-    architectureEvaluationState.traceDetail = detail;
-    renderArchitectureEvaluationTraceDetail();
-  } catch (err) {
-    if (architectureEvaluationState.selectedTrace?.traceId !== traceId) return;
-    architectureStatus(architectureEvaluationStatusEl, String(err?.message || err), true);
-  }
-}
-
-async function replayArchitectureEvaluationTrace(traceId) {
-  architectureStatus(architectureEvaluationStatusEl, 'Replaying recorded trace without side effects…');
-  try {
-    const replay = await callTool('evaluation_action', { action: 'replay', traceId });
-    architectureStatus(architectureEvaluationStatusEl, `Playback ready: ${replay.timeline?.length || 0} event(s), writes executed: ${replay.writesExecuted ? 'yes' : 'no'}`);
-  } catch (err) {
-    architectureStatus(architectureEvaluationStatusEl, String(err?.message || err), true);
-  }
-}
-
-function renderArchitectureEvaluationSuiteList() {
-  architectureClear(evaluationSuiteListEl);
-  if (!evaluationSuiteListEl) return;
-  if (!architectureEvaluationState.suites.length) {
-    evaluationSuiteListEl.appendChild(architectureEmpty('No regression suites'));
-    return;
-  }
-  for (const suite of architectureEvaluationState.suites) {
-    const latest = architectureEvaluationState.runs.filter(run => run.suiteId === suite.id).sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')))[0];
-    const item = architectureItemButton({
-      title: suite.name,
-      meta: `${suite.caseIds?.length || 0} case(s) · gate ${evaluationPercent(suite.passThreshold)}`,
-      badge: latest ? (latest.passed ? 'passed' : latest.status) : 'not run',
-      active: architectureEvaluationState.selectedSuite?.id === suite.id,
-      onClick: () => { architectureEvaluationState.selectedSuite = suite; renderArchitectureEvaluationSuiteList(); renderArchitectureEvaluationSuiteDetail(); },
-    });
-    item.dataset.suiteId = suite.id;
-    evaluationSuiteListEl.appendChild(item);
-  }
-}
-
-function renderArchitectureEvaluationSuiteDetail() {
-  architectureClear(evaluationSuiteDetailEl);
-  if (!evaluationSuiteDetailEl) return;
-  const suite = architectureEvaluationState.selectedSuite;
-  if (!suite) {
-    evaluationSuiteDetailEl.appendChild(architectureEmpty('Select a regression suite'));
-    return;
-  }
-  const runs = architectureEvaluationState.runs.filter(run => run.suiteId === suite.id).sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
-  evaluationSuiteDetailEl.appendChild(architectureHeading(3, suite.name));
-  if (suite.description) evaluationSuiteDetailEl.appendChild(architectureMuted(suite.description));
-  evaluationSuiteDetailEl.appendChild(architectureKeyValues([
-    ['Cases', suite.caseIds?.length || 0],
-    ['Scorers', suite.scorerIds?.length || 0],
-    ['Pass gate', evaluationPercent(suite.passThreshold)],
-    ['Version', suite.version],
-  ]));
-  const runButton = document.createElement('button');
-  runButton.type = 'button';
-  runButton.textContent = 'Run regression suite';
-  runButton.onclick = () => runArchitectureEvaluationSuite(suite.id, runButton);
-  evaluationSuiteDetailEl.appendChild(runButton);
-  if (runs.length) {
-    evaluationSuiteDetailEl.appendChild(architectureHeading(4, 'Recent runs'));
-    evaluationSuiteDetailEl.appendChild(architectureTable(runs.slice(0, 10).map(run => ({
-      Candidate: run.candidate,
-      Status: run.status,
-      Score: evaluationPercent(run.score),
-      Pass: run.passed ? 'yes' : 'no',
-    })), ['Candidate', 'Status', 'Score', 'Pass']));
-  }
-}
-
-async function runArchitectureEvaluationSuite(suiteId, button) {
-  if (button) button.disabled = true;
-  architectureStatus(architectureEvaluationStatusEl, 'Running regression suite…');
-  try {
-    const result = await callTool('evaluation_action', { action: 'run_suite', suiteId, candidate: 'webui', ...(providerSel.value ? { provider: providerSel.value } : {}) });
-    await loadArchitectureEvaluation(true);
-    architectureStatus(architectureEvaluationStatusEl, `Evaluation ${result.run.passed ? 'passed' : 'failed'} at ${evaluationPercent(result.run.score)}.` , !result.run.passed);
-  } catch (err) {
-    architectureStatus(architectureEvaluationStatusEl, String(err?.message || err), true);
-  } finally {
-    if (button) button.disabled = false;
-  }
-}
-
-function renderArchitectureEvaluationRoi() {
-  architectureClear(evaluationRoiDetailEl);
-  if (!evaluationRoiDetailEl) return;
-  const roi = architectureEvaluationState.roi;
-  const metrics = architectureEvaluationState.metrics;
-  if (!roi) {
-    evaluationRoiDetailEl.appendChild(architectureEmpty('No ROI evidence available'));
-    return;
-  }
-  evaluationRoiDetailEl.appendChild(architectureKeyValues([
-    ['Verified outcomes', roi.verifiedOutcomes],
-    ['Time saved', `${Number(roi.timeSavedHours || 0).toFixed(1)} h`],
-    ['Total benefit', evaluationMoney(roi.totalBenefitUsd)],
-    ['Operating cost', evaluationMoney(roi.operatingCostUsd)],
-    ['Net benefit', evaluationMoney(roi.netBenefitUsd)],
-    ['ROI', roi.roi === null ? 'Awaiting cost baseline' : evaluationPercent(roi.roi)],
-    ['Approval rate', evaluationPercent(metrics?.workflows?.approvalRate)],
-    ['Escalation rate', evaluationPercent(metrics?.workflows?.escalationRate)],
-    ['Action success', evaluationPercent(metrics?.actions?.successRate)],
-    ['Citation coverage', evaluationPercent(metrics?.citations?.coverageRate)],
-  ]));
-  if (Array.isArray(roi.byWorkflow) && roi.byWorkflow.length) {
-    evaluationRoiDetailEl.appendChild(architectureHeading(4, 'Benefit by workflow'));
-    evaluationRoiDetailEl.appendChild(architectureTable(roi.byWorkflow.map(item => ({
-      Workflow: item.workflowId,
-      Outcomes: item.verifiedOutcomes,
-      Hours: Number(item.timeSavedHours || 0).toFixed(1),
-      Benefit: evaluationMoney(item.benefitUsd),
-    })), ['Workflow', 'Outcomes', 'Hours', 'Benefit']));
-  }
-}
-
-async function loadArchitectureEvaluation(force = false) {
-  if (!force && architectureEvaluationState.loaded) return;
-  const request = ++architectureEvaluationLoadRequest;
-  architectureStatus(architectureEvaluationStatusEl, 'Loading traces, evaluations, and sponsor evidence…');
-  const workspaceId = activeWorkspaceId();
-  const query = { where: { op: 'eq', field: 'workspaceId', value: workspaceId } };
-  const [traceResult, suiteResult, runResult, metricsResult, roiResult] = await Promise.allSettled([
-    callTool('evaluation_action', { action: 'traces', query }),
-    callTool('evaluation_action', { action: 'suites', query }),
-    callTool('evaluation_action', { action: 'evaluation_runs', query }),
-    callTool('evaluation_action', { action: 'metrics', workspaceId }),
-    callTool('evaluation_action', { action: 'roi', workspaceId }),
-  ]);
-  if (request !== architectureEvaluationLoadRequest) return;
-  const previousTraceId = architectureEvaluationState.selectedTrace?.traceId;
-  const previousSuiteId = architectureEvaluationState.selectedSuite?.id;
-  architectureEvaluationState.traces = traceResult.status === 'fulfilled' && Array.isArray(traceResult.value?.traces) ? traceResult.value.traces : [];
-  architectureEvaluationState.suites = suiteResult.status === 'fulfilled' && Array.isArray(suiteResult.value?.suites) ? suiteResult.value.suites : [];
-  architectureEvaluationState.runs = runResult.status === 'fulfilled' && Array.isArray(runResult.value?.runs) ? runResult.value.runs : [];
-  architectureEvaluationState.metrics = metricsResult.status === 'fulfilled' ? metricsResult.value : null;
-  architectureEvaluationState.roi = roiResult.status === 'fulfilled' ? roiResult.value : null;
-  architectureEvaluationState.selectedTrace = architectureEvaluationState.traces.find(item => item.traceId === previousTraceId) || evaluationSortedTraces()[0] || null;
-  architectureEvaluationState.selectedSuite = architectureEvaluationState.suites.find(item => item.id === previousSuiteId) || architectureEvaluationState.suites[0] || null;
-  architectureEvaluationState.traceDetail = null;
-  architectureEvaluationState.loaded = true;
-  renderArchitectureEvaluationSummary();
-  renderArchitectureEvaluationTraceList();
-  renderArchitectureEvaluationTraceDetail();
-  renderArchitectureEvaluationSuiteList();
-  renderArchitectureEvaluationSuiteDetail();
-  renderArchitectureEvaluationRoi();
-  const failures = [traceResult, suiteResult, runResult, metricsResult, roiResult].filter(result => result.status === 'rejected').length;
-  architectureStatus(architectureEvaluationStatusEl, failures ? `Loaded with ${failures} unavailable service(s).` : `${architectureEvaluationState.traces.length} trace(s), ${architectureEvaluationState.suites.length} suite(s).`, failures > 0);
-  if (architectureEvaluationState.selectedTrace) await selectArchitectureEvaluationTrace(architectureEvaluationState.selectedTrace.traceId);
-}
-
-function renderArchitectureGraphList() {
-  architectureClear(architectureGraphListEl);
-  if (!architectureGraphListEl) return;
-  const entities = architectureGraphEntities();
-  if (!entities.length) {
-    architectureGraphListEl.appendChild(architectureEmpty('No entities'));
-    return;
-  }
-  for (const entity of entities) {
-    architectureGraphListEl.appendChild(architectureItemButton({
-      title: entity.canonicalName || entity.id,
-      meta: [entity.id, Array.isArray(entity.aliases) ? entity.aliases.join(', ') : ''].filter(Boolean).join(' | '),
-      badge: entity.type,
-      active: architectureGraphState.selected?.id === entity.id,
-      onClick: () => selectArchitectureGraphEntity(entity.id),
-    }));
-  }
-}
-
-function renderArchitectureGraphDetail() {
-  architectureClear(architectureGraphDetailEl);
-  if (!architectureGraphDetailEl) return;
-  const entity = architectureGraphState.selected;
-  if (!entity) {
-    architectureGraphDetailEl.appendChild(architectureEmpty('Select an entity'));
-    return;
-  }
-  architectureGraphDetailEl.append(
-    architectureHeading(3, entity.canonicalName || entity.id),
-    architectureKeyValues([
-      ['ID', entity.id],
-      ['Type', entity.type],
-      ['Aliases', entity.aliases],
-      ['Sensitivity', entity.sensitivity],
-      ['Updated', architectureDate(entity.updatedAt)],
-    ])
-  );
-
-  const relationships = architectureGraphRelationships().filter(rel =>
-    rel.subjectEntityId === entity.id || rel.objectEntityId === entity.id
-  );
-  architectureGraphDetailEl.appendChild(architectureHeading(4, 'Relationships'));
-  if (relationships.length) {
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const rel of relationships) {
-      grid.appendChild(architectureCard(rel.predicate || rel.id, [
-        `${rel.subjectEntityId} -> ${rel.objectEntityId}`,
-        `Source: ${architectureString(rel.sourceId)}`,
-        rel.evidenceSpan,
-      ], rel.confidence !== undefined ? `confidence ${rel.confidence}` : rel.extractionMethod));
-    }
-    architectureGraphDetailEl.appendChild(grid);
-  } else {
-    architectureGraphDetailEl.appendChild(architectureEmpty('No relationships'));
-  }
-
-  const facts = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts : [];
-  const validRelationships = new Set(architectureGraphRelationships());
-  const entityFacts = facts.filter(fact =>
-    validRelationships.has(fact?.relationship)
-    && (fact?.subject?.id === entity.id || fact?.object?.id === entity.id)
-  );
-  if (entityFacts.length) {
-    architectureGraphDetailEl.appendChild(architectureHeading(4, 'Evidence'));
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const fact of entityFacts) {
-      grid.appendChild(architectureCard(fact.relationship?.predicate || fact.sourceId, [
-        `${architectureString(fact.subject?.canonicalName || fact.subject?.id)} -> ${architectureString(fact.object?.canonicalName || fact.object?.id)}`,
-        fact.citation?.text,
-        `Version: ${architectureString(fact.sourceVersionId)}`,
-      ], fact.sourceId));
-    }
-    architectureGraphDetailEl.appendChild(grid);
-  }
-}
-
-function selectArchitectureGraphEntity(entityId) {
-  const entity = architectureGraphEntities().find(item => item.id === entityId);
-  if (!entity) return;
-  architectureGraphState.selected = entity;
-  renderArchitectureGraphList();
-  renderArchitectureGraphDetail();
-}
-
-async function loadArchitectureGraph(resetRetrieve = false) {
-  if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
-  if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = true;
-  architectureStatus(architectureGraphStatusEl, 'Loading graph...');
-  try {
-    const result = await callTool('context_graph_action', {
-      action: 'list',
-      query: { where: { op: 'eq', field: 'workspaceId', value: activeWorkspaceId() } },
-    });
-    architectureGraphState.entities = Array.isArray(result?.entities) ? result.entities : [];
-    architectureGraphState.relationships = Array.isArray(result?.relationships) ? result.relationships : [];
-    if (resetRetrieve) architectureGraphState.retrieve = null;
-    architectureGraphState.loaded = true;
-    const previousId = architectureGraphState.selected?.id;
-    const next = architectureGraphEntities().find(entity => entity.id === previousId) || architectureGraphEntities()[0] || null;
-    architectureGraphState.selected = next;
-    renderArchitectureGraphList();
-    renderArchitectureGraphDetail();
-    architectureStatus(architectureGraphStatusEl, `${architectureGraphState.entities.length} entity record(s)`);
-  } catch (err) {
-    architectureStatus(architectureGraphStatusEl, String(err?.message || err), true);
-    architectureGraphState.loaded = true;
-  } finally {
-    if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = false;
-    if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = false;
-  }
-}
-
-function firstRetrievedArchitectureGraphEntity(retrieve) {
-  const direct = Array.isArray(retrieve?.entities) ? retrieve.entities.find(entity => entity?.id) : null;
-  if (direct) return direct;
-  const facts = Array.isArray(retrieve?.facts) ? retrieve.facts : [];
-  for (const fact of facts) {
-    if (fact?.subject?.id) return fact.subject;
-    if (fact?.object?.id) return fact.object;
-  }
-  return null;
-}
-
-async function retrieveArchitectureGraph(event) {
-  event?.preventDefault();
-  if (architectureGraphRetrieveBtn?.disabled) return;
-  const requestId = ++architectureGraphRetrieveRequest;
-  if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = true;
-  if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = true;
-  architectureStatus(architectureGraphStatusEl, 'Retrieving graph context...');
-  const terms = [...new Set((architectureGraphSearchEl?.value || '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean))];
-  const sourceIds = [...new Set((architectureGraphSourceEl?.value || '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean))];
-  try {
-    const retrieve = await callTool('context_graph_action', {
-      action: 'retrieve',
-      workspaceId: activeWorkspaceId(),
-      terms,
-      ...(sourceIds.length ? { sourceIds } : {}),
-      maxRelationships: 25,
-    });
-    if (requestId !== architectureGraphRetrieveRequest) return;
-    architectureGraphState.retrieve = retrieve;
-    architectureGraphState.selected = firstRetrievedArchitectureGraphEntity(retrieve) || architectureGraphEntities()[0] || null;
-    renderArchitectureGraphList();
-    renderArchitectureGraphDetail();
-    const factCount = Array.isArray(architectureGraphState.retrieve?.facts) ? architectureGraphState.retrieve.facts.length : 0;
-    architectureStatus(architectureGraphStatusEl, `Retrieved ${factCount} fact(s).`);
-  } catch (err) {
-    if (requestId !== architectureGraphRetrieveRequest) return;
-    architectureStatus(architectureGraphStatusEl, String(err?.message || err), true);
-  } finally {
-    if (requestId === architectureGraphRetrieveRequest) {
-      if (architectureGraphRetrieveBtn) architectureGraphRetrieveBtn.disabled = false;
-      if (architectureGraphRefreshBtn) architectureGraphRefreshBtn.disabled = false;
-    }
-  }
-}
-
-function renderArchitectureReviewList() {
-  architectureClear(architectureReviewListEl);
-  if (!architectureReviewListEl) return;
-  const reviews = architectureReviewState.reviews;
-  if (!reviews.length) {
-    architectureReviewListEl.appendChild(architectureEmpty('No reviews'));
-    return;
-  }
-  for (const review of reviews) {
-    const expertIds = Array.isArray(review.expertIds) && review.expertIds.length
-      ? review.expertIds
-      : (review.experts || []).map(expert => expert.expertId).filter(Boolean);
-    architectureReviewListEl.appendChild(architectureItemButton({
-      title: review.question || review.id,
-      meta: [review.targetType, review.targetId, review.workflowRunId, expertIds.length ? `Experts: ${expertIds.join(', ')}` : undefined].filter(Boolean).join(' | '),
-      badge: review.status,
-      active: architectureReviewState.selected?.id === review.id,
-      onClick: () => selectArchitectureReview(review.id),
-    }));
-  }
-}
-
-function renderArchitectureReviewDetail() {
-  architectureClear(architectureReviewDetailEl);
-  if (!architectureReviewDetailEl) return;
-  const review = architectureReviewState.selected;
-  if (!review) {
-    architectureReviewDetailEl.appendChild(architectureEmpty('Select a review'));
-    return;
-  }
-  architectureReviewDetailEl.append(
-    architectureHeading(3, review.question || review.id),
-    architectureKeyValues([
-      ['Review', review.id],
-      ['Status', review.status],
-      ['Mode', review.reviewMode || review.mode],
-      ['Target', [review.targetType, review.targetId].filter(Boolean).join(': ')],
-      ['Workflow', review.workflowId],
-      ['Run', review.workflowRunId],
-      ['Sources', review.sourceIds],
-      ['Created', architectureDate(review.createdAt)],
-    ])
-  );
-  if (review.synthesis) {
-    architectureReviewDetailEl.append(architectureHeading(4, 'Synthesis'), architectureMuted(review.synthesis));
-  }
-  const experts = Array.isArray(review.experts) ? review.experts : [];
-  architectureReviewDetailEl.appendChild(architectureHeading(4, 'Expert Cards'));
-  if (experts.length) {
-    const grid = document.createElement('div');
-    grid.className = 'architecture-card-grid';
-    for (const expert of experts) {
-      grid.appendChild(architectureCard(expert.title || expert.expertId, [
-        expert.answer,
-        `Risks: ${architectureString(expert.risks)}`,
-        `Mitigations: ${architectureString(expert.mitigations)}`,
-        `Checklist: ${architectureString(expert.approvalChecklist)}`,
-      ], expert.recommendation || expert.confidence));
-    }
-    architectureReviewDetailEl.appendChild(grid);
-  } else {
-    architectureReviewDetailEl.appendChild(architectureEmpty('No expert cards'));
-  }
-  const risks = Array.isArray(review.riskRegister) ? review.riskRegister : [];
-  if (risks.length) {
-    architectureReviewDetailEl.append(architectureHeading(4, 'Risk Register'), architectureTable(risks, ['severity', 'description', 'ownerExpertId', 'mitigation']));
-  }
-}
-
-async function selectArchitectureReview(reviewId) {
-  const review = architectureReviewState.reviews.find(item => item.id === reviewId);
-  if (!review) return;
-  architectureReviewState.selected = review;
-  renderArchitectureReviewList();
-  renderArchitectureReviewDetail();
-  architectureStatus(architectureReviewStatusEl, 'Loading review...');
-  try {
-    const result = await callTool('expert_panel', { action: 'get_review', reviewId });
-    if (architectureReviewState.selected?.id !== review.id) return;
-    if (result?.review) {
-      architectureReviewState.selected = result.review;
-      const idx = architectureReviewState.reviews.findIndex(item => item.id === result.review.id);
-      if (idx >= 0) architectureReviewState.reviews[idx] = result.review;
-    }
-    renderArchitectureReviewList();
-    renderArchitectureReviewDetail();
-    architectureStatus(architectureReviewStatusEl, `${architectureReviewState.reviews.length} review(s)`);
-  } catch (err) {
-    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
-  }
-}
-
-async function loadArchitectureReviews() {
-  if (architectureReviewRefreshBtn) architectureReviewRefreshBtn.disabled = true;
-  architectureStatus(architectureReviewStatusEl, 'Loading reviews...');
-  try {
-    const result = await callTool('expert_panel', { action: 'list_reviews' });
-    architectureReviewState.reviews = Array.isArray(result?.reviews) ? result.reviews : [];
-    architectureReviewState.loaded = true;
-    const previousId = architectureReviewState.selected?.id;
-    const next = architectureReviewState.reviews.find(review => review.id === previousId) || architectureReviewState.reviews[0] || null;
-    architectureReviewState.selected = next;
-    renderArchitectureReviewList();
-    renderArchitectureReviewDetail();
-    if (next) await selectArchitectureReview(next.id);
-    else architectureStatus(architectureReviewStatusEl, 'No reviews');
-  } catch (err) {
-    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
-    architectureReviewState.loaded = true;
-  } finally {
-    if (architectureReviewRefreshBtn) architectureReviewRefreshBtn.disabled = false;
-  }
-}
-
-async function createArchitectureReview(event) {
-  event?.preventDefault();
-  const question = architectureReviewQuestionEl?.value.trim() || '';
-  if (!question) {
-    architectureStatus(architectureReviewStatusEl, 'Question is required.', true);
-    return;
-  }
-  const experts = [...new Set(Array.from(architectureReviewExpertsEl?.selectedOptions || [])
-    .map(option => option.value.trim())
-    .filter(Boolean))];
-  const targetId = architectureReviewTargetIdEl?.value.trim() || undefined;
-  const workflowId = architectureReviewWorkflowIdEl?.value.trim() || undefined;
-  const workflowRunId = architectureReviewRunIdEl?.value.trim() || undefined;
-  const targetType = architectureReviewTargetTypeEl?.value || 'workflow';
-  if (!targetId) {
-    architectureStatus(architectureReviewStatusEl, 'Target ID is required.', true);
-    return;
-  }
-  if (targetType === 'workflow' && !workflowId) {
-    architectureStatus(architectureReviewStatusEl, 'Workflow ID is required for workflow reviews.', true);
-    return;
-  }
-  if (targetType === 'workflow_run' && !workflowRunId) {
-    architectureStatus(architectureReviewStatusEl, 'Run ID is required for workflow run reviews.', true);
-    return;
-  }
-  if (!experts.length) {
-    architectureStatus(architectureReviewStatusEl, 'Select at least one expert.', true);
-    return;
-  }
-  architectureStatus(architectureReviewStatusEl, 'Creating review...');
-  if (architectureReviewCreateBtn) architectureReviewCreateBtn.disabled = true;
-  try {
-    const result = await callTool('expert_panel', {
-      action: 'review',
-      question,
-      mode: 'review',
-      reviewMode: 'pre_automation_review',
-      targetType,
-      ...(targetId ? { targetId } : {}),
-      ...(workflowId ? { workflowId } : {}),
-      ...(workflowRunId ? { workflowRunId } : {}),
-      ...(experts.length ? { experts } : {}),
-      synthesize: true,
-    });
-    const review = result?.review;
-    if (review?.id) {
-      const existing = architectureReviewState.reviews.findIndex(item => item.id === review.id);
-      if (existing >= 0) architectureReviewState.reviews[existing] = review;
-      else architectureReviewState.reviews.unshift(review);
-      architectureReviewState.selected = review;
-      architectureReviewState.loaded = true;
-      renderArchitectureReviewList();
-      renderArchitectureReviewDetail();
-    } else {
-      await loadArchitectureReviews();
-    }
-    architectureStatus(architectureReviewStatusEl, 'Review created.');
-    if (architectureReviewModalEl) architectureReviewModalEl.hidden = true;
-  } catch (err) {
-    architectureStatus(architectureReviewStatusEl, String(err?.message || err), true);
-  } finally {
-    if (architectureReviewCreateBtn) architectureReviewCreateBtn.disabled = false;
-  }
-}
-
-if (architectureScreenEl) {
-  for (const btn of architectureNavBtns) {
-    btn.addEventListener('click', () => setArchitectureOpen(true, btn.dataset.architectureView || 'sources'));
-  }
-  for (const btn of architectureTabBtns) {
-    btn.addEventListener('click', () => setArchitectureOpen(true, btn.dataset.architectureTab || 'sources'));
-    btn.addEventListener('keydown', event => {
-      const current = architectureTabBtns.indexOf(btn);
-      let next = current;
-      if (event.key === 'ArrowRight') next = (current + 1) % architectureTabBtns.length;
-      else if (event.key === 'ArrowLeft') next = (current - 1 + architectureTabBtns.length) % architectureTabBtns.length;
-      else if (event.key === 'Home') next = 0;
-      else if (event.key === 'End') next = architectureTabBtns.length - 1;
-      else return;
-      event.preventDefault();
-      architectureTabBtns[next].focus();
-      architectureTabBtns[next].click();
-    });
-  }
-  for (const btn of workflowOpsTabBtns) {
-    btn.addEventListener('click', () => activateWorkflowOpsView(btn.dataset.workflowOpsView || 'overview'));
-    btn.addEventListener('keydown', event => {
-      const current = workflowOpsTabBtns.indexOf(btn);
-      let next = current;
-      if (event.key === 'ArrowRight') next = (current + 1) % workflowOpsTabBtns.length;
-      else if (event.key === 'ArrowLeft') next = (current - 1 + workflowOpsTabBtns.length) % workflowOpsTabBtns.length;
-      else if (event.key === 'Home') next = 0;
-      else if (event.key === 'End') next = workflowOpsTabBtns.length - 1;
-      else return;
-      event.preventDefault();
-      workflowOpsTabBtns[next].focus();
-      workflowOpsTabBtns[next].click();
-    });
-  }
-  for (const btn of workflowOpsSummaryBtns) {
-    btn.addEventListener('click', () => activateWorkflowOpsView(btn.dataset.workflowSummaryView || 'overview'));
-  }
-  architectureSourceRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('sources', true));
-  architectureSourceHealthModalCloseBtn?.addEventListener('click', () => {
-    if (architectureSourceHealthModalEl) architectureSourceHealthModalEl.hidden = true;
-  });
-  architectureSqlForm?.addEventListener('submit', planArchitectureSql);
-  architectureSqlApproveBtn?.addEventListener('click', approveArchitectureSql);
-  architectureSqlExecuteBtn?.addEventListener('click', executeArchitectureSql);
-  architectureSqlValidationForm?.addEventListener('submit', validateArchitectureSql);
-  [
-    architectureSqlMetricEl,
-    architectureSqlDimensionEl,
-    architectureSqlFilterColumnEl,
-    architectureSqlFilterValueEl,
-    architectureSqlLimitEl,
-  ].forEach(control => control?.addEventListener('input', invalidateArchitectureSqlPlan));
-  architectureWorkflowRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('workflows', true));
-  architectureEvaluationRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('evaluation', true));
-  workflowOpsCompileForm?.addEventListener('submit', compileWorkflowOperation);
-  workflowOpsLibrarySearchEl?.addEventListener('input', renderWorkflowOpsLibraryList);
-  workflowOpsRunSearchEl?.addEventListener('input', renderWorkflowOpsRunList);
-  workflowOpsRunStatusEl?.addEventListener('change', renderWorkflowOpsRunList);
-  architectureGraphRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('graph', true));
-  architectureGraphForm?.addEventListener('submit', retrieveArchitectureGraph);
-  architectureReviewRefreshBtn?.addEventListener('click', () => loadArchitecturePanel('reviews', true));
-  architectureReviewForm?.addEventListener('submit', createArchitectureReview);
-  architectureReviewOpenBtn?.addEventListener('click', () => {
-    if (!architectureReviewModalEl) return;
-    architectureReviewModalEl.hidden = false;
-    architectureReviewQuestionEl?.focus();
-  });
-  const closeArchitectureReviewModal = () => {
-    if (architectureReviewModalEl) architectureReviewModalEl.hidden = true;
-    architectureReviewOpenBtn?.focus();
-  };
-  architectureReviewCloseBtn?.addEventListener('click', closeArchitectureReviewModal);
-  architectureReviewCancelBtn?.addEventListener('click', closeArchitectureReviewModal);
-  architectureHighRiskWriteCloseBtn?.addEventListener('click', closeHighRiskWriteModal);
-  architectureHighRiskWriteRejectBtn?.addEventListener('click', async () => {
-    const approval = architectureHighRiskWriteContext?.approval;
-    closeHighRiskWriteModal();
-    if (approval) await decideArchitectureApproval('reject', approval);
-  });
-  architectureHighRiskWriteApproveBtn?.addEventListener('click', async () => {
-    const approval = architectureHighRiskWriteContext?.approval;
-    closeHighRiskWriteModal();
-    if (approval) await decideArchitectureApproval('approve', approval);
-  });
-  architectureOpenPluginManagementBtn?.addEventListener('click', () => {
-    setArchitectureOpen(false, architectureView, { skipWorkspace: true });
-    const section = document.querySelector('[data-section="plugins"]');
-    if (section?.classList.contains('collapsed')) section.querySelector('.sidebar-heading')?.click();
-    document.body.classList.add('sidebar-open');
-  });
-}
-
-// ── Cortex workspaces ───────────────────────────────────────────────────────
-
-function setWorkspaceStatus(text, isError = false) {
-  if (!workspaceStatusEl) return;
-  workspaceStatusEl.textContent = text || '';
-  workspaceStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function setWorkspaceSwitching(value) {
-  workspaceSwitching = Boolean(value);
-  if (workspaceToggleBtn) workspaceToggleBtn.disabled = workspaceSwitching;
-  if (workspaceNewBtn) workspaceNewBtn.disabled = workspaceSwitching;
-  if (workspaceRenameBtn) workspaceRenameBtn.disabled = workspaceSwitching;
-  if (workspaceConfigBtn) workspaceConfigBtn.disabled = workspaceSwitching;
-  if (inputEl) {
-    inputEl.disabled = workspaceSwitching;
-    inputEl.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
-  }
-  if (sendBtn) {
-    sendBtn.disabled = workspaceSwitching;
-    sendBtn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
-  }
-  if (newBtn) {
-    newBtn.disabled = workspaceSwitching;
-    newBtn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
-  }
-  const workspaceUploadInput = document.getElementById('upload-input');
-  if (workspaceUploadInput) workspaceUploadInput.disabled = workspaceSwitching;
-  renderWorkspaces();
-}
-
-function workspaceRestartSleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function workspaceStateHasActiveId(state, id) {
-  return state?.active === id || Boolean(state?.workspaces?.some(workspace => workspace.id === id && workspace.active));
-}
-
-function isWorkspaceFetchFailure(error) {
-  const message = String(error?.message || error || '');
-  return error instanceof TypeError || /failed to fetch|networkerror|fetch failed/i.test(message);
-}
-
-// A switch replaces the process serving this page. The only trustworthy evidence that it completed is
-// that a DIFFERENT process is answering — `active` alone is not evidence, because the outgoing process
-// writes the registry file before it starts shutting down and will happily report the new id while
-// still serving the old workspace's sessions. That is what made a switch look like it worked while the
-// conversation list stayed on the previous workspace.
-async function waitForWorkspaceRestart(workspaceId, previousRuntimeId) {
-  const startedAt = Date.now();
-  let nextStatusAt = startedAt + WORKSPACE_RESTART_STATUS_INTERVAL_MS;
-  let sawUnavailable = false;
-  await workspaceRestartSleep(350);
-  while (Date.now() - startedAt < WORKSPACE_RESTART_TIMEOUT_MS) {
-    try {
-      const nextState = await T.listWorkspaces();
-      const runtimeId = nextState?.runtime?.id;
-      // Older servers report no runtime identity; fall back to the previous heuristic rather than
-      // hanging until the timeout.
-      const replaced = runtimeId !== undefined
-        ? (previousRuntimeId === undefined || runtimeId !== previousRuntimeId)
-        : (sawUnavailable || Date.now() - startedAt >= 1200);
-      if (workspaceStateHasActiveId(nextState, workspaceId) && replaced) {
-        workspaceState = nextState;
-        renderWorkspaces();
-        return;
-      }
-    } catch (_e) {
-      sawUnavailable = true;
-    }
-    const now = Date.now();
-    if (now >= nextStatusAt) {
-      setWorkspaceStatus(`Restarting... ${Math.floor((now - startedAt) / 1000)}s`);
-      nextStatusAt = now + WORKSPACE_RESTART_STATUS_INTERVAL_MS;
-    }
-    await workspaceRestartSleep(500);
-  }
-  throw new Error(`Timed out after ${Math.floor(WORKSPACE_RESTART_TIMEOUT_MS / 1000)} seconds waiting for workspace restart. Refresh once Cortex is back online.`);
-}
-
-function workspaceInitial(name) {
-  const trimmed = String(name || 'Default').trim();
-  return (trimmed[0] || 'C').toUpperCase();
-}
-
-function activeWorkspace() {
-  return workspaceState.workspaces.find(w => w.active) ??
-         workspaceState.workspaces.find(w => w.id === workspaceState.active) ??
-         workspaceState.workspaces[0] ??
-         { id: 'default', name: 'Default', active: true };
-}
-
-function activeWorkspaceId() {
-  return activeWorkspace().id || workspaceState.active || 'default';
-}
-
-function setWorkspacePopoverOpen(open) {
-  if (!workspacePopoverEl || !workspaceToggleBtn) return;
-  if (workspaceSwitching && !open) return;
-  workspacePopoverEl.classList.toggle('open', open);
-  workspaceToggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open) setWorkspaceSettingsOpen(false);
-}
-
-function setWorkspaceSettingsOpen(open) {
-  if (!workspaceSettingsScreenEl || !workspaceConfigBtn) return;
-  if (workspaceSwitching && open) return;
-  workspaceSettingsScreenEl.classList.toggle('open', open);
-  document.body.classList.toggle('workspace-settings-open', open);
-  workspaceConfigBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open) {
-    setArchitectureOpen(false, architectureView, { skipWorkspace: true });
-    setWorkspacePopoverOpen(false);
-    closeSidebar();
-    loadWorkspaceRagConfig();
-    startWorkspaceRagPoll();
-  } else {
-    stopWorkspaceRagPoll();
-  }
-}
-
-function confirmWorkspaceDelete(workspace) {
-  if (!workspaceDeleteDialogEl || !workspaceDeleteMessageEl || !workspaceDeleteCancelBtn || !workspaceDeleteConfirmBtn) {
-    return Promise.resolve(false);
-  }
-  workspaceDeleteMessageEl.textContent = `Delete "${workspace.name}" and its local workspace files?`;
-  const restoreFocus = document.activeElement;
-  workspaceDeleteDialogEl.classList.add('open');
-  workspaceDeleteDialogEl.setAttribute('aria-hidden', 'false');
-  workspaceDeleteConfirmBtn.focus();
-
-  return new Promise(resolve => {
-    const finish = (confirmed) => {
-      workspaceDeleteDialogEl.classList.remove('open');
-      workspaceDeleteDialogEl.setAttribute('aria-hidden', 'true');
-      workspaceDeleteCancelBtn.removeEventListener('click', onCancel);
-      workspaceDeleteConfirmBtn.removeEventListener('click', onConfirm);
-      workspaceDeleteDialogEl.removeEventListener('click', onBackdrop);
-      document.removeEventListener('keydown', onKeyDown);
-      if (!confirmed && restoreFocus instanceof HTMLElement && restoreFocus.isConnected) restoreFocus.focus();
-      resolve(confirmed);
-    };
-    const onCancel = (event) => { event.stopPropagation(); finish(false); };
-    const onConfirm = (event) => { event.stopPropagation(); finish(true); };
-    const onBackdrop = (event) => {
-      event.stopPropagation();
-      if (event.target === workspaceDeleteDialogEl) finish(false);
-    };
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape') finish(false);
-      if (event.key === 'Tab') {
-        const focusable = [workspaceDeleteConfirmBtn, workspaceDeleteCancelBtn].filter(button => !button.disabled);
-        const current = focusable.indexOf(document.activeElement);
-        const next = event.shiftKey
-          ? (current <= 0 ? focusable.length - 1 : current - 1)
-          : (current < 0 || current === focusable.length - 1 ? 0 : current + 1);
-        event.preventDefault();
-        focusable[next]?.focus();
-      }
-    };
-    workspaceDeleteCancelBtn.addEventListener('click', onCancel);
-    workspaceDeleteConfirmBtn.addEventListener('click', onConfirm);
-    workspaceDeleteDialogEl.addEventListener('click', onBackdrop);
-    document.addEventListener('keydown', onKeyDown);
-  });
-}
-
-function workspaceDeleteErrorMessage(error) {
-  const details = error?.details;
-  if (details?.locked) {
-    const suffix = details.state ? ` (${details.state})` : '';
-    return `${details.reason || 'Workspace indexing is currently running or pending.'}${suffix}`;
-  }
-  return String(error?.message || error);
-}
-
-function renderWorkspaces() {
-  const current = activeWorkspace();
-  if (workspaceNameEl) workspaceNameEl.textContent = current.name || 'Default';
-  if (workspaceAvatarEl) workspaceAvatarEl.textContent = workspaceInitial(current.name);
-  if (!workspaceListEl) return;
-  workspaceListEl.innerHTML = '';
-  for (const workspace of workspaceState.workspaces) {
-    const row = document.createElement('div');
-    row.className = 'workspace-row';
-    row.dataset.workspaceId = workspace.id;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'workspace-option' + (workspace.active ? ' active' : '');
-    btn.dataset.workspaceId = workspace.id;
-    btn.disabled = workspaceSwitching;
-    btn.setAttribute('aria-disabled', workspaceSwitching ? 'true' : 'false');
-    btn.innerHTML = `<span class="workspace-option-name"></span><span class="workspace-option-check">${workspace.active ? '✓' : ''}</span>`;
-    btn.querySelector('.workspace-option-name').textContent = workspace.name;
-    btn.addEventListener('click', async () => {
-      if (workspaceSwitching) return;
-      if (workspace.active) { setWorkspacePopoverOpen(false); return; }
-      try {
-        setWorkspaceSwitching(true);
-        setWorkspaceStatus('Switching...');
-        // Captured before the switch: the process about to be replaced.
-        const previousRuntimeId = workspaceState?.runtime?.id;
-        let result;
-        try {
-          result = await T.switchWorkspace(workspace.id);
-        } catch (e) {
-          if (!isWorkspaceFetchFailure(e)) throw e;
-          result = { active: workspace.id, restarting: true };
-        }
-        if (result?.restarting) {
-          setWorkspaceStatus('Restarting...');
-          await waitForWorkspaceRestart(workspace.id, previousRuntimeId);
-          window.location.reload();
-        } else {
-          await loadWorkspaces();
-          setWorkspacePopoverOpen(false);
-          setWorkspaceSwitching(false);
-        }
-      } catch (e) {
-        setWorkspaceSwitching(false);
-        setWorkspaceStatus(String(e.message || e), true);
-      }
-    });
-    row.appendChild(btn);
-    if (!workspace.active) {
-      const deleteBtn = document.createElement('button');
-      deleteBtn.type = 'button';
-      deleteBtn.className = 'workspace-delete-btn';
-      deleteBtn.innerHTML = ICON_TRASH;
-      deleteBtn.title = `Delete ${workspace.name}`;
-      deleteBtn.setAttribute('aria-label', `Delete ${workspace.name}`);
-      deleteBtn.disabled = workspaceSwitching;
-      deleteBtn.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        if (workspaceSwitching) return;
-        try {
-          setWorkspaceStatus('Checking workspace...');
-          await T.checkWorkspaceDelete(workspace.id);
-        } catch (e) {
-          setWorkspaceStatus(workspaceDeleteErrorMessage(e), true);
-          return;
-        }
-        const confirmed = await confirmWorkspaceDelete(workspace);
-        if (!confirmed) {
-          setWorkspaceStatus('');
-          return;
-        }
-        try {
-          setWorkspaceStatus('Deleting...');
-          await T.deleteWorkspace(workspace.id);
-          await loadWorkspaces();
-        } catch (e) {
-          setWorkspaceStatus(String(e.message || e), true);
-        }
-      });
-      row.appendChild(deleteBtn);
-    }
-    workspaceListEl.appendChild(row);
-  }
-}
-
-async function loadWorkspaces() {
-  if (!T.listWorkspaces || !workspaceToggleBtn) return;
-  try {
-    const previousWorkspaceId = activeWorkspaceId();
-    const nextWorkspaceState = await T.listWorkspaces();
-    workspaceState = nextWorkspaceState;
-    if (activeWorkspaceId() !== previousWorkspaceId) {
-      workspaceGeneration += 1;
-      selectedWorkspaceFiles.clear();
-      selectedWorkspaceOwner = null;
-      renderAttachmentTray();
-      architectureSourcesLoadSeq += 1;
-      architectureSqlPlanRequest += 1;
-      architectureWorkflowLoadRequest += 1;
-      architectureEvaluationLoadRequest += 1;
-      architectureGraphRetrieveRequest += 1;
-      workspaceRagLoadSeq += 1;
-    }
-    workspaceRagConfig = null;
-    renderWorkspaces();
-    if (workspaceSettingsScreenEl?.classList.contains('open')) void loadWorkspaceRagConfig();
-    setWorkspaceStatus('');
-  } catch (e) {
-    setWorkspaceStatus('Workspace API unavailable.', true);
-  }
-}
-
-workspaceToggleBtn?.addEventListener('click', () => {
-  if (workspaceSwitching) return;
-  setWorkspacePopoverOpen(!workspacePopoverEl?.classList.contains('open'));
-});
-
-workspaceConfigBtn?.addEventListener('click', () => {
-  if (workspaceSwitching) return;
-  setWorkspaceSettingsOpen(true);
-});
-
-workspaceNewBtn?.addEventListener('click', async () => {
-  if (workspaceSwitching) return;
-  const name = prompt('New workspace name');
-  if (!name || !name.trim()) return;
-  try {
-    await T.createWorkspace(name.trim());
-    await loadWorkspaces();
-  } catch (e) {
-    setWorkspaceStatus(String(e.message || e), true);
-  }
-});
-
-workspaceRenameBtn?.addEventListener('click', async () => {
-  if (workspaceSwitching) return;
-  const current = activeWorkspace();
-  const name = prompt('Rename workspace', current.name || 'Default');
-  if (!name || !name.trim()) return;
-  try {
-    await T.renameWorkspace(current.id, name.trim());
-    await loadWorkspaces();
-  } catch (e) {
-    setWorkspaceStatus(String(e.message || e), true);
-  }
-});
-
-document.addEventListener('click', (e) => {
-  if (!workspacePopoverEl?.classList.contains('open')) return;
-  if (e.target.closest('#workspace-menu')) return;
-  setWorkspacePopoverOpen(false);
-});
-
-function setWorkspaceRagStatus(text, isError = false) {
-  if (!workspaceRagStatusEl) return;
-  workspaceRagStatusEl.textContent = text || '';
-  workspaceRagStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function renderWorkspaceRagStatus(status) {
-  if (!status) return;
-  if (status.workspaceId && status.workspaceId !== activeWorkspaceId()) return;
-  const job = status.job && typeof status.job === 'object' ? status.job : null;
-  const totalFiles = Number(job?.totalFiles ?? 0);
-  const processedFiles = Number(job?.processedFiles ?? 0);
-  const terminal = typeof job?.state === 'string' && (job.state.startsWith('active_') || ['cancelled', 'retryable_failure', 'permanent_failure'].includes(job.state));
-  const percent = totalFiles > 0
-    ? Math.max(0, Math.min(100, Math.round(processedFiles / totalFiles * 100)))
-    : (terminal && job?.discoveryComplete ? 100 : 0);
-  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = percent + '%';
-  const accel = status.accelerated
-    ? `CUDA · ${status.embeddingModel || 'GPU embeddings'}`
-    : (status.nvidiaAvailable ? 'CPU (NVIDIA detected)' : 'CPU');
-  const state = !status.available
-    ? 'unavailable'
-    : (job?.state || status.activeState || 'pending');
-  const backend = status.backend === 'postgres-pgvector'
-    ? ' · Postgres/pgvector'
-    : (status.backend === 'memory' ? ' · Memory (test)' : '');
-  const progress = job ? ` · ${processedFiles}/${totalFiles} files · ${percent}%` : '';
-  const changes = job
-    ? ` · ${job.addedFiles ?? 0} added, ${job.changedFiles ?? 0} changed, ${job.unchangedFiles ?? 0} unchanged, ${job.removedFiles ?? 0} removed`
-    : '';
-  const indexed = Number.isFinite(Number(status.indexedDocuments))
-    ? ` · ${Number(status.indexedDocuments)} indexed in database`
-    : '';
-  const resumed = Number(job?.resumedFiles) > 0 ? ` · resumed ${Number(job.resumedFiles)} from interrupted run` : '';
-  const checkpoints = Number(job?.publishedCheckpoints) > 0
-    ? ` · ${Number(job.publishedCheckpoints)} checkpoint${Number(job.publishedCheckpoints) === 1 ? '' : 's'} published`
-    : '';
-  const watcher = status.watcher
-    ? ` · watcher ${status.watcher.state}${status.watcher.pendingChanges ? ' (pending)' : ''}${status.watcher.reconcileQueued ? ' (queued)' : ''}`
-    : '';
-  const message = status.message ? ' · ' + status.message : '';
-  const accelerationMessage = status.accelerationMessage ? ' · ' + status.accelerationMessage : '';
-  const isError = !status.available || ['retryable_failure', 'permanent_failure'].includes(state) || status.watcher?.state === 'degraded';
-  setWorkspaceRagStatus(`${state}${progress}${changes}${indexed}${resumed}${checkpoints} · ${accel}${backend}${watcher}${message}${accelerationMessage}`, isError);
-  if (workspaceRagCurrentFileEl) {
-    const currentFile = typeof job?.currentPath === 'string' && job.currentPath.trim()
-      ? job.currentPath.trim()
-      : '';
-    workspaceRagCurrentFileEl.textContent = currentFile ? `Current file: ${currentFile}` : '';
-    workspaceRagCurrentFileEl.title = currentFile;
-  }
-}
-
-function parseWorkspaceRagPaths(value) {
-  return String(value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-}
-
-function workspaceRagSnapshotFromConfig(config) {
-  const active = activeWorkspaceRagContext(config);
-  const paths = Array.isArray(active?.paths ?? config?.paths)
-    ? (active?.paths ?? config.paths).map(item => String(item))
-    : [];
-  const contextName = String(
-    active?.name || config?.contextName || activeWorkspace().name || 'Workspace',
-  ).trim() || activeWorkspace().name || 'Workspace';
-  return {
-    contextId: active?.id || config?.activeContextId || '',
-    contextName,
-    paths,
-  };
-}
-
-function currentWorkspaceRagFormSnapshot() {
-  return {
-    contextId: activeWorkspaceRagContext()?.id || workspaceRagSavedSnapshot?.contextId || '',
-    contextName: workspaceContextNameEl?.value?.trim() || activeWorkspace().name || 'Workspace',
-    paths: parseWorkspaceRagPaths(workspaceRagPathsEl?.value || ''),
-  };
-}
-
-function workspaceRagSnapshotsEqual(left, right) {
-  if (!left || !right) return false;
-  if (left.contextId !== right.contextId || left.contextName !== right.contextName) return false;
-  if (left.paths.length !== right.paths.length) return false;
-  return left.paths.every((item, index) => item === right.paths[index]);
-}
-
-function updateWorkspaceRagSaveState() {
-  if (!workspaceRagSaveBtn) return;
-  const hasLoadedConfig = Boolean(workspaceRagSavedSnapshot);
-  const dirty = hasLoadedConfig && !workspaceRagSnapshotsEqual(workspaceRagSavedSnapshot, currentWorkspaceRagFormSnapshot());
-  workspaceRagSaveBtn.disabled = workspaceRagSaving || !dirty;
-  workspaceRagSaveBtn.setAttribute('aria-disabled', workspaceRagSaveBtn.disabled ? 'true' : 'false');
-  workspaceRagSaveBtn.title = workspaceRagSaving
-    ? 'Saving...'
-    : (dirty ? 'Save changes' : 'No changes to save');
-}
-
-function activeWorkspaceRagContext(config = workspaceRagConfig) {
-  if (!config) return null;
-  const contexts = Array.isArray(config.contexts) ? config.contexts : [];
-  return contexts.find(context => context.id === config.activeContextId) ?? contexts[0] ?? null;
-}
-
-function renderWorkspaceRagConfig(config) {
-  workspaceRagConfig = config;
-  const active = activeWorkspaceRagContext(config);
-  if (workspaceContextNameEl) workspaceContextNameEl.value = active?.name || config?.contextName || activeWorkspace().name || '';
-  if (workspaceRagPathsEl) workspaceRagPathsEl.value = Array.isArray(active?.paths ?? config?.paths) ? (active?.paths ?? config.paths).join('\n') : '';
-  workspaceRagSavedSnapshot = workspaceRagSnapshotFromConfig(config);
-  updateWorkspaceRagSaveState();
-}
-
-function resetWorkspaceRagConfigForm() {
-  workspaceRagConfig = null;
-  workspaceRagSavedSnapshot = null;
-  workspaceRagSaving = false;
-  if (workspaceContextNameEl) workspaceContextNameEl.value = activeWorkspace().name || '';
-  if (workspaceRagPathsEl) workspaceRagPathsEl.value = '';
-  if (workspaceRagProgressBarEl) workspaceRagProgressBarEl.style.width = '0%';
-  if (workspaceRagCurrentFileEl) {
-    workspaceRagCurrentFileEl.textContent = '';
-    workspaceRagCurrentFileEl.title = '';
-  }
-  updateWorkspaceRagSaveState();
-}
-
-async function loadWorkspaceRagStatus() {
-  try {
-    const status = await callTool('workspace_rag', { action: 'status' });
-    renderWorkspaceRagStatus(status);
-  } catch (e) {
-    setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
-    if (workspaceRagCurrentFileEl) {
-      workspaceRagCurrentFileEl.textContent = '';
-      workspaceRagCurrentFileEl.title = '';
-    }
-  }
-}
-
-async function loadWorkspaceRagConfig() {
-  const loadSeq = ++workspaceRagLoadSeq;
-  const workspaceId = activeWorkspaceId();
-  resetWorkspaceRagConfigForm();
-  setWorkspaceRagStatus('Loading workspace settings...');
-  try {
-    const [config, status] = await Promise.all([
-      callTool('workspace_rag', { action: 'get_config' }),
-      callTool('workspace_rag', { action: 'status' }),
-    ]);
-    if (loadSeq !== workspaceRagLoadSeq || workspaceId !== activeWorkspaceId()) return;
-    if (status?.workspaceId && status.workspaceId !== workspaceId) return;
-    renderWorkspaceRagConfig(config);
-    renderWorkspaceRagStatus(status);
-  } catch (e) {
-    if (loadSeq !== workspaceRagLoadSeq) return;
-    workspaceRagSavedSnapshot = null;
-    updateWorkspaceRagSaveState();
-    setWorkspaceRagStatus('workspace_rag plugin unavailable.', true);
-    if (workspaceRagCurrentFileEl) {
-      workspaceRagCurrentFileEl.textContent = '';
-      workspaceRagCurrentFileEl.title = '';
-    }
-  }
-}
-
-function startWorkspaceRagPoll() {
-  stopWorkspaceRagPoll();
-  workspaceRagPoll = setInterval(() => { loadWorkspaceRagStatus(); }, 3000);
-}
-
-function stopWorkspaceRagPoll() {
-  if (workspaceRagPoll !== null) {
-    clearInterval(workspaceRagPoll);
-    workspaceRagPoll = null;
-  }
-}
-
-workspaceContextNameEl?.addEventListener('input', updateWorkspaceRagSaveState);
-workspaceRagPathsEl?.addEventListener('input', updateWorkspaceRagSaveState);
-
-workspaceRagSaveBtn?.addEventListener('click', async () => {
-  if (workspaceRagSaving || !workspaceRagSavedSnapshot) return;
-  const nextSnapshot = currentWorkspaceRagFormSnapshot();
-  if (workspaceRagSnapshotsEqual(workspaceRagSavedSnapshot, nextSnapshot)) {
-    updateWorkspaceRagSaveState();
-    return;
-  }
-  workspaceRagSaving = true;
-  updateWorkspaceRagSaveState();
-  try {
-    const input = {
-      action: 'configure',
-      contextName: nextSnapshot.contextName,
-      paths: nextSnapshot.paths,
-    };
-    if (nextSnapshot.contextId) input.contextId = nextSnapshot.contextId;
-    const result = await callTool('workspace_rag', input);
-    if (result?.config) renderWorkspaceRagConfig(result.config);
-    else workspaceRagSavedSnapshot = nextSnapshot;
-    if (result?.status) renderWorkspaceRagStatus(result.status);
-  } catch (e) {
-    setWorkspaceRagStatus(String(e.message || e), true);
-  } finally {
-    workspaceRagSaving = false;
-    updateWorkspaceRagSaveState();
-  }
-});
-
-workspaceSettingsCancelBtn?.addEventListener('click', () => {
-  setWorkspaceSettingsOpen(false);
-});
-
-// ── Expert panel ─────────────────────────────────────────────────────────────
-
-function setExpertStatus(text, isError = false) {
-  if (!expertStatusEl) return;
-  expertStatusEl.textContent = text || '';
-  expertStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function updateExpertControlsState() {
-  if (expertEnabledEl) expertEnabledEl.disabled = expertPanelBusy || expertPanelExperts.length === 0;
-  if (expertToggleBtn) {
-    const enabled = expertEnabledEl?.checked === true;
-    expertToggleBtn.classList.toggle('enabled', enabled);
-    expertToggleBtn.classList.toggle('active', expertPopoverEl?.classList.contains('open') === true);
-    expertToggleBtn.setAttribute('aria-expanded', expertPopoverEl?.classList.contains('open') ? 'true' : 'false');
-    expertToggleBtn.textContent = enabled ? 'Experts on' : 'Experts';
-  }
-}
-
-function setExpertPopoverOpen(open) {
-  if (!expertPopoverEl) return;
-  if (open) setWorkspaceSettingsOpen(false);
-  expertPopoverEl.classList.toggle('open', open);
-  updateExpertControlsState();
-}
-
-async function loadExperts() {
-  if (!expertListEl) return;
-  try {
-    const result = await callTool('expert_panel', { action: 'list' });
-    renderExpertPanel(Array.isArray(result.experts) ? result.experts : []);
-    setExpertStatus(result.experts?.length ? '' : 'No experts configured.', !result.experts?.length);
-  } catch {
-    expertPanelExperts = [];
-    renderExpertPanel([]);
-    setExpertStatus('expert_panel plugin unavailable.', true);
-  }
-}
-
-function renderExpertPanel(experts) {
-  if (!expertListEl) return;
-  expertPanelExperts = [...experts];
-  expertListEl.innerHTML = '';
-
-  if (!expertPanelExperts.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:2px 0 2px 20px;';
-    empty.textContent = '(none)';
-    expertListEl.appendChild(empty);
-    updateExpertControlsState();
-    return;
-  }
-
-  for (const expert of expertPanelExperts) {
-    const label = document.createElement('label');
-    label.className = 'expert-option';
-    if (expert.description) label.title = expert.description;
-
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'expert-choice';
-    checkbox.value = expert.id;
-    checkbox.checked = true;
-
-    const text = document.createElement('span');
-    text.textContent = expert.title || expert.id;
-
-    label.appendChild(checkbox);
-    label.appendChild(text);
-    expertListEl.appendChild(label);
-  }
-
-  if (expertAllEl) expertAllEl.checked = true;
-  updateExpertControlsState();
-}
-
-function selectedExpertIds() {
-  if (expertAllEl?.checked) return [];
-  return Array.from(document.querySelectorAll('.expert-choice:checked')).map(el => el.value);
-}
-
-function syncExpertAllFromChoices() {
-  if (!expertAllEl) return;
-  const choices = Array.from(document.querySelectorAll('.expert-choice'));
-  expertAllEl.checked = choices.length > 0 && choices.every(choice => choice.checked);
-}
-
-function expertUserSummary(question, selected, mode, synthesize) {
-  return [
-    `Expert panel (${mode})`,
-    `Experts: ${selected.length ? selected.join(', ') : 'all'}`,
-    `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
-    '',
-    question
-  ].join('\n');
-}
-
-function formatExpertPanelResult(result) {
-  const lines = [
-    '## Expert panel',
-    `Mode: ${result?.mode ?? 'parallel'}`
-  ];
-
-  const opinions = Array.isArray(result?.experts) ? result.experts : [];
-  for (const opinion of opinions) {
-    lines.push('', `### ${opinion.title || opinion.expertId || 'Expert'}`, opinion.answer || '(No answer returned.)');
-    const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
-    if (citations.length) {
-      lines.push('', 'Citations:');
-      for (const citation of citations) {
-        const title = citation.title || citation.id || citation.path || 'source';
-        const path = citation.path ? ` - ${citation.path}` : '';
-        lines.push(`- ${title}${path}`);
-      }
-    }
-  }
-
-  if (result?.synthesis) {
-    lines.push('', '### Synthesis', result.synthesis);
-  }
-
-  if (!opinions.length && !result?.synthesis) {
-    lines.push('', 'No expert response was returned.');
-  }
-
-  return lines.join('\n');
-}
-
-async function runExpertPanelFromUi() {
-  if (expertPanelBusy) return;
-  const question = inputEl.value.trim();
-  const mode = expertModeEl?.value || 'parallel';
-  const synthesize = expertSynthesizeEl?.checked !== false;
-  const experts = selectedExpertIds();
-
-  if (!question) {
-    setExpertStatus('Enter a question for the panel.', true);
-    inputEl.focus();
-    return;
-  }
-  if (!expertAllEl?.checked && experts.length === 0) {
-    setExpertStatus('Select at least one expert, or choose all experts.', true);
-    return;
-  }
-
-  closeSidebar();
-  setExpertPopoverOpen(false);
-  expertPanelBusy = true;
-  updateExpertControlsState();
-  setExpertStatus('Running expert panel...');
-  inputEl.value = '';
-  inputEl.style.height = 'auto';
-
-  try {
-    if (newSessionPromise && !(await newSessionPromise)) return;
-    if (!currentSessionId) {
-      const { id } = await apiNewSession();
-      currentSessionId = id;
-      location.hash = id;
-    }
-    await connectSessionStream(currentSessionId);
-
-    const input = { question, mode, synthesize, maxCitationsPerExpert: 5, provider: providerSel.value };
-    if (experts.length) input.experts = experts;
-    const result = await T.submitExpertPanel(currentSessionId, input);
-    if (result?.session) {
-      if (result.traceId) foldedTraces.add(result.traceId);
-      renderSession(result.session);
-    }
-    if (result?.isError) {
-      setExpertStatus(result.error || 'Expert panel failed.', true);
-    } else {
-      setExpertStatus('Complete.');
-    }
-  } catch (err) {
-    const message = err?.message ?? String(err);
-    showSubmitError(expertUserSummary(question, experts, mode, synthesize), message);
-    setExpertStatus(message, true);
-  } finally {
-    expertPanelBusy = false;
-    updateExpertControlsState();
-    // This flow consumes the HTTP response directly rather than the stream's `done` event, so it never
-    // reaches the refresh wired in there. The server titles this session out of band too — same hook.
-    refreshTitlesAfterFollowup();
-  }
-}
-
-expertToggleBtn?.addEventListener('click', (event) => {
-  event.stopPropagation();
-  setExpertPopoverOpen(!expertPopoverEl?.classList.contains('open'));
-});
-
-expertPopoverEl?.addEventListener('click', event => event.stopPropagation());
-
-document.addEventListener('click', () => setExpertPopoverOpen(false));
-
-expertEnabledEl?.addEventListener('change', () => updateExpertControlsState());
-
-expertAllEl?.addEventListener('change', () => {
-  const checked = expertAllEl.checked;
-  document.querySelectorAll('.expert-choice').forEach(choice => { choice.checked = checked; });
-});
-
-expertListEl?.addEventListener('change', (event) => {
-  if (event.target?.classList?.contains('expert-choice')) syncExpertAllFromChoices();
-});
-
-// Join an in-progress server run for sessionId. renderedCount is the number of
-// non-system messages already in the DOM so incremental appends start from there.
-// If the bottom of messages is not visible in the viewport, transform the
-// send button into a ▼ down-arrow that scrolls to bottom on click.
 function maybeShowScrollDown() {
   if (sending) return;
   updateScrollDownButton();
@@ -4002,12 +571,8 @@ async function hideSession(id) {
   } catch (e) { alert('Hide failed: ' + e.message); }
 }
 
-// A session title can be written by a `followup` hook, which runs *post-commit* — after the `done`
-// event carrying the session was already emitted. So the title on that event is the pre-hook value and
-// nothing else announces the later write. Re-read the list a moment afterwards so a hook-written title
-// reaches the sidebar and header without a page reload. Two passes: a fast model lands well inside the
-// first, a slow local one inside the second.
 const TITLE_REFRESH_DELAYS_MS = [1500, 5000];
+
 let titleRefreshTimers = [];
 
 function refreshTitlesAfterFollowup() {
@@ -4029,835 +594,6 @@ function refreshTitlesAfterFollowup() {
 async function apiNewSession() {
   return T.createSession();
 }
-
-// ── Workspace files ───────────────────────────────────────────────────────────
-
-function formatSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
-function syncWorkspaceFileAttachmentRows() {
-  document.querySelectorAll('#file-list .file-item').forEach(row => {
-    const selected = selectedWorkspaceFiles.has(row.dataset.path);
-    row.classList.toggle('attached', selected);
-    const button = row.querySelector('.file-attach-btn');
-    if (button) {
-      button.setAttribute('aria-pressed', String(selected));
-      button.title = selected ? 'Remove from next message' : 'Attach to next message';
-      button.setAttribute('aria-label', button.title);
-    }
-  });
-}
-
-function renderAttachmentTray() {
-  if (!attachmentTrayEl) return;
-  attachmentTrayEl.innerHTML = '';
-  for (const file of selectedWorkspaceFiles.values()) {
-    const chip = document.createElement('span');
-    chip.className = 'attachment-chip';
-    chip.dataset.attachmentPath = file.path;
-    chip.title = file.path + (file.size !== undefined ? ` (${formatSize(file.size)})` : '');
-
-    const icon = document.createElement('span');
-    icon.setAttribute('aria-hidden', 'true');
-    icon.textContent = '📎';
-    chip.appendChild(icon);
-
-    const name = document.createElement('span');
-    name.className = 'attachment-chip-name';
-    name.textContent = file.path;
-    chip.appendChild(name);
-
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'attachment-chip-remove';
-    remove.title = `Remove ${file.path} from the next message`;
-    remove.setAttribute('aria-label', remove.title);
-    remove.textContent = '×';
-    remove.onclick = () => {
-      selectedWorkspaceFiles.delete(file.path);
-      renderAttachmentTray();
-      syncWorkspaceFileAttachmentRows();
-    };
-    chip.appendChild(remove);
-    attachmentTrayEl.appendChild(chip);
-  }
-  attachmentTrayEl.hidden = selectedWorkspaceFiles.size === 0;
-}
-
-function setWorkspaceFileAttached(file, attached = true) {
-  const owner = workspaceState.active || 'default';
-  if (selectedWorkspaceOwner !== null && selectedWorkspaceOwner !== owner) {
-    selectedWorkspaceFiles.clear();
-  }
-  selectedWorkspaceOwner = owner;
-  if (attached) selectedWorkspaceFiles.set(file.path, { path: file.path, size: file.size });
-  else selectedWorkspaceFiles.delete(file.path);
-  renderAttachmentTray();
-  syncWorkspaceFileAttachmentRows();
-}
-
-function clearWorkspaceFileAttachments() {
-  selectedWorkspaceFiles.clear();
-  selectedWorkspaceOwner = workspaceState.active || 'default';
-  renderAttachmentTray();
-  syncWorkspaceFileAttachmentRows();
-}
-
-function reconcileWorkspaceFileAttachments(files) {
-  const owner = workspaceState.active || 'default';
-  if (selectedWorkspaceOwner !== null && selectedWorkspaceOwner !== owner) {
-    selectedWorkspaceFiles.clear();
-  }
-  selectedWorkspaceOwner = owner;
-  const available = new Map(files.map(file => [file.path, file]));
-  for (const path of [...selectedWorkspaceFiles.keys()]) {
-    const current = available.get(path);
-    if (current) selectedWorkspaceFiles.set(path, { path, size: current.size });
-    else selectedWorkspaceFiles.delete(path);
-  }
-  renderAttachmentTray();
-}
-
-function renderFiles(files) {
-  const el = document.getElementById('file-list');
-  if (!el) return;
-  knownWorkspaceFiles.clear();
-  for (const file of files || []) {
-    if (file?.path) knownWorkspaceFiles.add(file.path);
-  }
-  el.innerHTML = '';
-  if (!files || !files.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:4px 10px;';
-    empty.textContent = '(empty)';
-    el.appendChild(empty);
-    return;
-  }
-  for (const f of files) {
-    const div = document.createElement('div');
-    div.className = 'file-item' + (updatedFiles.has(f.path) ? ' updated' : '');
-    div.dataset.path = f.path;
-    div.title = f.path + (f.size !== undefined ? ' (' + formatSize(f.size) + ')' : '');
-    div.onclick = () => {
-      updatedFiles.delete(f.path);
-      div.classList.remove('updated');
-      T.openFile('workspace', f.path);
-    };
-    const nameEl = document.createElement('span');
-    nameEl.className = 'file-name';
-    nameEl.textContent = f.path;
-    div.appendChild(nameEl);
-    if (f.size !== undefined) {
-      const sizeEl = document.createElement('span');
-      sizeEl.className = 'file-size';
-      sizeEl.textContent = formatSize(f.size);
-      div.appendChild(sizeEl);
-    }
-    const actions = document.createElement('div');
-    actions.className = 'file-actions';
-    const attachBtn = document.createElement('button');
-    attachBtn.type = 'button';
-    attachBtn.className = 'file-attach-btn';
-    attachBtn.textContent = '📎';
-    attachBtn.setAttribute('aria-pressed', String(selectedWorkspaceFiles.has(f.path)));
-    attachBtn.title = selectedWorkspaceFiles.has(f.path) ? 'Remove from next message' : 'Attach to next message';
-    attachBtn.setAttribute('aria-label', attachBtn.title);
-    attachBtn.onclick = (e) => {
-      e.stopPropagation();
-      setWorkspaceFileAttached(f, !selectedWorkspaceFiles.has(f.path));
-    };
-    actions.appendChild(attachBtn);
-    const delBtn = document.createElement('button');
-    delBtn.className = 'file-action-btn';
-    delBtn.textContent = '\u00d7';
-    delBtn.title = 'Delete';
-    delBtn.onclick = async (e) => {
-      e.stopPropagation();
-      try {
-        await callTool('workspace_action', { action: 'delete', path: f.path });
-        selectedWorkspaceFiles.delete(f.path);
-        renderAttachmentTray();
-        loadFiles();
-      } catch (err) {
-        alert('Delete failed: ' + err.message);
-      }
-    };
-    actions.appendChild(delBtn);
-    div.appendChild(actions);
-    el.appendChild(div);
-  }
-  syncWorkspaceFileAttachmentRows();
-}
-
-async function loadFiles() {
-  const generation = workspaceGeneration;
-  const workspaceId = activeWorkspaceId();
-  try {
-    const data = await callTool('workspace_action', { action: 'list' });
-    if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
-    const files = Array.isArray(data) ? data : (data?.files ?? []);
-    reconcileWorkspaceFileAttachments(files);
-    renderFiles(files);
-  } catch (e) {
-    const msg = String(e);
-    if (msg.includes('not found') || msg.includes('404')) {
-      const el = document.getElementById('file-list');
-      if (el) {
-        el.innerHTML = '';
-        const prompt = document.createElement('div');
-        prompt.className = 'plugin-prompt-banner';
-        prompt.style.display = 'block';
-        prompt.innerHTML = `Workspace plugin not loaded - workspace file management is unavailable.<button style="display:block;margin:6px 10px;padding:4px 12px;font-size:0.86em;color:#fff;background:#2563eb;border:none;border-radius:5px;cursor:pointer;font-family:inherit;font-weight:500;">Enable workspace</button>`;
-        const btn = prompt.querySelector('button');
-        btn.onmouseover = () => { btn.style.background = '#1d4ed8'; };
-        btn.onmouseout  = () => { btn.style.background = '#2563eb'; };
-        btn.onclick = () => {
-          submit('Please discover local plugins and add the workspace plugin to enable file management.');
-        };
-        el.appendChild(prompt);
-      }
-    } else {
-      renderFiles([]);
-    }
-  }
-}
-
-function makePluginLabel(name) {
-  const container = document.createElement('span');
-  container.className = 'plugin-name-label';
-  // Split at the last non-alpha char so the trailing word is always visible.
-  const idx = name.search(/[^a-zA-Z][a-zA-Z]+$/);
-  const prefix = document.createElement('span');
-  prefix.className = 'plugin-name-prefix';
-  const suffix = document.createElement('span');
-  suffix.className = 'plugin-name-suffix';
-  if (idx >= 0) {
-    prefix.textContent = name.slice(0, idx + 1); // includes the separator
-    suffix.textContent = name.slice(idx + 1);
-    container.appendChild(prefix);
-    container.appendChild(suffix);
-  } else {
-    prefix.textContent = name;
-    container.appendChild(prefix);
-  }
-  return container;
-}
-
-async function loadPlugins() {
-  const generation = workspaceGeneration;
-  const workspaceId = activeWorkspaceId();
-  let listResult;
-  try {
-    listResult = await callTool('plugin', { action: 'list' });
-  } catch {
-    return;
-  }
-  let localResult = [];
-  try {
-    localResult = await callTool('plugin', { action: 'discover_local' });
-  } catch { /* discover_local optional */ }
-  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
-  renderPlugins(listResult.loaded ?? [], Array.isArray(localResult) ? localResult : []);
-}
-
-// A plugin can run here only if its declared matbotRuntime includes the host runtime. The transport
-// reports it ('node' when served over HTTP, 'browser' for the in-process bundle); default 'node'.
-// An absent/empty declaration means "unknown" — allow it (the backend's load/rollback gate is the
-// real arbiter; we only suppress installs that are guaranteed to fail).
-const HOST_RUNTIME = T.hostRuntime || 'node';
-const CORE_PLUGIN_NAMES = new Set([
-  '@matatbread/matbot-sessions',
-  '@matatbread/matbot-tool-workspace',
-  '@matatbread/matbot-workflow-governance',
-  '@matatbread/matbot-frontend',
-]);
-const corePluginRemovalDialogEl = document.getElementById('core-plugin-removal-dialog');
-const corePluginRemovalMessageEl = document.getElementById('core-plugin-removal-message');
-const corePluginRemovalCloseBtn = document.getElementById('core-plugin-removal-close');
-const corePluginRemovalCancelBtn = document.getElementById('core-plugin-removal-cancel');
-
-function closeCorePluginRemovalDialog() {
-  if (corePluginRemovalDialogEl) corePluginRemovalDialogEl.hidden = true;
-}
-
-function openCorePluginRemovalDialog(plugin) {
-  if (!corePluginRemovalDialogEl) return;
-  if (corePluginRemovalMessageEl) corePluginRemovalMessageEl.textContent = `The core plugin ${plugin.name} (${plugin.specifier}) was selected for removal.`;
-  corePluginRemovalDialogEl.hidden = false;
-  corePluginRemovalCancelBtn?.focus();
-}
-
-corePluginRemovalCloseBtn?.addEventListener('click', closeCorePluginRemovalDialog);
-corePluginRemovalCancelBtn?.addEventListener('click', closeCorePluginRemovalDialog);
-
-function runsHere(p) {
-  const rt = p && p.matbotRuntime;
-  if (!Array.isArray(rt) || rt.length === 0) return true;
-  return rt.includes(HOST_RUNTIME);
-}
-
-function renderPlugins(loaded, local) {
-  const el = document.getElementById('plugin-list');
-  if (!el) return;
-  el.innerHTML = '';
-
-  const loadedNames = new Set(loaded.map(p => p.name));
-
-  for (const p of loaded) {
-    const det = document.createElement('details');
-    det.className = 'plugin-entry';
-    const sum = document.createElement('summary');
-    if (p.description) sum.title = p.description;
-    const main = document.createElement('div');
-    main.className = 'plugin-summary-main';
-    main.appendChild(makePluginLabel(p.name));
-    const types = p.types ?? [];
-    if (types.length) {
-      const badges = document.createElement('div');
-      badges.className = 'plugin-badges';
-      for (const ty of types) {
-        const isService = ty.startsWith('service:');
-        const badge = document.createElement('span');
-        badge.className = 'plugin-badge';
-        badge.dataset.type = isService ? 'service' : ty;
-        badge.textContent = isService ? ty.slice('service:'.length) : ty;
-        if (isService) badge.title = ty;
-        badges.appendChild(badge);
-      }
-      main.appendChild(badges);
-    }
-    sum.appendChild(main);
-    if (p.specifier) {
-      const actions = document.createElement('div');
-      actions.className = 'plugin-actions';
-      const removeBtn = document.createElement('button');
-      removeBtn.className = 'plugin-action-btn remove';
-      removeBtn.textContent = '×';
-      removeBtn.title = 'Remove plugin';
-      if (CORE_PLUGIN_NAMES.has(p.name)) {
-        removeBtn.dataset.corePlugin = p.name;
-        removeBtn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          openCorePluginRemovalDialog(p);
-        };
-      } else {
-        removeBtn.onclick = (e) => {
-          e.stopPropagation();
-          closeSidebar();
-          // Direct submit so it queues during a turn instead of being blocked by the input.
-          submit(`Remove the plugin '${p.specifier}'`);
-        };
-      }
-      actions.appendChild(removeBtn);
-      sum.appendChild(actions);
-    }
-    det.appendChild(sum);
-    const tools = p.tools ?? [];
-    if (tools.length) {
-      const toolList = document.createElement('div');
-      toolList.className = 'plugin-tool-list';
-      for (const t of tools) {
-        const name = typeof t === 'string' ? t : t.name;
-        const desc = typeof t === 'object' && t !== null ? t.description : undefined;
-        const row = document.createElement('div');
-        row.className = 'plugin-tool-row';
-        row.textContent = name;
-        if (desc) row.title = desc;
-        toolList.appendChild(row);
-      }
-      det.appendChild(toolList);
-    }
-    el.appendChild(det);
-  }
-
-  for (const p of local) {
-    if (loadedNames.has(p.name)) continue;
-    const row = document.createElement('div');
-    row.className = 'plugin-entry-inactive';
-    // This is the node-hosted web frontend, so a plugin whose declared matbotRuntime excludes 'node'
-    // can never activate here. Show it struck-through with no add button rather than offering an
-    // install that would only fail (and roll back) on the runtime gate.
-    const compatible = runsHere(p);
-    if (!compatible) row.classList.add('plugin-incompatible');
-    const runtimeNote = !compatible ? `requires runtime: ${(p.matbotRuntime ?? []).join(', ')} — cannot run on this host` : '';
-    if (p.description || runtimeNote) row.title = [p.description, runtimeNote].filter(Boolean).join(' — ');
-    row.appendChild(makePluginLabel(p.name));
-    if (compatible) {
-      const actions = document.createElement('div');
-      actions.className = 'plugin-actions';
-      const addBtn = document.createElement('button');
-      addBtn.className = 'plugin-action-btn add';
-      addBtn.textContent = '+';
-      addBtn.title = 'Add plugin';
-      addBtn.onclick = (e) => {
-        e.stopPropagation();
-        closeSidebar();
-        // Direct submit so it queues during a turn instead of being blocked by the input.
-        submit(`Add the plugin '${p.specifier}'`);
-      };
-      actions.appendChild(addBtn);
-      row.appendChild(actions);
-    }
-    el.appendChild(row);
-  }
-
-  if (!loaded.length && !local.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'color:#9ca3af;font-size:12px;padding:4px 10px;';
-    empty.textContent = '(none)';
-    el.appendChild(empty);
-  }
-}
-
-// ── Skills ──────────────────────────────────────────────────────────────────
-
-async function loadSkills() {
-  const generation = workspaceGeneration;
-  const workspaceId = activeWorkspaceId();
-  let result;
-  try {
-    result = await callTool('skill_action', { action: 'list' });
-  } catch {
-    // skills plugin not loaded — leave the section empty.
-    renderSkills([]);
-    return;
-  }
-  if (generation !== workspaceGeneration || workspaceId !== activeWorkspaceId()) return;
-  renderSkills(Array.isArray(result.skills) ? result.skills : []);
-}
-
-function renderSkills(skills) {
-  const el = document.getElementById('skill-list');
-  if (!el) return;
-  el.innerHTML = '';
-
-  skills = [...skills].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
-  let memoryBrowserInserted = false;
-
-  for (const s of skills) {
-    const row = document.createElement('div');
-    row.className = 'skill-entry';
-    row.onclick = () => openSkillEditor(s.name);
-
-    // Skill names are short phrases, not long unbreakable identifiers — place them
-    // plainly rather than reusing the plugin-name prefix/suffix split.
-    const label = document.createElement('span');
-    label.className = 'skill-name-label';
-    label.textContent = s.name;
-    row.appendChild(label);
-
-    const actions = document.createElement('div');
-    actions.className = 'plugin-actions';
-
-    const editBtn = document.createElement('button');
-    editBtn.className = 'plugin-action-btn edit';
-    editBtn.textContent = '✎';
-    editBtn.title = 'Edit skill';
-    editBtn.onclick = (e) => { e.stopPropagation(); openSkillEditor(s.name); };
-    actions.appendChild(editBtn);
-
-    const removeBtn = document.createElement('button');
-    removeBtn.className = 'plugin-action-btn remove';
-    removeBtn.textContent = '×';
-    removeBtn.title = 'Delete skill';
-    removeBtn.onclick = async (e) => {
-      e.stopPropagation();
-      if (!confirm(`Delete skill "${s.name}"?`)) return;
-      try {
-        await callTool('skill_action', { action: 'delete', name: s.name });
-      } catch (err) {
-        alert('Failed to delete skill: ' + (err?.message ?? err));
-        return;
-      }
-      loadSkills();
-    };
-    actions.appendChild(removeBtn);
-
-    row.appendChild(actions);
-    el.appendChild(row);
-
-    if (!memoryBrowserInserted &&
-        s.name.localeCompare('Inner voice', undefined, { sensitivity: 'base' }) === 0) {
-      appendMemoryBrowserLauncher(el);
-      memoryBrowserInserted = true;
-    }
-  }
-
-  // Cognition normally seeds "Inner voice". Keep the memory command available at
-  // the end of the list if that skill is unavailable during startup or reload.
-  if (!memoryBrowserInserted) appendMemoryBrowserLauncher(el);
-}
-
-function appendMemoryBrowserLauncher(el) {
-  const row = document.createElement('div');
-  row.id = 'memory-browser-btn';
-  row.className = 'skill-entry';
-  row.setAttribute('role', 'button');
-  row.tabIndex = 0;
-
-  const label = document.createElement('span');
-  label.className = 'skill-name-label';
-  label.textContent = 'Open memory browser';
-  row.appendChild(label);
-  el.appendChild(row);
-
-  const status = document.createElement('div');
-  status.id = 'memory-browser-status';
-  status.hidden = true;
-  el.appendChild(status);
-  memoryBrowserStatusEl = status;
-}
-
-const skillEditorOverlay = document.getElementById('skill-editor-overlay');
-const skillEditorText    = document.getElementById('skill-editor-text');
-const skillEditorTitle   = document.getElementById('skill-editor-title');
-const skillEditorError   = document.getElementById('skill-editor-error');
-const skillEditorSave    = document.getElementById('skill-editor-save');
-const skillEditorRoot    = document.getElementById('skill-editor');
-const skillTriggerList   = document.getElementById('skill-trigger-list');
-const skillTriggerDialog = document.getElementById('skill-trigger-dialog');
-const skillTriggerDialogKind = document.getElementById('skill-trigger-dialog-kind');
-const skillTriggerDialogRule = document.getElementById('skill-trigger-dialog-rule');
-const skillTriggerDialogAction = document.getElementById('skill-trigger-dialog-action');
-const skillTriggerDialogError = document.getElementById('skill-trigger-dialog-error');
-const TRIGGER_KINDS = ['ephemeral', 'contextual', 'retract', 'followup'];
-let editingSkillName = null;
-let skillEditor = null;   // TinyMDE.Editor, created lazily on first open
-let editingSkillSavedContent = '';
-// A skill is fired by (at most) one Trigger whose invoke is skill_action(use, {name}); its
-// `conditions` are what the Triggers tab edits. `editingTriggerId` is that trigger's id (null when
-// the skill has no trigger yet — we create one on save if conditions are added).
-let editingTriggerId = null;
-
-function setSkillTab(tab) {
-  for (const btn of document.querySelectorAll('.skill-tab')) btn.classList.toggle('active', btn.dataset.tab === tab);
-  document.getElementById('skill-editor-pane-content').classList.toggle('active', tab === 'content');
-  document.getElementById('skill-editor-pane-triggers').classList.toggle('active', tab === 'triggers');
-  document.getElementById('skill-editor-pane-metadata').classList.toggle('active', tab === 'metadata');
-  skillEditorRoot.classList.toggle('tab-triggers', tab === 'triggers');
-  skillEditorRoot.classList.toggle('tab-metadata', tab === 'metadata');
-}
-
-// Render the skill's metadata pane: the "system skill" toggle (always), then the read-only derived
-// LLM analysis. `knowledge` is null until the background analysis has run and cached it (see
-// SkillManager) — show a note rather than empty sections. `catalogue` is the current advertise flag.
-function renderSkillMetadata(catalogue, knowledge) {
-  const el = document.getElementById('skill-metadata');
-  el.innerHTML = '';
-
-  // System-skill toggle — advertise this skill in the system prompt (using its summary). Independent
-  // of whether analysis has run; the editor persists it (with content + triggers) on Save.
-  const sysRow = document.createElement('label');
-  sysRow.className = 'meta-system';
-  const cb = document.createElement('input');
-  cb.type = 'checkbox';
-  cb.id = 'skill-system-checkbox';
-  cb.checked = catalogue === true;
-  const sysLbl = document.createElement('span');
-  sysLbl.textContent = 'This is a system skill';
-  sysRow.append(cb, sysLbl);
-  el.appendChild(sysRow);
-  const sysHint = document.createElement('div');
-  sysHint.className = 'meta-note';
-  sysHint.textContent = 'When set, the skill is advertised in the system prompt using the generated summary below.';
-  el.appendChild(sysHint);
-
-  if (!knowledge) {
-    const note = document.createElement('div');
-    note.className = 'meta-note';
-    note.textContent = 'No analysis yet. Metadata (summary, entities, tags) is generated in the background after a skill is saved.';
-    el.appendChild(note);
-    return;
-  }
-
-  const section = (label, build) => {
-    const wrap = document.createElement('div');
-    wrap.className = 'meta-section';
-    const lbl = document.createElement('div');
-    lbl.className = 'meta-label';
-    lbl.textContent = label;
-    wrap.appendChild(lbl);
-    wrap.appendChild(build());
-    el.appendChild(wrap);
-  };
-
-  const chips = (items, cls) => {
-    if (!Array.isArray(items) || items.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'meta-empty';
-      empty.textContent = '(none)';
-      return empty;
-    }
-    const row = document.createElement('div');
-    row.className = 'meta-chips';
-    for (const item of items) {
-      const chip = document.createElement('span');
-      chip.className = 'meta-chip ' + cls;
-      chip.textContent = item;
-      row.appendChild(chip);
-    }
-    return row;
-  };
-
-  section('Summary', () => {
-    const p = document.createElement('div');
-    if (knowledge.summary) {
-      p.className = 'meta-summary';
-      p.textContent = knowledge.summary;
-    } else {
-      p.className = 'meta-empty';
-      p.textContent = '(none)';
-    }
-    return p;
-  });
-  section('Entities', () => chips(knowledge.entities, 'entity'));
-  section('Tags', () => chips(knowledge.tags, 'tag'));
-}
-
-// One condition row: a phase <select> + the rubric <textarea>, both disabled (read-only) until ✎ is
-// clicked; × removes the row. New rows (no `c`) start editable. Nothing is persisted until Save,
-// which replaces the skill's trigger conditions wholesale (conditions have no stable id).
-function makeTriggerRow(c) {
-  const editable = !c;
-  const row = document.createElement('div');
-  row.className = 'trigger-row';
-
-  const sel = document.createElement('select');
-  sel.className = 'trigger-kind';
-  for (const k of TRIGGER_KINDS) {
-    const o = document.createElement('option');
-    o.value = k; 
-    o.textContent = { 'ephemeral': 'User Ephemeral', 'contextual': 'User Contextual', 'retract': 'Agent Retract', 'followup': 'Agent Follow-up' }[k];
-    sel.appendChild(o);
-  }
-  // ephemeral/contextual = fire on the user message (route knowledge in for this turn / fold it in
-  // durably); retract/followup = fire on the assistant response (discard+redo / keep+steer). Most
-  // skill triggers route on user input.
-  sel.value = c?.kind ?? 'ephemeral';
-  sel.disabled = !editable;
-
-  const txt = document.createElement('textarea');
-  txt.className = 'trigger-text';
-  txt.rows = 2;
-  txt.value = c?.rule ?? '';
-  txt.disabled = !editable;
-  txt.placeholder = '"MATCH if the message is …; DO NOT MATCH if …" — judged against the latest turn';
-
-  const body = document.createElement('div');
-  body.className = 'trigger-body';
-  const action = document.createElement('div');
-  action.className = 'trigger-action';
-  action.textContent = `Action: skill_action use ${editingSkillName ?? ''}`.trim();
-  body.append(txt, action);
-
-  const editBtn = document.createElement('button');
-  editBtn.className = 'trigger-edit';
-  editBtn.title = 'Edit';
-  editBtn.textContent = '✎';
-  editBtn.classList.toggle('editing', editable);
-  editBtn.onclick = () => {
-    const enable = txt.disabled;
-    txt.disabled = sel.disabled = !enable;
-    editBtn.classList.toggle('editing', enable);
-    if (enable) txt.focus();
-  };
-
-  const delBtn = document.createElement('button');
-  delBtn.className = 'trigger-del';
-  delBtn.title = 'Remove';
-  delBtn.textContent = '×';
-  delBtn.onclick = () => row.remove();
-
-  row.append(sel, body, editBtn, delBtn);
-  return row;
-}
-
-function renderTriggers(conditions) {
-  skillTriggerList.innerHTML = '';
-  for (const c of conditions) skillTriggerList.appendChild(makeTriggerRow(c));
-}
-
-// Collect the live rows into a `conditions` array and reconcile the skill's single load-trigger:
-// update it (or create it if absent) when there are conditions, remove it when the last one is
-// cleared. Conditions have no stable id, so this is a wholesale replace, not a per-row diff.
-async function saveTriggers(name) {
-  const conditions = [];
-  for (const row of skillTriggerList.querySelectorAll('.trigger-row')) {
-    const kind = row.querySelector('.trigger-kind').value;
-    const rule = row.querySelector('.trigger-text').value.trim();
-    if (!rule) continue; // an empty row is a no-op, not a delete
-    conditions.push({ kind, rule });
-  }
-
-  if (editingTriggerId) {
-    if (conditions.length) {
-      await callTool('trigger_action', { action: 'update', id: editingTriggerId, conditions });
-    } else {
-      await callTool('trigger_action', { action: 'remove', id: editingTriggerId });
-      editingTriggerId = null;
-    }
-  } else if (conditions.length) {
-    const res = await callTool('trigger_action', {
-      action: 'add', conditions, tool: 'skill_action', params: { action: 'use', name },
-    });
-    editingTriggerId = res?.id ?? null;
-  }
-}
-
-function ensureSkillEditor() {
-  if (!skillEditor) {
-    skillEditor = new TinyMDE.Editor({ textarea: skillEditorText });
-    new TinyMDE.CommandBar({
-      element: 'skill-editor-toolbar',
-      editor: skillEditor,
-      commands: [
-        { name: 'h1', action: 'h1', title: 'Level 1 heading', innerHTML: '<span style="font-size:1.3em;font-weight:700">H</span>' },
-        { name: 'h2', action: 'h2', title: 'Level 2 heading', innerHTML: '<span style="font-size:1.05em;font-weight:700">H</span>' },
-        { name: 'h3', action: 'h3', title: 'Level 3 heading', innerHTML: '<span style="font-size:0.82em;font-weight:700">H</span>' },
-        '|', 'bold', 'italic', 'strikethrough', '|', 'code', 'blockquote', '|', 'ul', 'ol', '|', 'insertLink',
-      ],
-    });
-  }
-  return skillEditor;
-}
-
-async function openSkillEditor(name) {
-  setWorkspaceSettingsOpen(false);
-  editingSkillName = name;
-  skillEditorError.textContent = '';
-  skillEditorTitle.textContent = name;
-  editingTriggerId = null;
-  renderTriggers([]);
-  renderSkillMetadata(false, null);
-  setSkillTab('content');
-  skillEditorOverlay.classList.add('open');
-  // Triggers live in their own store now, keyed by the tool they invoke — find the one that loads
-  // this skill. Independent of the markdown editor, so load it even if TinyMDE is absent.
-  callTool('trigger_action', { action: 'query', tool: 'skill_action', params: { action: 'use', name } })
-    .then((res) => {
-      const trig = Array.isArray(res?.triggers) ? res.triggers[0] : undefined;
-      editingTriggerId = trig?.id ?? null;
-      renderTriggers(Array.isArray(trig?.conditions) ? trig.conditions : []);
-    })
-    .catch(() => { /* triggers plugin not loaded — leave the triggers tab empty. */ });
-  // Derived analysis, likewise independent of TinyMDE; absent until the background pass has cached it.
-  callTool('skill_action', { action: 'metadata', name })
-    .then((meta) => renderSkillMetadata(meta?.catalogue ?? false, meta?.knowledge ?? null))
-    .catch(() => { /* old skills plugin without the metadata action — leave the note. */ });
-  // The editor needs TinyMDE (CDN, http(s) only). On an offline file:// bundle it never loaded —
-  // degrade with a message rather than throwing on `new TinyMDE.Editor`.
-  if (typeof TinyMDE === 'undefined') {
-    skillEditorError.textContent = 'Markdown editor unavailable offline (TinyMDE failed to load).';
-    skillEditorSave.disabled = true;
-    return;
-  }
-  const editor = ensureSkillEditor();
-  editor.setContent('Loading…');
-  skillEditorSave.disabled = true;
-  try {
-    const result = await callTool('skill_action', { action: 'load', name });
-    editingSkillSavedContent = result.content ?? '';
-    editor.setContent(editingSkillSavedContent);
-  } catch (err) {
-    editor.setContent('');
-    skillEditorError.textContent = 'Failed to load: ' + (err?.message ?? err);
-  }
-  skillEditorSave.disabled = false;
-  skillEditorOverlay.querySelector('.TinyMDE')?.focus();
-}
-
-function closeSkillEditor(force = false) {
-  const currentContent = skillEditor?.getContent?.() ?? skillEditorText?.value ?? '';
-  if (!force && editingSkillName !== null && currentContent !== editingSkillSavedContent) {
-    if (!window.confirm('Discard unsaved skill changes?')) return false;
-  }
-  skillEditorOverlay.classList.remove('open');
-  if (skillTriggerDialog?.open) skillTriggerDialog.close();
-  editingSkillName = null;
-  editingSkillSavedContent = '';
-  return true;
-}
-
-if (skillEditorOverlay) {
-  skillEditorOverlay.addEventListener('click', (e) => {
-    if (e.target === skillEditorOverlay) closeSkillEditor();
-  });
-  document.getElementById('skill-editor-close').onclick  = () => closeSkillEditor();
-  document.getElementById('skill-editor-cancel').onclick = () => closeSkillEditor();
-  for (const btn of document.querySelectorAll('.skill-tab')) btn.onclick = () => setSkillTab(btn.dataset.tab);
-  document.getElementById('skill-trigger-add').onclick = () => {
-    skillTriggerDialogKind.value = 'ephemeral';
-    skillTriggerDialogRule.value = '';
-    skillTriggerDialogAction.value = `skill_action use ${editingSkillName ?? ''}`.trim();
-    skillTriggerDialogError.textContent = '';
-    skillTriggerDialog.showModal();
-    skillTriggerDialogKind.focus();
-  };
-  document.getElementById('skill-trigger-dialog-cancel').onclick = () => skillTriggerDialog.close();
-  document.getElementById('skill-trigger-dialog-save').onclick = () => {
-    const rule = skillTriggerDialogRule.value.trim();
-    if (!rule) {
-      skillTriggerDialogError.textContent = 'Enter a classifier condition before adding the trigger.';
-      skillTriggerDialogRule.focus();
-      return;
-    }
-    skillTriggerList.appendChild(makeTriggerRow({ kind: skillTriggerDialogKind.value, rule }));
-    skillTriggerDialog.close();
-  };
-  skillEditorSave.onclick = async () => {
-    if (editingSkillName === null) return;
-    skillEditorSave.disabled = true;
-    skillEditorError.textContent = '';
-    try {
-      if (skillEditor) {
-        const sysCb = document.getElementById('skill-system-checkbox');
-        await callTool('skill_action', {
-          action: 'save', name: editingSkillName, content: skillEditor.getContent(),
-          ...(sysCb ? { catalogue: sysCb.checked } : {}),
-        });
-      }
-      await saveTriggers(editingSkillName);
-    } catch (err) {
-      skillEditorError.textContent = 'Failed to save: ' + (err?.message ?? err);
-      skillEditorSave.disabled = false;
-      return;
-    }
-    editingSkillSavedContent = skillEditor?.getContent?.() ?? editingSkillSavedContent;
-    closeSkillEditor(true);
-    loadSkills();
-  };
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && skillEditorOverlay.classList.contains('open')) closeSkillEditor();
-  });
-}
-
-async function uploadFiles(fileList) {
-  const files = Array.from(fileList);
-  if (!files.length) return;
-  for (const file of files) {
-    try {
-      if (knownWorkspaceFiles.has(file.name) && !window.confirm(`Replace existing workspace file "${file.name}"?`)) {
-        continue;
-      }
-      const buffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      const CHUNK = 0x8000;
-      let bin = '';
-      for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-      await callTool('workspace_action', { action: 'write', path: file.name, content: btoa(bin), encoding: 'base64' });
-      setWorkspaceFileAttached({ path: file.name, size: file.size });
-    } catch (err) {
-      alert('Upload failed for ' + file.name + ': ' + err.message);
-    }
-  }
-  loadFiles();
-}
-
-// ── DOM builders ──────────────────────────────────────────────────────────────
 
 function makeThinkingBlock(label, openByDefault) {
   const details = document.createElement('details');
@@ -4942,8 +678,6 @@ function makeTokenStatsBlock(inputTokens, outputTokens, costUsd, cacheReadTokens
   return det;
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────────
-
 function showEmpty() {
   messagesEl.innerHTML =
     '<div class=\"empty-state\">' +
@@ -4952,9 +686,6 @@ function showEmpty() {
     '</div>';
 }
 
-// A title is a handful of words, so a hard character cut lands mid-word for no benefit. Trim back to
-// the last word boundary instead, and mark the elision only when something was actually dropped. A
-// single word longer than the budget still has to be cut hard — there is no boundary to fall back to.
 function truncateAtWord(text, max) {
   if (text.length <= max) return text;
   const cut = text.slice(0, max);
@@ -5012,8 +743,6 @@ function makeBubble(className, text) {
   return div;
 }
 
-// Scroll the latest message into view (e.g. the user just sent it). Respect the suppression timer
-// in case they scrolled away earlier.
 function scrollMessagesToBottom() {
   if (!isScrollSuppressed()) {
     programmaticScrollTo(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
@@ -5032,7 +761,6 @@ function appendUserBubble(text, msgIdx, pending, traceId) {
   return div;
 }
 
-// A machine-authored turn (a followup resubmission). Presented agent-side with the robot badge.
 function appendRoboBubble(text, msgIdx, traceId) {
   messagesEl.querySelector('.empty-state')?.remove();
   if (messagesEl.querySelector('.message')) {
@@ -5075,9 +803,6 @@ function appendMessageAttachments(bubble, content) {
   }
 }
 
-// Render one stored user turn, split by block provenance: contiguous human blocks render as the user
-// bubble, contiguous robo blocks (a hook-injected fragment) as an agent-side robo bubble. One stored
-// message can therefore become two bubbles, under a single turn divider. Returns the last bubble.
 function appendUserTurn(content, msgIdx, traceId) {
   const runs = [];
   for (const c of content) {
@@ -5265,12 +990,6 @@ function scrollToMsgIdx(msgIdx) {
   });
 }
 
-// anchorAfter: insert the wrap immediately after this node (its turn's user bubble) rather than at
-// the container tail. Live, several submissions can be queued — and their user bubbles drawn — before
-// any response streams; appending each response at the tail would group all bubbles then all
-// responses. Anchoring each turn's wrap to its own user bubble keeps responses interleaved, matching
-// the reload (renderSession) order. A joined in-progress turn has no user bubble (it's in committed
-// history); passing nothing falls back to tail-append, which is correct there.
 function createAssistantWrap(labelText, anchorAfter) {
   messagesEl.querySelector('.empty-state')?.remove();
   const wrap = document.createElement('div');
@@ -5288,8 +1007,6 @@ function createAssistantWrap(labelText, anchorAfter) {
   return wrap;
 }
 
-// Render marker blocks as centered cross-thread notices. Markers are opaque to the LLM; the UI
-// is free to interpret known creators. Unknown creators get a generic, non-navigating chip.
 function appendMarker(content, traceId) {
   messagesEl.querySelector('.empty-state')?.remove();
   for (const part of content) {
@@ -5389,7 +1106,6 @@ function renderMarker(part) {
   return wrap;
 }
 
-// Populate a wrapper from historical message content parts
 function renderContentParts(wrap, content) {
   for (const part of content) {
     switch (part.type) {
@@ -5500,9 +1216,6 @@ function renderContentParts(wrap, content) {
   }
 }
 
-// startIdx > 0 appends only messages from that index — used for incremental updates.
-// origIdx (index in session.messages including system) is passed to dividers so
-// the edit-session plugin tools can reference exact positions.
 function renderSession(session, startIdx, scrollTarget) {
   const allMsgs = session.messages;
   if (!startIdx) {
@@ -5540,12 +1253,10 @@ function renderSession(session, startIdx, scrollTarget) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-// ── Actions ───────────────────────────────────────────────────────────────────
-
 async function openSession(id, scrollTarget) {
   closeSidebar();
   setArchitectureOpen(false);
-  setWorkspaceSettingsOpen(false);
+  featureApis.rag.setWorkspaceSettingsOpen(false);
   currentSessionId = id;
   unreadSessions.delete(id);
   sessionListEl.querySelector('[data-sid="' + id + '"]')?.classList.remove('unread');
@@ -5560,14 +1271,10 @@ async function openSession(id, scrollTarget) {
   // One persistent stream for this session; it replays any in-progress turn and carries all future
   // turns. Renders happen via renderTurn() keyed by traceId.
   connectSessionStream(id);
-  loadFiles();
+  featureApis.files.loadFiles();
   inputEl.focus();
 }
 
-// Shared: create a new session and navigate to it (used by click + hash). DOM event
-// dispatch does not wait for an async listener, so retain the transition promise:
-// a message typed immediately after clicking New must not be posted to the previous
-// session while createSession() is still in flight.
 let newSessionPromise = null;
 
 function handleNewSession() {
@@ -5575,7 +1282,7 @@ function handleNewSession() {
 
   closeSidebar();
   setArchitectureOpen(false);
-  setWorkspaceSettingsOpen(false);
+  featureApis.rag.setWorkspaceSettingsOpen(false);
   const pending = (async () => {
     try {
       const { id } = await apiNewSession();
@@ -5596,7 +1303,7 @@ function handleNewSession() {
       alert('New session failed: ' + e.message);
       return null;
     }
-  })();
+})();
 
   newSessionPromise = pending;
   void pending.then(() => {
@@ -5605,45 +1312,22 @@ function handleNewSession() {
   return pending;
 }
 
-// Left-click creates a new session in the current tab.
-// Right-click / middle-click on the <a href="#new"> opens in a new tab naturally.
-newBtn.addEventListener('click', async (e) => {
-  if (e.button !== 0) return; // let right-click / middle-click open in new tab
-  e.preventDefault();
-  await handleNewSession();
-});
-
-// ── Form submission ───────────────────────────────────────────────────────────
-
 async function submitFormResponse(sessionId, values) {
   if (!sessionId) return;
   // A form answer is just another submission; it renders over the persistent stream like any turn.
   await postSubmit(sessionId, { type: 'form-response', values });
 }
 
-// ── Send ──────────────────────────────────────────────────────────────────────
+let streamSessionId = null;
 
-// ── Per-session event stream (one persistent connection; submits are fire-and-forget) ──────────
-//
-// A single GET /events/sessions/:id SSE carries ALL turns for the session. Events are demuxed by
-// traceId into per-turn queues, each drained by renderTurn(). One connection per session (not per
-// submission) is what keeps queued submits off the browser's ~6-socket-per-host limit — the cause
-// of both the missing-queued-badge and the prompt-stall bugs.
+let streamAc        = null;
 
-let streamSessionId = null;       // session the persistent stream is bound to
-let streamAc        = null;       // AbortController for the current stream
-let streamReady     = Promise.resolve(); // settles after the transport confirms subscription
-const turnQueues    = new Map();  // traceId -> { items, wake, done, started }
+let streamReady     = Promise.resolve();
 
-// Concat policy (the runner merges submissions queued behind a running turn into one turn, answered
-// under the first/head submission's traceId). Mirror it in the UI: a submission that arrives while an
-// earlier one is still queued-and-unanswered folds its text into that head bubble instead of getting
-// its own turn — whose traceId the runner dropped, so it would never receive a response. activeBatchHead
-// is the head's traceId; it resets the moment the head turn produces real output (its response has
-// started, so the next submission begins a fresh batch). Tracked synchronously here — not via the DOM —
-// so the refresh-replay, which delivers all pending `queued` events in one synchronous batch, folds
-// correctly without racing the async bubble creation in renderTurn.
-let activeBatchHead = null;   // { traceId, concat } | null — the open batch a follower may fold into
+const turnQueues    = new Map();
+
+let activeBatchHead = null;
+
 const foldedTraces  = new Set();
 
 function queueFor(traceId) {
@@ -5748,37 +1432,26 @@ function connectSessionStream(sid) {
   return streamReady;
 }
 
-// Read the input box and submit it. The single entry point for *typed* messages; canned/programmatic
-// messages (plugin install banners, etc.) call submit() directly so they aren't gated by the input.
-// concat = false (Enter / send button): a distinct queued turn, run in order — use when the next ask
-// depends on this one's tools/state (e.g. install a plugin, then use it). concat = true
-// (Ctrl/Cmd+Enter): fold into the running turn's batch — fastest way to add more context.
 async function sendMessage(concat = false) {
-  if (expertEnabledEl?.checked) {
-    await runExpertPanelFromUi();
+  if (featureApis.experts.expertEnabledEl?.checked) {
+    await featureApis.experts.runExpertPanelFromUi();
     return;
   }
   const content = inputEl.value.trim();
   if (!content) return;
-  const attachments = [...selectedWorkspaceFiles.values()]
+  const attachments = [...featureApis.files.selectedWorkspaceFiles.values()]
     .map(file => ({ namespace: 'workspace', path: file.path }));
   inputEl.value = '';
   inputEl.style.height = 'auto';
   if (await submit(content, concat, attachments)) {
-    clearWorkspaceFileAttachments();
+    featureApis.files.clearWorkspaceFileAttachments();
   } else {
     inputEl.value = content;
   }
 }
 
-// Submit typed content to the current session, fire-and-forget. The server enqueues it and the
-// turn (its 'queued' user bubble + response) renders entirely over the persistent stream — there's
-// no optimistic rendering here, so there's a single source of truth.
-// concat defaults false: robo/programmatic submits (plugin install/remove banners, etc.) must each be
-// their own ordered turn — one's tools/state are a precondition for the next ("add plugin X" then "use
-// X", X only visible to a later turn). The human path passes its choice explicitly via sendMessage.
 async function submit(content, concat = false, attachments = []) {
-  const provider = providerSel.value;
+  const provider = providerPicker.providerSel.value;
   if (!content) return false;
   if (!provider) {
     showSubmitError(content, 'no model provider is available in the active workspace');
@@ -5795,12 +1468,8 @@ async function submit(content, concat = false, attachments = []) {
   return postSubmit(currentSessionId, content, concat, attachments);
 }
 
-// POST a submission and return. The user bubble + response arrive on the stream as a 'queued' event
-// then turn events. Only *failures* are surfaced here (the stream can't, since no turn was created):
-// a timeout (incl. the socket-exhaustion stall that never errors on its own), network error, or
-// non-2xx is shown inline so the message is never silently lost.
 async function postSubmit(sid, content, concat = false, attachments = []) {
-  const provider = providerSel.value;
+  const provider = providerPicker.providerSel.value;
   if (!provider) return false;
   try {
     await T.submit(sid, {
@@ -5816,7 +1485,6 @@ async function postSubmit(sid, content, concat = false, attachments = []) {
   }
 }
 
-// The submission never reached a turn, so show what was typed plus the failure, inline.
 function showSubmitError(content, msg) {
   const text = typeof content === 'string' ? content : '';
   if (text) appendUserBubble(text);
@@ -5826,10 +1494,6 @@ function showSubmitError(content, msg) {
   messagesEl.appendChild(div);
 }
 
-// Render one turn by draining its event queue, keyed by traceId. The user bubble is created from
-// the 'queued' event (so it lands in the live delta in stream order); the assistant wrap + loading
-// dots are created lazily on first activity. A turn we merely joined (the in-progress run, replayed
-// on connect) gets no 'queued' — its user message is already in committed/stored history.
 async function renderTurn(sid, traceId) {
   let userBubble = null;   // set by the 'queued' event when this turn is a fresh submission
   let userBubbleText = ''; // raw markdown of the bubble; grows as concat'd submissions fold in
@@ -6029,7 +1693,7 @@ async function renderTurn(sid, traceId) {
           currentTool = null;
           textElFinalised = true;
           textAccum = '';
-          if (providerToolPending && !ev.isError) { providerToolPending = false; refreshProviderSelect(); }
+          if (providerToolPending && !ev.isError) { providerToolPending = false; providerPicker.refreshProviderSelect(); }
           break;
         }
 
@@ -6225,7 +1889,7 @@ async function renderTurn(sid, traceId) {
           if (ev.session?.title && chatHeaderEl) chatTitleEl.textContent = ev.session.title;
           refreshTitlesAfterFollowup();
           appendTurnStats();
-          loadFiles();
+          featureApis.files.loadFiles();
           // Back-fill origIdx on any dividers added without an index this turn.
           if (ev.session) {
             const allDividers = [...messagesEl.querySelectorAll('.msg-divider')];
@@ -6267,44 +1931,13 @@ async function renderTurn(sid, traceId) {
     // assistant wrap. Just clear any loading dots that are still showing.
     if (loadingEl) { loadingEl.remove(); loadingEl = null; }
     apiListSessions().then(renderSessions);
-    loadFiles();
+    featureApis.files.loadFiles();
     // If the output extends below the viewport fold, morph the send button
     // into a ▼ down-arrow so the user can jump to the bottom with one click.
     maybeShowScrollDown();
   }
 }
 
-// ── Send / Stop button handlers ───────────────────────────────────────────────
-//
-// Send has three visual modes in one fixed slot: scroll-down (▼), stop (■), or default send (▶).
-// The input stays live during a turn so you can type-ahead, but the action button aborts while busy.
-sendBtn.onclick = () => {
-  if (sendBtn.classList.contains('scroll-down-mode')) scrollToBottomAndReset();
-  else if (sending) requestStop();
-  else sendMessage(false);
-};
-
-document.getElementById('sessions-enable-btn').onclick = () => {
-  submit('Discover the local plugins and add the sessions plugin to enable persistent conversations.');
-};
-
-inputEl.addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
-  // Plain Enter → queued (own turn, run in order). Ctrl/Cmd+Enter → concat (fold into the running
-  // batch). Shift+Enter keeps the textarea's newline behaviour.
-  if (e.shiftKey) return;
-  e.preventDefault();
-  sendMessage(e.ctrlKey || e.metaKey);
-});
-
-inputEl.addEventListener('input', () => {
-  inputEl.style.height = 'auto';
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
-});
-
-// Sync the single send/stop affordance to a session's busy state. Called from each path that changes
-// which session is in view and from the live status stream, so the button always reflects the
-// session on screen, not stale state from the previously-viewed session.
 function setBusyState(busy) {
   sending = busy;
   if (busy) showStopButton();
@@ -6321,8 +1954,6 @@ function requestStop() {
     .catch(() => {})
     .finally(() => { sendBtn.disabled = false; });
 }
-
-// ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
   // Configure marked
@@ -6367,32 +1998,32 @@ async function init() {
     };
   }
 
-  const [sessions, providers] = await Promise.all([apiListSessions(), apiListProviders(), loadWorkspaces()]);
+  const [sessions, providers] = await Promise.all([apiListSessions(), providerPicker.apiListProviders(), featureApis.workspace.loadWorkspaces()]);
 
   for (const p of providers) {
     const opt = document.createElement('option');
     opt.value = opt.textContent = p;
-    providerSel.appendChild(opt);
+    providerPicker.providerSel.appendChild(opt);
   }
-  if (providerDiscoveryFailed) {
+  if (providerPicker.providerDiscoveryFailed) {
     const unavailable = document.createElement('option');
     unavailable.value = '';
     unavailable.textContent = 'Provider list unavailable — retry after restart';
     unavailable.disabled = true;
     unavailable.selected = true;
-    providerSel.appendChild(unavailable);
-    providerSel.dataset.error = unavailable.textContent;
-    providerSel.title = 'Check the active workspace provider configuration and retry after Cortex restarts.';
+    providerPicker.providerSel.appendChild(unavailable);
+    providerPicker.providerSel.dataset.error = unavailable.textContent;
+    providerPicker.providerSel.title = 'Check the active workspace provider configuration and retry after Cortex restarts.';
   }
 
-  const savedProvider = savedProviderForWorkspace();
+  const savedProvider = providerPicker.savedProviderForWorkspace();
   if (savedProvider && providers.includes(savedProvider)) {
-    providerSel.value = savedProvider;
+    providerPicker.providerSel.value = savedProvider;
   }
-  localStorage.setItem(providerStorageKey(), providerSel.value);
+  localStorage.setItem(providerPicker.providerStorageKey(), providerPicker.providerSel.value);
 
-  providerSel.addEventListener('change', () => {
-    localStorage.setItem(providerStorageKey(), providerSel.value);
+  providerPicker.providerSel.addEventListener('change', () => {
+    localStorage.setItem(providerPicker.providerStorageKey(), providerPicker.providerSel.value);
   });
 
   // Subscribe to session busy/idle transitions (the transport owns the wire + reconnect).
@@ -6426,15 +2057,15 @@ async function init() {
       const el = document.getElementById('file-list');
       const item = el?.querySelector('[data-path="' + CSS.escape(name) + '"]');
       if (item) {
-        updatedFiles.add(name);
+        featureApis.files.updatedFiles.add(name);
         item.classList.add('updated');
         // Update the size display if present.
         const sizeEl = item.querySelector('.file-size');
-        if (sizeEl && event.size !== undefined) sizeEl.textContent = formatSize(event.size);
+        if (sizeEl && event.size !== undefined) sizeEl.textContent = featureApis.files.formatSize(event.size);
       } else {
         // New file — mark updated before reloading so the dot appears.
-        updatedFiles.add(name);
-        loadFiles();
+        featureApis.files.updatedFiles.add(name);
+        featureApis.files.loadFiles();
       }
     }
   })();
@@ -6447,7 +2078,7 @@ async function init() {
     let timer = null;
     for await (const _event of T.toolEvents(new AbortController().signal)) {
       if (timer) continue;
-      timer = setTimeout(() => { timer = null; loadSkills(); }, 150);
+      timer = setTimeout(() => { timer = null; featureApis.skills.loadSkills(); }, 150);
     }
   })();
 
@@ -6458,7 +2089,7 @@ async function init() {
     let timer = null;
     for await (const _event of T.skillEvents(new AbortController().signal)) {
       if (timer) continue;
-      timer = setTimeout(() => { timer = null; loadSkills(); }, 150);
+      timer = setTimeout(() => { timer = null; featureApis.skills.loadSkills(); }, 150);
     }
   })();
 
@@ -6469,7 +2100,7 @@ async function init() {
     let timer = null;
     for await (const _event of T.pluginEvents(new AbortController().signal)) {
       if (timer) continue;
-      timer = setTimeout(() => { timer = null; loadPlugins(); loadExperts(); }, 150);
+      timer = setTimeout(() => { timer = null; featureApis.runtime.loadPlugins(); featureApis.experts.loadExperts(); }, 150);
     }
   })();
 
@@ -6496,36 +2127,623 @@ async function init() {
     setBusyState(false);
   }
   if (startArchitectureView) setArchitectureOpen(true, startArchitectureView);
-  loadFiles();
-  loadPlugins();
-  loadSkills();
-  loadExperts();
+  featureApis.files.loadFiles();
+  featureApis.runtime.loadPlugins();
+  featureApis.skills.loadSkills();
+  featureApis.experts.loadExperts();
 }
+const featureHost={get LS_FONT_SIZE(){return LS_FONT_SIZE},
+get providerPicker(){return providerPicker},
+get LS_PROVIDER(){return providerPicker.LS_PROVIDER},
+get LS_SIDEBAR(){return LS_SIDEBAR},
+get LS_SIDEBAR_WIDTH(){return LS_SIDEBAR_WIDTH},
+get SIDEBAR_ACCORDION_SECTIONS(){return SIDEBAR_ACCORDION_SECTIONS},
+get applyBranding(){return applyBranding},
+get providerStorageKey(){return providerPicker.providerStorageKey},
+get savedProviderForWorkspace(){return providerPicker.savedProviderForWorkspace},
+get currentSessionId(){return currentSessionId},set currentSessionId(value){currentSessionId=value},
+get sending(){return sending},set sending(value){sending=value},
+get busySessions(){return busySessions},
+get unreadSessions(){return unreadSessions},
+get updatedFiles(){return featureApis.files.updatedFiles},
+get selectedWorkspaceFiles(){return featureApis.files.selectedWorkspaceFiles},
+get knownWorkspaceFiles(){return featureApis.files.knownWorkspaceFiles},
+get selectedWorkspaceOwner(){return featureApis.files.selectedWorkspaceOwner},set selectedWorkspaceOwner(value){featureApis.files.selectedWorkspaceOwner=value},
+get workspaceGeneration(){return workspaceGeneration},set workspaceGeneration(value){workspaceGeneration=value},
+get providerDiscoveryFailed(){return providerPicker.providerDiscoveryFailed},set providerDiscoveryFailed(value){providerPicker.providerDiscoveryFailed=value},
+get scrollSuppressUntil(){return scrollSuppressUntil},set scrollSuppressUntil(value){scrollSuppressUntil=value},
+get programmaticScroll(){return programmaticScroll},set programmaticScroll(value){programmaticScroll=value},
+get isScrollSuppressed(){return isScrollSuppressed},
+get programmaticScrollTo(){return programmaticScrollTo},
+get onUserScroll(){return onUserScroll},
+get isMessagesBottomVisible(){return isMessagesBottomVisible},
+get ICON_SEND(){return ICON_SEND},
+get ICON_SCROLL(){return ICON_SCROLL},
+get ICON_STOP(){return ICON_STOP},
+get ICON_TRASH(){return ICON_TRASH},
+get showScrollDownButton(){return showScrollDownButton},
+get scrollToBottomAndReset(){return scrollToBottomAndReset},
+get resetSendButton(){return resetSendButton},
+get showStopButton(){return showStopButton},
+get scrollDownBtn(){return scrollDownBtn},set scrollDownBtn(value){scrollDownBtn=value},
+get updateScrollDownButton(){return updateScrollDownButton},
+get messagesEl(){return messagesEl},
+get sessionsBanner(){return sessionsBanner},
+get sessionListEl(){return sessionListEl},
+get chatHeaderEl(){return chatHeaderEl},
+get chatTitleEl(){return chatTitleEl},
+get inputEl(){return inputEl},
+get attachmentTrayEl(){return featureApis.files.attachmentTrayEl},
+get sendBtn(){return sendBtn},
+get stopBtn(){return stopBtn},
+get newBtn(){return newBtn},
+get providerSel(){return providerPicker.providerSel},
+get burgerBtn(){return burgerBtn},
+get sidebarOverlay(){return sidebarOverlay},
+get expertMenuEl(){return featureApis.experts.expertMenuEl},
+get expertToggleBtn(){return featureApis.experts.expertToggleBtn},
+get expertPopoverEl(){return featureApis.experts.expertPopoverEl},
+get expertEnabledEl(){return featureApis.experts.expertEnabledEl},
+get expertAllEl(){return featureApis.experts.expertAllEl},
+get expertListEl(){return featureApis.experts.expertListEl},
+get expertModeEl(){return featureApis.experts.expertModeEl},
+get expertSynthesizeEl(){return featureApis.experts.expertSynthesizeEl},
+get expertStatusEl(){return featureApis.experts.expertStatusEl},
+get workspaceToggleBtn(){return featureApis.workspace.workspaceToggleBtn},
+get workspacePopoverEl(){return featureApis.workspace.workspacePopoverEl},
+get workspaceListEl(){return featureApis.workspace.workspaceListEl},
+get workspaceNameEl(){return featureApis.workspace.workspaceNameEl},
+get workspaceAvatarEl(){return featureApis.workspace.workspaceAvatarEl},
+get workspaceStatusEl(){return featureApis.workspace.workspaceStatusEl},
+get workspaceNewBtn(){return featureApis.workspace.workspaceNewBtn},
+get workspaceRenameBtn(){return featureApis.workspace.workspaceRenameBtn},
+get workspaceConfigBtn(){return featureApis.workspace.workspaceConfigBtn},
+get workspaceSettingsScreenEl(){return featureApis.rag.workspaceSettingsScreenEl},
+get workspaceSettingsCancelBtn(){return featureApis.rag.workspaceSettingsCancelBtn},
+get workspaceContextNameEl(){return featureApis.rag.workspaceContextNameEl},
+get workspaceRagPathsEl(){return featureApis.rag.workspaceRagPathsEl},
+get workspaceRagProgressBarEl(){return featureApis.rag.workspaceRagProgressBarEl},
+get workspaceRagStatusEl(){return featureApis.rag.workspaceRagStatusEl},
+get workspaceRagCurrentFileEl(){return featureApis.rag.workspaceRagCurrentFileEl},
+get workspaceRagSaveBtn(){return featureApis.rag.workspaceRagSaveBtn},
+get workspaceDeleteDialogEl(){return featureApis.workspace.workspaceDeleteDialogEl},
+get workspaceDeleteMessageEl(){return featureApis.workspace.workspaceDeleteMessageEl},
+get workspaceDeleteCancelBtn(){return featureApis.workspace.workspaceDeleteCancelBtn},
+get workspaceDeleteConfirmBtn(){return featureApis.workspace.workspaceDeleteConfirmBtn},
+get memoryBrowserStatusEl(){return featureApis.memory.memoryBrowserStatusEl},set memoryBrowserStatusEl(value){featureApis.memory.memoryBrowserStatusEl=value},
+get memoryBrowserOverlay(){return featureApis.memory.memoryBrowserOverlay},
+get memoryBrowserCountEl(){return featureApis.memory.memoryBrowserCountEl},
+get memoryBrowserRefreshBtn(){return featureApis.memory.memoryBrowserRefreshBtn},
+get memoryBrowserCloseBtn(){return featureApis.memory.memoryBrowserCloseBtn},
+get memoryBrowserSearchForm(){return featureApis.memory.memoryBrowserSearchForm},
+get memoryBrowserSearchEl(){return featureApis.memory.memoryBrowserSearchEl},
+get memoryBrowserFilterEl(){return featureApis.memory.memoryBrowserFilterEl},
+get memoryBrowserNewFactEl(){return featureApis.memory.memoryBrowserNewFactEl},
+get memoryBrowserAddBtn(){return featureApis.memory.memoryBrowserAddBtn},
+get memoryBrowserPanelStatusEl(){return featureApis.memory.memoryBrowserPanelStatusEl},
+get memoryBrowserListEl(){return featureApis.memory.memoryBrowserListEl},
+get memoryBrowserLoadMoreBtn(){return featureApis.memory.memoryBrowserLoadMoreBtn},
+get memoryBrowserEmptyEl(){return featureApis.memory.memoryBrowserEmptyEl},
+get memoryBrowserDetailForm(){return featureApis.memory.memoryBrowserDetailForm},
+get memoryBrowserStateEl(){return featureApis.memory.memoryBrowserStateEl},
+get memoryBrowserMemoryTitleEl(){return featureApis.memory.memoryBrowserMemoryTitleEl},
+get memoryBrowserFactInput(){return featureApis.memory.memoryBrowserFactInput},
+get memoryBrowserSessionIdInput(){return featureApis.memory.memoryBrowserSessionIdInput},
+get memoryBrowserMessageIdInput(){return featureApis.memory.memoryBrowserMessageIdInput},
+get memoryBrowserCreatedAtInput(){return featureApis.memory.memoryBrowserCreatedAtInput},
+get memoryBrowserVersionInput(){return featureApis.memory.memoryBrowserVersionInput},
+get memoryBrowserDreamSkillInput(){return featureApis.memory.memoryBrowserDreamSkillInput},
+get memoryBrowserIgnoreUntilInput(){return featureApis.memory.memoryBrowserIgnoreUntilInput},
+get memoryBrowserDeleteBtn(){return featureApis.memory.memoryBrowserDeleteBtn},
+get memoryBrowserSaveBtn(){return featureApis.memory.memoryBrowserSaveBtn},
+get architectureScreenEl(){return architectureScreenEl},
+get architectureTitleEl(){return architectureTitleEl},
+get architectureNavBtns(){return architectureNavBtns},
+get architectureTabBtns(){return architectureTabBtns},
+get architecturePanelEls(){return architecturePanelEls},
+get architectureSourceStatusEl(){return featureApis.sources.architectureSourceStatusEl},
+get architectureSourceRefreshBtn(){return featureApis.sources.architectureSourceRefreshBtn},
+get architectureSourceListEl(){return featureApis.sources.architectureSourceListEl},
+get architectureSourceDetailEl(){return featureApis.sources.architectureSourceDetailEl},
+get architectureSourceHealthSummaryEl(){return featureApis.sources.architectureSourceHealthSummaryEl},
+get architectureSourceHealthModalEl(){return featureApis.sources.architectureSourceHealthModalEl},
+get architectureSourceHealthModalContentEl(){return featureApis.sources.architectureSourceHealthModalContentEl},
+get architectureSourceHealthModalCloseBtn(){return featureApis.sources.architectureSourceHealthModalCloseBtn},
+get architectureSqlForm(){return featureApis.sql.architectureSqlForm},
+get architectureSqlMetricEl(){return featureApis.sql.architectureSqlMetricEl},
+get architectureSqlDimensionEl(){return featureApis.sql.architectureSqlDimensionEl},
+get architectureSqlFilterColumnEl(){return featureApis.sql.architectureSqlFilterColumnEl},
+get architectureSqlFilterValueEl(){return featureApis.sql.architectureSqlFilterValueEl},
+get architectureSqlLimitEl(){return featureApis.sql.architectureSqlLimitEl},
+get architectureSqlPlanBtn(){return featureApis.sql.architectureSqlPlanBtn},
+get architectureSqlApproveBtn(){return featureApis.sql.architectureSqlApproveBtn},
+get architectureSqlExecuteBtn(){return featureApis.sql.architectureSqlExecuteBtn},
+get architectureSqlStatusEl(){return featureApis.sql.architectureSqlStatusEl},
+get architectureSqlPreviewEl(){return featureApis.sql.architectureSqlPreviewEl},
+get architectureSqlResultsEl(){return featureApis.sql.architectureSqlResultsEl},
+get architectureSqlValidationForm(){return featureApis.sql.architectureSqlValidationForm},
+get architectureSqlValidationInputEl(){return featureApis.sql.architectureSqlValidationInputEl},
+get architectureSqlValidationBtn(){return featureApis.sql.architectureSqlValidationBtn},
+get architectureSqlValidationResultEl(){return featureApis.sql.architectureSqlValidationResultEl},
+get architectureWorkflowStatusEl(){return featureApis.workflows.architectureWorkflowStatusEl},
+get architectureWorkflowRefreshBtn(){return featureApis.workflows.architectureWorkflowRefreshBtn},
+get architectureApprovalListEl(){return featureApis.workflows.architectureApprovalListEl},
+get architectureApprovalDetailEl(){return featureApis.workflows.architectureApprovalDetailEl},
+get architectureHighRiskWriteModalEl(){return featureApis.workflows.architectureHighRiskWriteModalEl},
+get architectureHighRiskWriteContentEl(){return featureApis.workflows.architectureHighRiskWriteContentEl},
+get architectureHighRiskWriteCloseBtn(){return featureApis.workflows.architectureHighRiskWriteCloseBtn},
+get architectureHighRiskWriteRejectBtn(){return featureApis.workflows.architectureHighRiskWriteRejectBtn},
+get architectureHighRiskWriteApproveBtn(){return featureApis.workflows.architectureHighRiskWriteApproveBtn},
+get workflowOpsTabBtns(){return featureApis.workflows.workflowOpsTabBtns},
+get workflowOpsPanelEls(){return featureApis.workflows.workflowOpsPanelEls},
+get workflowOpsSummaryBtns(){return featureApis.workflows.workflowOpsSummaryBtns},
+get workflowOpsWorkflowCountEl(){return featureApis.workflows.workflowOpsWorkflowCountEl},
+get workflowOpsRunCountEl(){return featureApis.workflows.workflowOpsRunCountEl},
+get workflowOpsPendingCountEl(){return featureApis.workflows.workflowOpsPendingCountEl},
+get workflowOpsAcceptanceRateEl(){return featureApis.workflows.workflowOpsAcceptanceRateEl},
+get workflowOpsAcceptanceTrendEl(){return featureApis.workflows.workflowOpsAcceptanceTrendEl},
+get workflowOpsAttentionEl(){return featureApis.workflows.workflowOpsAttentionEl},
+get workflowOpsRecentRunsEl(){return featureApis.workflows.workflowOpsRecentRunsEl},
+get workflowOpsShadowReadinessEl(){return featureApis.workflows.workflowOpsShadowReadinessEl},
+get workflowOpsCompileForm(){return featureApis.workflows.workflowOpsCompileForm},
+get workflowOpsCompileNameEl(){return featureApis.workflows.workflowOpsCompileNameEl},
+get workflowOpsCompileRiskEl(){return featureApis.workflows.workflowOpsCompileRiskEl},
+get workflowOpsCompileTranscriptEl(){return featureApis.workflows.workflowOpsCompileTranscriptEl},
+get workflowOpsCompileSourcesEl(){return featureApis.workflows.workflowOpsCompileSourcesEl},
+get workflowOpsCompileToolEl(){return featureApis.workflows.workflowOpsCompileToolEl},
+get workflowOpsCompilePublishEl(){return featureApis.workflows.workflowOpsCompilePublishEl},
+get workflowOpsCompileDryRunEl(){return featureApis.workflows.workflowOpsCompileDryRunEl},
+get workflowOpsCompileBtn(){return featureApis.workflows.workflowOpsCompileBtn},
+get workflowOpsLibrarySearchEl(){return featureApis.workflows.workflowOpsLibrarySearchEl},
+get workflowOpsLibraryListEl(){return featureApis.workflows.workflowOpsLibraryListEl},
+get workflowOpsLibraryDetailEl(){return featureApis.workflows.workflowOpsLibraryDetailEl},
+get workflowOpsRunSearchEl(){return featureApis.workflows.workflowOpsRunSearchEl},
+get workflowOpsRunStatusEl(){return featureApis.workflows.workflowOpsRunStatusEl},
+get workflowOpsRunListEl(){return featureApis.workflows.workflowOpsRunListEl},
+get workflowOpsRunDetailEl(){return featureApis.workflows.workflowOpsRunDetailEl},
+get workflowOpsShadowListEl(){return featureApis.workflows.workflowOpsShadowListEl},
+get workflowOpsShadowDetailEl(){return featureApis.workflows.workflowOpsShadowDetailEl},
+get architectureEvaluationStatusEl(){return featureApis.evaluation.architectureEvaluationStatusEl},
+get architectureEvaluationRefreshBtn(){return featureApis.evaluation.architectureEvaluationRefreshBtn},
+get evaluationTraceCountEl(){return featureApis.evaluation.evaluationTraceCountEl},
+get evaluationPassRateEl(){return featureApis.evaluation.evaluationPassRateEl},
+get evaluationCompletionRateEl(){return featureApis.evaluation.evaluationCompletionRateEl},
+get evaluationNetBenefitEl(){return featureApis.evaluation.evaluationNetBenefitEl},
+get evaluationTraceListEl(){return featureApis.evaluation.evaluationTraceListEl},
+get evaluationTraceDetailEl(){return featureApis.evaluation.evaluationTraceDetailEl},
+get evaluationSuiteListEl(){return featureApis.evaluation.evaluationSuiteListEl},
+get evaluationSuiteDetailEl(){return featureApis.evaluation.evaluationSuiteDetailEl},
+get evaluationRoiDetailEl(){return featureApis.evaluation.evaluationRoiDetailEl},
+get architectureGraphForm(){return featureApis.graph.architectureGraphForm},
+get architectureGraphRefreshBtn(){return featureApis.graph.architectureGraphRefreshBtn},
+get architectureGraphRetrieveBtn(){return featureApis.graph.architectureGraphRetrieveBtn},
+get architectureGraphSearchEl(){return featureApis.graph.architectureGraphSearchEl},
+get architectureGraphSourceEl(){return featureApis.graph.architectureGraphSourceEl},
+get architectureGraphStatusEl(){return featureApis.graph.architectureGraphStatusEl},
+get architectureGraphListEl(){return featureApis.graph.architectureGraphListEl},
+get architectureGraphDetailEl(){return featureApis.graph.architectureGraphDetailEl},
+get architectureReviewForm(){return featureApis.experts.architectureReviewForm},
+get architectureReviewModalEl(){return featureApis.experts.architectureReviewModalEl},
+get architectureReviewOpenBtn(){return featureApis.experts.architectureReviewOpenBtn},
+get architectureReviewCloseBtn(){return featureApis.experts.architectureReviewCloseBtn},
+get architectureReviewCancelBtn(){return featureApis.experts.architectureReviewCancelBtn},
+get architectureReviewQuestionEl(){return featureApis.experts.architectureReviewQuestionEl},
+get architectureReviewTargetTypeEl(){return featureApis.experts.architectureReviewTargetTypeEl},
+get architectureReviewTargetIdEl(){return featureApis.experts.architectureReviewTargetIdEl},
+get architectureReviewWorkflowIdEl(){return featureApis.experts.architectureReviewWorkflowIdEl},
+get architectureReviewRunIdEl(){return featureApis.experts.architectureReviewRunIdEl},
+get architectureReviewExpertsEl(){return featureApis.experts.architectureReviewExpertsEl},
+get architectureReviewRefreshBtn(){return featureApis.experts.architectureReviewRefreshBtn},
+get architectureReviewCreateBtn(){return featureApis.experts.architectureReviewCreateBtn},
+get architectureReviewStatusEl(){return featureApis.experts.architectureReviewStatusEl},
+get architectureReviewListEl(){return featureApis.experts.architectureReviewListEl},
+get architectureReviewDetailEl(){return featureApis.experts.architectureReviewDetailEl},
+get architectureOpenPluginManagementBtn(){return featureApis.runtime.architectureOpenPluginManagementBtn},
+get expertPanelExperts(){return featureApis.experts.expertPanelExperts},set expertPanelExperts(value){featureApis.experts.expertPanelExperts=value},
+get expertPanelBusy(){return featureApis.experts.expertPanelBusy},set expertPanelBusy(value){featureApis.experts.expertPanelBusy=value},
+get workspaceState(){return featureApis.workspace.workspaceState},set workspaceState(value){featureApis.workspace.workspaceState=value},
+get workspaceRagPoll(){return featureApis.rag.workspaceRagPoll},set workspaceRagPoll(value){featureApis.rag.workspaceRagPoll=value},
+get workspaceRagConfig(){return featureApis.rag.workspaceRagConfig},set workspaceRagConfig(value){featureApis.rag.workspaceRagConfig=value},
+get workspaceRagSavedSnapshot(){return featureApis.rag.workspaceRagSavedSnapshot},set workspaceRagSavedSnapshot(value){featureApis.rag.workspaceRagSavedSnapshot=value},
+get workspaceRagSaving(){return featureApis.rag.workspaceRagSaving},set workspaceRagSaving(value){featureApis.rag.workspaceRagSaving=value},
+get workspaceRagLoadSeq(){return featureApis.rag.workspaceRagLoadSeq},set workspaceRagLoadSeq(value){featureApis.rag.workspaceRagLoadSeq=value},
+get workspaceSwitching(){return featureApis.workspace.workspaceSwitching},set workspaceSwitching(value){featureApis.workspace.workspaceSwitching=value},
+get WORKSPACE_RESTART_TIMEOUT_MS(){return featureApis.workspace.WORKSPACE_RESTART_TIMEOUT_MS},
+get WORKSPACE_RESTART_STATUS_INTERVAL_MS(){return featureApis.workspace.WORKSPACE_RESTART_STATUS_INTERVAL_MS},
+get memoryBrowserState(){return featureApis.memory.memoryBrowserState},set memoryBrowserState(value){featureApis.memory.memoryBrowserState=value},
+get architectureView(){return architectureView},set architectureView(value){architectureView=value},
+get architectureSourcesState(){return featureApis.sources.architectureSourcesState},set architectureSourcesState(value){featureApis.sources.architectureSourcesState=value},
+get architectureSourcesLoadSeq(){return featureApis.sources.architectureSourcesLoadSeq},set architectureSourcesLoadSeq(value){featureApis.sources.architectureSourcesLoadSeq=value},
+get architectureSqlState(){return featureApis.sql.architectureSqlState},set architectureSqlState(value){featureApis.sql.architectureSqlState=value},
+get architectureSqlBusy(){return featureApis.sql.architectureSqlBusy},set architectureSqlBusy(value){featureApis.sql.architectureSqlBusy=value},
+get architectureSqlPlanRequest(){return featureApis.sql.architectureSqlPlanRequest},set architectureSqlPlanRequest(value){featureApis.sql.architectureSqlPlanRequest=value},
+get architectureSqlValidationState(){return featureApis.sql.architectureSqlValidationState},set architectureSqlValidationState(value){featureApis.sql.architectureSqlValidationState=value},
+get architectureWorkflowState(){return featureApis.workflows.architectureWorkflowState},set architectureWorkflowState(value){featureApis.workflows.architectureWorkflowState=value},
+get architectureWorkflowDecision(){return featureApis.workflows.architectureWorkflowDecision},set architectureWorkflowDecision(value){featureApis.workflows.architectureWorkflowDecision=value},
+get architectureHighRiskWriteContext(){return featureApis.workflows.architectureHighRiskWriteContext},set architectureHighRiskWriteContext(value){featureApis.workflows.architectureHighRiskWriteContext=value},
+get architectureWorkflowBusy(){return featureApis.workflows.architectureWorkflowBusy},set architectureWorkflowBusy(value){featureApis.workflows.architectureWorkflowBusy=value},
+get architectureWorkflowLoadRequest(){return featureApis.workflows.architectureWorkflowLoadRequest},set architectureWorkflowLoadRequest(value){featureApis.workflows.architectureWorkflowLoadRequest=value},
+get architectureWorkflowRefreshTimer(){return featureApis.workflows.architectureWorkflowRefreshTimer},set architectureWorkflowRefreshTimer(value){featureApis.workflows.architectureWorkflowRefreshTimer=value},
+get WORKFLOW_OPS_REFRESH_MS(){return featureApis.workflows.WORKFLOW_OPS_REFRESH_MS},
+get architectureEvaluationState(){return featureApis.evaluation.architectureEvaluationState},set architectureEvaluationState(value){featureApis.evaluation.architectureEvaluationState=value},
+get architectureEvaluationLoadRequest(){return featureApis.evaluation.architectureEvaluationLoadRequest},set architectureEvaluationLoadRequest(value){featureApis.evaluation.architectureEvaluationLoadRequest=value},
+get architectureGraphState(){return featureApis.graph.architectureGraphState},set architectureGraphState(value){featureApis.graph.architectureGraphState=value},
+get architectureGraphRetrieveRequest(){return featureApis.graph.architectureGraphRetrieveRequest},set architectureGraphRetrieveRequest(value){featureApis.graph.architectureGraphRetrieveRequest=value},
+get architectureReviewState(){return featureApis.experts.architectureReviewState},set architectureReviewState(value){featureApis.experts.architectureReviewState=value},
+get closeSidebar(){return closeSidebar},
+get loadSidebarState(){return loadSidebarState},
+get saveSidebarState(){return saveSidebarState},
+get escHtml(){return escHtml},
+get md(){return md},
+get T(){return T},
+get apiListSessions(){return apiListSessions},
+get apiGetSession(){return apiGetSession},
+get apiSessionBusy(){return apiSessionBusy},
+get apiListProviders(){return providerPicker.apiListProviders},
+get refreshProviderSelect(){return providerPicker.refreshProviderSelect},
+get callTool(){return callTool},
+get setMemoryBrowserLauncherStatus(){return featureApis.memory.setMemoryBrowserLauncherStatus},
+get setMemoryBrowserPanelStatus(){return featureApis.memory.setMemoryBrowserPanelStatus},
+get formatMemoryBrowserDate(){return featureApis.memory.formatMemoryBrowserDate},
+get getMemoryBrowserState(){return featureApis.memory.getMemoryBrowserState},
+get memoryBrowserWhere(){return featureApis.memory.memoryBrowserWhere},
+get callMemoryBrowserAction(){return featureApis.memory.callMemoryBrowserAction},
+get renderMemoryBrowserCount(){return featureApis.memory.renderMemoryBrowserCount},
+get renderMemoryBrowserList(){return featureApis.memory.renderMemoryBrowserList},
+get renderMemoryBrowserDetail(){return featureApis.memory.renderMemoryBrowserDetail},
+get selectMemoryBrowserMemory(){return featureApis.memory.selectMemoryBrowserMemory},
+get loadMemoryBrowserMemories(){return featureApis.memory.loadMemoryBrowserMemories},
+get memoryBrowserSelectedData(){return featureApis.memory.memoryBrowserSelectedData},
+get saveMemoryBrowserSelection(){return featureApis.memory.saveMemoryBrowserSelection},
+get deleteMemoryBrowserSelection(){return featureApis.memory.deleteMemoryBrowserSelection},
+get addMemoryBrowserMemory(){return featureApis.memory.addMemoryBrowserMemory},
+get openMemoryBrowser(){return featureApis.memory.openMemoryBrowser},
+get closeMemoryBrowser(){return featureApis.memory.closeMemoryBrowser},
+get ARCHITECTURE_PANEL_TITLES(){return ARCHITECTURE_PANEL_TITLES},
+get ARCHITECTURE_HASH_VIEWS(){return ARCHITECTURE_HASH_VIEWS},
+get architectureString(){return architectureString},
+get architectureDate(){return architectureDate},
+get architectureBadgeClass(){return architectureBadgeClass},
+get architectureClear(){return architectureClear},
+get architectureStatus(){return architectureStatus},
+get architectureEmpty(){return architectureEmpty},
+get architectureBadge(){return architectureBadge},
+get architectureMuted(){return architectureMuted},
+get architectureHeading(){return architectureHeading},
+get architectureKeyValues(){return architectureKeyValues},
+get architectureInlineBadges(){return architectureInlineBadges},
+get architectureItemButton(){return architectureItemButton},
+get architectureCard(){return architectureCard},
+get architectureTable(){return architectureTable},
+get architectureJsonBlock(){return architectureJsonBlock},
+get setArchitectureOpen(){return setArchitectureOpen},
+get architectureStatusElement(){return architectureStatusElement},
+get activateArchitecturePanel(){return activateArchitecturePanel},
+get loadArchitecturePanel(){return loadArchitecturePanel},
+get sourceHealthFindings(){return featureApis.sources.sourceHealthFindings},
+get sourceHealthSeverity(){return featureApis.sources.sourceHealthSeverity},
+get renderArchitectureSourceHealthSummary(){return featureApis.sources.renderArchitectureSourceHealthSummary},
+get openArchitectureSourceHealthModal(){return featureApis.sources.openArchitectureSourceHealthModal},
+get renderArchitectureSourceList(){return featureApis.sources.renderArchitectureSourceList},
+get renderArchitectureSourceDetail(){return featureApis.sources.renderArchitectureSourceDetail},
+get selectArchitectureSource(){return featureApis.sources.selectArchitectureSource},
+get loadArchitectureSources(){return featureApis.sources.loadArchitectureSources},
+get architectureSqlPlanInput(){return featureApis.sql.architectureSqlPlanInput},
+get invalidateArchitectureSqlPlan(){return featureApis.sql.invalidateArchitectureSqlPlan},
+get renderArchitectureSqlValidation(){return featureApis.sql.renderArchitectureSqlValidation},
+get validateArchitectureSql(){return featureApis.sql.validateArchitectureSql},
+get renderArchitectureSqlResults(){return featureApis.sql.renderArchitectureSqlResults},
+get planArchitectureSql(){return featureApis.sql.planArchitectureSql},
+get approveArchitectureSql(){return featureApis.sql.approveArchitectureSql},
+get executeArchitectureSql(){return featureApis.sql.executeArchitectureSql},
+get workflowOpsWorkspaceQuery(){return featureApis.workflows.workflowOpsWorkspaceQuery},
+get workflowOpsSplitValues(){return featureApis.workflows.workflowOpsSplitValues},
+get workflowOpsAcceptanceText(){return featureApis.workflows.workflowOpsAcceptanceText},
+get workflowOpsAcceptanceTrend(){return featureApis.workflows.workflowOpsAcceptanceTrend},
+get stopWorkflowOpsAutoRefresh(){return featureApis.workflows.stopWorkflowOpsAutoRefresh},
+get scheduleWorkflowOpsAutoRefresh(){return featureApis.workflows.scheduleWorkflowOpsAutoRefresh},
+get activateWorkflowOpsView(){return featureApis.workflows.activateWorkflowOpsView},
+get renderWorkflowOpsSummary(){return featureApis.workflows.renderWorkflowOpsSummary},
+get workflowOpsSortedRuns(){return featureApis.workflows.workflowOpsSortedRuns},
+get renderWorkflowOpsOverview(){return featureApis.workflows.renderWorkflowOpsOverview},
+get workflowOpsFilteredCompilations(){return featureApis.workflows.workflowOpsFilteredCompilations},
+get renderWorkflowOpsLibraryList(){return featureApis.workflows.renderWorkflowOpsLibraryList},
+get renderWorkflowOpsLibraryDetail(){return featureApis.workflows.renderWorkflowOpsLibraryDetail},
+get selectWorkflowOpsCompilation(){return featureApis.workflows.selectWorkflowOpsCompilation},
+get compileWorkflowOperation(){return featureApis.workflows.compileWorkflowOperation},
+get startWorkflowOpsRun(){return featureApis.workflows.startWorkflowOpsRun},
+get workflowOpsFilteredRuns(){return featureApis.workflows.workflowOpsFilteredRuns},
+get renderWorkflowOpsRunList(){return featureApis.workflows.renderWorkflowOpsRunList},
+get workflowOpsDisclosure(){return featureApis.workflows.workflowOpsDisclosure},
+get openWorkflowEvidenceSource(){return featureApis.workflows.openWorkflowEvidenceSource},
+get workflowOpsEvidenceLinks(){return featureApis.workflows.workflowOpsEvidenceLinks},
+get workflowOpsActionCards(){return featureApis.workflows.workflowOpsActionCards},
+get renderWorkflowOpsRunDetail(){return featureApis.workflows.renderWorkflowOpsRunDetail},
+get selectWorkflowOpsRun(){return featureApis.workflows.selectWorkflowOpsRun},
+get workflowOpsComparisonForRun(){return featureApis.workflows.workflowOpsComparisonForRun},
+get workflowOpsShadowRuns(){return featureApis.workflows.workflowOpsShadowRuns},
+get renderWorkflowOpsShadowList(){return featureApis.workflows.renderWorkflowOpsShadowList},
+get renderWorkflowOpsShadowDetail(){return featureApis.workflows.renderWorkflowOpsShadowDetail},
+get selectWorkflowOpsShadowRun(){return featureApis.workflows.selectWorkflowOpsShadowRun},
+get labelWorkflowOpsShadow(){return featureApis.workflows.labelWorkflowOpsShadow},
+get renderWorkflowOperationsCenter(){return featureApis.workflows.renderWorkflowOperationsCenter},
+get renderArchitectureApprovalList(){return featureApis.workflows.renderArchitectureApprovalList},
+get highRiskWriteDetails(){return featureApis.workflows.highRiskWriteDetails},
+get closeHighRiskWriteModal(){return featureApis.workflows.closeHighRiskWriteModal},
+get openHighRiskWriteModal(){return featureApis.workflows.openHighRiskWriteModal},
+get renderArchitectureApprovalDetail(){return featureApis.workflows.renderArchitectureApprovalDetail},
+get selectArchitectureApproval(){return featureApis.workflows.selectArchitectureApproval},
+get loadArchitectureWorkflowApprovals(){return featureApis.workflows.loadArchitectureWorkflowApprovals},
+get decideArchitectureApproval(){return featureApis.workflows.decideArchitectureApproval},
+get architectureGraphEntities(){return featureApis.graph.architectureGraphEntities},
+get architectureGraphRelationships(){return featureApis.graph.architectureGraphRelationships},
+get evaluationPercent(){return featureApis.evaluation.evaluationPercent},
+get evaluationMoney(){return featureApis.evaluation.evaluationMoney},
+get evaluationDuration(){return featureApis.evaluation.evaluationDuration},
+get renderArchitectureEvaluationSummary(){return featureApis.evaluation.renderArchitectureEvaluationSummary},
+get evaluationSortedTraces(){return featureApis.evaluation.evaluationSortedTraces},
+get renderArchitectureEvaluationTraceList(){return featureApis.evaluation.renderArchitectureEvaluationTraceList},
+get renderArchitectureEvaluationTraceDetail(){return featureApis.evaluation.renderArchitectureEvaluationTraceDetail},
+get selectArchitectureEvaluationTrace(){return featureApis.evaluation.selectArchitectureEvaluationTrace},
+get replayArchitectureEvaluationTrace(){return featureApis.evaluation.replayArchitectureEvaluationTrace},
+get renderArchitectureEvaluationSuiteList(){return featureApis.evaluation.renderArchitectureEvaluationSuiteList},
+get renderArchitectureEvaluationSuiteDetail(){return featureApis.evaluation.renderArchitectureEvaluationSuiteDetail},
+get runArchitectureEvaluationSuite(){return featureApis.evaluation.runArchitectureEvaluationSuite},
+get renderArchitectureEvaluationRoi(){return featureApis.evaluation.renderArchitectureEvaluationRoi},
+get loadArchitectureEvaluation(){return featureApis.evaluation.loadArchitectureEvaluation},
+get renderArchitectureGraphList(){return featureApis.graph.renderArchitectureGraphList},
+get renderArchitectureGraphDetail(){return featureApis.graph.renderArchitectureGraphDetail},
+get selectArchitectureGraphEntity(){return featureApis.graph.selectArchitectureGraphEntity},
+get loadArchitectureGraph(){return featureApis.graph.loadArchitectureGraph},
+get firstRetrievedArchitectureGraphEntity(){return featureApis.graph.firstRetrievedArchitectureGraphEntity},
+get retrieveArchitectureGraph(){return featureApis.graph.retrieveArchitectureGraph},
+get renderArchitectureReviewList(){return featureApis.experts.renderArchitectureReviewList},
+get renderArchitectureReviewDetail(){return featureApis.experts.renderArchitectureReviewDetail},
+get selectArchitectureReview(){return featureApis.experts.selectArchitectureReview},
+get loadArchitectureReviews(){return featureApis.experts.loadArchitectureReviews},
+get createArchitectureReview(){return featureApis.experts.createArchitectureReview},
+get setWorkspaceStatus(){return featureApis.workspace.setWorkspaceStatus},
+get setWorkspaceSwitching(){return featureApis.workspace.setWorkspaceSwitching},
+get workspaceRestartSleep(){return featureApis.workspace.workspaceRestartSleep},
+get workspaceStateHasActiveId(){return featureApis.workspace.workspaceStateHasActiveId},
+get isWorkspaceFetchFailure(){return featureApis.workspace.isWorkspaceFetchFailure},
+get waitForWorkspaceRestart(){return featureApis.workspace.waitForWorkspaceRestart},
+get workspaceInitial(){return featureApis.workspace.workspaceInitial},
+get activeWorkspace(){return featureApis.workspace.activeWorkspace},
+get activeWorkspaceId(){return featureApis.workspace.activeWorkspaceId},
+get setWorkspacePopoverOpen(){return featureApis.workspace.setWorkspacePopoverOpen},
+get setWorkspaceSettingsOpen(){return featureApis.rag.setWorkspaceSettingsOpen},
+get confirmWorkspaceDelete(){return featureApis.workspace.confirmWorkspaceDelete},
+get workspaceDeleteErrorMessage(){return featureApis.workspace.workspaceDeleteErrorMessage},
+get renderWorkspaces(){return featureApis.workspace.renderWorkspaces},
+get loadWorkspaces(){return featureApis.workspace.loadWorkspaces},
+get setWorkspaceRagStatus(){return featureApis.rag.setWorkspaceRagStatus},
+get renderWorkspaceRagStatus(){return featureApis.rag.renderWorkspaceRagStatus},
+get parseWorkspaceRagPaths(){return featureApis.rag.parseWorkspaceRagPaths},
+get workspaceRagSnapshotFromConfig(){return featureApis.rag.workspaceRagSnapshotFromConfig},
+get currentWorkspaceRagFormSnapshot(){return featureApis.rag.currentWorkspaceRagFormSnapshot},
+get workspaceRagSnapshotsEqual(){return featureApis.rag.workspaceRagSnapshotsEqual},
+get updateWorkspaceRagSaveState(){return featureApis.rag.updateWorkspaceRagSaveState},
+get activeWorkspaceRagContext(){return featureApis.rag.activeWorkspaceRagContext},
+get renderWorkspaceRagConfig(){return featureApis.rag.renderWorkspaceRagConfig},
+get resetWorkspaceRagConfigForm(){return featureApis.rag.resetWorkspaceRagConfigForm},
+get loadWorkspaceRagStatus(){return featureApis.rag.loadWorkspaceRagStatus},
+get loadWorkspaceRagConfig(){return featureApis.rag.loadWorkspaceRagConfig},
+get startWorkspaceRagPoll(){return featureApis.rag.startWorkspaceRagPoll},
+get stopWorkspaceRagPoll(){return featureApis.rag.stopWorkspaceRagPoll},
+get setExpertStatus(){return featureApis.experts.setExpertStatus},
+get updateExpertControlsState(){return featureApis.experts.updateExpertControlsState},
+get setExpertPopoverOpen(){return featureApis.experts.setExpertPopoverOpen},
+get loadExperts(){return featureApis.experts.loadExperts},
+get renderExpertPanel(){return featureApis.experts.renderExpertPanel},
+get selectedExpertIds(){return featureApis.experts.selectedExpertIds},
+get syncExpertAllFromChoices(){return featureApis.experts.syncExpertAllFromChoices},
+get expertUserSummary(){return featureApis.experts.expertUserSummary},
+get formatExpertPanelResult(){return featureApis.experts.formatExpertPanelResult},
+get runExpertPanelFromUi(){return featureApis.experts.runExpertPanelFromUi},
+get maybeShowScrollDown(){return maybeShowScrollDown},
+get renameSession(){return renameSession},
+get hideSession(){return hideSession},
+get TITLE_REFRESH_DELAYS_MS(){return TITLE_REFRESH_DELAYS_MS},
+get titleRefreshTimers(){return titleRefreshTimers},set titleRefreshTimers(value){titleRefreshTimers=value},
+get refreshTitlesAfterFollowup(){return refreshTitlesAfterFollowup},
+get apiNewSession(){return apiNewSession},
+get formatSize(){return featureApis.files.formatSize},
+get syncWorkspaceFileAttachmentRows(){return featureApis.files.syncWorkspaceFileAttachmentRows},
+get renderAttachmentTray(){return featureApis.files.renderAttachmentTray},
+get setWorkspaceFileAttached(){return featureApis.files.setWorkspaceFileAttached},
+get clearWorkspaceFileAttachments(){return featureApis.files.clearWorkspaceFileAttachments},
+get reconcileWorkspaceFileAttachments(){return featureApis.files.reconcileWorkspaceFileAttachments},
+get renderFiles(){return featureApis.files.renderFiles},
+get loadFiles(){return featureApis.files.loadFiles},
+get makePluginLabel(){return featureApis.runtime.makePluginLabel},
+get loadPlugins(){return featureApis.runtime.loadPlugins},
+get HOST_RUNTIME(){return featureApis.runtime.HOST_RUNTIME},
+get CORE_PLUGIN_NAMES(){return featureApis.runtime.CORE_PLUGIN_NAMES},
+get corePluginRemovalDialogEl(){return featureApis.runtime.corePluginRemovalDialogEl},
+get corePluginRemovalMessageEl(){return featureApis.runtime.corePluginRemovalMessageEl},
+get corePluginRemovalCloseBtn(){return featureApis.runtime.corePluginRemovalCloseBtn},
+get corePluginRemovalCancelBtn(){return featureApis.runtime.corePluginRemovalCancelBtn},
+get closeCorePluginRemovalDialog(){return featureApis.runtime.closeCorePluginRemovalDialog},
+get openCorePluginRemovalDialog(){return featureApis.runtime.openCorePluginRemovalDialog},
+get runsHere(){return featureApis.runtime.runsHere},
+get renderPlugins(){return featureApis.runtime.renderPlugins},
+get loadSkills(){return featureApis.skills.loadSkills},
+get renderSkills(){return featureApis.skills.renderSkills},
+get appendMemoryBrowserLauncher(){return featureApis.memory.appendMemoryBrowserLauncher},
+get skillEditorOverlay(){return featureApis.skills.skillEditorOverlay},
+get skillEditorText(){return featureApis.skills.skillEditorText},
+get skillEditorTitle(){return featureApis.skills.skillEditorTitle},
+get skillEditorError(){return featureApis.skills.skillEditorError},
+get skillEditorSave(){return featureApis.skills.skillEditorSave},
+get skillEditorRoot(){return featureApis.skills.skillEditorRoot},
+get skillTriggerList(){return featureApis.skills.skillTriggerList},
+get skillTriggerDialog(){return featureApis.skills.skillTriggerDialog},
+get skillTriggerDialogKind(){return featureApis.skills.skillTriggerDialogKind},
+get skillTriggerDialogRule(){return featureApis.skills.skillTriggerDialogRule},
+get skillTriggerDialogAction(){return featureApis.skills.skillTriggerDialogAction},
+get skillTriggerDialogError(){return featureApis.skills.skillTriggerDialogError},
+get TRIGGER_KINDS(){return featureApis.skills.TRIGGER_KINDS},
+get editingSkillName(){return featureApis.skills.editingSkillName},set editingSkillName(value){featureApis.skills.editingSkillName=value},
+get skillEditor(){return featureApis.skills.skillEditor},set skillEditor(value){featureApis.skills.skillEditor=value},
+get editingSkillSavedContent(){return featureApis.skills.editingSkillSavedContent},set editingSkillSavedContent(value){featureApis.skills.editingSkillSavedContent=value},
+get editingTriggerId(){return featureApis.skills.editingTriggerId},set editingTriggerId(value){featureApis.skills.editingTriggerId=value},
+get setSkillTab(){return featureApis.skills.setSkillTab},
+get renderSkillMetadata(){return featureApis.skills.renderSkillMetadata},
+get makeTriggerRow(){return featureApis.skills.makeTriggerRow},
+get renderTriggers(){return featureApis.skills.renderTriggers},
+get saveTriggers(){return featureApis.skills.saveTriggers},
+get ensureSkillEditor(){return featureApis.skills.ensureSkillEditor},
+get openSkillEditor(){return featureApis.skills.openSkillEditor},
+get closeSkillEditor(){return featureApis.skills.closeSkillEditor},
+get uploadFiles(){return featureApis.files.uploadFiles},
+get makeThinkingBlock(){return makeThinkingBlock},
+get makeToolBlock(){return makeToolBlock},
+get makeToolResultBlock(){return makeToolResultBlock},
+get formatElapsed(){return formatElapsed},
+get makeTokenStatsBlock(){return makeTokenStatsBlock},
+get showEmpty(){return showEmpty},
+get truncateAtWord(){return truncateAtWord},
+get renderSessions(){return renderSessions},
+get makeBubble(){return makeBubble},
+get scrollMessagesToBottom(){return scrollMessagesToBottom},
+get appendUserBubble(){return appendUserBubble},
+get appendRoboBubble(){return appendRoboBubble},
+get appendMessageAttachments(){return appendMessageAttachments},
+get appendUserTurn(){return appendUserTurn},
+get createMsgDivider(){return createMsgDivider},
+get handleDividerAction(){return handleDividerAction},
+get showEditSessionBanner(){return showEditSessionBanner},
+get flashMessage(){return flashMessage},
+get scrollToMsgIdx(){return scrollToMsgIdx},
+get createAssistantWrap(){return createAssistantWrap},
+get appendMarker(){return appendMarker},
+get renderMarker(){return renderMarker},
+get renderContentParts(){return renderContentParts},
+get renderSession(){return renderSession},
+get openSession(){return openSession},
+get newSessionPromise(){return newSessionPromise},set newSessionPromise(value){newSessionPromise=value},
+get handleNewSession(){return handleNewSession},
+get submitFormResponse(){return submitFormResponse},
+get streamSessionId(){return streamSessionId},set streamSessionId(value){streamSessionId=value},
+get streamAc(){return streamAc},set streamAc(value){streamAc=value},
+get streamReady(){return streamReady},set streamReady(value){streamReady=value},
+get turnQueues(){return turnQueues},
+get activeBatchHead(){return activeBatchHead},set activeBatchHead(value){activeBatchHead=value},
+get foldedTraces(){return foldedTraces},
+get queueFor(){return queueFor},
+get wake(){return wake},
+get pushTurnEvent(){return pushTurnEvent},
+get turnEvents(){return turnEvents},
+get connectSessionStream(){return connectSessionStream},
+get sendMessage(){return sendMessage},
+get submit(){return submit},
+get postSubmit(){return postSubmit},
+get showSubmitError(){return showSubmitError},
+get renderTurn(){return renderTurn},
+get setBusyState(){return setBusyState},
+get requestStop(){return requestStop},
+get init(){return init},
+get filesSectionEl(){return featureApis.files.filesSectionEl},};
+await ui.bind(featureHost,featureApis);
+ui.onChange=()=>{architectureNavBtns=Array.from(document.querySelectorAll('.architecture-nav-btn')).filter(el=>!el.hidden);architectureTabBtns=Array.from(document.querySelectorAll('.architecture-tab')).filter(el=>!el.hidden);architecturePanelEls=Array.from(document.querySelectorAll('.architecture-panel'));ARCHITECTURE_PANEL_TITLES=Object.fromEntries(ui.descriptors.filter(d=>d.view).map(d=>[d.view,d.panelTitle??d.title]));ARCHITECTURE_HASH_VIEWS=new Set(Object.keys(ARCHITECTURE_PANEL_TITLES));
+  if(architectureScreenEl?.classList.contains('open')&&!ARCHITECTURE_HASH_VIEWS.has(architectureView)){
+    setArchitectureOpen(false);history.replaceState(null,'',location.pathname+location.search);
+  }
+};ui.onChange();
+void fetch('/branding', { cache: 'no-store' }).then(response => response.ok ? response.json() : null).then(applyBranding).catch(() => {});
 
-// ── File drag-drop + upload button ───────────────────────────────────────────
+if (burgerBtn)      burgerBtn.onclick      = () => document.body.classList.toggle('sidebar-open');
 
-const filesSectionEl = document.querySelector('[data-section="files"]');
-if (filesSectionEl) {
-  filesSectionEl.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    filesSectionEl.classList.add('drop-over');
-  });
-  filesSectionEl.addEventListener('dragleave', (e) => {
-    if (!filesSectionEl.contains(e.relatedTarget)) filesSectionEl.classList.remove('drop-over');
-  });
-  filesSectionEl.addEventListener('drop', (e) => {
-    e.preventDefault();
-    filesSectionEl.classList.remove('drop-over');
-    if (e.dataTransfer?.files.length) uploadFiles(e.dataTransfer.files);
-  });
-}
+if (sidebarOverlay) sidebarOverlay.onclick = closeSidebar;
 
-document.getElementById('upload-btn')?.addEventListener('click', (e) => {
-  e.stopPropagation();
-  document.getElementById('upload-input')?.click();
+document.getElementById('sidebar').addEventListener('click', (e) => {
+  const heading = e.target.closest('.sidebar-heading');
+  if (!heading) return;
+  const section = heading.closest('.sidebar-section');
+  if (!section) return;
+  if (SIDEBAR_ACCORDION_SECTIONS.has(section.dataset.section) && section.classList.contains('collapsed')) {
+    for (const other of document.querySelectorAll('.sidebar-section[data-section]')) {
+      if (other !== section && SIDEBAR_ACCORDION_SECTIONS.has(other.dataset.section)) {
+        other.classList.add('collapsed');
+      }
+    }
+  }
+  section.classList.toggle('collapsed');
+  saveSidebarState();
 });
-document.getElementById('upload-input')?.addEventListener('change', function() {
-  if (this.files?.length) { uploadFiles(this.files); this.value = ''; }
+
+loadSidebarState();
+
+{
+  const sidebarEl  = document.getElementById('sidebar');
+  const resizerEl  = document.getElementById('sidebar-resizer');
+  const MIN_W = 160, MAX_W = 600;
+
+  const savedW = parseInt(localStorage.getItem(LS_SIDEBAR_WIDTH) ?? '');
+  if (savedW >= MIN_W && savedW <= MAX_W) sidebarEl.style.width = savedW + 'px';
+
+  resizerEl?.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startX     = e.clientX;
+    const startWidth = sidebarEl.offsetWidth;
+    resizerEl.classList.add('active');
+    document.body.classList.add('sidebar-resizing');
+
+    function onMove(e) {
+      const w = Math.max(MIN_W, Math.min(MAX_W, startWidth + e.clientX - startX));
+      sidebarEl.style.width = w + 'px';
+    }
+    function onUp() {
+      resizerEl.classList.remove('active');
+      document.body.classList.remove('sidebar-resizing');
+      localStorage.setItem(LS_SIDEBAR_WIDTH, String(sidebarEl.offsetWidth));
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup',   onUp);
+  });
+}
+
+document.getElementById('architecture-list')?.addEventListener('click',event=>{const button=event.target.closest('[data-architecture-view]');if(button&&!button.hidden)setArchitectureOpen(true,button.dataset.architectureView);});
+document.querySelector('.architecture-tabs')?.addEventListener('click',event=>{const button=event.target.closest('[data-architecture-tab]');if(button&&!button.hidden)setArchitectureOpen(true,button.dataset.architectureTab);});
+document.querySelector('.architecture-tabs')?.addEventListener('keydown',event=>{
+ const button=event.target.closest('[data-architecture-tab]');if(!button)return;const current=architectureTabBtns.indexOf(button);let next=current;
+ if(event.key==='ArrowRight')next=(current+1)%architectureTabBtns.length;
+ else if(event.key==='ArrowLeft')next=(current-1+architectureTabBtns.length)%architectureTabBtns.length;
+ else if(event.key==='Home')next=0;else if(event.key==='End')next=architectureTabBtns.length-1;else return;
+ event.preventDefault();architectureTabBtns[next]?.focus();architectureTabBtns[next]?.click();
+});
+
+newBtn.addEventListener('click', async (e) => {
+  if (e.button !== 0) return; // let right-click / middle-click open in new tab
+  e.preventDefault();
+  await handleNewSession();
+});
+
+sendBtn.onclick = () => {
+  if (sendBtn.classList.contains('scroll-down-mode')) scrollToBottomAndReset();
+  else if (sending) requestStop();
+  else sendMessage(false);
+};
+
+document.getElementById('sessions-enable-btn').onclick = () => {
+  submit('Discover the local plugins and add the sessions plugin to enable persistent conversations.');
+};
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  // Plain Enter → queued (own turn, run in order). Ctrl/Cmd+Enter → concat (fold into the running
+  // batch). Shift+Enter keeps the textarea's newline behaviour.
+  if (e.shiftKey) return;
+  e.preventDefault();
+  sendMessage(e.ctrlKey || e.metaKey);
+});
+
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
 });
 
 window.addEventListener('hashchange', async () => {
@@ -6545,4 +2763,5 @@ window.addEventListener('hashchange', async () => {
   }
 });
 
-init().catch(console.error);
+init().then(()=>{document.body.dataset.cortexReady='true';}).catch(console.error);
+})().catch(console.error);

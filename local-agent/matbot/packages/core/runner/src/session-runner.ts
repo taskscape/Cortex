@@ -12,6 +12,7 @@ import { runSession } from './runner.js';
 
 /** Dependencies a host supplies to build the session runner: persistence, provider resolution, registries. */
 export interface SessionRunnerDeps {
+  permissions?:()=>import('./runner.js').RunSessionOpts['permissions'];
   /** The session store (system of record). */
   store:           Store<Session>;
   /**
@@ -273,6 +274,7 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
               ...(head.redo          !== undefined ? { injectedEphemeral: head.redo.ephemeral } : {}),
               ...(tailEphemeral.length > 0 ? { tailEphemeral } : {}),
               ...(observability !== undefined ? { observability } : {}),
+              ...(deps.permissions?.()!==undefined?{permissions:deps.permissions()!}:{}),
             })) {
               emit(s, ev);
             }

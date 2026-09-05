@@ -1,26 +1,34 @@
 {
   "name": "@matatbread/matbot-cli",
-  "matbotRuntime": ["node"],
+  "matbotRuntime": [
+    "node"
+  ],
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "repl":     "node --import ./register.js src/index.ts",
-    "start":     "node --import ./register.js src/index.ts start",
-    "test":      "node --import ./register.js --test test/*.test.ts",
+    "repl": "node --import ./register.js src/index.ts",
+    "start": "node --import ./register.js src/index.ts start",
+    "test": "node --import ./register.js --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-config":              "workspace:*",
-    "@matatbread/matbot-core":                "workspace:*",
-    "@matatbread/matbot-knowledge":           "workspace:*",
-    "@matatbread/matbot-files-node":          "workspace:*",
-    "@matatbread/matbot-security":            "workspace:*",
-    "@matatbread/matbot-storage-base":        "workspace:*",
-    "@matatbread/matbot-storage-filesystem":  "workspace:*",
-    "@matatbread/matbot-tool-plugin":          "workspace:*"
+    "@matatbread/matbot-config": "workspace:*",
+    "@matatbread/matbot-core": "workspace:*",
+    "@matatbread/matbot-knowledge": "workspace:*",
+    "@matatbread/matbot-files-node": "workspace:*",
+    "@matatbread/matbot-security": "workspace:*",
+    "@matatbread/matbot-storage-base": "workspace:*",
+    "@matatbread/matbot-storage-filesystem": "workspace:*",
+    "@matatbread/matbot-tool-plugin": "workspace:*",
+    "@matatbread/matbot-workspace-manager-types": "workspace:*",
+    "@matatbread/matbot-workspace-manager-node": "workspace:*",
+    "@matatbread/matbot-runtime-admin": "workspace:*",
+    "@matatbread/matbot-frontend-cli-node": "workspace:*",
+    "@matatbread/matbot-vault-env-node": "workspace:*",
+    "@matatbread/matbot-file-services-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "typescript":  "catalog:"
+    "typescript": "catalog:"
   }
 }

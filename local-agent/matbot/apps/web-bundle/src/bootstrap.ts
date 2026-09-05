@@ -1,10 +1,10 @@
 import {
-  createSessionRunner, HookRegistry, SystemContextRegistryImpl, ToolRegistryImpl,
+  createSessionRunner, freezeInvocationPolicy, HookRegistry, SystemContextRegistryImpl, ToolRegistryImpl,
   resolveProviderFactory, getPluginNameForSpecifier, recordServiceKey,
   installPrincipalCarrier, createConstantPrincipalCarrier,
   createMessage, MissingSecretError, loadPlugins,
   unloadPlugin as unloadPluginFn, unifyServices,
-  forwardingProxy, makeSwappable, singleTurnRequest, createSingleTurnTool,
+  forwardingProxy, makeSwappable, singleTurnRequest,
   createMountTable, onContextQuiesce, flushIfQuiescent,
 } from '@matatbread/matbot-core';
 import type {
@@ -15,7 +15,7 @@ import type {
 import { LookupKnowledgeIndex } from '@matatbread/matbot-knowledge';
 import { BrowserStorageBackend, LocalStorageVault } from '@matatbread/matbot-browser';
 import { runProviderSetup, type AvailableProvider, type ProviderDraft } from './setup.js';
-import { createBrowserProviderTool } from './provider-tool.js';
+import type {} from '@matatbread/matbot-runtime-admin/browser';
 
 /** Shape of the inlined config baked into the artifact (the browser analogue of matbot.yaml). */
 export interface BrowserConfig {
@@ -27,6 +27,7 @@ export interface BrowserConfig {
    *  artifact + import map but not auto-loaded, offered for on-demand load by package name. */
   availablePlugins?: { name: string; specifier: string; matbotRuntime?: readonly Runtime[]; description?: string }[];
   defaultProvider?: string;
+  permissions?: MatbotServices['ToolInvocationPolicy'];
   /** Boot identity for this single-principal realm. Absent ⇒ the anonymous web user.
    *  A user-associated bundle (served per-tenant) bakes the tenant's identity here. */
   principal?: Principal;
@@ -208,6 +209,7 @@ export async function boot(env: BootEnv): Promise<void> {
   const hookReg          = new HookRegistry();
   const systemContextReg = new SystemContextRegistryImpl();
   const serviceRegistry  = new Map<string, unknown>();
+  serviceRegistry.set('ToolInvocationPolicy', freezeInvocationPolicy(config.permissions ?? { defaultAction: 'allow' }));
 
   let knowledgeImpl: KnowledgeIndex = new LookupKnowledgeIndex();
   // Capture-safe handles (see forwardingProxy): a captured reference, including a destructure like
@@ -388,6 +390,7 @@ export async function boot(env: BootEnv): Promise<void> {
   };
 
   sessionRunner = createSessionRunner({
+    permissions: () => services.ToolInvocationPolicy,
     store,
     resolveProvider,
     tools:         toolReg,
@@ -428,7 +431,7 @@ export async function boot(env: BootEnv): Promise<void> {
   };
 
   // The portable `provider` tool — list/add/remove over the same persistence the wizard uses.
-  toolReg.register(createBrowserProviderTool({
+  serviceRegistry.set('BrowserProviderAdmin',{
     available: config.availableProviders,
     list: () => [...providers.values()].map(p => ({
       name: p.name, module: p.module, model: p.model,
@@ -438,12 +441,12 @@ export async function boot(env: BootEnv): Promise<void> {
     })),
     add:    applyDraft,
     remove: removeProvider,
-  }));
+  });
 
   // single_turn: the same core tool the node app registers — a one-shot completion against any
   // configured provider (or the current turn's, when omitted). Pure (services only), so it runs
   // identically in the browser realm.
-  toolReg.register(createSingleTurnTool(services));
+
 
   // Let the frontend offer "add another provider" from the UI (runs the wizard form).
   (globalThis as unknown as Record<string, unknown>).__mbProviders = {

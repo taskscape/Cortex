@@ -1,8 +1,11 @@
 param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
     [string]$WorkspaceConfig = "local-agent\config\workspaces.json"
 )
 
 $ErrorActionPreference = "Stop"
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 if (-not [System.IO.Path]::IsPathRooted($WorkspaceConfig)) {
@@ -37,7 +40,8 @@ if (-not (Test-Command wsl)) {
     Write-Warning "WSL was not found. Docker Desktop WSL2 integration may be unavailable."
 }
 
-foreach ($port in @(8877, 8878, 8888, 8890, 3000)) {
+$dependencyPorts = if ($CapabilityProfile -eq 'compatibility') { @(8877,8878,8888,8890,3000) } elseif ($CapabilityProfile -eq 'standard') { @(8888,8890,3000) } else { @() }
+foreach ($port in $dependencyPorts) {
     if (-not (Test-PortFree $port)) {
         Write-Warning "Port $port is already in use."
     }
@@ -50,7 +54,14 @@ if (-not (Test-Path -LiteralPath $WorkspaceConfig)) {
 Push-Location $Root
 try {
     npm install
+    if ($LASTEXITCODE -ne 0) { throw 'Root dependency installation failed.' }
     npm run build
+    if ($LASTEXITCODE -ne 0) { throw 'Root build failed.' }
+    Push-Location (Join-Path $Root 'local-agent\matbot')
+    try {
+        corepack pnpm install --frozen-lockfile
+        if ($LASTEXITCODE -ne 0) { throw 'Plugin workspace installation failed.' }
+    } finally { Pop-Location }
 }
 finally {
     Pop-Location

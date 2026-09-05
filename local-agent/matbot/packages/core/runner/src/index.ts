@@ -32,3 +32,6 @@ export * from './loader.js';
 export * from './tool-registry.js';
 export * from './system-context.js';
 export * from './single-turn.js';
+
+export * from './tool-invocation.js';
+export * from './contributions.js';

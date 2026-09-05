@@ -1,3 +1,12 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
+import {createSemanticServices} from './adapters/semantic.js';
+import {HashCpuVectorizer,createLaunchVectorizer} from './adapters/embedding-node.js';
+import type {TextVectorizer,Accelerator,VectorizerBackend,EmbeddingPurpose} from './adapters/embedding-node.js';
+export {validateCudaEmbeddingHealth} from './adapters/embedding-node.js';
+import {createRagRepository} from './adapters/repository-node.js';
+import type {} from '@matatbread/matbot-capabilities-types';
+import type { WorkspaceLifecycleParticipant, WorkspaceDeletionLease } from '@matatbread/matbot-workspace-manager-types';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type {
   KnowledgeEntry,
@@ -17,8 +26,6 @@ import path from 'node:path';
 import { ragV2GcSettingsFromEnv, ragV2ModeFromEnv } from './v2/config.js';
 import type { RagV2EvaluationCase } from './v2/evaluation.js';
 import { WorkspaceRagV2Manager, type RagV2SourceBridge } from './v2/manager.js';
-import { MemoryRagV2Repository } from './v2/memory-repository.js';
-import { PostgresRagV2Repository } from './v2/postgres-repository.js';
 import type { RagV2SemanticServices } from './v2/semantic.js';
 import {
   evaluateOpenSearchAdoption,
@@ -52,37 +59,6 @@ const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const MIN_RECONCILE_INTERVAL_MS = 10_000;
 const WATCH_DEBOUNCE_MS = 500;
 const MAX_CONTEXT_CHUNKS = 4;
-const DEFAULT_CUDA_EMBEDDING_URL = 'http://localhost:8890';
-const CUDA_EMBED_REQUEST_LIMIT = 256;
-const CUDA_EMBED_TIMEOUT_MS    = 120_000;
-const CUDA_EMBED_MAX_ATTEMPTS  = 3;
-const CPU_VECTOR_BACKEND = 'hash-cpu';
-const CPU_VECTOR_MODEL = 'token-hash-v1';
-
-type Accelerator = 'nvidia' | 'cpu';
-type VectorizerBackend = 'hash-cpu' | 'cuda-http';
-type EmbeddingPurpose = 'query' | 'document';
-
-interface VectorizerMetadata {
-  backend: VectorizerBackend;
-  model: string;
-  dimensions: number;
-  signature: string;
-}
-
-interface VectorizerRuntime extends VectorizerMetadata {
-  accelerated: boolean;
-  accelerator: Accelerator;
-  profile: string;
-  maxTokens?: number;
-  batchSize?: number;
-}
-
-interface TextVectorizer {
-  readonly info: VectorizerRuntime;
-  embed(texts: readonly string[], purpose: EmbeddingPurpose, signal?: AbortSignal): Promise<number[][]>;
-}
-
 interface WorkspaceRegistry {
   active: string;
   workspaces: Array<{ id: string; name: string; configPath: string }>;
@@ -404,300 +380,6 @@ function configView(config: RagConfig): RagConfigView {
   };
 }
 
-function tokenize(text: string): string[] {
-  return text.toLowerCase().match(/[a-z0-9\u00c0-\u024f]{2,}/g) ?? [];
-}
-
-function vectorize(text: string): number[] {
-  const vector = new Array<number>(VECTOR_DIMS).fill(0);
-  for (const token of tokenize(text)) {
-    const hash = createHash('sha1').update(token).digest();
-    const idx = hash.readUInt32BE(0) % VECTOR_DIMS;
-    vector[idx] = (vector[idx] ?? 0) + 1;
-  }
-  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
-  return norm > 0 ? vector.map(value => value / norm) : vector;
-}
-
-function cpuVectorizerInfo(): VectorizerRuntime {
-  return {
-    backend: CPU_VECTOR_BACKEND,
-    model: CPU_VECTOR_MODEL,
-    dimensions: VECTOR_DIMS,
-    signature: 'hash-cpu-token-hash-v1',
-    accelerated: false,
-    accelerator: 'cpu',
-    profile: 'token-hash-v1',
-  };
-}
-
-class HashCpuVectorizer implements TextVectorizer {
-  readonly info = cpuVectorizerInfo();
-
-  async embed(texts: readonly string[], _purpose: EmbeddingPurpose): Promise<number[][]> {
-    return texts.map(text => vectorize(text));
-  }
-}
-
-/**
- * Health payload reported by the CUDA embedding sidecar.
- */
-export interface CudaHealthResponse {
-  ok?: boolean;
-  cudaAvailable?: boolean;
-  device?: string;
-  model?: string;
-  dimensions?: number;
-  profile?: string;
-  signature?: string;
-  maxTokens?: number;
-  batchSize?: number;
-  normalized?: boolean;
-  queryPrefix?: string;
-  documentPrefix?: string;
-  message?: string;
-  dtype?: string;
-}
-
-/**
- * Keep the CUDA sidecar contract in one testable place.  A status code alone is
- * not enough: vectors from a changed model or preprocessing profile cannot be
- * mixed safely with an existing Workspace RAG index.
- */
-export function validateCudaEmbeddingHealth(health: CudaHealthResponse): string | undefined {
-  if (health.ok !== true) return 'Embedding service did not report ok=true.';
-  if (typeof health.model !== 'string' || !health.model.trim()) return 'Embedding service did not report a model.';
-  if (!Number.isInteger(health.dimensions) || health.dimensions! <= 0) return 'Embedding service reported invalid dimensions.';
-  if (typeof health.profile !== 'string' || !health.profile.trim()) return 'Embedding service did not report a profile.';
-  if (typeof health.signature !== 'string' || !health.signature.trim()) return 'Embedding service did not report a preprocessing signature.';
-  if (health.normalized !== true) return 'Embedding service must report normalized output.';
-  if (!Number.isInteger(health.batchSize) || health.batchSize! <= 0 || health.batchSize! > CUDA_EMBED_REQUEST_LIMIT) {
-    return `Embedding service reported invalid batch size (expected 1-${CUDA_EMBED_REQUEST_LIMIT}).`;
-  }
-  if (health.profile === 'e5-asymmetric-v1') {
-    if (health.queryPrefix !== 'query: ' || health.documentPrefix !== 'passage: ') {
-      return 'E5 embedding service must report query: and passage: preprocessing prefixes.';
-    }
-    if (health.model === 'intfloat/multilingual-e5-base' && health.dimensions !== 768) {
-      return 'intfloat/multilingual-e5-base must report 768 dimensions.';
-    }
-  }
-  if (health.profile === 'plain-v1') {
-    if (health.queryPrefix !== '' || health.documentPrefix !== '') {
-      return 'plain-v1 embedding service must not report asymmetric preprocessing prefixes.';
-    }
-    if (health.model === 'sentence-transformers/all-MiniLM-L6-v2' && health.dimensions !== 384) {
-      return 'sentence-transformers/all-MiniLM-L6-v2 must report 384 dimensions.';
-    }
-  }
-  return undefined;
-}
-
-interface VectorizerLaunchState {
-  vectorizer: TextVectorizer;
-  nvidiaAvailable: boolean;
-  cudaAvailable: boolean;
-  cudaServiceUrl?: string;
-  accelerationMessage: string;
-}
-
-function isTruthyEnv(value: string | undefined): boolean {
-  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
-}
-
-function normalizeBaseUrl(value: string | undefined): string {
-  return (value?.trim() || DEFAULT_CUDA_EMBEDDING_URL).replace(/\/+$/, '');
-}
-
-async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function probeCudaEmbeddingService(baseUrl: string): Promise<CudaHealthResponse> {
-  try {
-    const response = await fetchWithTimeout(`${baseUrl}/health`, 1500);
-    if (!response.ok) {
-      return { ok: false, cudaAvailable: false, message: `Embedding service returned HTTP ${response.status}.` };
-    }
-    const body = await response.json() as CudaHealthResponse;
-    const result: CudaHealthResponse = {
-      ok: body.ok === true,
-      cudaAvailable: body.cudaAvailable === true,
-    };
-    if (typeof body.device === 'string') result.device = body.device;
-    if (typeof body.model === 'string') result.model = body.model;
-    if (typeof body.dimensions === 'number' && Number.isFinite(body.dimensions)) result.dimensions = body.dimensions;
-    if (typeof body.profile === 'string') result.profile = body.profile;
-    if (typeof body.signature === 'string') result.signature = body.signature;
-    if (typeof body.maxTokens === 'number' && Number.isFinite(body.maxTokens)) result.maxTokens = body.maxTokens;
-    if (typeof body.batchSize === 'number' && Number.isFinite(body.batchSize)) result.batchSize = body.batchSize;
-    if (typeof body.normalized === 'boolean') result.normalized = body.normalized;
-    if (typeof body.queryPrefix === 'string') result.queryPrefix = body.queryPrefix;
-    if (typeof body.documentPrefix === 'string') result.documentPrefix = body.documentPrefix;
-    if (typeof body.message === 'string') result.message = body.message;
-    if (typeof body.dtype === 'string') result.dtype = body.dtype;
-    const validationError = validateCudaEmbeddingHealth(result);
-    if (validationError !== undefined) return { ...result, ok: false, message: validationError };
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, cudaAvailable: false, message: `Embedding service unavailable: ${message}` };
-  }
-}
-
-class CudaHttpVectorizer implements TextVectorizer {
-  readonly info: VectorizerRuntime;
-  private readonly baseUrl: string;
-
-  constructor(baseUrl: string, health: Required<Pick<CudaHealthResponse, 'model' | 'dimensions' | 'profile' | 'signature' | 'batchSize'>> & Pick<CudaHealthResponse, 'maxTokens'>) {
-    this.baseUrl = baseUrl;
-    this.info = {
-      backend: 'cuda-http',
-      model: health.model,
-      dimensions: health.dimensions,
-      signature: health.signature,
-      accelerated: true,
-      accelerator: 'nvidia',
-      profile: health.profile,
-      batchSize: health.batchSize,
-      ...(health.maxTokens !== undefined ? { maxTokens: health.maxTokens } : {}),
-    };
-  }
-
-  async embed(texts: readonly string[], purpose: EmbeddingPurpose, signal?: AbortSignal): Promise<number[][]> {
-    if (texts.length === 0) return [];
-    const embeddings: number[][] = [];
-    for (let start = 0; start < texts.length; start += CUDA_EMBED_REQUEST_LIMIT) {
-      const batch = texts.slice(start, start + CUDA_EMBED_REQUEST_LIMIT);
-      embeddings.push(...await this.embedBatch(batch, purpose, start, signal));
-    }
-    return embeddings;
-  }
-
-  private async embedBatch(texts: readonly string[], purpose: EmbeddingPurpose, offset: number, signal?: AbortSignal): Promise<number[][]> {
-    const body = JSON.stringify({ texts, inputType: purpose });
-    let response: Response | undefined;
-    for (let attempt = 1;; attempt++) {
-      const timeout = AbortSignal.timeout(CUDA_EMBED_TIMEOUT_MS);
-      try {
-        response = await fetch(`${this.baseUrl}/embed`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body,
-          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-        });
-      } catch (e) {
-        if (attempt >= CUDA_EMBED_MAX_ATTEMPTS || signal?.aborted) throw e;
-      }
-      if (response !== undefined
-        && response.status !== 429 && response.status < 500) break;
-      // Transient sidecar failure (429/5xx/network): back off and retry the batch.
-      if (signal?.aborted || attempt >= CUDA_EMBED_MAX_ATTEMPTS) break;
-      await new Promise(resolve => setTimeout(resolve, Math.min(1_000 * 2 ** (attempt - 1), 10_000)));
-    }
-    if (response === undefined) throw new Error('CUDA embedding service request failed.');
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`CUDA embedding service HTTP ${response.status}: ${detail.slice(0, 300)}`);
-    }
-    const parsed = await response.json() as {
-      embeddings?: unknown;
-      dimensions?: unknown;
-      model?: unknown;
-      signature?: unknown;
-      inputType?: unknown;
-    };
-    if (parsed.model !== this.info.model) {
-      throw new Error(`CUDA embedding service model changed from "${this.info.model}" to "${String(parsed.model)}". Restart Matbot after the sidecar is stable.`);
-    }
-    if (parsed.signature !== this.info.signature) {
-      throw new Error('CUDA embedding service preprocessing signature changed. Restart Matbot and reindex before searching.');
-    }
-    if (parsed.dimensions !== this.info.dimensions) {
-      throw new Error(`CUDA embedding service dimensions changed from ${this.info.dimensions} to ${String(parsed.dimensions)}.`);
-    }
-    if (parsed.inputType !== purpose) {
-      throw new Error(`CUDA embedding service returned inputType="${String(parsed.inputType)}"; expected "${purpose}".`);
-    }
-    if (!Array.isArray(parsed.embeddings)) throw new Error('CUDA embedding service returned no embeddings array.');
-    if (parsed.embeddings.length !== texts.length) {
-      throw new Error(`CUDA embedding service returned ${parsed.embeddings.length} embeddings for ${texts.length} text(s).`);
-    }
-    return parsed.embeddings.map((embedding, index) => {
-      const embeddingIndex = offset + index;
-      if (!Array.isArray(embedding)) throw new Error(`CUDA embedding ${embeddingIndex} is not an array.`);
-      const vector = embedding.map(value => Number(value));
-      if (vector.length !== this.info.dimensions) {
-        throw new Error(`CUDA embedding ${embeddingIndex} has ${vector.length} dimensions; expected ${this.info.dimensions}.`);
-      }
-      if (vector.some(value => !Number.isFinite(value))) {
-        throw new Error(`CUDA embedding ${embeddingIndex} contains a non-finite value.`);
-      }
-      return vector;
-    });
-  }
-}
-
-async function createLaunchVectorizer(): Promise<VectorizerLaunchState> {
-  const nvidiaAvailable = await detectNvidia();
-  if (isTruthyEnv(process.env['CORTEX_RAG_DISABLE_CUDA'])) {
-    return {
-      vectorizer: new HashCpuVectorizer(),
-      nvidiaAvailable,
-      cudaAvailable: false,
-      accelerationMessage: 'CUDA ingestion disabled by CORTEX_RAG_DISABLE_CUDA.',
-    };
-  }
-
-  const cudaServiceUrl = normalizeBaseUrl(
-    process.env['CORTEX_RAG_CUDA_EMBEDDING_URL'] ?? process.env['CORTEX_RAG_EMBEDDING_URL'],
-  );
-  const probe = await probeCudaEmbeddingService(cudaServiceUrl);
-  if (
-    probe.ok
-    && probe.cudaAvailable
-    && probe.model
-    && probe.dimensions
-    && probe.dimensions > 0
-    && probe.profile
-    && probe.signature
-    && probe.batchSize
-  ) {
-    const device = probe.device ? ` on ${probe.device}` : '';
-    return {
-      vectorizer: new CudaHttpVectorizer(cudaServiceUrl, {
-        model: probe.model,
-        dimensions: probe.dimensions,
-        profile: probe.profile,
-        signature: probe.signature,
-        batchSize: probe.batchSize,
-        ...(probe.maxTokens !== undefined ? { maxTokens: probe.maxTokens } : {}),
-      }),
-      nvidiaAvailable,
-      cudaAvailable: true,
-      cudaServiceUrl,
-      accelerationMessage: `CUDA embedding backend active${device}.`,
-    };
-  }
-
-  const reason = probe.message ?? (nvidiaAvailable
-    ? 'CUDA embedding service is not ready.'
-    : 'NVIDIA GPU was not detected by nvidia-smi.');
-  return {
-    vectorizer: new HashCpuVectorizer(),
-    nvidiaAvailable,
-    cudaAvailable: false,
-    cudaServiceUrl,
-    accelerationMessage: `Using CPU hash vectorizer. ${reason}`,
-  };
-}
-
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   try {
     return JSON.parse(await readFile(filePath, 'utf8')) as T;
@@ -708,14 +390,8 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}
-
-async function detectNvidia(): Promise<boolean> {
-  return new Promise(resolve => {
-    const child = execFile('nvidia-smi', ['-L'], { timeout: 2000 }, error => resolve(!error));
-    child.on('error', () => resolve(false));
-  });
+  const temporary=filePath+'.tmp-'+randomUUID();
+  try{await writeFile(temporary,JSON.stringify(value,null,2)+'\n','utf8');await rename(temporary,filePath);}finally{await rm(temporary,{force:true});}
 }
 
 class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
@@ -795,10 +471,13 @@ class WorkspaceRagManager {
   private cudaAvailable = false;
   private cudaServiceUrl: string | undefined;
   private accelerationMessage = 'Using CPU hash vectorizer.';
+  private readonly deletionReservations = new Set<string>();
+  private releaseWorkspaceParticipant: (() => void) | undefined;
+  private readonly workspaceMountAbort = new AbortController();
   private disposed = false;
   private readonly activeConfigPath: string;
-  private readonly sourceRegistry: SourceRegistryLike | undefined;
-  private readonly contextGraph: ContextGraphLike | undefined;
+  private get sourceRegistry(): SourceRegistryLike | undefined { return this.services.get('SourceRegistry' as never) as SourceRegistryLike | undefined; }
+  private get contextGraph(): ContextGraphLike | undefined { return this.services.get('ContextGraph' as never) as ContextGraphLike | undefined; }
   private readonly services: MatbotMachine;
   private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
   private readonly gcSettings = ragV2GcSettingsFromEnv();
@@ -807,17 +486,47 @@ class WorkspaceRagManager {
 
   constructor(
     activeConfigPath: string,
-    sourceRegistry: SourceRegistryLike | undefined,
-    contextGraph: ContextGraphLike | undefined,
     services: MatbotMachine,
   ) {
     this.activeConfigPath = activeConfigPath;
-    this.sourceRegistry = sourceRegistry;
-    this.contextGraph = contextGraph;
     this.services = services;
   }
 
+  async acquireWorkspaceDeletion(workspaceId: string): Promise<WorkspaceDeletionLease> {
+    if (this.deletionReservations.has(workspaceId)) throw new Error('Workspace deletion already reserved');
+    this.deletionReservations.add(workspaceId);
+    try {
+      const lock = this.workspaceLockStatus(workspaceId);
+      if (lock.locked) throw new Error(lock.reason ?? 'Workspace indexing is busy');
+      const workspace = (await this.listWorkspaces()).find(w => w.id === workspaceId);
+      if (!workspace) throw new Error('Unknown workspace: ' + workspaceId);
+      const config = await this.readConfig(workspace);
+      return {
+        commit: async () => {
+          for (const context of config.contexts) {
+            await this.v2?.purgeContext(this.v2Workspace(workspace), context);
+            const key = this.reconcileKey(workspaceId, context.id);
+            const timer = this.watchDebounce.get(key); if (timer) clearTimeout(timer);
+            this.watchDebounce.delete(key); this.reconcileStates.delete(key);
+          }
+          for (let i = this.watchers.length - 1; i >= 0; i--) {
+            if (this.watchers[i]!.workspaceId === workspaceId) { this.watchers[i]!.watcher.close(); this.watchers.splice(i, 1); }
+          }
+        },
+        release: () => { this.deletionReservations.delete(workspaceId); },
+      };
+    } catch (error) { this.deletionReservations.delete(workspaceId); throw error; }
+  }
+
   async start(): Promise<void> {
+    const participant: WorkspaceLifecycleParticipant = {
+      id: 'workspace-rag',
+      readiness: id => { const lock = this.workspaceLockStatus(id); return { ...lock, canDelete: !lock.locked && !this.deletionReservations.has(id) }; },
+      acquireDeletion: id => this.acquireWorkspaceDeletion(id),
+    };
+    const bind = () => { this.releaseWorkspaceParticipant?.(); this.releaseWorkspaceParticipant = this.services.WorkspaceManager?.registerParticipant?.(participant); };
+    bind();
+    this.services.mounted?.consume({ key: 'WorkspaceManager', signal: this.workspaceMountAbort.signal, onUnmount: () => { this.releaseWorkspaceParticipant?.(); this.releaseWorkspaceParticipant = undefined; } }, bind);
     const launch = await createLaunchVectorizer();
     this.vectorizer = launch.vectorizer;
     this.nvidiaAvailable = launch.nvidiaAvailable;
@@ -844,7 +553,10 @@ class WorkspaceRagManager {
     });
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    this.workspaceMountAbort.abort();
+    this.releaseWorkspaceParticipant?.();
+    this.releaseWorkspaceParticipant = undefined;
     this.disposed = true;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     if (this.gcTimer) clearTimeout(this.gcTimer);
@@ -852,7 +564,7 @@ class WorkspaceRagManager {
     this.watchDebounce.clear();
     for (const { watcher } of this.watchers.splice(0)) watcher.close();
     this.watcherState = 'stopped';
-    void this.v2?.close().catch(error => {
+    await this.v2?.close().catch(error => {
       console.warn(`[workspace-rag-v2] failed to close: ${errorMessage(error)}`);
     });
   }
@@ -883,7 +595,7 @@ class WorkspaceRagManager {
     changedPaths: readonly string[] = [],
     forceAll = false,
   ): Promise<RagV2Job | undefined> {
-    if (this.disposed || this.v2Mode === 'off') return undefined;
+    if (this.disposed || this.v2Mode === 'off' || this.deletionReservations.has(workspace.id)) return undefined;
     if (!this.v2) throw new Error(this.v2Message);
     const key = this.reconcileKey(workspace.id, context.id);
     if (trigger !== 'watch') {
@@ -956,6 +668,7 @@ class WorkspaceRagManager {
     if (this.disposed || this.v2Mode === 'off' || !this.v2) return;
     const scheduled: Array<Promise<unknown>> = [];
     for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
+      if(this.deletionReservations.has(workspace.id))continue;
       let config: RagConfig;
       try {
         config = await this.readConfig(workspace);
@@ -997,12 +710,14 @@ class WorkspaceRagManager {
       }
       for (const context of config.contexts) {
         if (this.disposed) return;
+        if(this.deletionReservations.has(workspace.id))break;
         await this.v2.garbageCollect(this.v2Workspace(workspace), context);
       }
     }
   }
 
   private scheduleWatchReconcile(workspaceId: string, contextId: string, changedPath?: string): void {
+    if(this.disposed||this.deletionReservations.has(workspaceId))return;
     const key = this.reconcileKey(workspaceId, contextId);
     const state = this.reconcileState(workspaceId, contextId);
     if (changedPath?.toLocaleLowerCase().endsWith('.md')) {
@@ -1045,7 +760,7 @@ class WorkspaceRagManager {
             this.watcherError = `Cannot watch ${root}: ${errorMessage(error)}`;
             return undefined;
           });
-          if (!rootStat) continue;
+          if (!rootStat||this.disposed||this.deletionReservations.has(workspace.id)) continue;
           const watchRoot = rootStat.isFile() ? path.dirname(root) : root;
           const expectedFile = rootStat.isFile() ? normalizePathForId(root) : undefined;
           let watcher: FSWatcher;
@@ -1072,12 +787,18 @@ class WorkspaceRagManager {
   }
 
   currentWorkspaceId(): string {
+    if(this.services.WorkspaceContext)return this.services.WorkspaceContext.id;
     const normalized = normalizePathForId(this.activeConfigPath);
     const match = /\/workspaces\/([^/]+)\/matbot\.ya?ml$/i.exec(normalized);
     return match?.[1] ?? 'default';
   }
 
-  async configureCurrent(config: RagConfigInput): Promise<RagConfigView> {
+  private configQueue:Promise<unknown>=Promise.resolve();
+  private async mutateConfig<T>(operation:()=>Promise<T>):Promise<T>{const next=this.configQueue.catch(()=>{}).then(operation);this.configQueue=next;return next;}
+  async configurationSnapshot(){const value=await this.configCurrent();return {version:createHash('sha256').update(JSON.stringify(value)).digest('hex'),value:{contextId:value.activeContextId,contextName:value.contextName,paths:value.paths}};}
+  async updateConfiguration(value:unknown,expectedVersion:string){return this.mutateConfig(async()=>{const current=await this.configurationSnapshot();if(current.version!==expectedVersion)throw new Error('Configuration conflict; reload before editing');await this.configureOwned(value as RagConfigInput);return this.configurationSnapshot();});}
+  async configureCurrent(config:RagConfigInput):Promise<RagConfigView>{return this.mutateConfig(()=>this.configureOwned(config));}
+  private async configureOwned(config: RagConfigInput): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
     const targetId = typeof config.contextId === 'string' && config.contextId.trim()
@@ -1115,7 +836,8 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
-  async selectContextCurrent(contextId: string): Promise<RagConfigView> {
+  async selectContextCurrent(contextId: string): Promise<RagConfigView>{return this.mutateConfig(()=>this.selectContextOwned(contextId));}
+  private async selectContextOwned(contextId: string): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
     const context = current.contexts.find(item => item.id === contextId);
@@ -1130,7 +852,8 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
-  async createContextCurrent(contextName?: string, paths?: string[]): Promise<RagConfigView> {
+  async createContextCurrent(contextName?: string, paths?: string[]): Promise<RagConfigView>{return this.mutateConfig(()=>this.createContextOwned(contextName,paths));}
+  private async createContextOwned(contextName?: string, paths?: string[]): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
     if (contextName !== undefined && !contextName.trim()) throw new Error('Workspace RAG context name must not be blank.');
@@ -1162,7 +885,8 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
-  async deleteContextCurrent(contextId: string): Promise<RagConfigView> {
+  async deleteContextCurrent(contextId: string): Promise<RagConfigView>{return this.mutateConfig(()=>this.deleteContextOwned(contextId));}
+  private async deleteContextOwned(contextId: string): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
     const context = current.contexts.find(item => item.id === contextId);
@@ -1578,9 +1302,7 @@ class WorkspaceRagManager {
   private async startV2(): Promise<void> {
     if (this.v2Mode === 'off') return;
     const storageMode = String(process.env['CORTEX_RAG_V2_STORAGE'] ?? 'postgres').trim().toLowerCase();
-    const repository = storageMode === 'memory'
-      ? new MemoryRagV2Repository()
-      : new PostgresRagV2Repository();
+    const repository = createRagRepository(storageMode);
     const embedder = {
       info: {
         backend: this.vectorizer.info.backend,
@@ -1599,7 +1321,7 @@ class WorkspaceRagManager {
       repository,
       embedder,
       this.v2SourceBridge(),
-      this.v2SemanticServices(),
+      createSemanticServices(this.services),
       async event => {
         const workspace: WorkspaceRef = {
           id: event.workspace.id,
@@ -1736,63 +1458,6 @@ class WorkspaceRagManager {
     };
   }
 
-  private v2SemanticServices(): RagV2SemanticServices {
-    const services = this.services;
-    const summaryProvider = process.env['CORTEX_RAG_V2_SUMMARY_PROVIDER']?.trim();
-    const summaryModel = summaryProvider ? services.providers.get(summaryProvider)?.model : undefined;
-    const parseJsonString = (text: string, key: string): string | undefined => {
-      const match = /\{[\s\S]*\}/u.exec(text);
-      if (match) {
-        try {
-          const parsed = JSON.parse(match[0]) as Record<string, unknown>;
-          if (typeof parsed[key] === 'string' && parsed[key].trim()) return parsed[key].trim();
-        } catch {
-          // Fall through to a bounded plain-text response.
-        }
-      }
-      const value = text.replace(/^```(?:json)?|```$/gimu, '').trim();
-      return value || undefined;
-    };
-    return {
-      rewriteQuery: async input => {
-        if (!input.provider || !services.providers.has(input.provider)) return undefined;
-        const result = await services.singleTurn({
-          provider: input.provider,
-          system: [
-            'Rewrite a conversational follow-up as one standalone knowledge-retrieval query.',
-            'Resolve pronouns, ellipsis, relative versions, people, and dates only from the supplied conversation.',
-            'Preserve exact identifiers and quoted strings. Do not answer the question.',
-            'Return JSON only: {"standaloneQuery":"..."}.',
-          ].join(' '),
-          prompt: `Conversation:\n${input.compactConversation}\n\nLatest question:\n${input.latestQuestion}`,
-          ...(input.signal ? { signal: input.signal } : {}),
-        });
-        return parseJsonString(result.text, 'standaloneQuery');
-      },
-      ...(summaryProvider && services.providers.has(summaryProvider) ? {
-        summarizerSignature: `${summaryProvider}:${summaryModel ?? 'unknown'}:rag-routing-summary-v1`,
-        summarize: async (input, signal) => {
-          const result = await services.singleTurn({
-            provider: summaryProvider,
-            system: [
-              'Create a concise semantic routing summary for retrieval.',
-              'Include distinctive topics, entities, terminology, version cues, and relationships.',
-              'Do not invent facts. The output is a routing derivative and will never be cited as evidence.',
-              'Use at most 180 words. Return JSON only: {"summary":"..."}.',
-            ].join(' '),
-            prompt: [
-              `Level: ${input.level}`,
-              `Title: ${input.title}`,
-              `Breadcrumb: ${input.breadcrumb.join(' > ')}`,
-              `Source material:\n${input.text.slice(0, 12_000)}`,
-            ].join('\n\n'),
-            ...(signal ? { signal } : {}),
-          });
-          return parseJsonString(result.text, 'summary');
-        },
-      } : {}),
-    };
-  }
 
   private async v2Current(): Promise<{
     workspace: WorkspaceRef;
@@ -1856,6 +1521,11 @@ class WorkspaceRagManager {
   }
 
   private async listWorkspaces(): Promise<WorkspaceRef[]> {
+    if (this.services.WorkspaceManager) {
+      const list = await this.services.WorkspaceManager.list();
+      const registryDir = path.dirname(this.services.WorkspaceContext?.registryPath ?? this.activeConfigPath);
+      return list.workspaces.map(w => { const configPath = path.resolve(registryDir, w.configPath); return { id: w.id, name: w.name, configPath, configDir: path.dirname(configPath), active: w.id === this.services.WorkspaceContext?.id }; });
+    }
     const registryPath = await this.registryPath();
     if (!registryPath) {
       const workspace = await this.currentWorkspaceFallback();
@@ -2397,16 +2067,18 @@ export const plugin: MatbotPluginSpec = {
     description: 'Workspace-scoped markdown RAG ingestion, vector search, and automatic per-turn context.',
   },
   async setup(services: MatbotMachine) {
+    services.contributions?.register('webui','rag',uiContribution);
     if (services.isSubAgent()) return;
     if (!services.configPath) throw new Error('workspace-rag requires services.configPath.');
 
-    const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
-    const contextGraph = services.get('ContextGraph' as never) as ContextGraphLike | undefined;
-    const manager = new WorkspaceRagManager(services.configPath, sourceRegistry, contextGraph, services);
+    const manager = new WorkspaceRagManager(services.configPath, services);
     activeManager = manager;
     await manager.start();
     await services.register('WorkspaceRagManager' as never, manager as never);
     services.tools.register(createWorkspaceRagTool(manager, services));
+    services.contributions?.register('retrieval','workspace-rag',{title:'Workspace RAG passages',scope:'workspace',async search(query){if(query.workspaceId!==manager.currentWorkspaceId())throw new Error('RAG workspace mismatch');const hits=await manager.searchCurrent(query.query,query.limit,query.signal);return hits.map((hit,index)=>({id:hit.chunkId,sourceId:'workspace_rag',workspaceId:query.workspaceId,content:hit.text,citation:hit}));}});
+    services.contributions?.register('configuration','workspace-rag',{title:'Workspace RAG context',scope:'workspace',schema:{type:'object',properties:{contextId:{type:'string'},contextName:{type:'string'},paths:{type:'array',items:{type:'string'}}}},secretPaths:[],apply:'immediate',read:()=>manager.configurationSnapshot(),async validate(value){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('RAG configuration must be an object');const row=value as Record<string,unknown>;if(Object.keys(row).some(key=>!['contextId','contextName','paths'].includes(key)))throw new Error('Unknown RAG configuration field');if(typeof row.contextId!=='string'||typeof row.contextName!=='string'||!row.contextName.trim()||!Array.isArray(row.paths)||!row.paths.every(p=>typeof p==='string'))throw new Error('Context id, name and paths are required');await assertAccessibleContextPaths(row.paths as string[],'any');},update:(value,expected)=>manager.updateConfiguration(value,expected)});
+    services.contributions?.register('health','workspace-rag',{async probe(){const status=await manager.statusCurrent();return {state:status.activeGenerationId?'ready':'degraded',details:status};}});
     services.hooks.register({
       on: 'screen',
       priority: -10,
@@ -2468,7 +2140,7 @@ export const plugin: MatbotPluginSpec = {
     });
   },
   async teardown() {
-    activeManager?.stop();
+    await activeManager?.stop();
     activeManager = undefined;
   },
 };

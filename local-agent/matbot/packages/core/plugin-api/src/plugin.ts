@@ -48,6 +48,9 @@ export interface SingleTurnRequest {
 
 /** Scoped key-value store for a single plugin's runtime settings. */
 export interface PluginSettings {
+  /** Atomic document snapshot and replacement for versioned configuration owners. */
+  snapshot?(): Promise<{version:string;data:Record<string,unknown>}>;
+  replace?(data:Record<string,unknown>,expectedVersion:string): Promise<{version:string;data:Record<string,unknown>}>;
   /**
    * Read a stored setting.
    *
@@ -124,6 +127,10 @@ export interface PluginSelf {
  * optional and simply drops. Read each as a member (`services.KnowledgeIndex`); swap with register().
  */
 export interface MatbotServices {
+  /** Host-bound, validated direct invocation; shares the model turn pipeline. */
+  readonly ToolInvoker?: { invoke(tool: Tool, input: unknown, ctx: import('./types.js').ToolContext): AsyncIterable<import('./types.js').ToolEvent> };
+  readonly ToolInvocationPolicy?: { rules?: Array<{ permission: string; pattern: string; action: 'allow' | 'ask' | 'deny' }>; defaultAction?: 'allow' | 'ask' | 'deny' };
+
   readonly StorageBackend?: StorageBackend | undefined;
   /** The live vault — also the `register('Vault', impl)` swap key. Capture-safe behind a proxy, so a
    *  reference held across a swap keeps resolving to the live backend. Always present (boot default). */
@@ -142,6 +149,8 @@ export type MatbotMachine = MatbotServices & MatbotRuntime;
  * `systemContext`), plugin lifecycle, and the registry API itself. Not augmentable, not registerable.
  */
 export interface MatbotRuntime {
+  /** Loader-scoped registrations are revoked on failed setup or unload. */
+  readonly contributions?: import('./contributions.js').ContributionRegistry;
   /**
    * Run a full completion against a named provider and await the aggregated result.
    *

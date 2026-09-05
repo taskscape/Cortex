@@ -1,10 +1,13 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const staticRoot = path.join(root, "local-agent/matbot/packages/plugins/frontend/web/static");
+await import('../../local-agent/matbot/apps/cli/register.js');
+const featureContributions=await Promise.all(Object.entries({"sources":"packages/plugins/source-registry","sql":"packages/plugins/structured-data","workflows":"packages/plugins/workflow-governance","evaluation":"packages/plugins/evaluation-observability","graph":"packages/plugins/context-graph","experts":"plugins/expert-panel","workspace":"packages/plugins/workspace-admin","rag":"packages/plugins/workspace-rag","memory":"packages/plugins/cognition","files":"packages/plugins/workspace","runtime":"packages/plugins/runtime-admin","skills":"packages/plugins/skills","configuration":"packages/plugins/configuration-admin","diagnostics":"packages/plugins/runtime-diagnostics"}).map(async([id,folder])=>({id,owner:folder,...(await import(pathToFileURL(path.join(root,'local-agent/matbot',folder,'src/ui.ts')).href)).uiContribution})));
+const unavailableUi=new Set();
 const memoryBrowserStaticRoot = path.join(root, "local-agent/matbot/packages/plugins/memory-browser/static");
 const port = Number(process.env.MATBOT_WEBUI_TEST_PORT ?? 19787);
 const memoryBrowserPort = Number(process.env.MATBOT_MEMORY_BROWSER_TEST_PORT ?? port + 1);
@@ -1601,6 +1604,7 @@ async function handle(req, res) {
   if (method === "OPTIONS") return void res.writeHead(204).end();
 
   if (method === "GET" && url.pathname === "/health") return json(res, 200, { status: "ok" });
+  if (method === "GET" && url.pathname === "/providers") return json(res, 200, { providers: providersForWorkspace().map(name => ({ name })) });
   if (method === "POST" && url.pathname === "/__test/reset-memory") {
     for (const run of runningTurns.values()) run.aborted = true;
     sessions.clear();
@@ -1637,6 +1641,7 @@ async function handle(req, res) {
     skillsByWorkspace.clear();
     triggersByWorkspace.clear();
     loadedPluginsByWorkspace.clear();
+    unavailableUi.clear();
     providersByWorkspace.clear();
     workspaceRagStateByWorkspace.clear();
     workspaceRagConfig = {
@@ -1707,7 +1712,11 @@ async function handle(req, res) {
       hasProviderState: providersByWorkspace.has(id)
     });
   }
+  if (method === 'GET' && url.pathname === '/__test/matbot-bundle') { const body=await readFile(path.join(root,'local-agent/matbot/apps/web-bundle/dist/matbot.html'),'utf8');res.writeHead(200,{'content-type':'text/html; charset=utf-8'});res.end(body);return; }
   if (method === "GET" && url.pathname === "/") return file(res, "text/html; charset=utf-8", "index.html");
+  if (method === "GET" && ["/feature-runtime.js", "/feature-fallbacks.js"].includes(url.pathname)) return file(res, "application/javascript; charset=utf-8", url.pathname.slice(1));
+  if(method==='POST'&&url.pathname==='/__test/ui-availability'){const body=await readJson(req);if(body.enabled)unavailableUi.delete(body.id);else unavailableUi.add(body.id);sendGlobal('plugin-changed',{type:body.enabled?'loaded':'unloaded',name:body.id});return json(res,200,{ok:true});}
+  if (method === "GET" && url.pathname === "/ui/contributions") return json(res,200,featureContributions.filter(feature=>!unavailableUi.has(feature.id)));
   if (method === "GET" && url.pathname === "/app.js") return file(res, "application/javascript; charset=utf-8", "app.js");
   if (method === "GET" && url.pathname === "/http-transport.js") return file(res, "application/javascript; charset=utf-8", "http-transport.js");
   if (method === "GET" && url.pathname === "/favicon.ico") return file(res, "image/svg+xml", "favicon.svg");

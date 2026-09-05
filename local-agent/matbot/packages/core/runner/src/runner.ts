@@ -1,3 +1,4 @@
+import { executeToolInvocation, createInvocationState } from './tool-invocation.js';
 import type {
   Session, MessageContent,
   PipelineEvent, RunConfig, ProviderAdapter, ProviderConfig,
@@ -6,10 +7,7 @@ import type {
 } from './types.js';
 import type { MatbotPlugin } from './plugin.js';
 import type { ToolOutputLimits } from './truncate.js';
-import { DEFAULT_OUTPUT_LIMITS, truncateToolResult } from './truncate.js';
 import type { PermissionAction, PermissionRule } from './permissions.js';
-import { evaluatePermission } from './permissions.js';
-import { validateAgainstSchema, formatValidationIssues } from './schema-validator.js';
 import { isToolHiddenByRules } from './permissions.js';
 import { HookRegistry } from './hooks.js';
 import { appendMessage, createMessage } from './session.js';
@@ -169,7 +167,6 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   // ── Loop policy state ─────────────────────────────────────────────────────
   const policy = opts.loopPolicy ?? {};
   const doomThreshold = policy.doomLoopThreshold === undefined ? 3 : Math.max(0, Math.trunc(policy.doomLoopThreshold));
-  const outputLimits: ToolOutputLimits = opts.toolOutput ?? DEFAULT_OUTPUT_LIMITS;
   let iteration = 0;
   let executedToolCalls = 0;
   let totalInputTokens = 0;
@@ -179,11 +176,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   const turnCallCounts = new Map<string, number>();
   // Serializes permission-gate entry across a parallel batch so mid-batch "always allow"
   // answers are visible to sibling calls before they prompt.
-  let permissionGateChain: Promise<void> = Promise.resolve();
-  const approvedPermissionRules: PermissionRule[] = [];
-  // A permission 'always' answer or a later config rule may approve a subject mid-turn; approved
-  // session rules are appended AFTER configured rules so they win under last-match evaluation.
-  const permissionRules = (): PermissionRule[] => [...(opts.permissions?.rules ?? []), ...approvedPermissionRules];
+  const invocationState = createInvocationState();
 
   // Append isError tool results for any assistant tool-call block that never received one — an
   // aborted turn must persist paired calls/results so provider submissions stay valid (spec R19).
@@ -556,164 +549,12 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
             return;
           }
 
-          // Input validation at the boundary (spec R3): invalid input never reaches the executor.
-          const issues = validateAgainstSchema(tc.input, tool.inputSchema);
-          if (issues.length > 0) {
-            finishSkipped(tc, index, toolSpanId, toolStartedAt,
-              { error: formatValidationIssues(tc.name, issues), code: 'invalid_input' }, push);
-            return;
-          }
-
-          // Permission gate (spec R8/R9). Configured rules first; session-approved ('always') rules
-          // appended later win under last-match evaluation.
-          const permKey   = tool.permission?.action ?? tc.name;
-          const patterns  = tool.permission?.patterns?.(tc.input) ?? ['*'];
-          const permFallback = opts.permissions?.defaultAction ?? 'allow';
-          let gate: PermissionAction = (() => {
-            const d = patterns.map(p => evaluatePermission(permissionRules(), permKey, p, permFallback));
-            return d.includes('deny') ? 'deny' : d.includes('ask') ? 'ask' : 'allow';
-          })();
-          if (gate === 'deny') {
-            finishSkipped(tc, index, toolSpanId, toolStartedAt, {
-              error: `Permission denied by policy: ${permKey} (${patterns.join(', ')}).`,
-              code: 'permission_denied',
-            }, push);
-            return;
-          }
-          if (gate === 'ask') {
-            // The gate slot is held through the whole prompt round-trip: an "always allow" answered
-            // for one call must be visible to sibling calls in the same parallel batch before they
-            // decide to prompt, and prompts are presented one at a time.
-            const prevGate = permissionGateChain;
-            let releaseGate!: () => void;
-            permissionGateChain = new Promise<void>(r => { releaseGate = r; });
-            try {
-              await prevGate;
-              const d = patterns.map(p => evaluatePermission(permissionRules(), permKey, p, permFallback));
-              gate = d.includes('deny') ? 'deny' : d.includes('ask') ? 'ask' : 'allow';
-              if (gate === 'deny') {
-                finishSkipped(tc, index, toolSpanId, toolStartedAt, {
-                  error: `Permission denied by policy: ${permKey} (${patterns.join(', ')}).`,
-                  code: 'permission_denied',
-                }, push);
-                return;
-              }
-              if (gate === 'ask') {
-                const askId = crypto.randomUUID();
-                push({ type: 'permission:ask', askId, callId: tc.id, toolName: tc.name, permission: permKey, patterns, traceId });
-                let answer: string;
-                try {
-                  answer = (await promptFn({
-                    name:       'permission',
-                    label:      `Allow ${tc.name}? (${permKey}: ${patterns.join(', ')})`,
-                    type:       'select',
-                    options:    ['allow', 'always allow', 'deny'],
-                    required:   true,
-                  } satisfies FormField)).trim().toLowerCase();
-                } catch (e) {
-                  push({ type: 'permission:reply', askId, outcome: 'cancelled', traceId });
-                  abortReason = e instanceof Error && e.name === 'PromptCancelledError' ? 'permission prompt cancelled' : String(e);
-                  finishSkipped(tc, index, toolSpanId, toolStartedAt, { error: 'Permission prompt was cancelled.', code: 'aborted' }, push);
-                  return;
-                }
-                if (answer === 'deny' || answer === 'no') {
-                  push({ type: 'permission:reply', askId, outcome: 'deny', traceId });
-                  finishSkipped(tc, index, toolSpanId, toolStartedAt, {
-                    error: `The user denied this request (${permKey}: ${patterns.join(', ')}). Do not retry it without asking first.`,
-                    code: 'permission_denied',
-                  }, push);
-                  return;
-                }
-                if (answer === 'always allow' || answer === 'always') {
-                  for (const p of patterns) approvedPermissionRules.push({ permission: permKey, pattern: p, action: 'allow' });
-                  push({ type: 'permission:reply', askId, outcome: 'always', traceId });
-                } else {
-                  push({ type: 'permission:reply', askId, outcome: 'allow', traceId });
-                }
-              }
-            } finally {
-              releaseGate();
-            }
-          }
-
-          const decision = await hookReg.runToolCall({
-            session, config, signal,
-            toolCall: { id: tc.id, name: tc.name, input: tc.input },
-            tool,
-          });
-          if (decision.abort) {
-            abortReason = decision.abort;
-            finishSkipped(tc, index, toolSpanId, toolStartedAt, { error: decision.abort, code: 'aborted' }, push);
-            const policySpanId = crypto.randomUUID();
-            await observe({
-              phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
-              parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
-              attributes: { callId: tc.id, policyOutcome: 'aborted', reason: decision.abort },
-            });
-            return;
-          }
-          if (decision.rejectTool) {
-            const err = { error: decision.rejectTool.message };
-            finishSkipped(tc, index, toolSpanId, toolStartedAt, err, push);
-            const policySpanId = crypto.randomUUID();
-            await observe({
-              phase: 'end', kind: 'guardrail', name: `${tc.name}.policy`, spanId: policySpanId,
-              parentSpanId: toolSpanId, sessionId, status: 'error', durationMs: 0,
-              attributes: { callId: tc.id, policyOutcome: 'denied', reason: decision.rejectTool.message },
-            });
-            return;
-          }
-
-          let result: unknown;
-          let isError = false;
-          const startedAt = Date.now();
-
-          const toolCtx: ToolContext = {
-            callId: tc.id, session, signal, vault,
-            provider:     config.provider,
-            traceId,
-            rootTraceId,
-            parentSpanId: toolSpanId,
-            prompt:       promptFn,
-            loadPlugin:   (specifier: string) => opts.loadPlugin(specifier, promptFn),
-            unloadPlugin: opts.unloadPlugin,
-            ...(opts.workdir     !== undefined ? { workdir:     opts.workdir     } : {}),
-            ...(opts.configPath  !== undefined ? { configPath:  opts.configPath  } : {}),
-            ...(opts.files       !== undefined ? { files:       opts.files       } : {}),
-          };
-
-          try {
-            for await (const toolEv of tool.executor.execute(tc.input, toolCtx)) {
-              switch (toolEv.type) {
-                case 'stdout':   push({ type: 'tool:stdout', callId: tc.id, chunk: toolEv.chunk, traceId }); break;
-                case 'stderr':   push({ type: 'tool:stderr', callId: tc.id, chunk: toolEv.chunk, traceId }); break;
-                case 'file':     push({ type: 'file', handle: toolEv.handle, traceId }); break;
-                case 'result':   result = toolEv.value; break;
-                case 'marker':   toolMarkers.push({ type: 'marker', creator: toolEv.creator, data: toolEv.data }); break;
-                case 'progress': break;
-                case 'error':    result = {
-                  error: toolEv.message,
-                  ...(toolEv.stdout !== undefined ? { stdout: toolEv.stdout } : {}),
-                  ...(toolEv.stderr !== undefined ? { stderr: toolEv.stderr } : {}),
-                }; isError = true; break;
-              }
-            }
-          } catch (e) {
-            result  = { error: String(e) };
-            isError = true;
-          }
-
-          // toolresult — last chance to transform the result before it's recorded/yielded (hard redaction),
-          // or to observe it (auditing: args + result + timing). Owns the LLM-facing + persisted surfaces.
-          result = await hookReg.runToolResult({
-            session, config, signal,
-            toolCall: { id: tc.id, name: tc.name, input: tc.input },
-            tool, result, isError, durationMs: Date.now() - startedAt,
-          });
-
-          // Universal output truncation (spec R16) — applied after hooks so redaction wins.
-          const truncation = await truncateToolResult(result, outputLimits, opts.files, `${sessionId}/${tc.name}`);
-          result = truncation.result;
+          const outcome = await executeToolInvocation({
+            ...opts, session, tool, call: tc, state: invocationState, markers: toolMarkers,
+            vault, prompt: promptFn, hooks: hookReg, spanId: toolSpanId, observe,
+          }, push);
+          const { result, isError } = outcome;
+          if (outcome.abortReason !== undefined) abortReason = outcome.abortReason;
 
           toolResults[index] = { type: 'tool-result', id: tc.id, result, isError };
           push({ type: 'tool:end', callId: tc.id, result, isError, traceId });

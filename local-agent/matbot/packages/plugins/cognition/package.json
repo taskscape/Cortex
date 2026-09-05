@@ -1,20 +1,26 @@
 {
   "name": "@matatbread/matbot-cognition",
-  "matbotRuntime": ["node", "browser"],
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
   "version": "0.1.0",
   "description": "Cognitive services: seeds built-in cognition skills (Inner voice, Remember this, Dream time) into the active skills service. A home for further cognitive skills and tools.",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./recall": "./src/recall.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@matatbread/matbot-plugin-api": "workspace:*",
-    "@matatbread/matbot-skills":     "workspace:*",
-    "@matatbread/matbot-triggers":   "workspace:*",
-    "@matatbread/matbot-tool-store":  "workspace:*"
+    "@matatbread/matbot-skills": "workspace:*",
+    "@matatbread/matbot-triggers": "workspace:*",
+    "@matatbread/matbot-tool-store": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*",
+    "@matatbread/matbot-configuration-contributors": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:"

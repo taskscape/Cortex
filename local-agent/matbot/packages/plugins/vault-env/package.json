@@ -1,0 +1,20 @@
+{
+  "name": "@matatbread/matbot-vault-env-node",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-security": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  }
+}

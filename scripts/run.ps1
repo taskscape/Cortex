@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
     [switch]$ForceInstall,
     [switch]$SkipInstall,
     [switch]$SkipBuild,
@@ -13,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $MatbotRoot = Join-Path $Root "local-agent\matbot"
@@ -197,6 +200,7 @@ if (-not $NoStart) {
     # containing quotes cannot break child-process quoting.
     $matbotCommand = "pnpm --filter '@matatbread/matbot-cli' start -- --session create"
     $startArgs = @{
+        CapabilityProfile = $CapabilityProfile
         SkipBuild = $true
         MatbotCommand = $matbotCommand
         MatbotWorkingDirectory = $MatbotRoot
@@ -220,21 +224,10 @@ if (-not $SkipHealth) {
     Write-Step "Checking service health"
     $webReady = $true
     if (-not $NoStart) {
-        Wait-HttpOk "file-index" "http://localhost:8877/health" $HealthTimeoutSec | Out-Null
-        Wait-HttpOk "file-broker" "http://localhost:8878/health" $HealthTimeoutSec | Out-Null
-        if (-not $SkipDocker) {
-            Wait-HttpOk "mem0" "http://localhost:8888/docs" $HealthTimeoutSec | Out-Null
-            $postgresHost = if ($env:CORTEX_RAG_POSTGRES_HOST) { $env:CORTEX_RAG_POSTGRES_HOST } else { "localhost" }
-            $postgresPort = if ($env:CORTEX_RAG_POSTGRES_PORT) { [int]$env:CORTEX_RAG_POSTGRES_PORT } else { 5432 }
-            Wait-TcpOk "postgres" $postgresHost $postgresPort $HealthTimeoutSec | Out-Null
-            if (-not $SkipCudaIngestion -and $env:CORTEX_RAG_CUDA_EMBEDDING_URL) {
-                Wait-HttpOk "workspace-rag-cuda" "$env:CORTEX_RAG_CUDA_EMBEDDING_URL/health" $HealthTimeoutSec | Out-Null
-            }
-        }
         $webReady = Wait-HttpOk "matbot-web" $WebUrl $HealthTimeoutSec
     }
 
-    & $HealthScript
+    & $HealthScript -WebUrl $WebUrl -CapabilityProfile $CapabilityProfile
 
     if (-not $webReady) {
         throw "Matbot WebUI did not become healthy at $WebUrl. Check local-agent\logs\matbot.err.log."
@@ -255,6 +248,8 @@ else {
 Write-Host ""
 Write-Host "Matbot WebUI: $WebUrl"
 Write-Host "Logs:"
-Write-Host "  local-agent\logs\file-index.out.log"
-Write-Host "  local-agent\logs\file-broker.out.log"
+if ($CapabilityProfile -eq 'compatibility') {
+    Write-Host "  local-agent\logs\file-index.out.log"
+    Write-Host "  local-agent\logs\file-broker.out.log"
+}
 Write-Host "  local-agent\logs\matbot.out.log"

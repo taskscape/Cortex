@@ -9,7 +9,7 @@ invoked integration lane:
   guarded PostgreSQL and 2-GiB cases that are skipped until explicitly enabled.
 - Matbot CLI tests for loader behavior, ephemeral attachments, and
   workspace-storage isolation.
-- Five Playwright WebUI specs in `tests\webui\` for browser interactions against
+- Six Playwright WebUI specs in `tests\webui\` for browser interactions against
   the real static WebUI and a fake Matbot server.
 - The Playwright README question set in `tests\readme-qa\` for answer quality
   against a running Cortex, scored 0/1 by static rules.
@@ -287,7 +287,7 @@ prove it never touched real memory.
 <!-- BEGIN GENERATED TEST CATALOG -->
 ## Complete automated test catalog
 
-Inventory snapshot: **2026-08-28**. It contains **450 named test cases or named Node subtests across 88 test source files**. A Playwright definition is listed once even when the desktop and mobile projects both discover it. Generated README questions and the named memory/workspace-switch subtests are expanded because those are the titles the runners report.
+Inventory snapshot: **2026-09-05**. It contains **474 named test cases or named Node subtests across 92 test source files**, including 24 C1–C14 migration cases. A Playwright definition is listed once even when the desktop and mobile projects both discover it. Generated README questions and the named memory/workspace-switch subtests are expanded because those are the titles the runners report.
 
 The catalog describes source-defined behavior, not a coverage-percentage claim. "Excludes" records what a passing test does not prove. "Assumptions" records the environment and fidelity boundary on which the assertion relies.
 
@@ -295,9 +295,9 @@ The catalog describes source-defined behavior, not a coverage-percentage claim. 
 
 | Lane | Command | Cataloged titles | Discovery boundary |
 | --- | --- | ---: | --- |
-| Default Node test lane | `npm test` | 277 | `tests/*.test.mjs`; guarded PostgreSQL and 2-GiB definitions are discovered but skipped without opt-in. |
+| Default Node test lane | `npm test` | 297 | `tests/*.test.mjs`; guarded PostgreSQL and 2-GiB definitions are discovered but skipped without opt-in. |
 | Matbot CLI test lane | `npm run test:cli` | 5 | Three CLI test files through the Matbot TypeScript loader. |
-| Harness-backed Playwright WebUI lane | `npm run test:webui` | 131 | Five specs against the fake harness; definitions may be discovered by both Chromium projects and then project-skipped. |
+| Harness-backed Playwright WebUI lane | `npm run test:webui` | 135 | Six specs against the fake harness, including a bundled browser runtime fixture; definitions may be discovered by both Chromium projects and then project-skipped. |
 | Live README question lane | `npm run test:readme-qa` | 34 | 34 generated cases against a separately running real Cortex; excluded from `test:all`. |
 | Guarded Docker and CUDA lane | `npm run test:integration:docker` / `npm run test:integration:cuda` | 3 | One guarded integration file; excluded from `test:all`. |
 
@@ -1228,3 +1228,51 @@ Runner: `npm run test:integration:docker` / `npm run test:integration:cuda`. Tit
 | <code>MISSING-02/MISSING-14 disposable Docker stack validates health and credential-volume recreation</code> | Starts the generated disposable container fixture and checks this outcome: disposable Docker stack validates health and credential-volume recreation. | docker stack.integration.mjs behavior and the positive/negative boundary named by the test; specifically the outcome and boundary stated in this title. | D: `test:all`, existing developer Compose projects/volumes, live providers, and browser behavior. | D: Explicit Docker opt-in on a disposable host; CUDA cases also need NVIDIA runtime and their dedicated opt-ins. |
 | <code>DCU-1/DCU-2/DCU-3/DCU-4/DCU-6/DCU-7 guarded CUDA sidecar validates hardware, parity, memory, performance, and cold E5 caching</code> | Starts the generated disposable container fixture and checks this outcome: guarded CUDA sidecar validates hardware, parity, memory, performance, and cold E5 caching. | docker stack.integration.mjs behavior and the positive/negative boundary named by the test; specifically the outcome and boundary stated in this title. | D: `test:all`, existing developer Compose projects/volumes, live providers, and browser behavior. | D: Explicit Docker opt-in on a disposable host; CUDA cases also need NVIDIA runtime and their dedicated opt-ins. |
 | <code>WRS-4/WRS-5/WRS-8 V2 PostgreSQL keeps MiniLM and E5 dimension tables side by side</code> | Starts the generated disposable container fixture and checks this outcome: postgreSQL keeps MiniLM and E5 dimension tables side by side. | docker stack.integration.mjs behavior and the positive/negative boundary named by the test; specifically the outcome and boundary stated in this title. | D: `test:all`, existing developer Compose projects/volumes, live providers, and browser behavior. | D: Explicit Docker opt-in on a disposable host; CUDA cases also need NVIDIA runtime and their dedicated opt-ins. |
+
+
+### `tests\plugin-migration-invocation.test.mjs` (5)
+
+| Test title | What it does and covers | Excludes | Assumptions |
+| --- | --- | --- | --- |
+| direct calls apply validation, policy, hooks and result redaction before returning content | Shared model/direct invocation, consent, policy loss and result hooks. | Live providers, external broker clients and a real browser. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| model and direct invocation share a rejecting tool hook | Shared model/direct invocation, consent, policy loss and result hooks. | Live providers, external broker clients and a real browser. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| an already cancelled direct request never calls the executor | Shared model/direct invocation, consent, policy loss and result hooks. | Live providers, external broker clients and a real browser. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| managed invocations fail closed without host policy and freeze nested rules | Shared model/direct invocation, consent, policy loss and result hooks. | Live providers, external broker clients and a real browser. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| file tool approval flags require runtime consent on both local and remote adapters | Shared model/direct invocation, consent, policy loss and result hooks. | Live providers, external broker clients and a real browser. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+
+
+### `tests\plugin-migration-contracts.test.mjs` (12)
+
+| Test title | What it does and covers | Excludes | Assumptions |
+| --- | --- | --- | --- |
+| contributions reject route collisions and release identity and lifetime on unload | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| settings first writes serialize and configuration CAS preserves unrelated owner state | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| configuration history redacts secrets and restores under the current schema and version | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| federation distinguishes no matches from partial failure, isolates workspaces and follows unload | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| workspace mutations reserve deletion and commit participants without an owned directory | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| incomplete host-index discovery retains prior chunks and current policy still excludes denied paths | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| provider model configuration preserves credentials and unrelated YAML and rejects stale writes | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| vault serializes durable writes and failed persistence leaves memory unchanged | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| profiles migrate hybrid selection without requiring legacy HTTP in the standard runtime | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| expert definition refresh affects subsequent calls while in-flight panels retain their snapshot | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| loader rollback removes failed contributions; unloading an older provider preserves its replacement | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| persistent BGE memory contributes to federation without taking over KnowledgeIndex | Plugin ownership, configuration/vault durability, retrieval, deletion and adapter contracts. | Live databases, GPUs, crash recovery and external services. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+
+
+### `tests\plugin-migration-launch.test.mjs` (3)
+
+| Test title | What it does and covers | Excludes | Assumptions |
+| --- | --- | --- | --- |
+| standard profile starts with in-process file services, configuration and contributed feature UI | Isolated real Node startup profiles and authorized HTTP capability adapters. | The user workspace, Windows service installation and Docker. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| minimal profile exposes no implicit administration or feature panels | Isolated real Node startup profiles and authorized HTTP capability adapters. | The user workspace, Windows service installation and Docker. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| workspace and diagnostic HTTP adapters enforce the shared host permission policy | Isolated real Node startup profiles and authorized HTTP capability adapters. | The user workspace, Windows service installation and Docker. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+
+
+### `tests\webui\plugin-contributions.spec.mjs` (4)
+
+| Test title | What it does and covers | Excludes | Assumptions |
+| --- | --- | --- | --- |
+| unloading a feature removes its markup and listeners and reloading installs one copy | Feature lifecycle, minimal chat metadata, contributed panels and assembled browser startup. | Live providers, external CDN availability and production deployment. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| chat shell starts with an empty capability list | Feature lifecycle, minimal chat metadata, contributed panels and assembled browser startup. | Live providers, external CDN availability and production deployment. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| additional configuration and diagnostics views mount without editing the shell | Feature lifecycle, minimal chat metadata, contributed panels and assembled browser startup. | Live providers, external CDN availability and production deployment. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |
+| assembled browser runtime boots the shared shell with plugin-owned administration | Feature lifecycle, minimal chat metadata, contributed panels and assembled browser startup. | Live providers, external CDN availability and production deployment. | Node 24+, local fixtures; browser cases require installed Playwright Chromium. |

@@ -1,3 +1,5 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
 /**
  * Workflow-governance plugin: governed workflow definitions, approval-gated
  * and shadow-mode runs, evidence resolution, deterministic workflow
@@ -2253,6 +2255,7 @@ export const plugin: MatbotPluginSpec = {
     description: 'Registers WorkflowRegistry, WorkflowRunner, WorkflowCompiler, workflow_action, and workflow-scoped connector policy hooks.',
   },
   async setup(services: MatbotMachine) {
+    services.contributions?.register('webui','workflows',uiContribution);
     const registry = createWorkflowRegistry(services);
     const runner = createWorkflowRunner(services, registry);
     const compiler = createWorkflowCompiler(services, registry, runner);

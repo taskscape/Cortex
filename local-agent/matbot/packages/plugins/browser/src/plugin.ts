@@ -2,7 +2,7 @@ import type { MatbotPluginSpec, MatbotMachine, PluginSettings } from '@matatbrea
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import { makePluginSettings, type SettingsDoc } from '@matatbread/matbot-core';
 import { BrowserStorageBackend, assertBrowserRealm } from './storage-backend.js';
-import { createBrowserPluginTool, type ExtraPlugins } from './plugin-tool.js';
+import { type ExtraPlugins } from './plugin-tool.js';
 
 const EXTRA_KEY = 'extra-plugins';
 
@@ -62,7 +62,7 @@ export const plugin: MatbotPluginSpec = {
       },
     };
 
-    services.tools.register(createBrowserPluginTool(extras));
+    await services.register('BrowserPluginPersistence',extras);
 
     // Replay user-added plugins from a previous realm. Failures are warned and skipped — a stale
     // specifier (a URL that 404s now) must not abort boot.

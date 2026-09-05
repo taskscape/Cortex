@@ -15,6 +15,7 @@ test.afterEach(async ({ page }) => {
 });
 
 async function openPlugins(page) {
+  await expect(page.locator('body')).toHaveAttribute('data-cortex-ready','true');
   const section = page.locator('[data-section="plugins"]');
   const classes = await section.getAttribute("class");
   if (classes?.includes("collapsed")) {
@@ -23,6 +24,7 @@ async function openPlugins(page) {
 }
 
 async function openSkills(page) {
+  await expect(page.locator('body')).toHaveAttribute('data-cortex-ready','true');
   const section = page.locator('[data-section="skills"]');
   const classes = await section.getAttribute("class");
   if (classes?.includes("collapsed")) {
@@ -2233,10 +2235,10 @@ test("E2E-022 font controls clamp at documented UI bounds and architecture tabs 
   if (await page.locator("#burger").isVisible()) await page.locator("#burger").click();
   await openArchitecturePanel(page, "sources");
   const sourcesTab = page.getByRole("tab", { name: "Sources" });
-  const pluginsTab = page.getByRole("tab", { name: "Plugins" });
+  const lastTab = page.getByRole("tab", { name: "Diagnostics" });
   await sourcesTab.press("ArrowLeft");
-  await expect(pluginsTab).toHaveAttribute("aria-selected", "true");
-  await pluginsTab.press("ArrowRight");
+  await expect(lastTab).toHaveAttribute("aria-selected", "true");
+  await lastTab.press("ArrowRight");
   await expect(sourcesTab).toHaveAttribute("aria-selected", "true");
 });
 
@@ -2925,15 +2927,15 @@ test("T3-E2E-002 fences a delayed file response to its initiating workspace", as
       action: "write", path: "workspace-b.txt", content: "B"
     });
     await window.matbotTransport.switchWorkspace("default");
-    await loadWorkspaces();
+    await window.CortexUI.features.workspace.loadWorkspaces();
   });
   holdNextList = true;
-  await page.evaluate(() => { void loadFiles(); });
+  await page.evaluate(() => { void window.CortexUI.features.files.loadFiles(); });
   await oldSeen;
   await page.evaluate(async id => {
     await window.matbotTransport.switchWorkspace(id);
-    await loadWorkspaces();
-    await loadFiles();
+    await window.CortexUI.features.workspace.loadWorkspaces();
+    await window.CortexUI.features.files.loadFiles();
   }, target.id);
   await expect(page.locator(".file-item")).toContainText("workspace-b.txt");
   releaseOld();
@@ -2988,7 +2990,7 @@ test("T3-E2E-008 preserves a valid provider through discovery failure and falls 
   await page.goto("/");
   await page.locator("#provider-select").selectOption("openai");
   let failDiscovery = true;
-  await page.route("**/tools/provider", async route => {
+  await page.route("**/providers", async route => {
     if (failDiscovery) {
       failDiscovery = false;
       await route.fulfill({
@@ -3004,10 +3006,10 @@ test("T3-E2E-008 preserves a valid provider through discovery failure and falls 
       body: JSON.stringify({ providers: [{ name: "Recovered-Provider" }] })
     });
   });
-  expect(await page.evaluate(() => refreshProviderSelect())).toBe(false);
+  expect(await page.evaluate(() => window.CortexUI.features.runtime.refreshProviderSelect())).toBe(false);
   await expect(page.locator("#provider-select")).toHaveValue("openai");
   await expect(page.locator("#provider-select")).toHaveAttribute("title", /Provider list unavailable/i);
-  expect(await page.evaluate(() => refreshProviderSelect())).toBe(true);
+  expect(await page.evaluate(() => window.CortexUI.features.runtime.refreshProviderSelect())).toBe(true);
   await expect(page.locator("#provider-select")).toHaveValue("Recovered-Provider");
   await expect(page.locator("#provider-select option")).toHaveCount(1);
 });
@@ -3149,7 +3151,7 @@ test("T3-E2E-013 requires an explicit decision before discarding unsaved skill c
   await openSkills(page);
   await page.locator(".skill-entry", { hasText: "Panel Etiquette" }).click();
   await expect(page.locator("#skill-editor-overlay")).toHaveClass(/open/);
-  await page.evaluate(() => skillEditor.setContent("# Unsaved content\nDo not lose this."));
+  await page.evaluate(() => window.CortexUI.features.skills.skillEditor.setContent("# Unsaved content\nDo not lose this."));
   const keepOpen = new Promise(resolve => page.once("dialog", async dialog => {
     resolve(dialog.message());
     await dialog.dismiss();
@@ -3397,7 +3399,7 @@ test("T3-E2E-022 traps focus and announces status for destructive workspace deci
 
 test("T3-E2E-023 distinguishes provider discovery, missing plugin, and RAG diagnostics without destructive advice", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop troubleshooting matrix");
-  await page.route("**/tools/provider", route => route.fulfill({
+  await page.route("**/providers", route => route.fulfill({
     status: 503,
     contentType: "application/json",
     body: JSON.stringify({ error: "provider discovery transport unavailable" })

@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('standard','minimal','compatibility')]
+    [string]$CapabilityProfile = $(if ($env:CORTEX_CAPABILITY_PROFILE) { $env:CORTEX_CAPABILITY_PROFILE } else { 'standard' }),
     [switch]$SkipDocker,
     [switch]$SkipCudaIngestion,
     [int]$WebPort = 19778,
@@ -6,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:CORTEX_CAPABILITY_PROFILE = $CapabilityProfile
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $MatbotRoot = Join-Path $Root "local-agent\matbot"
@@ -213,7 +216,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $MatbotRoot "node_modules"))) {
     throw "Matbot dependencies are missing. Run .\scripts\run.ps1 -NoStart before installing or starting the service."
 }
 
-if (-not $SkipDocker) {
+if (-not $SkipDocker -and $CapabilityProfile -ne 'minimal') {
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         if (Test-CudaIngestionAvailable) {
             Write-ServiceLog "Starting Mem0 Docker stack with workspace-rag CUDA embeddings"
@@ -257,6 +260,7 @@ if (-not $env:MEM0_BASE_URL) {
 $env:MATBOT_WEB_PORT = [string]$WebPort
 $env:CORTEX_SERVICE_SUPERVISED = "1"
 
+if ($CapabilityProfile -eq 'compatibility') {
 Start-NodeService `
     -Name "file-index" `
     -Port 8877 `
@@ -270,6 +274,8 @@ Start-NodeService `
     -ScriptPath "local-agent\file-broker\dist\server.js" `
     -OutLog "local-agent\logs\file-broker.out.log" `
     -ErrLog "local-agent\logs\file-broker.err.log"
+}
+
 
 if (Test-PortListening $WebPort) {
     Stop-PortListeners $WebPort "Matbot web UI"

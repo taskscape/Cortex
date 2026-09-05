@@ -70,6 +70,8 @@ export interface Store<T extends { id: string; version: string }> {
 
 /** Host services surface this plugin relies on. */
 export interface MatbotMachine {
+  WorkspaceRagManager?:import('./providers.js').ExpertRagSearch;
+  contributions?:{register(kind:'webui',id:string,value:unknown):()=>void};
   singleTurn(req: SingleTurnRequest): Promise<CompletionResponse>;
   tools: ToolRegistry;
   providers: ReadonlyMap<string, unknown>;

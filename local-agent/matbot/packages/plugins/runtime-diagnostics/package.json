@@ -1,0 +1,21 @@
+{
+  "name": "@matatbread/matbot-runtime-diagnostics",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*",
+    "@matatbread/matbot-core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

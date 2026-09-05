@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+import {selectCapabilityProfile,profilePlugins} from './capability-profiles.js';
+import type {} from '@matatbread/matbot-file-services-types';
+import { FileWorkspaceManager } from '@matatbread/matbot-workspace-manager-node';
+export { FileWorkspaceManager } from '@matatbread/matbot-workspace-manager-node';
+export type { WorkspaceDeletionHooks, WorkspaceDeletionResult, FileWorkspaceManagerOptions } from '@matatbread/matbot-workspace-manager-node';
+import type {} from '@matatbread/matbot-workspace-manager-types';
+import type {} from '@matatbread/matbot-runtime-admin';
+import type {} from '@matatbread/matbot-frontend-cli-node';
 import { loadConfig, loadConfigFromText, loadDotEnv } from './config.js';
 import { installPlugin }                    from './install.js';
 import { loadPluginsWithDescriptions, readPluginMeta, type PluginLoadRequest } from './plugin-description.js';
@@ -9,7 +17,7 @@ import type { Principal, ProviderAdapter,
               MessageContent, FileStore } from '@matatbread/matbot-core';
 import { appendMessage, createMessage,
          createSession,
-         createSessionRunner,
+         createSessionRunner, freezeInvocationPolicy,
          HookRegistry, SystemContextRegistryImpl, ToolRegistryImpl,
          resolveProviderFactory,
          teardownPlugins,
@@ -18,7 +26,6 @@ import { appendMessage, createMessage,
          installPrincipalCarrier, enterPrincipal, currentPrincipal,
          unifyServices, forwardingProxy, makeSwappable, singleTurnRequest,
          createMountTable, onContextQuiesce, flushIfQuiescent,
-         createSingleTurnTool,
          MissingSecretError }              from '@matatbread/matbot-core';
 import type { MatbotMachine, MatbotServices, PluginSettings, Vault, SessionRunner,
               MatbotPlugin, StorageBackend, KnowledgeIndex, PromptFn, FormField, SwapFn } from '@matatbread/matbot-core';
@@ -26,7 +33,7 @@ import { systemPrincipal }                 from '@matatbread/matbot-security';
 import { createAlsPrincipalCarrier }       from './principal-als.js';
 import { EnvFileVault }                     from './env-vault.js';
 import { FilesystemFileStore }             from '@matatbread/matbot-files-node';
-import { createBuiltinTools, createProviderTool, classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
+import { classifySpecifier, materializeRemote } from '@matatbread/matbot-tool-plugin';
 import { LookupKnowledgeIndex }               from '@matatbread/matbot-knowledge';
 import { appendFileSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { access, copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
@@ -56,22 +63,6 @@ for (const level of ['log', 'warn', 'error'] as const) {
   };
 }
 const write = isBackground ? (text: string) => {} : (text: string) => process.stderr.write(text);
-
-// Colour only when writing to an interactive terminal — piped/background output stays clean.
-const useColor = !isBackground && process.stderr.isTTY === true;
-const yellow = (s: string): string => (useColor ? `\x1b[33m${s}\x1b[0m` : s);
-const dim    = (s: string): string => (useColor ? `\x1b[2m${s}\x1b[0m`  : s);
-
-// One marker block → a human-facing line. The dispatcher's hook-failure marker is a warning
-// (amber); any other marker is shown dimmed and generic.
-function formatMarker(part: Extract<MessageContent, { type: 'marker' }>): string {
-  if (part.creator === 'matbot-hooks') {
-    const data = (part.data ?? {}) as { channel?: string; pluginName?: string; message?: string };
-    const who  = data.pluginName !== undefined ? ` (${data.pluginName})` : '';
-    return yellow(`⚠  ${data.channel ?? 'hook'} hook${who} failed and was skipped: ${data.message ?? 'unknown error'}`);
-  }
-  return dim(`🔖 ${part.creator}: ${JSON.stringify(part.data)}`);
-}
 
 /**
  * Given a package exports field (or any nested value), return the first
@@ -289,87 +280,6 @@ function resolveBootPrincipal(opts: CliOpts, config: import('./config.js').Matbo
 
 // ── Cortex workspaces ────────────────────────────────────────────────────────
 
-interface CortexWorkspaceRecord {
-  id:         string;
-  name:       string;
-  configPath: string;
-  createdAt:  string;
-  updatedAt:  string;
-}
-
-interface CortexWorkspaceRegistry {
-  active:     string;
-  workspaces: CortexWorkspaceRecord[];
-}
-
-interface CortexWorkspaceSummary extends CortexWorkspaceRecord {
-  active: boolean;
-}
-
-interface CortexWorkspaceManager {
-  current(): Promise<CortexWorkspaceSummary>;
-  list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }>;
-  create(name: string): Promise<CortexWorkspaceSummary>;
-  rename(id: string, name: string): Promise<CortexWorkspaceSummary>;
-  delete(id: string): Promise<{ id: string; deleted: true }>;
-  switch(id: string): Promise<{ active: string; restarting: boolean }>;
-}
-
-/**
- * Optional lifecycle callbacks invoked during workspace deletion, letting callers
- * (e.g. the local agent) run cleanup or auditing at well-defined points.
- */
-export interface WorkspaceDeletionHooks {
-  /** Called after staging but before the registry commit; throwing aborts and rolls back. */
-  beforeRegistryCommit?(workspaceId: string): void | Promise<void>;
-  /** Called with the staged path just before it is purged from disk. */
-  beforePurge?(workspaceId: string, stagedPath: string): void | Promise<void>;
-}
-
-/**
- * Outcome of a successful workspace deletion, including an audit log of every
- * cleanup step performed (and whether disk purge is still pending).
- */
-export interface WorkspaceDeletionResult {
-  id: string;
-  deleted: true;
-  /** Ordered audit messages for each cleanup operation attempted. */
-  cleanupLog: string[];
-  /** True when the directory purge failed or was interrupted and must be retried. */
-  cleanupPending?: true;
-  /** Staged path awaiting purge when `cleanupPending` is set. */
-  pendingCleanupPath?: string;
-}
-
-/** Options for constructing a {@link FileWorkspaceManager}. */
-export interface FileWorkspaceManagerOptions {
-  /** Lifecycle callbacks invoked during workspace deletion. */
-  deletionHooks?: WorkspaceDeletionHooks;
-  /** Sink for deletion audit messages; defaults to console.info. */
-  deletionLogger?: (message: string) => void;
-}
-
-function yamlSingleQuoted(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-function yamlPath(value: string): string {
-  return value.replace(/\\/g, '/');
-}
-
-function slugifyWorkspaceName(name: string): string {
-  const slug = name.trim().toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48);
-  return slug || `workspace-${Date.now().toString(36)}`;
-}
-
-function pathIsInsideOrEqual(child: string, parent: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === '' || (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
 function isPathLikeSpecifier(value: string): boolean {
   return value.startsWith('.') || value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(value);
 }
@@ -427,341 +337,6 @@ function matbotLogPaths(registryPath: string): { out: string; err: string } {
   };
 }
 
-function absolutizeLocalConfigSpecifiers(text: string, configDir: string): string {
-  return text.replace(
-    /^(\s*(?:-\s+|module:\s+))(['"]?)(\.{1,2}[\\/][^#\r\n'"]+)\2(\s*(?:#.*)?$)/gm,
-    (_whole, prefix: string, _quote: string, spec: string, suffix: string) => {
-      const abs = yamlPath(path.resolve(configDir, spec.trim()));
-      return `${prefix}${yamlSingleQuoted(abs)}${suffix}`;
-    },
-  );
-}
-
-/**
- * File-backed manager for Cortex workspaces: a JSON registry of named workspace
- * directories (each with its own matbot.yaml/.env) plus create/rename/delete/switch
- * operations. Deletion stages the directory under a `.deleting-` name so a failed
- * registry commit rolls back, and an optional restarter hook re-launches the runtime
- * on switch.
- */
-export class FileWorkspaceManager implements CortexWorkspaceManager {
-  private restarter: ((id: string) => Promise<void>) | undefined;
-  private readonly registryPath: string;
-  private readonly rootConfigPath: string;
-  private readonly deletionHooks: WorkspaceDeletionHooks;
-  private readonly deletionLogger: (message: string) => void;
-
-  /**
-   * Create the manager over a workspace registry file.
-   * @param registryPath Path to cortex-workspaces.json (created on first use).
-   * @param rootConfigPath Path to the root matbot.yaml new workspaces are cloned from.
-   * @param options Optional deletion hooks and audit logger.
-   */
-  constructor(
-    registryPath: string,
-    rootConfigPath: string,
-    options: FileWorkspaceManagerOptions = {},
-  ) {
-    this.registryPath = registryPath;
-    this.rootConfigPath = rootConfigPath;
-    this.deletionHooks = options.deletionHooks ?? {};
-    this.deletionLogger = options.deletionLogger ?? (message => console.info(message));
-  }
-
-  /**
-   * Register the restart callback used by {@link switch} to relaunch the runtime
-   * after the active workspace changes.
-   * @param restarter Async callback receiving the id of the newly activated workspace.
-   */
-  setRestarter(restarter: (id: string) => Promise<void>): void {
-    this.restarter = restarter;
-  }
-
-  /**
-   * @returns The path of the registry file backing this manager.
-   */
-  getRegistryPath(): string {
-    return this.registryPath;
-  }
-
-  /**
-   * @returns The currently active workspace summary.
-   */
-  async current(): Promise<CortexWorkspaceSummary> {
-    const registry = await this.load();
-    const current = registry.workspaces.find(w => w.id === registry.active) ?? registry.workspaces[0]!;
-    return this.summarize(current, current.id === registry.active);
-  }
-
-  /**
-   * @returns The active workspace id plus a summary of every registered workspace.
-   */
-  async list(): Promise<{ active: string; workspaces: CortexWorkspaceSummary[] }> {
-    const registry = await this.load();
-    return {
-      active: registry.active,
-      workspaces: registry.workspaces.map(w => this.summarize(w, w.id === registry.active)),
-    };
-  }
-
-  /**
-   * Create a new workspace: a directory under `workspaces/` containing a copy of the
-   * root config (with local specifiers absolutized) and, if present, the root .env.
-   * @param name Human-readable workspace name; must be non-empty.
-   * @returns The created workspace summary.
-   * @exception Error When the name is empty.
-   */
-  async create(name: string): Promise<CortexWorkspaceSummary> {
-    const cleanName = name.trim();
-    if (!cleanName) throw new Error('Workspace name is required.');
-    const registry = await this.load();
-    const existingIds = new Set(registry.workspaces.map(w => w.id));
-    const baseId = slugifyWorkspaceName(cleanName);
-    let id = baseId;
-    let suffix = 2;
-    while (existingIds.has(id)) id = `${baseId}-${suffix++}`;
-
-    const rootDir = path.dirname(this.rootConfigPath);
-    const workspaceDir = path.join(rootDir, 'workspaces', id);
-    await mkdir(workspaceDir, { recursive: true });
-
-    const sourceConfig = await readFile(this.rootConfigPath, 'utf8');
-    const workspaceConfig = absolutizeLocalConfigSpecifiers(sourceConfig, rootDir);
-    await writeFile(path.join(workspaceDir, 'matbot.yaml'), workspaceConfig, 'utf8');
-
-    const rootEnv = path.join(rootDir, '.env');
-    if (await exists(rootEnv)) await copyFile(rootEnv, path.join(workspaceDir, '.env'));
-
-    const nowIso = new Date().toISOString();
-    const record: CortexWorkspaceRecord = {
-      id,
-      name: cleanName,
-      configPath: yamlPath(path.relative(path.dirname(this.registryPath), path.join(workspaceDir, 'matbot.yaml'))),
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    registry.workspaces.push(record);
-    await this.save(registry);
-    return this.summarize(record, false);
-  }
-
-  /**
-   * Rename an existing workspace, updating its `updatedAt` timestamp.
-   * @param id Id of the workspace to rename.
-   * @param name New human-readable name; must be non-empty.
-   * @returns The updated workspace summary.
-   * @exception Error When the name is empty or the workspace id is unknown.
-   */
-  async rename(id: string, name: string): Promise<CortexWorkspaceSummary> {
-    const cleanName = name.trim();
-    if (!cleanName) throw new Error('Workspace name is required.');
-    const registry = await this.load();
-    const record = registry.workspaces.find(w => w.id === id);
-    if (record === undefined) throw new Error(`Unknown workspace "${id}".`);
-    record.name = cleanName;
-    record.updatedAt = new Date().toISOString();
-    await this.save(registry);
-    return this.summarize(record, record.id === registry.active);
-  }
-
-  /**
-   * Delete a workspace: stage its directory under a `.deleting-` name, commit the
-   * registry removal (rolling back the rename on failure), then purge the staged
-   * directory from disk.
-   * @param id Id of the workspace to delete.
-   * @returns A deletion result with an audit log; `cleanupPending` is set when the
-   *          disk purge could not be completed and must be retried later.
-   * @exception Error When the id is unknown, the workspace is active, or it is the only workspace.
-   */
-  async delete(id: string): Promise<WorkspaceDeletionResult> {
-    const registry = await this.load();
-    const record = registry.workspaces.find(w => w.id === id);
-    if (record === undefined) throw new Error(`Unknown workspace "${id}".`);
-    if (record.id === registry.active) {
-      throw new Error('Cannot delete the active workspace. Switch to another workspace first.');
-    }
-    if (registry.workspaces.length <= 1) {
-      throw new Error('Cannot delete the only workspace.');
-    }
-
-    const cleanupLog: string[] = [];
-    const audit = (operation: string): void => {
-      const message = `[workspace-delete] workspace=${id} ${operation}`;
-      cleanupLog.push(message);
-      this.deletionLogger(message);
-    };
-    const workspaceDir = this.ownedWorkspaceDirectory(record);
-    const stagedPath = workspaceDir !== undefined && await exists(workspaceDir)
-      ? `${workspaceDir}.deleting-${crypto.randomUUID()}`
-      : undefined;
-
-    if (stagedPath !== undefined && workspaceDir !== undefined) {
-      await rename(workspaceDir, stagedPath);
-      audit(`staged path=${stagedPath}`);
-    } else {
-      audit('no owned workspace directory to stage');
-    }
-
-    try {
-      await this.deletionHooks.beforeRegistryCommit?.(id);
-      registry.workspaces = registry.workspaces.filter(w => w.id !== id);
-      await this.save(registry);
-      audit('registry commit complete');
-    } catch (error) {
-      if (stagedPath !== undefined && workspaceDir !== undefined && await exists(stagedPath)) {
-        await rename(stagedPath, workspaceDir);
-        audit(`rolled back path=${workspaceDir}`);
-      }
-      audit(`aborted before commit error=${error instanceof Error ? error.message : String(error)}`);
-      throw error;
-    }
-
-    if (stagedPath !== undefined) {
-      try {
-        await this.deletionHooks.beforePurge?.(id, stagedPath);
-        await rm(stagedPath, { recursive: true, force: true });
-        audit(`purged path=${stagedPath}`);
-      } catch (error) {
-        audit(`cleanup pending path=${stagedPath} error=${error instanceof Error ? error.message : String(error)}`);
-        return { id, deleted: true, cleanupLog, cleanupPending: true, pendingCleanupPath: stagedPath };
-      }
-    }
-    return { id, deleted: true, cleanupLog };
-  }
-
-  /**
-   * Make a workspace active, persisting the registry and invoking the registered
-   * restarter (if any) to relaunch the runtime against it.
-   * @param id Id of the workspace to activate.
-   * @returns The new active id and whether a restart was performed.
-   * @exception Error When the id is unknown.
-   */
-  async switch(id: string): Promise<{ active: string; restarting: boolean }> {
-    const registry = await this.load();
-    if (!registry.workspaces.some(w => w.id === id)) throw new Error(`Unknown workspace "${id}".`);
-    registry.active = id;
-    await this.save(registry);
-    if (this.restarter === undefined) return { active: id, restarting: false };
-    await this.restarter(id);
-    return { active: id, restarting: true };
-  }
-
-  /**
-   * Pick the config file the process should boot: the workspace named by
-   * `CORTEX_WORKSPACE_ID` if valid, otherwise the active (or first) workspace.
-   * The selection is persisted as the registry's active entry.
-   * @returns Absolute path of the selected workspace's matbot.yaml.
-   */
-  async selectConfigPath(): Promise<string> {
-    const registry = await this.load();
-    const requested = process.env['CORTEX_WORKSPACE_ID'];
-    const workspace = registry.workspaces.find(w => w.id === requested)
-      ?? registry.workspaces.find(w => w.id === registry.active)
-      ?? registry.workspaces[0]!;
-    registry.active = workspace.id;
-    await this.save(registry);
-    return path.resolve(path.dirname(this.registryPath), workspace.configPath);
-  }
-
-  /**
-   * Ensure a root-relative plugin specifier appears in the `plugins:` list of every
-   * workspace config, inserting it before `options.before` when given. Non-root
-   * workspaces get the specifier absolutized to the root directory.
-   * @param rootRelativeSpecifier Root-relative path of the plugin to add.
-   * @param options Optional `before` specifier anchoring insertion order in each config.
-   */
-  async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string, options: { before?: string } = {}): Promise<void> {
-    const registry = await this.load();
-    const rootDir = path.dirname(this.rootConfigPath);
-    for (const workspace of registry.workspaces) {
-      const configPath = path.resolve(path.dirname(this.registryPath), workspace.configPath);
-      if (!(await exists(configPath))) continue;
-      const specifier = path.resolve(configPath) === path.resolve(this.rootConfigPath)
-        ? rootRelativeSpecifier
-        : yamlSingleQuoted(yamlPath(path.resolve(rootDir, rootRelativeSpecifier)));
-      const beforeSpecifier = options.before === undefined
-        ? undefined
-        : path.resolve(configPath) === path.resolve(this.rootConfigPath)
-          ? options.before
-          : yamlSingleQuoted(yamlPath(path.resolve(rootDir, options.before)));
-      await addPluginToConfigIfMissing(configPath, specifier, beforeSpecifier);
-    }
-  }
-
-  private summarize(record: CortexWorkspaceRecord, active: boolean): CortexWorkspaceSummary {
-    return { ...record, active };
-  }
-
-  private ownedWorkspaceDirectory(record: CortexWorkspaceRecord): string | undefined {
-    const rootDir = path.dirname(this.rootConfigPath);
-    const workspacesDir = path.resolve(rootDir, 'workspaces');
-    const expectedWorkspaceDir = path.resolve(workspacesDir, record.id);
-    const configPath = path.resolve(path.dirname(this.registryPath), record.configPath);
-    const configDir = path.dirname(configPath);
-
-    if (!pathIsInsideOrEqual(expectedWorkspaceDir, workspacesDir)) return undefined;
-    if (!pathIsInsideOrEqual(configDir, expectedWorkspaceDir)) return undefined;
-    return expectedWorkspaceDir;
-  }
-
-  private async load(): Promise<CortexWorkspaceRegistry> {
-    if (!(await exists(this.registryPath))) {
-      const nowIso = new Date().toISOString();
-      const registry: CortexWorkspaceRegistry = {
-        active: 'default',
-        workspaces: [{
-          id: 'default',
-          name: 'Default',
-          configPath: yamlPath(path.relative(path.dirname(this.registryPath), this.rootConfigPath)),
-          createdAt: nowIso,
-          updatedAt: nowIso,
-        }],
-      };
-      await this.save(registry);
-      return registry;
-    }
-    const registry = JSON.parse(await readFile(this.registryPath, 'utf8')) as CortexWorkspaceRegistry;
-    if (!Array.isArray(registry.workspaces) || registry.workspaces.length === 0) {
-      throw new Error(`Invalid Cortex workspace registry: ${this.registryPath}`);
-    }
-    if (!registry.workspaces.some(w => w.id === registry.active)) registry.active = registry.workspaces[0]!.id;
-    return registry;
-  }
-
-  private async save(registry: CortexWorkspaceRegistry): Promise<void> {
-    await mkdir(path.dirname(this.registryPath), { recursive: true });
-    await writeFile(this.registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
-  }
-}
-
-async function addPluginToConfigIfMissing(configPath: string, specifier: string, beforeSpecifier?: string): Promise<void> {
-  const text = await readFile(configPath, 'utf8');
-  if (text.includes(`- ${specifier}`)) return;
-  let updated: string;
-  if (beforeSpecifier !== undefined) {
-    const beforeLine = new RegExp(`^([ \\t]*)- ${escapeRegExp(beforeSpecifier)}[ \\t]*$`, 'm');
-    const match = beforeLine.exec(text);
-    if (match?.index !== undefined) {
-      const indent = match[1] ?? '  ';
-      updated = text.slice(0, match.index) + `${indent}- ${specifier}\n` + text.slice(match.index);
-      await writeFile(configPath, updated, 'utf8');
-      return;
-    }
-  }
-  const blockMatch = text.match(/^(plugins:\s*\n(?:[ \t]+-[^\n]*\n)*)/m);
-  if (blockMatch) {
-    const at = blockMatch.index! + blockMatch[0].length;
-    updated = text.slice(0, at) + `  - ${specifier}\n` + text.slice(at);
-  } else {
-    updated = `${text.trimEnd()}\n\nplugins:\n  - ${specifier}\n`;
-  }
-  await writeFile(configPath, updated, 'utf8');
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
-}
-
 function printHelp(): void {
   process.stderr.write(`
 matbot — AI CLI
@@ -788,130 +363,6 @@ If [prompt] and --prompt-file are both omitted, starts an interactive REPL.
 }
 
 // ── Single turn ────────────────────────────────────────────────────────────────
-
-async function runTurn(
-  session:      Session,
-  content:      string | MessageContent[],
-  run:          SessionRunner,
-  providerName: string,
-  principal:    Principal,
-  promptFn:     PromptFn,
-): Promise<Session> {
-  const ac       = new AbortController();
-  // Ctrl-C aborts the running turn (and drops anything queued) through the runner.
-  const onSigint = (): void => { run.abort(session.id); };
-  process.once('SIGINT', onSigint);
-
-  const contentArr: MessageContent[] = typeof content === 'string'
-    ? [{ type: 'text', text: content }]
-    : content;
-
-  let updated       = session;
-  let totalIn       = 0;
-  let totalOut      = 0;
-  let totalCostUsd  = 0;
-  let thinkingTicks = 0;
-
-  const clearThinking = (): void => {
-    if (thinkingTicks > 0) { process.stderr.write('\n'); thinkingTicks = 0; }
-  };
-
-  try {
-    // The runner appends + persists the user message and auto-titles at turn start.
-    const view = await run.open({
-      sessionId: session.id,
-      signal:    ac.signal,
-      content:   contentArr,
-      provider:  providerName,
-      principal,
-      prompt:    promptFn,
-    });
-    for await (const ev of view.events) {
-      if (ev.type === 'idle') continue; // session-level lifecycle signal, not this turn's
-      if (ev.traceId !== view.traceId) continue;
-      switch (ev.type) {
-        case 'text-delta':
-          clearThinking();
-          process.stdout.write(ev.delta);
-          break;
-        case 'thinking':
-          thinkingTicks++;
-          write(`\r[thinking… ×${thinkingTicks}]`);
-          break;
-        case 'tool:start':
-          clearThinking();
-          write(`\n⚙  ${ev.name} ${JSON.stringify(ev.input)}\n`);
-          break;
-        case 'tool:stdout': write(ev.chunk); break;
-        case 'tool:stderr': write(ev.chunk); break;
-        case 'tool:end':    write(`\n`); break;
-        case 'usage':
-          totalIn      += ev.inputTokens;
-          totalOut     += ev.outputTokens;
-          if (ev.costUsd !== undefined) totalCostUsd += ev.costUsd;
-          break;
-        case 'done':        clearThinking(); updated = ev.session; break;
-        case 'robo-user': {
-          // Machine-authored context folded onto the user turn by a screen hook (e.g. a fired
-          // `contextual` trigger) — system-supplied, not the user's words, so label it as such.
-          const text = ev.content
-            .filter((c): c is Extract<MessageContent, { type: 'text' }> => c.type === 'text')
-            .map(c => c.text).join('');
-          if (text) write(`[context] ${text}\nassistant: `);
-          break;
-        }
-        case 'aborted': {
-          clearThinking();
-          updated = ev.session;
-          const formMsg = [...ev.session.messages].reverse().find(
-            m => m.content.some(c => c.type === 'form'),
-          );
-          if (formMsg) {
-            const formPart = formMsg.content.find(
-              (c): c is Extract<MessageContent, { type: 'form' }> => c.type === 'form',
-            );
-            if (formPart) {
-              write('\n');
-              const values: Record<string, string> = {};
-              for (const field of formPart.fields) {
-                const hint = field.options ? ` [${field.options.join('/')}]` : '';
-                values[field.name] = await promptFn(`${field.label}${hint}`, field.default);
-              }
-              process.removeListener('SIGINT', onSigint);
-              ac.abort();
-              return await runTurn(ev.session, [{ type: 'form-response', values }], run, providerName, principal, promptFn);
-            }
-          } else {
-            process.stderr.write(`\n[aborted: ${ev.reason}]\n`);
-          }
-          break;
-        }
-        case 'marker': {
-          clearThinking();
-          for (const part of ev.content) {
-            if (part.type === 'marker') write(`\n${formatMarker(part)}\n`);
-          }
-          break;
-        }
-        case 'error': clearThinking(); process.stderr.write(`\n[error: ${ev.error}]\n`); break;
-        default: break;
-      }
-      // One submission == one turn here; the per-session stream would otherwise keep yielding.
-      if (ev.type === 'done' || ev.type === 'aborted' || ev.type === 'error' || ev.type === 'cancelled') break;
-    }
-  } finally {
-    process.removeListener('SIGINT', onSigint);
-    ac.abort();
-  }
-
-  write('\n');
-  if (totalIn > 0 || totalOut > 0) {
-    const cost = totalCostUsd > 0 ? ` ≈$${totalCostUsd.toFixed(4)}` : '';
-    write(`[↑${totalIn} ↓${totalOut} tokens${cost}]\n`);
-  }
-
-  return updated;
-}
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -1105,29 +556,6 @@ async function main(): Promise<void> {
       ? path.resolve(process.env['CORTEX_WORKSPACES_FILE'])
       : path.join(path.dirname(requestedConfigPath), 'cortex-workspaces.json');
     workspaceManager = new FileWorkspaceManager(registryPath, requestedConfigPath);
-    await workspaceManager.ensurePluginInAllWorkspaces('./plugins/file-broker');
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/storage/high-cardinality', {
-      before: './packages/plugins/source-registry',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/source-registry', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/connector-fabric', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/structured-data', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workflow-governance', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/evaluation-observability', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/context-graph', {
-      before: './packages/plugins/workspace-rag',
-    });
-    await workspaceManager.ensurePluginInAllWorkspaces('./packages/plugins/workspace-rag');
     configPath = await workspaceManager.selectConfigPath();
     process.chdir(path.dirname(configPath));
     await loadDotEnv(path.dirname(configPath));
@@ -1207,7 +635,11 @@ async function main(): Promise<void> {
     }
   }
   const resolvedProviderMods = await resolvePluginSpecifiers(providerModules, path.dirname(configPath));
-  const resolvedPluginMods   = await resolvePluginSpecifiers(matbotConfig.plugins, path.dirname(configPath));
+  const capabilityProfile=selectCapabilityProfile(process.env.CORTEX_CAPABILITY_PROFILE??matbotConfig.capabilityProfile);
+  const selectedPlugins=profilePlugins(capabilityProfile,matbotConfig.plugins,workspaceManager!==undefined,name=>fileURLToPath(new URL(name==='file-broker-tool'?'../../../plugins/file-broker':'../../../packages/plugins/'+name,import.meta.url)));
+  const resolvedSelections=await resolvePluginSpecifiers(selectedPlugins,path.dirname(configPath));
+  const selectedNames=new Set<string>();
+  const resolvedPluginMods=resolvedSelections.filter(request=>{const key=request.name??request.importSpec;if(selectedNames.has(key))return false;selectedNames.add(key);return true;});
   const allSpecifiers        = [...resolvedProviderMods, ...resolvedPluginMods];
 
   // A plugin with storageBackend replaces the default filesystem stores.
@@ -1337,7 +769,7 @@ async function main(): Promise<void> {
   };
 
   // toolReg is shared: plugins register into it via services, runSession reads it
-  const toolReg = new ToolRegistryImpl(createBuiltinTools());
+  const toolReg = new ToolRegistryImpl();
 
   // hookReg is shared: plugins register hooks via services, runSession fires them
   const hookReg = new HookRegistry();
@@ -1459,6 +891,9 @@ async function main(): Promise<void> {
     get KnowledgeIndex() { return knowledgeProxy; },
   };
   const services: MatbotMachine = unifyServices(baseServices);
+  // Authorization is available before the first plugin can expose a transport.
+  serviceRegistry.set('ToolInvocationPolicy',freezeInvocationPolicy(matbotConfig.permissions??{defaultAction:'allow'}));
+  if (capabilityProfile !== 'minimal') serviceRegistry.set('FileAccessSelection',{mode:capabilityProfile==='compatibility'?'http':'local'});
 
   // Shut the runtime down and give up its ports, but never let the shutdown itself become the reason
   // the process lingers: a hung teardown (a server close waiting on a keep-alive socket, a backend
@@ -1536,7 +971,11 @@ async function main(): Promise<void> {
         process.exit(0);
       })(); }, 250);
     });
-    serviceRegistry.set('WorkspaceManager', workspaceManager);
+    const current = await workspaceManager.current();
+    serviceRegistry.set('WorkspaceBootstrap', { manager: workspaceManager, context: Object.freeze({ id: current.id, configPath, registryPath: workspaceManager.getRegistryPath() }) });
+    await loadPluginsWithDescriptions(await resolvePluginSpecifiers([
+      fileURLToPath(new URL('../../../packages/plugins/workspace-manager', import.meta.url)),
+    ], path.dirname(configPath)), services, path.dirname(configPath));
   }
 
   // resolveProvider reads matbotConfig.providers lazily (per turn), so it sees both the
@@ -1567,6 +1006,7 @@ async function main(): Promise<void> {
     configPath,
     loadPlugin:    services.loadPlugin.bind(services),
     unloadPlugin:  services.unloadPlugin.bind(services),
+    permissions:()=>services.ToolInvocationPolicy,
     observability: () => services.get('Observability'),
   });
 
@@ -1601,6 +1041,7 @@ async function main(): Promise<void> {
   };
   recordOrigPaths(providerModules);
 
+  serviceRegistry.set('RuntimeAdminConfig',{providers:matbotConfig.providers,originalPaths:pluginNameToOrigPath,expectedPlugins:resolvedPluginMods.flatMap(request=>request.name?[request.name]:[])});
   const loadedPlugins = await loadPluginsWithDescriptions(resolvedPluginMods, services, path.dirname(configPath));
 
   // A plugin that fails to load is skipped rather than fatal (one bad entry must not brick startup).
@@ -1633,15 +1074,6 @@ async function main(): Promise<void> {
   // provider config. Record those too, so the provider tool knows the YAML-valid path
   // for every loaded adapter, not just ones already referenced by a provider profile.
   recordOrigPaths(matbotConfig.plugins);
-
-  // Register the provider management tool now that all adapter plugins are loaded and
-  // their YAML specifiers are recorded — createProviderTool reads getRegisteredPlugins()
-  // and pluginNameToOrigPath to build its description.
-  toolReg.register(createProviderTool(matbotConfig.providers, pluginNameToOrigPath));
-
-  // single_turn: the model-facing surface of the core singleTurn service. Registered here beside the
-  // other core service-management tools (it needs the live `services` for `singleTurn`/`providers`).
-  toolReg.register(createSingleTurnTool(services));
 
   // ── Server mode ───────────────────────────────────────────────────────────────
 
@@ -1679,103 +1111,12 @@ async function main(): Promise<void> {
     ...(rawConfig.fallback    !== undefined ? { fallback:   rawConfig.fallback   } : {}),
   };
 
-  // ── Session ───────────────────────────────────────────────────────────────────
+  await loadPluginsWithDescriptions(await resolvePluginSpecifiers([fileURLToPath(new URL('../../../packages/plugins/frontend-cli',import.meta.url))],path.dirname(configPath)),services,path.dirname(configPath));
+  if(!services.CliFrontend)throw new Error('CLI frontend unavailable');
+  const runStore:Store<Session>=isEphemeral?new MemoryStore<Session>():store;
+  try{await services.CliFrontend.start({store:runStore,run:isEphemeral?makeRunner(runStore):(sessionRunner??makeRunner(store)),provider:providerConfig.name,principal:currentPrincipal(),ephemeral:isEphemeral,...(opts.session?{session:opts.session}:{}),...(opts.system?{system:opts.system}:{}),...(argPrompt!==undefined?{prompt:argPrompt}:{})});}
+  finally{await releaseRuntime();}
 
-  // The session owner is the boot identity established at the entry, not a fresh system principal —
-  // so a single-turn run launched as a specific user (pod / `--principal` / background delegation)
-  // owns its session as that user.
-  const principal = currentPrincipal();
-  let session: Session;
-
-  if (opts.session && opts.session !== 'create') {
-    const existing = await store.get(opts.session);
-    if (!existing) {
-      throw new Error(`Session "${opts.session}" not found.`);
-    }
-    session = existing;
-  } else {
-    session = createSession({ ownerPrincipal: principal });
-    if (opts.system) {
-      session = appendMessage(session, createMessage({
-        role:    'system',
-        content: [{ type: 'text', text: opts.system }],
-        traceId: crypto.randomUUID(),
-      }));
-    }
-  }
-
-  if (isEphemeral) {
-    process.stderr.write(`[${new Date().toISOString()} ${_pid}] provider: ${providerName}  (ephemeral)\n\n`);
-  } else {
-    process.stderr.write(`[${new Date().toISOString()} ${_pid}] provider: ${providerName}  session: ${session.id}\n\n`);
-  }
-
-  const runStore: Store<Session> = isEphemeral ? new MemoryStore<Session>() : store;
-  // The runner loads the session before its first turn, so make sure it's resolvable: a fresh
-  // ephemeral session has never been persisted. (Non-ephemeral sessions were loaded from runStore.)
-  await runStore.set(session.id, session);
-  // Reuse the shared runner over the persistent store; spin up a private one over the ephemeral
-  // MemoryStore so a throwaway REPL session never shares a queue with the frontends.
-  const cliRun: SessionRunner = isEphemeral ? makeRunner(runStore) : (sessionRunner ?? makeRunner(store));
-
-  // ── Readline (shared by single-turn and REPL for tool prompts) ──────────────
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  rl.on('SIGINT', () => { process.stderr.write('\n'); rl.close(); });
-
-  const stdinPrompt = (async (p: string | FormField, defaultValue?: string): Promise<string> => {
-    if (typeof p !== 'string') {
-      const def = p.default;
-      if (p.type === 'select' || p.type === 'confirm') {
-        const opts = p.type === 'confirm' ? ['yes', 'no'] : (p.options ?? []);
-        const hint = opts.map(o => def !== undefined && o.toLowerCase() === def.toLowerCase() ? o.toUpperCase() : o).join('/');
-        const raw  = (await rl.question(`${p.label} [${hint}] `)).trim();
-        if (!raw) return def ?? '';
-        return opts.find(o => o.toLowerCase().startsWith(raw.toLowerCase())) ?? def ?? raw;
-      }
-      const suffix = def !== undefined ? ` [${def}] ` : ' ';
-      return (await rl.question(`${p.label}${suffix}`)).trim() || def || '';
-    }
-    const suffix = defaultValue !== undefined ? ` [${defaultValue}] ` : ' ';
-    const answer = await rl.question(`${p}${suffix}`);
-    return answer.trim() || defaultValue || '';
-  }) as PromptFn;
-
-  // ── Single-turn ──────────────────────────────────────────────────────────────
-  if (argPrompt !== undefined) {
-    try {
-      await runTurn(session, argPrompt, cliRun, providerConfig.name, principal, stdinPrompt);
-    } finally {
-      rl.close();
-      await teardownPlugins();
-      await activeStorageBackend?.close?.();
-    }
-    return;
-  }
-
-  // ── Interactive REPL ─────────────────────────────────────────────────────────
-  try {
-    for (;;) {
-      let line: string;
-      try {
-        line = await rl.question('you: ');
-      } catch {
-        break;  // Ctrl+D / EOF
-      }
-      if (!line.trim()) continue;
-      process.stderr.write('assistant: ');
-      session = await runTurn(session, line, cliRun, providerConfig.name, principal, stdinPrompt);
-    }
-  } finally {
-    rl.close();
-    await teardownPlugins();
-    await activeStorageBackend?.close?.();
-  }
-
-  if (!isEphemeral) {
-    process.stderr.write(
-      `\nTo resume: matbot --provider ${providerName} --session ${session.id}\n`
-    );
-  }
 }
 
 const invokedEntry = process.argv[1] === undefined ? undefined : pathToFileURL(path.resolve(process.argv[1])).href;

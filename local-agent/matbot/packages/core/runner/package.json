@@ -1,6 +1,9 @@
 {
   "name": "@matatbread/matbot-core",
-  "matbotRuntime": ["node", "browser"],
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
   "version": "0.1.0",
   "type": "module",
   "exports": {
@@ -10,7 +13,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-plugin-api": "workspace:*"
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-model-consultation": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:"

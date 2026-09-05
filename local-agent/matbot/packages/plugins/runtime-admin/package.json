@@ -1,0 +1,35 @@
+{
+  "name": "@matatbread/matbot-runtime-admin",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
+  "exports": {
+    ".": {
+      "browser": "./src/browser.ts",
+      "default": "./src/index.ts"
+    },
+    "./plugin": "./src/plugin.ts",
+    "./provider": "./src/provider.ts",
+    "./browser-types": "./src/browser-types.ts",
+    "./browser-provider": "./src/browser-provider.ts",
+    "./browser": "./src/browser.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-core": "workspace:*",
+    "@matatbread/matbot-plugin-materialization-node": "workspace:*",
+    "@matatbread/matbot-browser": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*",
+    "@matatbread/matbot-config": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  }
+}

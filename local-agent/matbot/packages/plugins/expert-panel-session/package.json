@@ -1,0 +1,21 @@
+{
+  "name": "@matatbread/matbot-expert-panel-session",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-core": "workspace:*",
+    "@matatbread/matbot-session-titler": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

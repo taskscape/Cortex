@@ -1,17 +1,22 @@
 {
   "name": "@matatbread/matbot-tool-workspace",
-  "matbotRuntime": ["node", "browser"],
+  "matbotRuntime": [
+    "node",
+    "browser"
+  ],
   "version": "0.1.0",
   "description": "Read, write, and list files in the session workspace. When the web frontend is running, all workspace files are also served as static read-only downloads at /workspace/<path> on the HTTP server, so you can give the user a direct link to any file you write there.",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./attachments": "./src/attachments.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-plugin-api": "workspace:*"
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-capabilities-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

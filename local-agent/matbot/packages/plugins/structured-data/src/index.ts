@@ -1,3 +1,5 @@
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
 /**
  * Structured-data plugin: a governed semantic data catalog (connections,
  * tables, columns, metrics), deterministic read-only SQL planning with
@@ -1211,6 +1213,7 @@ export const plugin: MatbotPluginSpec = {
     description: 'Registers DataCatalog, SqlPlanner, and structured_data_action for governed semantic SQL planning and read-only Postgres execution.',
   },
   async setup(services: MatbotMachine) {
+    services.contributions?.register('webui','sql',uiContribution);
     const catalog = createDataCatalog(services);
     const planner = createSqlPlanner(services, catalog);
     await services.register('DataCatalog', catalog);

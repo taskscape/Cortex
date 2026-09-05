@@ -1,3 +1,10 @@
+import type {ContributionRegistry} from '@matatbread/matbot-plugin-api';
+import type {} from '@matatbread/matbot-capabilities-types';
+import {ExpertSessionService,ExpertSessionError} from '@matatbread/matbot-expert-panel-session';
+import {prepareWorkspaceAttachments} from '@matatbread/matbot-tool-workspace/attachments';
+import type { WorkspaceManager, WorkspaceSummary } from '@matatbread/matbot-workspace-manager-types';
+export type { WorkspaceManager, WorkspaceSummary } from '@matatbread/matbot-workspace-manager-types';
+import { invokeToolEvents } from '@matatbread/matbot-core';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type {
@@ -58,6 +65,12 @@ export function parseWebBranding(raw = process.env['CORTEX_WEBUI_BRANDING_JSON']
 
 /** Dependencies injected into the HTTP+SSE chat server. */
 export interface WebServerDeps {
+  listProviders?: () => {name:string}[];
+  contributions?:ContributionRegistry;
+  attachments?: () => import('@matatbread/matbot-tool-workspace/attachments').AttachmentResolver | undefined;
+  expertSessions?: () => ExpertSessionService | undefined;
+  invokeTool?: (tool: import('@matatbread/matbot-plugin-api').Tool, input: unknown, ctx: import('@matatbread/matbot-plugin-api').ToolContext) => AsyncIterable<import('@matatbread/matbot-plugin-api').ToolEvent>;
+
   store:          Store<Session>;
   /** Per-session turn serialiser — submits queue instead of running concurrently. */
   run:            SessionRunner;
@@ -83,6 +96,7 @@ export interface WebServerDeps {
    *  so the old process reports the new workspace while still serving the old one's sessions. */
   runtime?:       { id: string; workspace?: string };
   workspaceManager?: WorkspaceManager;
+  getWorkspaceManager?:()=>WorkspaceManager|undefined;
   workspaceRagManager?: () => WorkspaceRagManager | undefined;
   /** Resolved per call, like {@link skills} — the titler plugin may load in any order, or not at all. */
   sessionTitler?: () => SessionTitler | undefined;
@@ -92,53 +106,10 @@ export interface WebServerDeps {
   branding?: WebBranding;
 }
 
-/** Summary of one workspace as reported by the workspace manager. */
-export interface WorkspaceSummary {
-  /** Workspace id. */
-  id:         string;
-  /** Human-readable workspace name. */
-  name:       string;
-  /** Path of the workspace's matbot.yaml. */
-  configPath: string;
-  /** ISO creation timestamp. */
-  createdAt:  string;
-  /** ISO last-modified timestamp. */
-  updatedAt:  string;
-  /** Whether this is the currently active workspace. */
-  active:     boolean;
-}
-
 /** Structural view of the session-titler plugin's service — kept local so frontend-web carries no
  *  dependency on an optional plugin (same treatment as {@link WorkspaceRagManager}). */
 export interface SessionTitler {
   titleSession(input: { sessionId: string; provider: string; signal?: AbortSignal }): Promise<string | undefined>;
-}
-
-/** Lifecycle operations over the set of workspaces (create/rename/delete/switch). */
-export interface WorkspaceManager {
-  /** Returns the active workspace summary.
-   * @returns The current {@link WorkspaceSummary}. */
-  current(): Promise<WorkspaceSummary>;
-  /** Lists all workspaces with the active id.
-   * @returns Active id plus all workspace summaries. */
-  list(): Promise<{ active: string; workspaces: WorkspaceSummary[] }>;
-  /** Creates a new workspace.
-   * @param name Workspace name.
-   * @returns The created workspace summary. */
-  create(name: string): Promise<WorkspaceSummary>;
-  /** Renames a workspace.
-   * @param id Workspace id.
-   * @param name New name.
-   * @returns The updated workspace summary. */
-  rename(id: string, name: string): Promise<WorkspaceSummary>;
-  /** Deletes an inactive workspace.
-   * @param id Workspace id.
-   * @returns The deleted workspace's id. */
-  delete(id: string): Promise<{ id: string; deleted: true }>;
-  /** Switches the active workspace (may restart the process).
-   * @param id Workspace id to activate.
-   * @returns The new active id and whether a restart is pending. */
-  switch(id: string): Promise<{ active: string; restarting: boolean }>;
 }
 
 /** Indexing lock state for a workspace's RAG pipeline. */
@@ -204,7 +175,7 @@ interface WorkspaceAttachment {
   path:      string;
 }
 
-const MAX_WORKSPACE_ATTACHMENTS = 20;
+
 
 interface DirectToolContextSpec {
   provider?:  string;
@@ -215,16 +186,6 @@ interface DirectToolInvocation {
   input:      unknown;
   session?:   Session;
   provider?:  string;
-}
-
-interface ExpertPanelSubmitBody {
-  question:               string;
-  provider:               string;
-  experts?:               string[];
-  mode?:                  'parallel' | 'review' | 'debate';
-  synthesize?:            boolean;
-  maxCitationsPerExpert?: number;
-  traceId?:               string;
 }
 
 // How long a connection that is still mid-request may hold up `close()` before it is cut. Long enough
@@ -347,57 +308,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function prepareWorkspaceAttachments(
-  files: FileStore | undefined,
-  rawAttachments: unknown,
-): Promise<{ refs: MessageContent[]; ephemeral: MessageContent[] }> {
-  if (rawAttachments === undefined) return { refs: [], ephemeral: [] };
-  if (!Array.isArray(rawAttachments)) throw new Error('"attachments" must be an array.');
-  if (rawAttachments.length > MAX_WORKSPACE_ATTACHMENTS) {
-    throw new Error(`A message can attach at most ${MAX_WORKSPACE_ATTACHMENTS} workspace files.`);
-  }
-  if (rawAttachments.length > 0 && files === undefined) {
-    throw new Error('Workspace file attachments are unavailable because no file store is configured.');
-  }
-
-  const refs: MessageContent[] = [];
-  const paths = new Set<string>();
-  for (const raw of rawAttachments) {
-    if (!isRecord(raw) || raw.namespace !== 'workspace' || typeof raw.path !== 'string') {
-      throw new Error('Each attachment must identify a workspace file with { namespace: "workspace", path }.');
-    }
-    const path = raw.path;
-    if (!path.trim() || path.length > 1024) throw new Error('Attachment paths must contain 1 to 1024 characters.');
-    if (paths.has(path)) continue;
-    paths.add(path);
-
-    const handle = await files!.getByName(path, 'workspace');
-    if (!handle) throw new Error(`Workspace attachment not found: ${JSON.stringify(path)}.`);
-    refs.push({ type: 'file-ref', fileId: handle.id, name: handle.name, mimeType: handle.mimeType });
-  }
-
-  if (refs.length === 0) return { refs, ephemeral: [] };
-  const calls = refs.map(ref => {
-    const name = (ref as Extract<MessageContent, { type: 'file-ref' }>).name;
-    return `- ${JSON.stringify(name)}: workspace_action ${JSON.stringify({ action: 'read', path: name })}`;
-  });
-  return {
-    refs,
-    ephemeral: [{
-      type: 'text',
-      origin: 'robo',
-      text: [
-        '[Explicit Cortex Files attachments]',
-        'The user explicitly attached the workspace files listed below to this message.',
-        'Read them with workspace_action using each exact path. They are imported workspace files, not host filesystem paths.',
-        'Prefer these attachments over same-named paths from Workspace RAG or other retrieved context. Do not use file_broker_action for these attachments.',
-        ...calls,
-        '[End explicit Cortex Files attachments]',
-      ].join('\n'),
-    }],
-  };
-}
-
 // The single interactive prompt implementation is the SSE round-trip built per-submit (see the
 // `/sessions/:id/submit` handler): it parks on `pendingPrompts` and is answered via
 // `POST /sessions/:id/prompt`. The direct tool-invocation endpoints (`/tools/:name`,
@@ -412,116 +322,6 @@ const nonInteractivePrompt: PromptFn = ((p: string | FormField, def?: string) =>
     ? Promise.resolve(fallback)
     : Promise.reject(new Error(`Non-interactive context (use /submit for interactive prompts): "${typeof p === 'string' ? p : p.label}"`));
 }) as PromptFn;
-
-function normaliseExpertPanelSubmitBody(value: unknown): { ok: true; body: ExpertPanelSubmitBody } | { ok: false; error: string } {
-  if (!isRecord(value)) return { ok: false, error: 'Request body must be an object.' };
-
-  const question = typeof value.question === 'string' ? value.question.trim() : '';
-  if (!question) return { ok: false, error: '"question" is required.' };
-
-  const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
-  if (!provider) return { ok: false, error: '"provider" is required.' };
-
-  const mode = value.mode === 'review' || value.mode === 'debate' || value.mode === 'parallel'
-    ? value.mode
-    : 'parallel';
-
-  let experts: string[] | undefined;
-  if (Object.prototype.hasOwnProperty.call(value, 'experts')) {
-    if (!Array.isArray(value.experts)) return { ok: false, error: '"experts" must be an array of expert ids.' };
-    experts = value.experts
-      .filter((item): item is string => typeof item === 'string')
-      .map(item => item.trim())
-      .filter(Boolean);
-  }
-
-  const maxCitationsPerExpert = typeof value.maxCitationsPerExpert === 'number'
-    ? value.maxCitationsPerExpert
-    : undefined;
-
-  return {
-    ok: true,
-    body: {
-      question,
-      provider,
-      mode,
-      ...(experts !== undefined ? { experts } : {}),
-      ...(typeof value.synthesize === 'boolean' ? { synthesize: value.synthesize } : {}),
-      ...(maxCitationsPerExpert !== undefined ? { maxCitationsPerExpert } : {}),
-      ...(typeof value.traceId === 'string' && value.traceId.trim() ? { traceId: value.traceId.trim() } : {}),
-    },
-  };
-}
-
-function expertUserSummary(question: string, selected: readonly string[] | undefined, mode: string, synthesize: boolean): string {
-  return [
-    `Expert panel (${mode})`,
-    `Experts: ${selected && selected.length ? selected.join(', ') : 'all'}`,
-    `Synthesize decision: ${synthesize ? 'yes' : 'no'}`,
-    '',
-    question,
-  ].join('\n');
-}
-
-function textValue(value: unknown, fallback = ''): string {
-  return typeof value === 'string' ? value : fallback;
-}
-
-function formatExpertPanelResult(result: unknown): string {
-  const record = isRecord(result) ? result : {};
-  const lines = [
-    '## Expert panel',
-    `Mode: ${textValue(record.mode, 'parallel')}`,
-  ];
-
-  const opinions = Array.isArray(record.experts) ? record.experts : [];
-  for (const rawOpinion of opinions) {
-    const opinion = isRecord(rawOpinion) ? rawOpinion : {};
-    lines.push('', `### ${textValue(opinion.title, textValue(opinion.expertId, 'Expert'))}`, textValue(opinion.answer, '(No answer returned.)'));
-    const citations = Array.isArray(opinion.citations) ? opinion.citations : [];
-    if (citations.length) {
-      lines.push('', 'Citations:');
-      for (const rawCitation of citations) {
-        const citation = isRecord(rawCitation) ? rawCitation : {};
-        const title = textValue(citation.title, textValue(citation.id, textValue(citation.path, 'source')));
-        const path = typeof citation.path === 'string' && citation.path ? ` - ${citation.path}` : '';
-        lines.push(`- ${title}${path}`);
-      }
-    }
-  }
-
-  if (typeof record.synthesis === 'string' && record.synthesis) {
-    lines.push('', '### Synthesis', record.synthesis);
-  }
-
-  if (!opinions.length && !record.synthesis) {
-    lines.push('', 'No expert response was returned.');
-  }
-
-  return lines.join('\n');
-}
-
-function expertPanelUsage(result: unknown): { inputTokens: number; outputTokens: number } | null {
-  const record = isRecord(result) ? result : {};
-  const opinions = Array.isArray(record.experts) ? record.experts : [];
-  let inputTokens = 0;
-  let outputTokens = 0;
-
-  for (const rawOpinion of opinions) {
-    const opinion = isRecord(rawOpinion) ? rawOpinion : {};
-    const usage = isRecord(opinion.usage) ? opinion.usage : {};
-    if (typeof usage.inputTokens === 'number') inputTokens += usage.inputTokens;
-    if (typeof usage.outputTokens === 'number') outputTokens += usage.outputTokens;
-  }
-
-  return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
-}
-
-function titleFromQuestion(question: string): string | undefined {
-  const words = question.trim().split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
-  if (!words) return undefined;
-  return words.length > 60 ? `${words.slice(0, 60)}...` : words;
-}
 
 /**
  * Creates the HTTP + SSE chat server.
@@ -556,7 +356,8 @@ export function createWebServer(deps: WebServerDeps) {
   const busyTrackers = new Set<string>();
   // Expert-panel composer submissions persist their own messages outside the model runner. Keep them
   // single-writer per session so they do not interleave with another forced panel run.
-  const expertPanelBusySessions = new Set<string>();
+  const fallbackExpertSessions = new ExpertSessionService({store:deps.store,run:deps.run,resolve:name=>deps.tools?.resolve(name)??null,invoke:deps.invokeTool??invokeToolEvents,...(deps.sessionTitler?{titleSession:(input:{sessionId:string;provider:string})=>deps.sessionTitler?.()?.titleSession(input)??Promise.resolve()}: {})});
+  const expertSessions=()=>deps.expertSessions?deps.expertSessions():fallbackExpertSessions;
   // session ID → the parked prompt's settlers. `resolve` delivers an answer (applying the default
   // fallback); `cancel` rejects it with PromptCancelledError — the "give up" path.
   const pendingPrompts = new Map<string, { resolve: (answer: string) => void; cancel: () => void }>();
@@ -636,8 +437,10 @@ export function createWebServer(deps: WebServerDeps) {
   }
 
   async function workspaceDeleteReadiness(workspaceId: string): Promise<WorkspaceDeleteReadiness> {
-    if (!deps.workspaceManager) return { canDelete: false, locked: false, reason: 'Workspace manager unavailable.' };
-    const state = await deps.workspaceManager.list();
+    const workspaceManager=deps.getWorkspaceManager?deps.getWorkspaceManager():deps.workspaceManager;
+    if (!workspaceManager) return { canDelete: false, locked: false, reason: 'Workspace manager unavailable.' };
+    if (workspaceManager.deleteCheck) return workspaceManager.deleteCheck(workspaceId);
+    const state = await workspaceManager.list();
     const workspace = state.workspaces.find(item => item.id === workspaceId);
     if (!workspace) return { canDelete: false, locked: false, reason: `Unknown workspace "${workspaceId}".` };
     if (workspace.active || state.active === workspaceId) {
@@ -764,27 +567,6 @@ export function createWebServer(deps: WebServerDeps) {
     return { ok: true, invocation };
   }
 
-  async function appendSessionMessages(
-    sessionId: string,
-    messages: readonly Message[],
-    shapeSession?: (session: Session) => Session,
-  ): Promise<Session | null> {
-    // Never bypass CAS on a shared session document: a contended append retries with randomized
-    // backoff and then fails the request with 409 instead of dropping concurrent messages.
-    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
-      const current = await deps.store.get(sessionId);
-      if (!current) return null;
-      const shaped = shapeSession ? shapeSession(current) : current;
-      const next = messages.reduce((session, message) => appendMessage(session, message), shaped);
-      const saved = await deps.store.cas(sessionId, current.version, next);
-      if (saved.ok) return saved.doc;
-      // Exponential start, clamped so the whole retry window stays sub-second.
-      await sleep(Math.min(2 ** attempt * 5, 50) + Math.random() * 10);
-    }
-
-    throw new SessionConflictError(sessionId);
-  }
-
   function static200(res: ServerResponse, contentType: string, path: string) {
     return async () => {
       const body = await readFile(new URL(path, import.meta.url), "utf-8");
@@ -802,9 +584,21 @@ export function createWebServer(deps: WebServerDeps) {
     }
 
     // --- Static UI ---
+    if(method==='GET'&&url==='/ui/contributions'){
+      const rows=deps.contributions?.list('webui');
+      json(res,200,rows?rows.map(({id,owner,value})=>({id,owner,...value})):[]);return;
+    }
+    const routes=deps.contributions?.list('http').filter(row=>row.value.method===method&&row.value.path===url)??[];
+    if(routes.length>1){json(res,503,{error:'Conflicting plugin routes'});return;}
+    if(routes.length){const route=routes[0]!;const ac=new AbortController();req.once('aborted',()=>ac.abort());let body:unknown;
+      if(method!=='GET'){try{body=JSON.parse(await readBody(req));}catch{json(res,400,{error:'Invalid JSON'});return;}}
+      try{const ctx=makeToolCtx(ac,principal);ctx.signal=AbortSignal.any([ac.signal,route.signal]);ctx.signal.throwIfAborted();const response=await route.value.handle({body,context:ctx,url});json(res,response.status,response.body);}finally{ac.abort();}return;
+    }
     const staticRoutes: Record<string, () => Promise<void>> = {
       '/': static200(res, 'text/html; charset=utf-8', "../static/index.html"),
       '/index.html': static200(res, 'text/html; charset=utf-8', "../static/index.html"),
+      '/feature-runtime.js':static200(res,'application/javascript; charset=utf-8','../static/feature-runtime.js'),
+      '/feature-fallbacks.js':static200(res,'application/javascript; charset=utf-8','../static/feature-fallbacks.js'),
       '/app.js': static200(res, 'application/javascript; charset=utf-8', "../static/app.js"),
       '/http-transport.js': static200(res, 'application/javascript; charset=utf-8', "../static/http-transport.js"),
       '/favicon.ico': static200(res, 'image/svg+xml', "../static/favicon.svg"),
@@ -820,52 +614,71 @@ export function createWebServer(deps: WebServerDeps) {
     // if (method === 'GET' && url === '/http-transport.js') { static200(res, 'application/javascript; charset=utf-8', await httpTransport()); return; }
     // if (method === 'GET' && url === '/favicon.ico') { static200(res, 'image/svg+xml', await favicon()); return; }
 
+    // Read-only conversation metadata is independent of optional administration tools.
+    if(method==='GET'&&url==='/providers'){json(res,200,{providers:deps.listProviders?.()??[]});return;}
+
     // --- GET /health ---
     if (method === 'GET' && url === '/health') {
       json(res, 200, { status: 'ok' }); return;
     }
 
+    const workspaceManager=deps.getWorkspaceManager?deps.getWorkspaceManager():deps.workspaceManager;
+    if(deps.contributions&&url.startsWith('/workspaces')){
+      const match=/^\/workspaces(?:\/([^/]+)(?:\/(delete-check|rename|switch))?)?$/.exec(url);
+      if(match){let action:string|undefined;let body:Record<string,unknown>={};const id=match[1]?decodeURIComponent(match[1]):undefined;
+        if(method==='GET')action=id?(match[2]==='delete-check'?'delete_check':undefined):'list';
+        if(method==='POST')action=id?(match[2]==='rename'?'rename':match[2]==='switch'?'switch':undefined):'create';
+        if(method==='DELETE'&&id&&!match[2])action='delete';
+        if(action){if(method==='POST'&&action!=='switch'){try{body=JSON.parse(await readBody(req)) as Record<string,unknown>;}catch{json(res,400,{error:'Invalid JSON'});return;}}
+          const tool=deps.tools?.resolve('workspace_admin_action');if(!tool){json(res,404,{error:'Workspace administration unavailable'});return;}
+          const ac=new AbortController();req.once('aborted',()=>ac.abort());try{for await(const event of (deps.invokeTool??invokeToolEvents)(tool,{action,...(id?{id}:{}),...(body.name!==undefined?{name:body.name}:{})},makeToolCtx(ac,principal))){
+            if(event.type==='error'){json(res,event.code==='permission_denied'?403:event.code==='approval_required'?409:400,{error:event.message,code:event.code});return;}
+            if(event.type==='result'){const result=event.value as Record<string,unknown>;const status=action==='delete_check'&&result.canDelete===false?(result.locked?409:400):action==='create'?201:200;json(res,status,action==='list'?{...result,...(deps.runtime?{runtime:deps.runtime}:{})}:result);return;}
+          }}finally{ac.abort();}json(res,500,{error:'Workspace administration returned no result'});return;
+        }
+      }
+    }
     if (method === 'GET' && url === '/workspaces') {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
-      json(res, 200, { ...await deps.workspaceManager.list(), ...(deps.runtime !== undefined ? { runtime: deps.runtime } : {}) }); return;
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      json(res, 200, { ...await workspaceManager.list(), ...(deps.runtime !== undefined ? { runtime: deps.runtime } : {}) }); return;
     }
 
     const workspaceDeleteCheck = /^\/workspaces\/([^/]+)\/delete-check$/.exec(url);
     if (method === 'GET' && workspaceDeleteCheck) {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       const readiness = await workspaceDeleteReadiness(decodeURIComponent(workspaceDeleteCheck[1]!));
       json(res, readiness.canDelete ? 200 : (readiness.locked ? 409 : 400), readiness);
       return;
     }
 
     if (method === 'POST' && url === '/workspaces') {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       let body: { name?: unknown };
       try { body = JSON.parse(await readBody(req)) as { name?: unknown }; }
       catch (e) { json(res, 400, { error: String(e) }); return; }
       if (typeof body.name !== 'string') { json(res, 400, { error: 'Workspace name is required' }); return; }
-      json(res, 201, await deps.workspaceManager.create(body.name)); return;
+      json(res, 201, await workspaceManager.create(body.name)); return;
     }
 
     const workspaceRename = /^\/workspaces\/([^/]+)\/rename$/.exec(url);
     if (method === 'POST' && workspaceRename) {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       let body: { name?: unknown };
       try { body = JSON.parse(await readBody(req)) as { name?: unknown }; }
       catch (e) { json(res, 400, { error: String(e) }); return; }
       if (typeof body.name !== 'string') { json(res, 400, { error: 'Workspace name is required' }); return; }
-      json(res, 200, await deps.workspaceManager.rename(decodeURIComponent(workspaceRename[1]!), body.name)); return;
+      json(res, 200, await workspaceManager.rename(decodeURIComponent(workspaceRename[1]!), body.name)); return;
     }
 
     const workspaceSwitch = /^\/workspaces\/([^/]+)\/switch$/.exec(url);
     if (method === 'POST' && workspaceSwitch) {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
-      json(res, 200, await deps.workspaceManager.switch(decodeURIComponent(workspaceSwitch[1]!))); return;
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      json(res, 200, await workspaceManager.switch(decodeURIComponent(workspaceSwitch[1]!))); return;
     }
 
     const workspaceDelete = /^\/workspaces\/([^/]+)$/.exec(url);
     if (method === 'DELETE' && workspaceDelete) {
-      if (!deps.workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
+      if (!workspaceManager) { json(res, 404, { error: 'Workspace manager unavailable' }); return; }
       try {
         const workspaceId = decodeURIComponent(workspaceDelete[1]!);
         const readiness = await workspaceDeleteReadiness(workspaceId);
@@ -873,7 +686,7 @@ export function createWebServer(deps: WebServerDeps) {
           json(res, readiness.locked ? 409 : 400, readiness);
           return;
         }
-        json(res, 200, await deps.workspaceManager.delete(workspaceId));
+        json(res, 200, await workspaceManager.delete(workspaceId));
       } catch (error) {
         json(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -936,7 +749,7 @@ export function createWebServer(deps: WebServerDeps) {
       const targetId  = body.sessionId ?? sessionId;
       const session   = await deps.store.get(targetId);
       if (!session) { json(res, 404, { error: 'Session not found' }); return; }
-      if (expertPanelBusySessions.has(targetId)) {
+      if (expertSessions()?.busy(targetId)) {
         json(res, 409, { error: 'Session is busy running an expert panel.' }); return;
       }
 
@@ -947,7 +760,8 @@ export function createWebServer(deps: WebServerDeps) {
       // mid-turn submit queues behind the running turn instead of clobbering session state.
       let preparedAttachments: Awaited<ReturnType<typeof prepareWorkspaceAttachments>>;
       try {
-        preparedAttachments = await prepareWorkspaceAttachments(deps.files, body.attachments);
+        const resolver=deps.attachments?.();if(deps.attachments&&!resolver&&Array.isArray(body.attachments)&&body.attachments.length)throw new Error('Attachment resolver unavailable');
+        preparedAttachments = await (resolver?.resolve ?? prepareWorkspaceAttachments)(deps.files, body.attachments);
       } catch (error) {
         json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         return;
@@ -1044,125 +858,10 @@ export function createWebServer(deps: WebServerDeps) {
       try { parsed = raw ? JSON.parse(raw) : {}; }
       catch { json(res, 400, { error: 'Invalid JSON' }); return; }
 
-      const normalised = normaliseExpertPanelSubmitBody(parsed);
-      if (!normalised.ok) { json(res, 400, { error: normalised.error }); return; }
-
-      const body = normalised.body;
-      const session = await deps.store.get(sessionId);
-      if (!session) { json(res, 404, { error: 'Session not found' }); return; }
-      if (deps.run.status(sessionId).busy || expertPanelBusySessions.has(sessionId)) {
-        json(res, 409, { error: 'Session is busy.' }); return;
-      }
-
-      const tool = deps.tools?.resolve('expert_panel');
-      if (!tool) { json(res, 404, { error: 'Tool "expert_panel" not found' }); return; }
-
-      const traceId = body.traceId ?? crypto.randomUUID();
-      const synthesize = body.synthesize !== false;
-      const selectedExperts = body.experts?.length ? body.experts : undefined;
-      const input = {
-        action: 'ask',
-        question: body.question,
-        mode: body.mode ?? 'parallel',
-        synthesize,
-        maxCitationsPerExpert: body.maxCitationsPerExpert ?? 5,
-        ...(selectedExperts !== undefined ? { experts: selectedExperts } : {}),
-      };
-      const userContent: MessageContent[] = [{
-        type: 'text',
-        text: expertUserSummary(body.question, selectedExperts, input.mode, synthesize),
-      }];
-      const userMessage = createMessage({
-        role: 'user',
-        content: userContent,
-        traceId,
-        providerName: body.provider,
-        metadata: { expertPanel: { mode: input.mode, synthesize, experts: selectedExperts ?? 'all' } },
-      });
-
-      expertPanelBusySessions.add(sessionId);
-      const ac = new AbortController();
-      req.on('aborted', () => ac.abort());
-
-      try {
-        let committed = await appendSessionMessages(sessionId, [userMessage], current => {
-          if (current.title || current.messages.some(message => message.role === 'user')) return current;
-          const title = titleFromQuestion(body.question);
-          return title ? { ...current, title } : current;
-        });
-        if (!committed) { json(res, 404, { error: 'Session not found' }); return; }
-
-        sendToSession(sessionId, sseEvent('queued', {
-          type: 'queued',
-          content: userContent,
-          queued: 0,
-          concatQueue: false,
-          traceId,
-          rootTraceId: traceId,
-        }));
-
-        let result: unknown;
-        let errorMessage: string | undefined;
-        const markers: MessageContent[] = [];
-        let stdout = '';
-        let stderr = '';
-
-        try {
-          for await (const ev of tool.executor.execute(input, makeToolCtx(ac, principal, { session: committed, provider: body.provider }))) {
-            if (ev.type === 'result') result = ev.value;
-            else if (ev.type === 'stdout') stdout += ev.chunk;
-            else if (ev.type === 'stderr') stderr += ev.chunk;
-            else if (ev.type === 'marker') markers.push({ type: 'marker', creator: ev.creator, data: ev.data });
-            else if (ev.type === 'error') errorMessage = ev.message;
-          }
-        } catch (e) {
-          errorMessage = e instanceof Error ? e.message : String(e);
-        }
-
-        const assistantText = errorMessage
-          ? `Expert panel failed: ${errorMessage}`
-          : formatExpertPanelResult(result);
-        const assistantMessage = createMessage({
-          role: 'assistant',
-          content: [{ type: 'text', text: assistantText }],
-          traceId,
-          providerName: body.provider,
-          metadata: { expertPanel: { result, ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) } },
-        });
-
-        const messagesToAppend: Message[] = [];
-        if (markers.length > 0) {
-          messagesToAppend.push(createMessage({ role: 'marker', content: markers, traceId }));
-        }
-        messagesToAppend.push(assistantMessage);
-
-        committed = await appendSessionMessages(sessionId, messagesToAppend);
-        if (!committed) { json(res, 404, { error: 'Session not found' }); return; }
-
-        if (markers.length > 0) {
-          sendToSession(sessionId, sseEvent('marker', { type: 'marker', content: markers, traceId }));
-        }
-        sendToSession(sessionId, sseEvent('text-delta', { type: 'text-delta', delta: assistantText, traceId }));
-        const usage = expertPanelUsage(result);
-        if (usage) sendToSession(sessionId, sseEvent('usage', { type: 'usage', ...usage, traceId }));
-        sendToSession(sessionId, sseEvent('done', { type: 'done', session: committed, traceId }));
-
-        // This path commits messages itself instead of going through the pump, so no `followup` hook
-        // runs and nothing would name the session beyond the truncation above. Fire-and-forget, after
-        // `done`, deliberately without `ac.signal` (the finally below aborts it): the client picks the
-        // new title up on its post-`done` refresh, so the response is not held up for a second call.
-        void deps.sessionTitler?.()?.titleSession({ sessionId, provider: body.provider }).catch(() => {});
-
-        json(res, 200, {
-          traceId,
-          session: committed,
-          ...(result !== undefined ? { result } : {}),
-          ...(errorMessage !== undefined ? { isError: true, error: errorMessage } : { isError: false }),
-        });
-      } finally {
-        expertPanelBusySessions.delete(sessionId);
-        ac.abort();
-      }
+      const ac=new AbortController();req.once('aborted',()=>ac.abort());
+      try {const service=expertSessions();if(!service){json(res,503,{error:'Expert session service unavailable'});return;}json(res,200,await service.submit(sessionId,parsed,makeToolCtx(ac,principal),event=>sendToSession(sessionId,sseEvent(event.type,event))));}
+      catch(error){if(error instanceof ExpertSessionError)json(res,error.status,{error:error.message});else throw error;}
+      finally{ac.abort();}
       return;
     }
 
@@ -1261,7 +960,7 @@ export function createWebServer(deps: WebServerDeps) {
       const markers: Array<{ creator: string; data: unknown }> = [];
       let sawNonResultEvent = false;
       try {
-        for await (const ev of tool.executor.execute(invocation.invocation.input, toolCtx)) {
+        for await (const ev of (deps.invokeTool ?? invokeToolEvents)(tool, invocation.invocation.input, toolCtx)) {
           if (ev.type === 'result') { json(res, 200, ev.value); return; }
           sawNonResultEvent = true;
           if (ev.type === 'stdout') { stdout += ev.chunk; }
@@ -1327,7 +1026,7 @@ export function createWebServer(deps: WebServerDeps) {
       res.write(sseComment('tool stream open'));
 
       try {
-        for await (const ev of tool.executor.execute(invocation.invocation.input, makeToolCtx(ac, principal, invocation.invocation))) {
+        for await (const ev of (deps.invokeTool ?? invokeToolEvents)(tool, invocation.invocation.input, makeToolCtx(ac, principal, invocation.invocation))) {
           if (!res.writable) break;
           res.write(sseEvent(ev.type, ev));
         }

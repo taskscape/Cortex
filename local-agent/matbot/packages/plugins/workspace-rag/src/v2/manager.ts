@@ -1,3 +1,5 @@
+import {filesystemSource,normalizedPath,isWithinRoot,discoveryPriority,errorCode} from './source-filesystem.js';
+import type {RagSourceAcquisition} from './source-filesystem.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -184,61 +186,26 @@ interface ActiveRun {
 
 type IngestionTrigger = RagV2Job['trigger'];
 
-function errorCode(error: unknown): string | undefined {
-  return error && typeof error === 'object' && 'code' in error
-    ? String((error as { code?: unknown }).code)
-    : undefined;
-}
 
-function discoveryError(target: string, error: unknown): Error {
-  const detail = error instanceof Error ? error.message : String(error);
-  return new Error(`Workspace RAG V2 could not completely discover ${target}: ${detail}`);
-}
+
+
 
 function now(): string {
   return new Date().toISOString();
 }
 
-function normalizedPath(value: string): string {
-  return path.resolve(value).replace(/\\/gu, '/');
-}
 
-const SKIPPABLE_ROOT_ERROR_CODES = new Set([
-  'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
-]);
+
+
 
 /** Files ingested concurrently when a bulk backlog is pending (adaptive mode). */
 const BULK_FILE_CONCURRENCY = 3;
 /** Adaptive mode tapers to sequential once this many files remain to process. */
 const FILE_CONCURRENCY_TAIL_FILES = 4;
 
-function isWithinRoot(filePath: string, root: string): boolean {
-  const relative = path.relative(root, filePath);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-}
 
-async function availableMarkdownRoots(paths: readonly string[]): Promise<{
-  paths: string[];
-  skippedPaths: string[];
-}> {
-  const available: string[] = [];
-  const skipped: string[] = [];
-  for (const configuredPath of paths) {
-    const root = path.resolve(configuredPath);
-    try {
-      const rootStat = await stat(root);
-      if (rootStat.isDirectory() || (rootStat.isFile() && root.toLocaleLowerCase().endsWith('.md'))) {
-        available.push(root);
-      } else {
-        skipped.push(root);
-      }
-    } catch (error) {
-      if (!SKIPPABLE_ROOT_ERROR_CODES.has(errorCode(error) ?? '')) throw discoveryError(root, error);
-      skipped.push(root);
-    }
-  }
-  return { paths: available, skippedPaths: skipped };
-}
+
+
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -275,113 +242,16 @@ async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function* discoverMarkdown(
-  paths: readonly string[],
-  signal: AbortSignal,
-  priority?: 'authority' | 'current' | 'archive',
-): AsyncGenerator<{
-  path: string;
-  size: number;
-  modifiedAt: string;
-}> {
-  const roots = [...paths].map(value => path.resolve(value));
-  const stack: Array<{ current: string; root: string; kind: 'root' | 'directory' | 'file' }> = roots
-    .slice()
-    .reverse()
-    .map(current => ({ current, root: current, kind: 'root' }));
-  while (stack.length > 0) {
-    if (signal.aborted) return;
-    const { current, root, kind } = stack.pop()!;
-    let currentStat;
-    try {
-      currentStat = await stat(current);
-    } catch (error) {
-      const code = errorCode(error);
-      if (kind === 'file' && code === 'ENOENT') continue;
-      if (kind === 'root' && code === 'ENOENT' && current.toLocaleLowerCase().endsWith('.md')) continue;
-      throw discoveryError(current, error);
-    }
-    if (currentStat.isFile()) {
-      if (current.toLocaleLowerCase().endsWith('.md')) {
-        const normalized = normalizedPath(current);
-        if (!priority || discoveryPriority(normalized) === priority) {
-          yield { path: normalized, size: currentStat.size, modifiedAt: currentStat.mtime.toISOString() };
-        }
-      }
-      continue;
-    }
-    if (!currentStat.isDirectory()) continue;
-    let entries;
-    try {
-      entries = (await readdir(current, { withFileTypes: true }))
-        .sort((left, right) => left.name.localeCompare(right.name));
-    } catch (error) {
-      throw discoveryError(current, error);
-    }
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index]!;
-      if (entry.isDirectory() && ['node_modules', '.git', '.data'].includes(entry.name)) continue;
-      if (entry.isDirectory() || (entry.isFile() && entry.name.toLocaleLowerCase().endsWith('.md'))) {
-        stack.push({
-          current: path.join(current, entry.name),
-          root,
-          kind: entry.isDirectory() ? 'directory' : 'file',
-        });
-      }
-    }
-  }
-}
+
 
 /**
  * Mirrors `discoverMarkdown` traversal without stat-ing every file, so ingestion knows the
  * denominator before it starts. Unreadable directories are skipped: an approximate total is
  * better than failing the count, and discovery reports the real error moments later.
  */
-async function countMarkdown(paths: readonly string[], signal: AbortSignal): Promise<number> {
-  const directories: string[] = [];
-  let files = 0;
-  for (const value of paths) {
-    const root = path.resolve(value);
-    let rootStat;
-    try {
-      rootStat = await stat(root);
-    } catch {
-      continue;
-    }
-    if (rootStat.isDirectory()) directories.push(root);
-    else if (rootStat.isFile() && root.toLocaleLowerCase().endsWith('.md')) files++;
-  }
-  while (directories.length > 0) {
-    if (signal.aborted) return files;
-    const current = directories.pop()!;
-    let entries;
-    try {
-      entries = await readdir(current, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (['node_modules', '.git', '.data'].includes(entry.name)) continue;
-        directories.push(path.join(current, entry.name));
-      } else if (entry.isFile() && entry.name.toLocaleLowerCase().endsWith('.md')) {
-        files++;
-      }
-    }
-  }
-  return files;
-}
 
-function discoveryPriority(filePath: string): 'authority' | 'current' | 'archive' {
-  const lower = filePath.toLocaleLowerCase();
-  if (/(?:^|\/)(?:authority|official|signed|approved|executed)(?:\/|$)/u.test(lower)) {
-    return 'authority';
-  }
-  if (/(?:^|\/)(?:archive|archived|history|old|obsolete)(?:\/|$)/u.test(lower)) {
-    return 'archive';
-  }
-  return 'current';
-}
+
+
 
 /**
  * The v2 RAG subsystem orchestrator: owns ingestion jobs (discovery,
@@ -439,6 +309,7 @@ export class WorkspaceRagV2Manager {
   private summaryCompleted = 0;
   private summaryFailed = 0;
   private initialized = false;
+  private readonly sourceAcquisition:RagSourceAcquisition;
 
   constructor(
     repository: RagV2Repository,
@@ -446,7 +317,9 @@ export class WorkspaceRagV2Manager {
     sourceBridge?: RagV2SourceBridge,
     semanticServices?: RagV2SemanticServices,
     gcObserver?: (event: RagV2GcEvent) => void | Promise<void>,
+    sourceAcquisition:RagSourceAcquisition=filesystemSource,
   ) {
+    this.sourceAcquisition=sourceAcquisition;
     this.repository = repository;
     this.embedder = embedder;
     this.sourceBridge = sourceBridge;
@@ -1137,7 +1010,7 @@ export class WorkspaceRagV2Manager {
       representativeSample: [],
     };
     const resumedAfter = options.resumeAfter ? normalizedPath(options.resumeAfter) : undefined;
-    for await (const file of discoverMarkdown(paths, signal)) {
+    for await (const file of this.sourceAcquisition.discoverMarkdown(paths, signal)) {
       if (resumedAfter && file.path.localeCompare(resumedAfter) <= 0) continue;
       if (signal.aborted) {
         result.complete = false;
@@ -1327,7 +1200,7 @@ export class WorkspaceRagV2Manager {
       job.updatedAt = now();
       await this.repository.updateJob(job);
     }
-    const rootSelection = await availableMarkdownRoots(context.paths);
+    const rootSelection = await this.sourceAcquisition.availableMarkdownRoots(context.paths);
     if (rootSelection.skippedPaths.length > 0) {
       job.skippedPaths = rootSelection.skippedPaths;
       job.message = `Skipping ${rootSelection.skippedPaths.length} unavailable configured path${rootSelection.skippedPaths.length === 1 ? '' : 's'} while indexing the remaining paths.`;
@@ -1349,7 +1222,7 @@ export class WorkspaceRagV2Manager {
       }
     }
     const indexContext: RagV2ContextRef = { ...context, paths: rootSelection.paths };
-    job.totalFiles = await countMarkdown(indexContext.paths, signal);
+    job.totalFiles = await this.sourceAcquisition.countMarkdown(indexContext.paths, signal);
     job.message = `Discovering ${job.totalFiles} Markdown file${job.totalFiles === 1 ? '' : 's'}.`;
     job.updatedAt = now();
     await this.repository.updateJob(job);
@@ -1370,7 +1243,7 @@ export class WorkspaceRagV2Manager {
         // sequential to preserve the authority -> current -> archive order,
         // and discovery only advances when a worker slot is free so a
         // concurrency of 1 keeps the exact sequential scan semantics.
-        const iterator = discoverMarkdown(indexContext.paths, signal, priority);
+        const iterator = this.sourceAcquisition.discoverMarkdown(indexContext.paths, signal, priority);
         const inflight = new Set<Promise<void>>();
         const failures: unknown[] = [];
         try {

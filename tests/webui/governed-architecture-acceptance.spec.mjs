@@ -71,8 +71,8 @@ test("AT-1 through AT-5 architecture tabs provide roving focus, native activatio
   await page.goto("/");
   await openArchitecturePanel(page, "sources");
 
-  const tabOrder = ["Sources", "SQL Preview", "Workflow Center", "Context Graph", "Reviews", "Evaluation & ROI", "Plugins"];
-  const hashOrder = ["sources", "sql", "workflows", "graph", "reviews", "evaluation", "plugins"];
+  const tabOrder = ["Sources", "SQL Preview", "Workflow Center", "Context Graph", "Reviews", "Evaluation & ROI", "Plugins", "Configuration", "Diagnostics"];
+  const hashOrder = ["sources", "sql", "workflows", "graph", "reviews", "evaluation", "plugins", "configuration", "diagnostics"];
   const sources = page.getByRole("tab", { name: "Sources" });
   await sources.focus();
   await expect(sources).toBeFocused();

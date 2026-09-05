@@ -38,8 +38,9 @@
     return { events, remaining };
   }
 
-  async function callTool(toolName, input) {
+  async function callTool(toolName, input, options = {}) {
     const res = await fetch('/tools/' + toolName, {
+      signal: options.signal,
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
@@ -255,6 +256,8 @@
 
   window.matbotTransport = {
     hostRuntime: 'node',
+    async listProviders(){const response=await fetch('/providers',{cache:'no-store'});if(!response.ok)throw new Error('Provider discovery failed: '+response.status);return response.json();},
+    async uiContributions(){const response=await fetch('/ui/contributions',{cache:'no-store'});if(response.ok)return response.json();if(response.status===404)return [];throw new Error('UI contribution discovery failed');},
     callTool, createSession, sessionBusy, submit, submitExpertPanel,
     sessionEvents, answerPrompt, abort, statusEvents, fileEvents, toolEvents, pluginEvents, skillEvents, openFile,
     listWorkspaces, createWorkspace, renameWorkspace, checkWorkspaceDelete, deleteWorkspace, switchWorkspace,

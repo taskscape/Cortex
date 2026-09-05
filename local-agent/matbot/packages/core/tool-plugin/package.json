@@ -1,6 +1,8 @@
 {
   "name": "@matatbread/matbot-tool-plugin",
-  "matbotRuntime": ["node"],
+  "matbotRuntime": [
+    "node"
+  ],
   "version": "0.1.0",
   "type": "module",
   "exports": {
@@ -10,8 +12,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@matatbread/matbot-core":       "workspace:*",
-    "@matatbread/matbot-plugin-api": "workspace:*"
+    "@matatbread/matbot-core": "workspace:*",
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-runtime-admin": "workspace:*",
+    "@matatbread/matbot-plugin-materialization-node": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

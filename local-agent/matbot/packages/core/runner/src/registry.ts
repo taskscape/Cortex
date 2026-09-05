@@ -1,3 +1,4 @@
+import {PluginContributions} from './contributions.js';
 import type { Tool, ToolRegistry, Hook, PromptFn, FormField, FrontendInfo, PluginRegistryEvent } from './types.js';
 import { createBroadcaster } from '@matatbread/matbot-plugin-api';
 import type {
@@ -12,12 +13,15 @@ import type { SettingsDoc } from './settings.js';
 // ── Internal state ────────────────────────────────────────────────────────────
 
 // Mutable arrays/maps held in a single object to make _resetRegistry() simple.
+const contributions = new PluginContributions();
 const state = {
   plugins:         [] as MatbotPlugin[],
+  lifetimes: new Map<string,AbortController>(),
   providers:       new Map<string, ProviderAdapterFactory>(),
   storage:         new Map<string, StoreFactory>(),
   toolRegistry:    undefined as ToolRegistry | undefined,
   frontendPlugins:  new Map<string, FrontendInfo>(),  // pluginName → info, written by services.registerFrontend()
+  serviceOwners: new Map<string, string>(),
   serviceKeys:     new Map<string, string[]>(),  // pluginName → MatbotMachine keys it registered
   hookPlugins:        new Set<string>(),         // plugins that registered at least one hook
   systemContextPlugins: new Set<string>(),       // plugins that registered a system-context contributor
@@ -270,6 +274,7 @@ export function recordServiceKey(pluginName: string, key: string): void {
   const keys = state.serviceKeys.get(pluginName) ?? [];
   if (!keys.includes(key)) keys.push(key);
   state.serviceKeys.set(pluginName, keys);
+  state.serviceOwners.set(key, pluginName);
 }
 
 /** Plugins that registered at least one hook in setup(). */
@@ -304,13 +309,14 @@ export function getSpecifierForPlugin(pluginName: string): string | undefined {
  */
 export async function setupPlugin(plugin: MatbotPlugin, services: MatbotMachine, prompt?: PromptFn): Promise<void> {
   state.toolRegistry ??= services.tools;
+  const lifetime=new AbortController();state.lifetimes.set(plugin.name,lifetime);
 
   // Single choke point for every plugin tool registration (static `plugin.tools` and in-setup
   // `services.tools.register`). Stamps ownership and resolves name collisions. The no-collision
   // path runs synchronously (an async fn yields nothing before its first await), so fire-and-forget
   // callers that don't await still get the tool registered in the same tick.
   const registerTool = async (tool: Tool): Promise<void> => {
-    const stamped: Tool = { ...tool, pluginName: plugin.name };
+    const stamped: Tool = { ...tool, pluginName: plugin.name,signal:lifetime.signal };
     const existing = services.tools.resolve(stamped.name);
     if (existing !== null && existing.pluginName !== plugin.name) {
       const overwrite = await resolveToolCollision(services, stamped.name, existing.pluginName, plugin.name, prompt);
@@ -342,6 +348,7 @@ export async function setupPlugin(plugin: MatbotPlugin, services: MatbotMachine,
   scoped = unifyServices({
     ...services,
     mounted: scopedMounted,
+    contributions: contributions.forOwner(plugin.name),
     settings: () => ownSettings,
     self: {
       name:      plugin.name,
@@ -366,10 +373,15 @@ export async function setupPlugin(plugin: MatbotPlugin, services: MatbotMachine,
       build:          (ctx)          => services.systemContext.build(ctx),
     },
     async register(key, svc) {
-      const keys = state.serviceKeys.get(plugin.name) ?? [];
-      keys.push(key as string);
-      state.serviceKeys.set(plugin.name, keys);
+      if(key==='ToolInvocationPolicy')throw new Error('Invocation policy is owned by the host');
       await services.register(key, svc);
+      recordServiceKey(plugin.name, key as string);
+    },
+    unregister(key) {
+      if (key === 'ToolInvocationPolicy') throw new Error('Invocation policy is owned by the host');
+      if (state.serviceOwners.get(key) !== plugin.name) throw new Error('Service is owned by another plugin: ' + key);
+      services.unregister(key);
+      state.serviceOwners.delete(key);
     },
     registerFrontend(info) {
       state.frontendPlugins.set(plugin.name, info);
@@ -390,12 +402,17 @@ export async function unloadPlugin(pluginName: string, services: MatbotMachine):
   // Note: all synchronous cleanup (removing tools, hooks, services) is done before any asynchronous teardown() calls, to ensure a consistent state even if teardown() fails or hangs.
   const plugin = state.plugins[idx]!;
 
+  state.lifetimes.get(pluginName)?.abort();state.lifetimes.delete(pluginName);
+  contributions.removeOwner(pluginName);
   services.tools.removeByPlugin(pluginName);
   services.hooks.removeByPlugin(pluginName);
   services.systemContext.removeByPlugin(pluginName);
 
   for (const key of state.serviceKeys.get(pluginName) ?? []) {
-    services.unregister(key);
+    if (state.serviceOwners.get(key) === pluginName) {
+      services.unregister(key);
+      state.serviceOwners.delete(key);
+    }
   }
   state.serviceKeys.delete(pluginName);
   state.hookPlugins.delete(pluginName);
@@ -425,6 +442,7 @@ export async function unloadPlugin(pluginName: string, services: MatbotMachine):
 /** Run each plugin's teardown() in reverse-registration order. Errors are logged, not thrown. */
 export async function teardownPlugins(): Promise<void> {
   const teardownOrder = [...state.plugins].reverse();
+  for(const plugin of teardownOrder){state.lifetimes.get(plugin.name)?.abort();contributions.removeOwner(plugin.name);}
   const results = await Promise.allSettled(teardownOrder.map(plugin => plugin.teardown?.()));
   results.forEach((result, i) => {
     if (result.status === 'rejected') {

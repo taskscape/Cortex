@@ -1,3 +1,7 @@
+import {settingsContributor,validateProviderPins} from '@matatbread/matbot-configuration-contributors';
+import type {} from '@matatbread/matbot-capabilities-types';
+import {uiContribution} from './ui.js';
+import type {} from '@matatbread/matbot-capabilities-types';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { MatbotPluginSpec, MatbotMachine, Store } from '@matatbread/matbot-plugin-api';
 import { SkillManager } from './manager.js';
@@ -49,6 +53,12 @@ export async function setupSkills(services: MatbotMachine): Promise<SkillManager
   // reacts only to future swaps. Ends with the manager (teardown aborts manager.signal).
   services.mounted.consume({ key: 'StorageBackend', signal: manager.signal }, () => void manager.load());
   await services.register('SkillManager', manager);
+  services.contributions?.register('webui','skills',uiContribution);
+  services.contributions?.register('configuration','skills',settingsContributor(services.settings(),{title:'Skill analysis',keys:['analysisProvider'],schema:{type:'object',properties:{analysisProvider:{type:'string'}}},validate:value=>validateProviderPins(value,['analysisProvider'],services.providers)}));
+  services.contributions?.register('retrieval','skills',{title:'Skills',scope:'workspace',async search(query){
+   query.signal.throwIfAborted();const terms=query.query.toLowerCase().split(/\s+/).filter(t=>t.length>1);
+   return manager.all().map(doc=>({doc,score:terms.filter(term=>(doc.name+' '+doc.content).toLowerCase().includes(term)).length})).filter(row=>row.score>0).sort((a,b)=>b.score-a.score).slice(0,query.limit).map(({doc})=>({id:doc.id,sourceId:'skills',workspaceId:query.workspaceId,content:doc.content,citation:{name:doc.name},knowledge:{id:doc.id,version:doc.version,entities:doc.knowledge?.entities??[doc.name],tags:doc.tags??[],summary:doc.knowledge?.summary??doc.name,content:doc.content,source:{type:'skill',uuid:doc.id},createdAt:doc.createdAt,updatedAt:doc.updatedAt}}));
+  }});
 
   services.tools.register(createSkillTool(manager));
   services.tools.register(createSkillsConfigTool(services));

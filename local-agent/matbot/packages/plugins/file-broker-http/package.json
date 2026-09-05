@@ -1,0 +1,21 @@
+{
+  "name": "@matatbread/matbot-file-broker-http",
+  "version": "0.1.0",
+  "type": "module",
+  "matbotRuntime": [
+    "node"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@local-agent/file-broker": "workspace:*",
+    "@matatbread/matbot-file-services-types": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@types/node": "catalog:"
+  }
+}

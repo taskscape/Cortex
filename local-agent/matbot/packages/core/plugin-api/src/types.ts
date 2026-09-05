@@ -613,7 +613,7 @@ export type ToolEvent =
   // marker. Independent of `result` — a tool may emit markers and no result (a silent side-effect,
   // e.g. a trigger-fired tool), a result and no markers, or both.
   | { type: 'marker';   creator: string; data: unknown }
-  | { type: 'error';    message: string; code?: number; stdout?: string; stderr?: string };
+  | { type: 'error';    message: string; code?: number | string; stdout?: string; stderr?: string };
 
 /**
  * Ask the user a question and resolve with their answer. The host supplies the
@@ -640,6 +640,8 @@ export interface PromptFn {
 }
 
 export interface ToolContext {
+  /** Set by the invocation gate after interactive consent, never copied from model input. */
+  approval?: { permission: string; patterns: readonly string[] };
   callId:      string;
   session:     Session;
   signal:      AbortSignal;
@@ -687,10 +689,14 @@ export interface ToolExecutor {
 export interface ToolPermissionDecl {
   action: string;
   patterns?(input: unknown): string[];
+  /** Requires fresh interactive consent even under an allow policy. */
+  requiresApproval?(input: unknown): boolean;
 }
 
 /** A tool the model can call: name/description/schema for the LLM plus an executor. */
 export interface Tool {
+  /** Aborted by the loader when the owning plugin is removed. */
+  signal?: AbortSignal;
   /** Unique tool name. */
   name:         string;
   /** Description shown to the LLM; for multi-action tools this teaches the per-action contract. */

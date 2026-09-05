@@ -2,14 +2,14 @@
 
 > Part of the [Cortex Local Agent documentation](../README.md).
 
-The active default plugin list is in `local-agent\matbot\matbot.yaml`.
+The selected workspace YAML supplies configured plugins. The host composes those with the selected `standard`, `compatibility` or `minimal` capability profile. See [plugin migration and profiles](plugin-migration.md) for the C1–C14 ownership map, defaults, configuration and adapter selection.
 
 | Plugin | Role | Main user-facing tools/services |
 | --- | --- | --- |
 | `./packages/plugins/providers/openai-compat` | OpenAI-compatible provider adapter. | Provider profiles in the UI selector. |
 | `./packages/plugins/sessions` | Persistent sessions and conversation metadata. | Conversation list, rename/hide/pin-style session actions. |
-| `./plugins/hybrid-knowledge-index` | Registers Matbot `KnowledgeIndex` backed by Mem0 and file-index. | Service consumed by retrieval tools. |
-| `./plugins/file-broker` | Client for the local file-broker HTTP service. | `file_broker_action`. |
+| `./plugins/hybrid-knowledge-index` | Legacy Mem0/file-index integration. Standard/compatibility profiles compose it as explicit memory and file sources behind federation. | Legacy `KnowledgeIndex` compatibility. |
+| `./plugins/file-broker` | Selects in-process host file access or the explicit HTTP adapter. | `file_broker_action`. |
 | `./packages/plugins/source-registry` | Source provenance, freshness, health, citation policy, source events, and health reports. | `SourceRegistry`, `source_action`, `source_health_action`. |
 | `./packages/plugins/connector-fabric` | Connector records, grants, health, tool bindings, and audit events for connector-backed tools. | `ConnectorRegistry`, `connector_action`, connector policy/audit hooks. |
 | `./packages/plugins/structured-data` | Governed structured data catalog, semantic SQL planning, read-only Postgres execution, and query result provenance. | `DataCatalog`, `SqlPlanner`, `structured_data_action`. |
@@ -25,6 +25,19 @@ The active default plugin list is in `local-agent\matbot\matbot.yaml`.
 | `./packages/plugins/workspace` | Matbot workspace file abstraction. | `workspace_action`, WebUI file upload/delete/list. |
 | `./plugins/expert-panel` | Multi-perspective expert orchestration and durable structured business review records. | `expert_panel`. |
 | `./packages/plugins/frontend/web` | Cortex WebUI HTTP/SSE server. | Browser UI and HTTP tool endpoints. |
+| `./packages/plugins/workspace-manager` / `workspace-admin` | Workspace registry/lifecycle service and optional administration surface. | `WorkspaceManager`, `WorkspaceContext`, `workspace_admin_action`. |
+| `./packages/plugins/host-file-access` | In-process host filesystem policy and resource owner. | `HostFileAccess`, consumed by the file-broker tool. |
+| `./packages/plugins/file-index` / `file-index-admin` | Host indexing jobs/snapshots and management/retrieval surface. | `FileIndex`, `file_index`, host-files retrieval source. |
+| `./packages/plugins/runtime-admin` / `model-consultation` | Optional model-facing runtime administration and consultation. | `plugin`, `provider`, `single_turn`. |
+| `./packages/plugins/configuration-admin` | Validated contributor-owned settings and redacted history/restore. | `configuration_action`, Configuration panel. |
+| `./packages/plugins/retrieval-federation` | Combines independently owned retrieval sources and routes writes to one selected memory sink. | `RetrievalFederation`, `KnowledgeIndex`. |
+| `./packages/plugins/memory-local` / `memory-mem0` | Alternative persistent local or workspace-scoped Mem0 memory adapters. | Retrieval source and `MemoryWriteSink`. |
+| `./packages/plugins/expert-panel-session` | Shared expert composer/session operation for HTTP and browser transports. | `ExpertSessions`. |
+| `./packages/plugins/frontend-cli` | Interactive conversation frontend, separate from host bootstrap. | CLI input, turn rendering and forms. |
+| `./packages/plugins/vault-env` | Selectable Node environment-file vault; also usable as a boot default. | `Vault`, atomic secret persistence. |
+| `./packages/plugins/runtime-diagnostics` | Health of selected capabilities and bounded dependency probes. | `runtime_diagnostics`, `/api/diagnostics`, Diagnostics panel. |
+
+`file-index-client` selects remote indexing in the compatibility profile. Optional `file-index-http` and `file-broker-http` plugins expose local services to legacy clients; the standard runtime does not require those listeners. Feature panels are contributed by their owning plugins, so unloading an owner also removes its UI.
 
 Bundled plugins that exist in `local-agent\matbot\packages\plugins` but are not
 loaded by the default `matbot.yaml`:
