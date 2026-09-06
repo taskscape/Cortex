@@ -10,6 +10,10 @@ import { OPFSFileStore } from './opfs-file-store.js';
  *
  * `process` is referenced via globalThis so this stays free of `@types/node` (the package is
  * platform-neutral); the IndexedDB check is the positive signal, the node check sharpens the message.
+ *
+ * @returns Nothing.
+ * @throws Error - When not running in a browser realm (no IndexedDB available, or a Node
+ *          runtime detected).
  */
 export function assertBrowserRealm(): void {
   const node = (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node;
@@ -40,6 +44,7 @@ export class BrowserStorageBackend implements StorageBackend {
    * Returns (creating and caching if needed) the document store for a namespace.
    * @param namespace Logical namespace; each gets its own IndexedDB database.
    * @returns A `Store<T>` backed by IndexedDB for that namespace.
+   * @throws Never — the database opens lazily; connection failures surface on store use.
    */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     let store = this.stores.get(namespace);
@@ -51,6 +56,12 @@ export class BrowserStorageBackend implements StorageBackend {
   }
 
   // IndexedDB connections close with the realm; nothing to flush. OPFS writes are durable on close.
+  /**
+   * Release resources; nothing to do — IndexedDB connections close with the realm and OPFS
+   * writes are durable on close.
+   * @returns Resolves immediately.
+   * @throws Never.
+   */
   async close(): Promise<void> {}
 
   /**

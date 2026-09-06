@@ -272,6 +272,11 @@ export interface RoiReport {
   }>;
 }
 
+/**
+ * Minimal shape of the optional `WorkflowRunner` service: used to dry-run workflow-based evaluation
+ * cases and to mirror recorded business outcomes onto runs. Looked up per call, so its absence
+ * simply disables both paths.
+ */
 interface WorkflowRunnerLike {
   startRun(input: {
     workflowId?: string;
@@ -356,28 +361,89 @@ const SCORE_STORE = 'evaluation_scores';
 const BASELINE_STORE = 'roi_baselines';
 const OUTCOME_STORE = 'outcome_events';
 
+/**
+ * Current time as an ISO-8601 UTC timestamp.
+ *
+ * @returns The timestamp string.
+ * @throws Never.
+ */
 function nowIso(): string { return new Date().toISOString(); }
 
+/**
+ * Checks for a plain object (non-null, non-array).
+ *
+ * @param value - The value to test.
+ * @returns True when `value` is a record.
+ * @throws Never.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Coerces a value to a finite number.
+ *
+ * @param value - The value to read.
+ * @param fallback - Returned when `value` is not a finite number (default 0).
+ * @returns `value` when it is a finite number, otherwise `fallback`.
+ * @throws Never.
+ */
 function asNumber(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * Deduplicates strings, preserving first-occurrence order.
+ *
+ * @param values - The strings to deduplicate.
+ * @returns A new array without repeats.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] { return [...new Set(values)]; }
 
+/**
+ * Deterministic JSON-style serialization: object keys are sorted at every level, so two values with
+ * equal content produce equal strings regardless of key order. Used for structural equality
+ * (e.g. the `equals` and `tool_sequence` scorers) and to derive stable ids.
+ *
+ * @param value - The value to serialize; assumed JSON-serializable.
+ * @returns The canonical string (`'null'` for undefined).
+ * @throws Never.
+ */
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (isRecord(value)) return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
   return JSON.stringify(value) ?? 'null';
 }
 
+/**
+ * Derives a stable id from content: a namespaced 24-hex-char SHA-256 prefix of the canonical form
+ * (see {@link canonical}) of `values`. Same inputs yield the same id, which is what makes upserts
+ * of suites, cases, scorers, and baselines idempotent without caller-supplied ids.
+ *
+ * @param namespace - Prefix marking the id's kind (e.g. `'evaluation-suite'`).
+ * @param values - The identity fields, canonically serialized before hashing.
+ * @returns The id as `namespace:<hash>`.
+ * @throws Never.
+ */
 function hashId(namespace: string, values: unknown[]): string {
   return `${namespace}:${createHash('sha256').update(canonical(values)).digest('hex').slice(0, 24)}`;
 }
 
+/**
+ * Deep redaction/truncation applied to attributes before they are persisted: keys matching
+ * secret-ish names (`secret`, `token`, `password`, `authorization`, `credential`, `api key`,
+ * `cookie`) are replaced wholesale, and string values have API keys, bearer tokens, and URL
+ * credentials masked. Caps depth at 7, strings at 4 000 characters, arrays at 100 entries, and
+ * objects at 200 properties.
+ *
+ * @param value - The value to sanitize.
+ * @param key - The key `value` sits under (top-level callers pass `''`); checked against the
+ *   secret-name pattern.
+ * @param depth - Current recursion depth (callers start at 0).
+ * @returns The sanitized copy; scalars other than strings pass through untouched.
+ * @throws Never.
+ */
 function sanitize(value: unknown, key = '', depth = 0): unknown {
   if (/secret|token|password|authorization|credential|api.?key|cookie/i.test(key)) return '[REDACTED]';
   if (depth > 7) return '[TRUNCATED_DEPTH]';
@@ -393,10 +459,28 @@ function sanitize(value: unknown, key = '', depth = 0): unknown {
   return value;
 }
 
+/**
+ * {@link sanitize} applied to a whole attributes record (undefined becomes `{}`).
+ *
+ * @param value - The attributes to sanitize.
+ * @returns A sanitized copy, safe to persist.
+ * @throws Never.
+ */
 function sanitizedAttributes(value: Record<string, unknown> | undefined): Record<string, unknown> {
   return (sanitize(value ?? {}) as Record<string, unknown>);
 }
 
+/**
+ * Drains a store query to completion, following cursor pagination until the store reports no next
+ * page. The initial `query` supplies filter/sort; once a cursor appears only the cursor is sent, so
+ * the store's own ordering carries across pages.
+ *
+ * @typeParam T - The stored record type; must carry `id` and `version`.
+ * @param store - The store to read.
+ * @param query - Initial filter/sort/paging (defaults to everything).
+ * @returns All matching items, in the store's query order.
+ * @throws If any page fetch rejects.
+ */
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query: StoreQuery = {}): Promise<T[]> {
   const items: T[] = [];
   let next: StoreQuery = query;
@@ -408,6 +492,16 @@ async function queryAll<T extends { id: string; version: string }>(store: Store<
   }
 }
 
+/**
+ * Dot-path lookup into nested records/arrays.
+ *
+ * @param value - The object to read from.
+ * @param path - Dotted key path (e.g. `'trace.durationMs'`); undefined or empty returns `value`
+ *   itself.
+ * @returns The value at the path, or undefined when any segment is missing or the traversal hits a
+ *   non-record.
+ * @throws Never.
+ */
 function field(value: unknown, path: string | undefined): unknown {
   if (!path) return value;
   let current = value;
@@ -418,16 +512,41 @@ function field(value: unknown, path: string | undefined): unknown {
   return current;
 }
 
+/**
+ * Nearest-rank percentile of a sample.
+ *
+ * @param values - The sample; copied and sorted internally, so need not be pre-sorted.
+ * @param fraction - The percentile as a fraction (0.5 → p50, 0.95 → p95, 0.99 → p99).
+ * @returns The order-statistic value; 0 for an empty sample.
+ * @throws Never.
+ */
 function percentile(values: number[], fraction: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1))] ?? 0;
 }
 
+/**
+ * Filters a value down to its string elements.
+ *
+ * @param value - Expected to be an array; anything else yields no strings.
+ * @returns The array's string elements, in order; `[]` for non-arrays.
+ * @throws Never.
+ */
 function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
+/**
+ * Recursively collects distinct citation source ids: a record counts as a citation when it carries a
+ * string `sourceId` plus any of `citation`, `citationText`, or `versionId`. Used by the
+ * `citation_count` scorer and the citation metrics.
+ *
+ * @param value - The structure to walk (span attributes, tool output, ...).
+ * @param found - Accumulator set, mutated in place (callers usually omit it).
+ * @returns The set of distinct source ids found (the same object passed as `found`).
+ * @throws Never.
+ */
 function collectCitations(value: unknown, found = new Set<string>()): Set<string> {
   if (Array.isArray(value)) value.forEach(item => collectCitations(item, found));
   else if (isRecord(value)) {
@@ -438,6 +557,15 @@ function collectCitations(value: unknown, found = new Set<string>()): Set<string
   return found;
 }
 
+/**
+ * Extracts the workflow-run ids an event belongs to: the event's own `workflowRunId`, a
+ * `workflowRunId` attribute, and — for `workflow_action` events — run ids inside the result payload
+ * (`result.id` / `result.run.id`). Deduplicated, first-occurrence order.
+ *
+ * @param event - The observability event to inspect.
+ * @returns The distinct workflow-run ids (possibly empty).
+ * @throws Never.
+ */
 function workflowIdsFromEvent(event: ObservabilityEvent): string[] {
   const ids: string[] = [];
   if (event.workflowRunId !== undefined) ids.push(event.workflowRunId);
@@ -452,7 +580,16 @@ function workflowIdsFromEvent(event: ObservabilityEvent): string[] {
   return uniq(ids);
 }
 
-/** Deterministic token-cost calculation used by trace aggregation and pricing-contract tests. */
+/** Deterministic token-cost calculation used by trace aggregation and pricing-contract tests.
+ *
+ * @param attributes - Event attributes: `costUsd` wins when present and positive; otherwise `model`,
+ *   `inputTokens`, `outputTokens`, and `cacheReadTokens` are priced from the
+ *   `CORTEX_MODEL_PRICING_JSON` catalog (`inputPerMillionUsd`, `cachedInputPerMillionUsd` defaulting
+ *   to the input rate, `outputPerMillionUsd`).
+ * @returns The computed cost in USD; 0 when there is no direct cost, no model, no catalog, a
+ *   malformed catalog, or a negative quantity/rate.
+ * @throws Never — catalog parse failures are swallowed and yield 0.
+ */
 export function pricedCost(attributes: Record<string, unknown> | undefined): number {
   const direct = asNumber(attributes?.['costUsd']);
   if (direct > 0) return direct;
@@ -478,6 +615,12 @@ export function pricedCost(attributes: Record<string, unknown> | undefined): num
   }
 }
 
+/**
+ * Store-backed implementation of {@link EvaluationObservability}: persists events, aggregates spans
+ * and trace rollups on ingest, and keeps suites/cases/scorers/runs/scores plus ROI baselines and
+ * outcome events in ten dedicated stores. Writes use plain `set` (last write wins) rather than
+ * compare-and-swap — the sink is the single writer of its own aggregates.
+ */
 class StoreBackedEvaluationObservability implements EvaluationObservability {
   private readonly services: MatbotMachine;
   private readonly traces: Store<CortexTrace>;
@@ -491,6 +634,21 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
   private readonly baselines: Store<RoiBaseline>;
   private readonly outcomes: Store<OutcomeEvent>;
 
+  /**
+   * @param services - The matbot machine, used for `singleTurn` (rubric scoring) and the optional
+   *   `WorkflowRunner` lookup.
+   * @param traces - Store for {@link CortexTrace} aggregates.
+   * @param spans - Store for {@link CortexSpan} records.
+   * @param events - Store for raw {@link CortexTraceEvent}s.
+   * @param suites - Store for {@link EvaluationSuite}s.
+   * @param cases - Store for {@link EvaluationCase}s.
+   * @param scorers - Store for {@link ScorerDefinition}s.
+   * @param evaluationRuns - Store for {@link EvaluationRun}s.
+   * @param scores - Store for {@link ScoreResult}s.
+   * @param baselines - Store for {@link RoiBaseline}s.
+   * @param outcomes - Store for {@link OutcomeEvent}s.
+   * @throws Never.
+   */
   constructor(
     services: MatbotMachine,
     traces: Store<CortexTrace>,
@@ -517,6 +675,20 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     this.outcomes = outcomes;
   }
 
+  /**
+   * Ingests one observability event (the {@link ObservabilitySink} entry point): persists the
+   * event, upserts the owning span, and rolls the aggregate trace up. Attributes are sanitized
+   * before any write; span attributes merge with new values winning; identity fields stick from the
+   * first sighting. Trace token/cost totals accumulate only on `end` events of `llm`/`evaluator`
+   * kind (cost via {@link pricedCost}); the trace's `status`/`endedAt`/`durationMs` are set by the
+   * agent kind's `end` event; `spanCount` is recomputed from the spans store and `eventCount`
+   * incremented per event. `workspaceId` comes from the existing trace, else the event's
+   * `workspaceId` attribute, else `CORTEX_WORKSPACE_ID`, else `'default'`.
+   *
+   * @param raw - The event to record.
+   * @returns Resolves when all three writes (event, span, trace) complete.
+   * @throws If any of the event/span/trace store writes rejects.
+   */
   async record(raw: ObservabilityEvent): Promise<void> {
     const event: CortexTraceEvent = {
       ...raw,
@@ -575,12 +747,35 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     await this.traces.set(trace.id, trace);
   }
 
+  /**
+   * Lists stored trace aggregates.
+   *
+   * @param query - Optional filter/sort/paging; cursor-paginated to completion.
+   * @returns Matching {@link CortexTrace} records in query order.
+   * @throws If a store page fetch rejects.
+   */
   listTraces(query?: StoreQuery): Promise<CortexTrace[]> { return queryAll(this.traces, query); }
 
+  /**
+   * All spans belonging to one trace.
+   *
+   * @param traceId - The trace to collect spans for.
+   * @returns The spans in store order (unsorted; {@link inspectTrace} sorts by start time).
+   * @throws If the store query rejects.
+   */
   private async spansForTrace(traceId: string): Promise<CortexSpan[]> {
     return queryAll(this.spans, { where: { op: 'eq', field: 'traceId', value: traceId } });
   }
 
+  /**
+   * Loads everything recorded about one trace: the aggregate, its spans (sorted by `startedAt`
+   * ascending), its events (sorted by `timestamp` ascending), and the scores whose evaluator spans
+   * ran on this trace. `trace` is null for an unknown id; the arrays are then empty.
+   *
+   * @param traceId - The trace to inspect.
+   * @returns The trace (or null) with its time-ordered spans/events and evaluator scores.
+   * @throws If any store query rejects.
+   */
   async inspectTrace(traceId: string): Promise<{ trace: CortexTrace | null; spans: CortexSpan[]; events: CortexTraceEvent[]; scores: ScoreResult[] }> {
     const [trace, spans, events, scores] = await Promise.all([
       this.traces.get(traceId),
@@ -596,11 +791,32 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     };
   }
 
+  /**
+   * Replays a trace as playback only: the recorded event timeline is returned, no tool or workflow
+   * write is executed, and `writesExecuted` is always false.
+   *
+   * @param traceId - The trace to replay.
+   * @returns The trace (or null) and its event timeline, explicitly marked playback/no-writes.
+   * @throws As {@link inspectTrace}.
+   */
   async replayTrace(traceId: string): Promise<{ mode: 'playback'; writesExecuted: false; trace: CortexTrace | null; timeline: CortexTraceEvent[] }> {
     const inspected = await this.inspectTrace(traceId);
     return { mode: 'playback', writesExecuted: false, trace: inspected.trace, timeline: inspected.events };
   }
 
+  /**
+   * Creates or updates a suite along with its embedded cases and scorers. Omitted ids are derived
+   * from content via {@link hashId} (suite: workspace+name; case/scorer: suite+name), so
+   * re-upserting the same names updates in place and prior `createdAt` values survive. Scorer
+   * defaults: threshold 0.7 for `model_rubric` else 1, weight 1, required true. Case defaults:
+   * empty input/expected, and scorers defaulting to the ones defined in this same call. When the
+   * call supplies cases/scorers the suite's id lists are replaced wholesale; otherwise the stored
+   * ones are kept. `passThreshold` defaults to the stored value, else 1.
+   *
+   * @param input - The suite definition (cases and scorers optional).
+   * @returns The stored suite plus the cases and scorers written this call (empty arrays when none).
+   * @throws If any store write rejects.
+   */
   async upsertSuite(input: EvaluationSuiteInput): Promise<{ suite: EvaluationSuite; cases: EvaluationCase[]; scorers: ScorerDefinition[] }> {
     const timestamp = nowIso();
     const suiteId = input.id ?? hashId('evaluation-suite', [input.workspaceId, input.name]);
@@ -667,9 +883,35 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     return { suite, cases: storedCases, scorers: storedScorers };
   }
 
+  /**
+   * Lists stored evaluation suites.
+   *
+   * @param query - Optional filter/sort/paging; cursor-paginated to completion.
+   * @returns Matching suites in query order.
+   * @throws If a store page fetch rejects.
+   */
   listSuites(query?: StoreQuery): Promise<EvaluationSuite[]> { return queryAll(this.suites, query); }
+
+  /**
+   * Lists recorded evaluation runs.
+   *
+   * @param query - Optional filter/sort/paging; cursor-paginated to completion.
+   * @returns Matching runs in query order.
+   * @throws If a store page fetch rejects.
+   */
   listEvaluationRuns(query?: StoreQuery): Promise<EvaluationRun[]> { return queryAll(this.evaluationRuns, query); }
 
+  /**
+   * Resolves what a case is scored against, by the fields present in its `input`, in priority
+   * order: a string `traceId` inspects that recorded trace; a string `workflowId` (with a
+   * `WorkflowRunner` service present) starts a `dry_run` workflow run, passing optional
+   * `workflowVersion`, `inputs`, `evidenceSourceIds`, and `proposedActions`; otherwise the inline
+   * `actual`/`output` (or the whole input record) is the target.
+   *
+   * @param item - The case being scored.
+   * @returns The scoring target handed to each scorer.
+   * @throws If the trace inspection or the workflow dry-run start rejects.
+   */
   private async resolveCaseTarget(item: EvaluationCase): Promise<unknown> {
     const traceId = item.input['traceId'];
     if (typeof traceId === 'string') return this.inspectTrace(traceId);
@@ -689,6 +931,25 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     return item.input['actual'] ?? item.input['output'] ?? item.input;
   }
 
+  /**
+   * Scores one case with one scorer, dispatching on {@link ScorerDefinition.type}: exact/substring
+   * match, required-JSON-fields presence, workflow status, citation count, tool-name sequence,
+   * latency/cost budget (partial credit as budget/actual when over budget), retrieval
+   * precision/recall at k, and `model_rubric` — the LLM-judged case. Rubric scoring needs a provider
+   * (`scorer.provider`, else `fallbackProvider`; score 0 with a rationale when neither exists),
+   * calls `singleTurn`, parses the first JSON object in the reply, clamps the score to [0, 1], and
+   * records evaluator start/end spans on `evaluationTraceId`; a judge failure scores 0 and records
+   * an error end-span instead of throwing. `expected` comes from the scorer or, absent there, from
+   * the case at the scorer's `path`; `actual`/`expected` in the result are sanitized.
+   *
+   * @param item - The case being scored (supplies `expected` when the scorer doesn't).
+   * @param scorer - The scorer definition (type, threshold, weight, path, expected, rubric, config).
+   * @param target - The resolved case target (see {@link resolveCaseTarget}).
+   * @param evaluationTraceId - Trace id under which evaluator spans are recorded.
+   * @param fallbackProvider - Provider for `model_rubric` when the scorer pins none.
+   * @returns The score result minus the identity fields {@link runSuite} fills in.
+   * @throws If an evaluator span store write rejects; judge failures are captured, not thrown.
+   */
   private async score(item: EvaluationCase, scorer: ScorerDefinition, target: unknown, evaluationTraceId: string, fallbackProvider?: string): Promise<Omit<ScoreResult, 'id' | 'version' | 'evaluationRunId' | 'suiteId' | 'caseId' | 'createdAt'>> {
     const actual = field(target, scorer.path);
     const expected = scorer.expected ?? field(item.expected, scorer.path);
@@ -814,6 +1075,20 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     };
   }
 
+  /**
+   * Executes every case in a suite, scoring each with its assigned scorers (a case with no scorers
+   * of its own falls back to the suite's). The run is persisted as `running` up front and finalized
+   * to `completed` or `failed`; missing cases/scorers are skipped silently. The run passes when no
+   * required scorer failed and the pass rate meets the suite's threshold; the overall score is the
+   * weight-weighted mean of the results.
+   *
+   * @param suiteId - Suite to run.
+   * @param candidate - Candidate label recorded on the run (default `'working-tree'`).
+   * @param provider - Optional provider for `model_rubric` scoring when a scorer pins none.
+   * @returns The completed run and all score results, in execution order.
+   * @throws If the suite is unknown (before any run record exists), or — after persisting the
+   *   failed run — if case resolution or scoring rejects.
+   */
   async runSuite(suiteId: string, candidate = 'working-tree', provider?: string): Promise<{ run: EvaluationRun; results: ScoreResult[] }> {
     const suite = await this.suites.get(suiteId);
     if (suite === null) throw new Error(`Unknown evaluation suite "${suiteId}".`);
@@ -864,6 +1139,18 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     }
   }
 
+  /**
+   * Aggregates operational metrics across traces, spans, events, outcomes, and evaluation runs.
+   * Loads all six stores (no server-side filter), so the cost is O(total data). When `workspaceId`
+   * is given, traces/outcomes/runs are filtered by their `workspaceId` and spans/events by
+   * membership in the selected traces' ids. Latency percentiles use {@link percentile}; approval
+   * waits are measured per workflow run from `workflow.approval_requested` to
+   * `workflow.approval_approved`.
+   *
+   * @param workspaceId - Optional workspace filter; omit to aggregate across all workspaces.
+   * @returns The computed snapshot; rates are 0 whenever their denominator is empty.
+   * @throws If any store query rejects.
+   */
   async metrics(workspaceId?: string): Promise<ObservabilityMetrics> {
     const [traces, spans, events, outcomes, runs, scores] = await Promise.all([
       queryAll(this.traces), queryAll(this.spans), queryAll(this.events), queryAll(this.outcomes), queryAll(this.evaluationRuns), queryAll(this.scores),
@@ -922,6 +1209,16 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     };
   }
 
+  /**
+   * Creates or updates a manual-effort/cost ROI baseline. The id defaults to a content hash of
+   * workspace + workflow + name (see {@link hashId}), making re-upserts idempotent; negative
+   * `manualActiveMinutes`, `loadedHourlyRateUsd`, and `fixedCostUsd` are clamped to zero; a prior
+   * `createdAt` is preserved on update.
+   *
+   * @param input - Baseline fields.
+   * @returns The stored baseline.
+   * @throws If the store write rejects.
+   */
   async upsertBaseline(input: Omit<RoiBaseline, 'id' | 'version' | 'createdAt' | 'updatedAt'> & { id?: string }): Promise<RoiBaseline> {
     const id = input.id ?? hashId('roi-baseline', [input.workspaceId, input.workflowId, input.name]);
     const existing = await this.baselines.get(id);
@@ -938,6 +1235,17 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     return baseline;
   }
 
+  /**
+   * Records a business outcome for a workflow run and notifies the WorkflowRunner (when registered)
+   * via `recordBusinessOutcome`. Validates against the referenced baseline — it must exist and
+   * belong to the same workspace and workflow — and requires `verifiedByPrincipalId` for
+   * `verified_completed` outcomes. Minute fields are clamped to zero; `recordedAt` is set to now.
+   *
+   * @param input - Outcome fields; `id` may be supplied for repeatable writes.
+   * @returns The persisted outcome.
+   * @throws If the baseline is unknown, belongs to another workspace/workflow, a verified outcome
+   *   lacks `verifiedByPrincipalId`, or the store write / runner notification rejects.
+   */
   async recordOutcome(input: Omit<OutcomeEvent, 'id' | 'version' | 'recordedAt'> & { id?: string }): Promise<OutcomeEvent> {
     const baseline = await this.baselines.get(input.baselineId);
     if (baseline === null) throw new Error(`Unknown ROI baseline "${input.baselineId}".`);
@@ -963,6 +1271,18 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     return outcome;
   }
 
+  /**
+   * Computes the ROI report for a workspace from verified outcomes only (other statuses contribute
+   * nothing). Per outcome, saved time is the baseline's manual minutes minus human/review/rework
+   * minutes (floored at zero) over 60, valued at the baseline's loaded hourly rate; outcomes whose
+   * baseline is missing are skipped. Operating cost is the summed cost of all traces in the
+   * workspace; fixed cost sums the workspace's baselines. `roi` and `paybackOutcomes` are null when
+   * their denominators are zero.
+   *
+   * @param workspaceId - Workspace to report on.
+   * @returns The totals plus a per-workflow breakdown sorted by benefit, descending.
+   * @throws If any store query rejects.
+   */
   async roi(workspaceId: string): Promise<RoiReport> {
     const [baselines, outcomes, traces] = await Promise.all([queryAll(this.baselines), queryAll(this.outcomes), queryAll(this.traces)]);
     const baselineMap = new Map(baselines.filter(item => item.workspaceId === workspaceId).map(item => [item.id, item]));
@@ -1001,6 +1321,11 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
   }
 }
 
+/**
+ * Loose input record for the `evaluation_action` tool: one `action` plus the optional fields that
+ * action needs (ids, suite/baseline/outcome payloads, query). The executor validates per action and
+ * answers unknown/malformed input with a tool error event rather than throwing.
+ */
 interface EvaluationActionInput {
   action: string;
   traceId?: string;
@@ -1014,6 +1339,16 @@ interface EvaluationActionInput {
   query?: StoreQuery;
 }
 
+/**
+ * Builds the `evaluation_action` multi-action tool (traces, inspect_trace, replay, upsert_suite,
+ * suites, run_suite, evaluation_runs, metrics, upsert_baseline, record_outcome, roi) over the given
+ * service. The executor maps each action to the corresponding service call and converts any thrown
+ * error into a tool error event.
+ *
+ * @param service - The observability/evaluation service to expose.
+ * @returns The `evaluation_action` tool.
+ * @throws Never.
+ */
 function createEvaluationActionTool(service: EvaluationObservability): Tool {
   return {
     name: 'evaluation_action',
@@ -1073,6 +1408,7 @@ function createEvaluationActionTool(service: EvaluationObservability): Tool {
  * dedicated stores created through the machine's store factory.
  * @param services The matbot machine providing stores, providers, and singleTurn.
  * @returns The service instance.
+ * @throws If any backing store cannot be created.
  */
 export function createEvaluationObservability(services: MatbotMachine): EvaluationObservability {
   return new StoreBackedEvaluationObservability(
@@ -1096,6 +1432,14 @@ export function createEvaluationObservability(services: MatbotMachine): Evaluati
  */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
+  /**
+   * Registers the web UI contribution, builds the observability service, registers it as the
+   * `Observability` sink, and exposes the `evaluation_action` tool.
+   *
+   * @param services - The machine to wire into.
+   * @returns Resolves when registration completes.
+   * @throws If service or tool registration rejects.
+   */
   async setup(services) {
     services.contributions?.register('webui','evaluation',uiContribution);
     const service = createEvaluationObservability(services);

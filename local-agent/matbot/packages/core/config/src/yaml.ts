@@ -24,11 +24,23 @@ export type YamlValue = YamlScalar | YamlValue[] | YamlMap;
 /** A string-keyed mapping of {@link YamlValue} — the top-level shape of a parsed YAML document. */
 export type YamlMap   = { [key: string]: YamlValue };
 
+/**
+ * One significant source line: its indentation width and the trimmed remainder after comment
+ * stripping. Blank lines are dropped by {@link tokenize}.
+ */
 interface Token {
   indent: number;
   raw:    string;
 }
 
+/**
+ * Remove a trailing `#` comment from a line, honouring quoting so a `#` inside single- or
+ * double-quoted scalars survives.
+ *
+ * @param line - The raw source line.
+ * @returns The line up to the first unquoted `#` (or the whole line when none).
+ * @throws Never.
+ */
 function stripComment(line: string): string {
   let quote: '"' | "'" | undefined;
   for (let i = 0; i < line.length; i++) {
@@ -49,6 +61,14 @@ function stripComment(line: string): string {
   return line;
 }
 
+/**
+ * Split YAML source into significant tokens: comment-stripped, blank lines dropped, each reduced
+ * to its indentation width plus trimmed content.
+ *
+ * @param text - The raw YAML source text.
+ * @returns One token per non-blank line, in source order.
+ * @throws Never.
+ */
 function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
   for (const line of text.split('\n')) {
@@ -60,6 +80,15 @@ function tokenize(text: string): Token[] {
   return tokens;
 }
 
+/**
+ * Interpret one scalar token: quoted text becomes a string (quotes stripped, no escape
+ * processing), `null`/`~` become null, `true`/`false` booleans, numeric-looking text a number,
+ * and anything else a plain string.
+ *
+ * @param raw - The trimmed scalar text.
+ * @returns The parsed scalar value.
+ * @throws Never.
+ */
 function parseScalar(raw: string): YamlScalar {
   if ((raw.startsWith('"') && raw.endsWith('"')) ||
       (raw.startsWith("'") && raw.endsWith("'"))) {
@@ -76,6 +105,14 @@ function parseScalar(raw: string): YamlScalar {
   return raw;
 }
 
+/**
+ * Interpret the text after a `key:` as a literal (`|`) or folded (`>`) block-scalar header,
+ * including chomping indicators (`-` strip, `+` keep) and ignored explicit-indentation digits.
+ *
+ * @param rest - The text following the key's colon (trimmed).
+ * @returns The parsed header, or `undefined` when `rest` is not a block-scalar header.
+ * @throws Never.
+ */
 function blockScalarHeader(rest: string): { folded: boolean; chomp: 'clip' | 'strip' | 'keep' } | undefined {
   if (rest === '') return undefined;
   const style = rest[0];
@@ -91,6 +128,18 @@ function blockScalarHeader(rest: string): { folded: boolean; chomp: 'clip' | 'st
   return { folded: style === '>', chomp };
 }
 
+/**
+ * Recursively parse a block of tokens at a given indentation into a mapping, a sequence, or a
+ * single scalar, consuming tokens from `pos` while they belong to the current block. May
+ * re-anchor a sequence-of-mappings token in place (mutating `tokens`) so continuation lines
+ * bind to the same record.
+ *
+ * @param tokens - The token stream (mutated in place for `- key: value` re-anchoring).
+ * @param pos - Index of the first token to parse.
+ * @param baseIndent - Minimum indentation that still belongs to the current block mapping.
+ * @returns The parsed value and the index of the first token after the block.
+ * @throws Never.
+ */
 function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlValue; next: number } {
   if (pos >= tokens.length) return { value: null, next: pos };
 

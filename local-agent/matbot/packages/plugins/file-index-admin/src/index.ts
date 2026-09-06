@@ -2,7 +2,17 @@ import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { MatbotPluginSpec, ToolEvent } from '@matatbread/matbot-plugin-api';
 import type {} from '@matatbread/matbot-capabilities-types';
 import type {} from '@matatbread/matbot-file-services-types';
-export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION, async setup(services) {
+export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION, /**
+     * Register the `host-files` retrieval contribution (search over the host text index), a
+     * `file-index` health probe, and the `file_index` tool (index/reconcile/search/status/cancel).
+     * The handlers resolve the `FileIndex` service per operation and throw if it has been unloaded.
+     *
+     * @param services - Machine services; the contributions and tools registries are used, and
+     *          `FileIndex` is resolved per operation.
+     * @returns Nothing.
+     * @throws Never - Registration only; the handlers report their own failures.
+     */
+    async setup(services) {
         services.contributions?.register('retrieval', 'host-files', { title: 'Host text index', scope: 'host', async search(query) { const index = services.FileIndex; if (!index)
                 throw new Error('File index unloaded'); const response = await index.search(query.query, query.limit, query.signal) as {
                 results: Array<{

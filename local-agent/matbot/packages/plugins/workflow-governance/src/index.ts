@@ -163,6 +163,9 @@ export type WorkflowDefinitionInput = {
   successMetrics?: string[];
 };
 
+/**
+ * A frozen snapshot of a workflow definition at a specific version, addressable by a deterministic version-record id.
+ */
 export interface WorkflowVersion {
   id: string;
   version: string;
@@ -173,6 +176,9 @@ export interface WorkflowVersion {
   createdAt: string;
 }
 
+/**
+ * A resolved evidence citation for a run: the cited source, its text/version, observation time and any health/staleness warning observed at resolution.
+ */
 export interface EvidenceReference {
   sourceId: string;
   citationText?: string;
@@ -183,6 +189,9 @@ export interface EvidenceReference {
   warning?: string;
 }
 
+/**
+ * A proposed tool call within a run, carrying its capability, approval state and optional risk/confidence/cost metadata.
+ */
 export interface ActionProposal {
   id: string;
   toolName: string;
@@ -198,6 +207,9 @@ export interface ActionProposal {
   costEstimateUsd?: number;
 }
 
+/**
+ * Input for proposing an action on a run; omitted capability/connector metadata is filled in during proposal normalization.
+ */
 export type ActionProposalInput = {
   id?: string;
   toolName: string;
@@ -224,6 +236,9 @@ export interface ExecutedAction {
   error?: string;
 }
 
+/**
+ * The full ledger state of a workflow run: mode, status and fine-grained completion state, inputs, resolved evidence, proposed/executed actions, labels and trace context.
+ */
 export interface WorkflowRun {
   id: string;
   version: string;
@@ -251,6 +266,9 @@ export interface WorkflowRun {
   outcomeId?: string;
 }
 
+/**
+ * An append-only, per-run sequenced audit event recorded whenever a run changes state.
+ */
 export interface WorkflowRunEvent {
   id: string;
   version: string;
@@ -343,6 +361,9 @@ export interface WorkflowCompilerMessage {
   timestamp?: string;
 }
 
+/**
+ * A declaration of one workflow input, used to build the definition's input schema and dry-run sample inputs.
+ */
 export type WorkflowInputHint = {
   name: string;
   type?: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
@@ -351,6 +372,9 @@ export type WorkflowInputHint = {
   sample?: unknown;
 };
 
+/**
+ * A tool call supplied to the compiler as evidence of the actions a workflow should govern.
+ */
 export type WorkflowCompilerToolCall = {
   toolName: string;
   input?: Record<string, unknown>;
@@ -362,6 +386,9 @@ export type WorkflowCompilerToolCall = {
   costEstimateUsd?: number;
 };
 
+/**
+ * Everything the compiler needs to draft a workflow: workspace and naming, transcript/message/tool-call evidence, input hints, risk and gate overrides, and the publish/dry-run switches.
+ */
 export type WorkflowCompileInput = {
   workspaceId: string;
   name?: string;
@@ -380,6 +407,9 @@ export type WorkflowCompileInput = {
   labels?: string[];
 };
 
+/**
+ * A stored compilation attempt: the draft definition, its validation, derived sources/tools/proposals and the status of any publish/dry-run stages.
+ */
 export interface WorkflowCompilation {
   id: string;
   version: string;
@@ -496,6 +526,9 @@ export interface WorkflowCompiler {
   queryCompilations(query?: StoreQuery): Promise<WorkflowCompilation[]>;
 }
 
+/**
+ * Minimal source-registry surface the runner consumes when present, for evidence citation, freshness checks and access recording.
+ */
 interface SourceRegistryLike {
   getSource(id: string): Promise<{
     id: string;
@@ -523,6 +556,9 @@ interface SourceRegistryLike {
   }): Promise<unknown>;
 }
 
+/**
+ * Minimal connector-registry surface the runner consumes when present, to evaluate tool calls against bound connector instances.
+ */
 interface ConnectorRegistryLike {
   evaluateToolCall(input: {
     toolName: string;
@@ -537,6 +573,9 @@ interface ConnectorRegistryLike {
   }>;
 }
 
+/**
+ * Minimal observability sink used to mirror workflow run events as trace events.
+ */
 interface ObservabilityLike {
   record(event: ObservabilityEvent): void | Promise<void>;
 }
@@ -577,29 +616,65 @@ const COMPILATION_STORE = 'workflow_compilations';
 const RISK_ORDER: WorkflowRiskLevel[] = ['low', 'medium', 'high', 'critical'];
 const WORKFLOW_COMPILER_VERSION = 'deterministic-workflow-compiler-v1';
 
+/**
+ * Returns the current wall-clock time as an ISO 8601 UTC timestamp.
+ * @returns Current time in `YYYY-MM-DDTHH:mm:ss.sssZ` format.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Computes the approval deadline for a request. The SLA defaults to 24 hours and can be overridden by the `CORTEX_APPROVAL_SLA_HOURS` environment variable; non-numeric or non-positive values fall back to the default.
+ * @param requestedAt - ISO 8601 timestamp at which the approval was requested.
+ * @returns ISO 8601 deadline timestamp, `requestedAt` plus the SLA.
+ * @throws RangeError - If `requestedAt` cannot be parsed as a date.
+ */
 function approvalDueAt(requestedAt: string): string {
   const configured = Number(process.env['CORTEX_APPROVAL_SLA_HOURS'] ?? 24);
   const hours = Number.isFinite(configured) && configured > 0 ? configured : 24;
   return new Date(Date.parse(requestedAt) + hours * 3_600_000).toISOString();
 }
 
+/**
+ * Derives a deterministic, collision-resistant identifier from the joined parts.
+ * @param prefix - Namespace prefix prepended to the hash (e.g. `workflow-definition`).
+ * @param parts - Ordered components hashed together; joined with a `NUL` separator so boundary shifts change the hash.
+ * @returns Identifier of the form `<prefix>:<hash>`, where `<hash>` is the first 32 hex characters of the SHA-256 digest.
+ * @throws Never.
+ */
 function hashId(prefix: string, parts: readonly string[]): string {
   const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
   return `${prefix}:${hash}`;
 }
 
+/**
+ * Hashes an arbitrary value over its canonical JSON encoding (see {@link canonicalJson}).
+ * @param value - Value to hash; must be JSON-serializable.
+ * @returns Full 64-character hex SHA-256 digest of the canonical JSON.
+ * @throws TypeError - If `value` is not JSON-serializable (circular references, BigInt, and similar).
+ */
 function hashPayload(value: unknown): string {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
+/**
+ * Serializes a value to JSON with object keys recursively sorted, so structurally equal values always produce byte-identical strings.
+ * @param value - Value to serialize.
+ * @returns Deterministic JSON string.
+ * @throws TypeError - If `value` contains circular references or other values JSON cannot serialize.
+ */
 function canonicalJson(value: unknown): string {
   return JSON.stringify(sortForJson(value));
 }
 
+/**
+ * Recursively sorts object entries by key (arrays keep their order; primitives pass through) to prepare a value for canonical JSON serialization.
+ * @param value - Value to normalize.
+ * @returns Structurally identical value with object keys sorted at every level.
+ * @throws Never.
+ */
 function sortForJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortForJson);
   if (value && typeof value === 'object') {
@@ -610,18 +685,42 @@ function sortForJson(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Normalizes a free-form name into a snake_case identifier: trims, lowercases, collapses non-alphanumeric runs to `_`, and strips leading/trailing underscores.
+ * @param value - Raw name to normalize.
+ * @returns Normalized name, or `unnamed` when nothing usable remains.
+ * @throws Never.
+ */
 function normalizeName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
 }
 
+/**
+ * Deduplicates string values while preserving first-occurrence order.
+ * @param values - Values to deduplicate; entries are trimmed and empty strings dropped.
+ * @returns Trimmed, non-empty values in first-occurrence order.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Normalizes human labels into canonical snake_case form via {@link normalizeName}, then deduplicates.
+ * @param labels - Raw label strings.
+ * @returns Deduplicated normalized labels in first-occurrence order.
+ * @throws Never.
+ */
 function normalizedLabels(labels: readonly string[]): string[] {
   return uniq(labels.map(label => normalizeName(label)));
 }
 
+/**
+ * Classifies normalized human labels into a shadow-comparison verdict: an accept synonym plus a reject synonym yields `mixed` (score 0.5), accept-only `accepted` (1), reject-only `rejected` (0), and no recognized label `unlabeled` (0).
+ * @param labels - Raw label strings; normalized before matching.
+ * @returns The outcome and its score in the range [0, 1].
+ * @throws Never.
+ */
 function classifyShadowLabels(labels: readonly string[]): { outcome: ShadowComparisonOutcome; score: number } {
   const normalized = new Set(normalizedLabels(labels));
   if (normalized.size === 0) return { outcome: 'unlabeled', score: 0 };
@@ -653,6 +752,11 @@ function classifyShadowLabels(labels: readonly string[]): { outcome: ShadowCompa
   return { outcome: 'mixed', score: 0.5 };
 }
 
+/**
+ * Creates a zeroed shadow-acceptance summary with no per-workflow breakdown.
+ * @returns Empty {@link WorkflowShadowSummary}.
+ * @throws Never.
+ */
 function emptyShadowSummary(): WorkflowShadowSummary {
   return {
     total: 0,
@@ -665,6 +769,12 @@ function emptyShadowSummary(): WorkflowShadowSummary {
   };
 }
 
+/**
+ * Extracts plain text from a compiler message: prefers `text`, then string `content`, then joins string or `{ text }` items of array content with newlines.
+ * @param message - Message to render.
+ * @returns Extracted text, or an empty string when the message carries none.
+ * @throws Never.
+ */
 function messageText(message: WorkflowCompilerMessage): string {
   if (typeof message.text === 'string') return message.text;
   if (typeof message.content === 'string') return message.content;
@@ -678,6 +788,12 @@ function messageText(message: WorkflowCompilerMessage): string {
   return '';
 }
 
+/**
+ * Flattens all compilation input text into one blob: purpose, transcript, rendered messages, and one `toolName + canonical input JSON` line per tool call. Used for name/purpose inference and `{{placeholder}}` detection.
+ * @param input - Compilation input.
+ * @returns Concatenated non-empty segments joined by newlines.
+ * @throws Never.
+ */
 function compileText(input: WorkflowCompileInput): string {
   return [
     input.purpose ?? '',
@@ -687,37 +803,79 @@ function compileText(input: WorkflowCompileInput): string {
   ].filter(Boolean).join('\n');
 }
 
+/**
+ * Extracts the first non-empty sentence-like fragment of a text, stripping markdown punctuation characters and collapsing whitespace.
+ * @param text - Raw text.
+ * @returns Cleaned first fragment, or an empty string when the text has none.
+ * @throws Never.
+ */
 function sentenceFragment(text: string): string {
   const first = text.split(/\r?\n|[.!?]/).map(item => item.trim()).find(Boolean) ?? '';
   return first.replace(/[`*_#:[\](){}]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Derives a Title Case workflow title from the first words of a text.
+ * @param text - Raw text to title-ize.
+ * @returns Up to seven Title Cased words joined by spaces, or `Compiled Workflow` when no words remain.
+ * @throws Never.
+ */
 function titleFromText(text: string): string {
   const words = sentenceFragment(text).split(/\s+/).filter(Boolean).slice(0, 7);
   const title = words.map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
   return title || 'Compiled Workflow';
 }
 
+/**
+ * Resolves the workflow name for a compilation: the explicit `name` when non-blank, otherwise a title derived from the purpose, transcript or compiled text.
+ * @param input - Compilation input.
+ * @returns Trimmed workflow name.
+ * @throws Never.
+ */
 function inferWorkflowName(input: WorkflowCompileInput): string {
   if (input.name !== undefined && input.name.trim()) return input.name.trim();
   return titleFromText(input.purpose ?? input.transcript ?? compileText(input));
 }
 
+/**
+ * Resolves the workflow description for a compilation: the explicit `purpose` when non-blank, otherwise the first sentence of the transcript or compiled text prefixed with `Compiled from selected conversation:`.
+ * @param input - Compilation input.
+ * @returns Purpose text, or `undefined` when nothing usable was supplied.
+ * @throws Never.
+ */
 function inferWorkflowPurpose(input: WorkflowCompileInput): string | undefined {
   if (input.purpose !== undefined && input.purpose.trim()) return input.purpose.trim();
   const fragment = sentenceFragment(input.transcript ?? compileText(input));
   return fragment ? `Compiled from selected conversation: ${fragment}` : undefined;
 }
 
+/**
+ * Scans text for `{{name}}` placeholders and converts each unique identifier-like name into a required string input hint.
+ * @param text - Text to scan (typically {@link compileText} output).
+ * @returns One hint per unique placeholder in first-occurrence order, all typed `string` and required.
+ * @throws Never.
+ */
 function inputHintsFromText(text: string): WorkflowInputHint[] {
   const placeholders = [...text.matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g)].map(match => match[1] ?? '');
   return uniq(placeholders).map(name => ({ name, type: 'string' as const, required: true }));
 }
 
+/**
+ * Sanitizes a raw input name into an identifier: trims, replaces non-alphanumeric runs with `_`, and strips leading/trailing underscores.
+ * @param value - Raw input name.
+ * @returns Sanitized name, or `input` when nothing usable remains.
+ * @throws Never.
+ */
 function cleanInputName(value: string): string {
   return value.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'input';
 }
 
+/**
+ * Merges inferred `{{placeholder}}` hints with explicit `inputHints`, keyed by normalized name: later entries win, and unspecified fields (type, description, required, sample) inherit from earlier entries, defaulting to type `string` and `required: true`.
+ * @param input - Compilation input.
+ * @returns Merged hints in first-seen order.
+ * @throws Never.
+ */
 function normalizeInputHints(input: WorkflowCompileInput): WorkflowInputHint[] {
   const explicit = input.inputHints ?? [];
   const inferred = inputHintsFromText(compileText(input));
@@ -736,6 +894,12 @@ function normalizeInputHints(input: WorkflowCompileInput): WorkflowInputHint[] {
   return [...byName.values()];
 }
 
+/**
+ * Builds a JSON Schema object from input hints: one property per hint (type defaulting to `string`) and a `required` list of every hint not explicitly optional.
+ * @param hints - Hints to translate.
+ * @returns JSON Schema with `type: 'object'`; the `required` list is omitted when empty.
+ * @throws Never.
+ */
 function schemaForInputHints(hints: readonly WorkflowInputHint[]): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
   const required: string[] = [];
@@ -753,6 +917,12 @@ function schemaForInputHints(hints: readonly WorkflowInputHint[]): Record<string
   };
 }
 
+/**
+ * Returns a minimal placeholder sample value for a JSON Schema type, used when an input hint supplies no `sample`.
+ * @param type - Hint type; `undefined` (or any unrecognized value) is treated as `string`.
+ * @returns `1` for number/integer, `true` for boolean, `[]` for array, `{}` for object, and `'sample'` otherwise.
+ * @throws Never.
+ */
 function defaultSampleForType(type: WorkflowInputHint['type']): unknown {
   if (type === 'number') return 1;
   if (type === 'integer') return 1;
@@ -762,6 +932,13 @@ function defaultSampleForType(type: WorkflowInputHint['type']): unknown {
   return 'sample';
 }
 
+/**
+ * Builds sample workflow inputs for compiled dry runs: each hint's `sample` or its type default, overlaid by explicit `input.sampleInputs` overrides.
+ * @param input - Compilation input providing optional `sampleInputs` overrides.
+ * @param hints - Normalized input hints.
+ * @returns Sample input object; explicit overrides win over derived samples.
+ * @throws Never.
+ */
 function sampleInputsForCompile(input: WorkflowCompileInput, hints: readonly WorkflowInputHint[]): Record<string, unknown> {
   const sample: Record<string, unknown> = {};
   for (const hint of hints) {
@@ -770,6 +947,12 @@ function sampleInputsForCompile(input: WorkflowCompileInput, hints: readonly Wor
   return { ...sample, ...(input.sampleInputs ?? {}) };
 }
 
+/**
+ * Collects the union of source ids from the input's explicit `sourceIds`, per-message `sourceIds` and per-tool-call `sourceIds`.
+ * @param input - Compilation input.
+ * @returns Deduplicated source ids in first-occurrence order.
+ * @throws Never.
+ */
 function compileSourceIds(input: WorkflowCompileInput): string[] {
   return uniq([
     ...(input.sourceIds ?? []),
@@ -778,6 +961,12 @@ function compileSourceIds(input: WorkflowCompileInput): string[] {
   ]);
 }
 
+/**
+ * Collects the tool calls a compilation should govern: explicit `toolCalls` first, then tool-bearing messages converted into calls (tool name with optional input and source ids).
+ * @param input - Compilation input.
+ * @returns Direct calls followed by message-derived calls in message order.
+ * @throws Never.
+ */
 function compileToolCalls(input: WorkflowCompileInput): WorkflowCompilerToolCall[] {
   const direct = input.toolCalls ?? [];
   const messageCalls = (input.messages ?? [])
@@ -790,6 +979,12 @@ function compileToolCalls(input: WorkflowCompileInput): WorkflowCompilerToolCall
   return [...direct, ...messageCalls];
 }
 
+/**
+ * Converts the collected tool calls into action proposals: capability defaults to {@link inferCapability} and source ids are deduplicated; optional fields (connectorInstanceId, reason, confidence, costEstimateUsd) are carried through only when present.
+ * @param input - Compilation input.
+ * @returns One proposal per tool call, in call order.
+ * @throws Never.
+ */
 function compiledProposals(input: WorkflowCompileInput): ActionProposalInput[] {
   return compileToolCalls(input).map(call => ({
     toolName: call.toolName,
@@ -803,6 +998,13 @@ function compiledProposals(input: WorkflowCompileInput): ActionProposalInput[] {
   }));
 }
 
+/**
+ * Determines the compiled workflow's risk level: explicit `input.riskLevel` wins; otherwise `critical` when any proposal is admin-capable, `high` when any is write-capable, `medium` when source ids are present, and `low` otherwise.
+ * @param input - Compilation input.
+ * @param proposals - Compiled action proposals.
+ * @returns Effective risk level.
+ * @throws Never.
+ */
 function inferCompilerRisk(input: WorkflowCompileInput, proposals: readonly ActionProposalInput[]): WorkflowRiskLevel {
   if (input.riskLevel !== undefined) return input.riskLevel;
   if (proposals.some(proposal => proposal.capability === 'admin')) return 'critical';
@@ -811,6 +1013,14 @@ function inferCompilerRisk(input: WorkflowCompileInput, proposals: readonly Acti
   return 'low';
 }
 
+/**
+ * Derives the default approval gates when a compilation input supplies none: an action gate when any proposal is not read-only, a stale-source gate when evidence sources exist, risk and expert-review gates at high risk or above, a low-confidence gate with an 0.8 threshold, and a cost gate when any proposal carries a positive cost estimate.
+ * @param riskLevel - Effective risk level (see {@link inferCompilerRisk}).
+ * @param proposals - Compiled action proposals.
+ * @param sourceIds - Compiled evidence source ids.
+ * @returns Gate list in the fixed order described above; possibly empty.
+ * @throws Never.
+ */
 function defaultApprovalGates(riskLevel: WorkflowRiskLevel, proposals: readonly ActionProposalInput[], sourceIds: readonly string[]): ApprovalGate[] {
   const gates: ApprovalGate[] = [];
   if (proposals.some(proposal => proposal.capability !== 'read')) {
@@ -828,6 +1038,12 @@ function defaultApprovalGates(riskLevel: WorkflowRiskLevel, proposals: readonly 
   return gates;
 }
 
+/**
+ * Deterministically compiles a full workflow definition from a compilation input: derives name, purpose, input schema (hints plus `{{placeholders}}`), allowed sources/connectors/tools, required evidence, risk level, default approval gates, sample inputs and an embedded dry-run smoke test. Missing tool calls, sources or hints are reported as warnings rather than failures.
+ * @param input - Compilation input.
+ * @returns The draft definition plus its derived source ids, proposals, sample inputs and warnings.
+ * @throws Never.
+ */
 function compileWorkflowDefinition(input: WorkflowCompileInput): {
   definition: WorkflowDefinitionInput;
   sourceIds: string[];
@@ -876,26 +1092,70 @@ function compileWorkflowDefinition(input: WorkflowCompileInput): {
   return { definition, sourceIds, proposals, sampleInputs, warnings };
 }
 
+/**
+ * Resolves the acting principal id from the ambient security scope (see {@link tryCurrentPrincipal}).
+ * @returns The current principal's id, or `system` when no principal scope is active.
+ * @throws Never.
+ */
 function principalId(): string {
   return tryCurrentPrincipal()?.id ?? 'system';
 }
 
+/**
+ * Runs a store query and returns the matching items.
+ * @typeParam T - Store record type; must carry `id` and `version` fields.
+ * @param store - Store to query.
+ * @param query - Filter/sort to apply; an empty query (matching everything) is used when omitted.
+ * @returns Promise of the query result's `items`, in the store/query-determined order.
+ * @throws Never.
+ */
 function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   return store.query(query ?? {}).then(result => result.items);
 }
 
+/**
+ * Compares risk levels by their ordering (low < medium < high < critical).
+ * @param value - Level to test.
+ * @param required - Minimum level to meet or exceed.
+ * @returns `true` when `value` is at least as severe as `required`.
+ * @throws Never.
+ */
 function riskAtLeast(value: WorkflowRiskLevel, required: WorkflowRiskLevel): boolean {
   return RISK_ORDER.indexOf(value) >= RISK_ORDER.indexOf(required);
 }
 
+/**
+ * Type guard for plain (non-null, non-array) object values.
+ * @param value - Value to test.
+ * @returns `true` when `value` is a non-null, non-array object.
+ * @throws Never.
+ */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Distinguishes `undefined` from a present value so optional record fields can be conditionally spread without violating `exactOptionalPropertyTypes`.
+ * @typeParam T - Value type.
+ * @param value - Value to wrap.
+ * @returns `{ include: false }` for `undefined`; otherwise `{ include: true, value }`.
+ * @throws Never.
+ */
 function optional<T>(value: T | undefined): { include: false } | { include: true; value: T } {
   return value === undefined ? { include: false } : { include: true, value };
 }
 
+/**
+ * Returns a shallow copy of `base` with `key` set to `value`, or `base` unchanged when `value` is `undefined` — the conditional-spread helper for optional fields.
+ * @typeParam T - Base record type.
+ * @typeParam K - Key name.
+ * @typeParam V - Value type.
+ * @param base - Record to copy.
+ * @param key - Optional field name.
+ * @param value - Field value; `undefined` leaves the field out of the copy entirely.
+ * @returns Copy of `base` with the optional field applied when present.
+ * @throws Never.
+ */
 function withOptional<T extends Record<string, unknown>, K extends string, V>(
   base: T,
   key: K,
@@ -905,6 +1165,14 @@ function withOptional<T extends Record<string, unknown>, K extends string, V>(
   return (opt.include ? { ...base, [key]: opt.value } : base) as T & Partial<Record<K, V>>;
 }
 
+/**
+ * Recursively validates a value against a subset of JSON Schema: `type`, `minLength`, `enum`, `required`, nested `properties` and array `items`. Unsupported keywords are ignored.
+ * @param schema - JSON Schema fragment to validate against.
+ * @param value - Value to validate.
+ * @param path - JSON path prefix used in error reports; defaults to `$`.
+ * @returns One {@link ValidationError} per violation in traversal order; empty when the value is valid.
+ * @throws Never.
+ */
 function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path = '$'): ValidationError[] {
   const errors: ValidationError[] = [];
   const expectedType = schema['type'];
@@ -951,6 +1219,12 @@ function validateSchemaValue(schema: Record<string, unknown>, value: unknown, pa
   return errors;
 }
 
+/**
+ * Validates a workflow definition against {@link WORKFLOW_DEFINITION_SCHEMA} plus structural rules JSON Schema cannot express: `inputSchema`/`triggerSchema` must be object-typed JSON Schemas, every approval gate needs an id and a supported type, and every required-evidence entry needs a name.
+ * @param input - Definition input (or persisted definition) to validate.
+ * @returns Validation errors in check order; empty when the definition is valid.
+ * @throws Never.
+ */
 function validateDefinitionShape(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[] {
   const errors = validateSchemaValue(WORKFLOW_DEFINITION_SCHEMA, input);
   if (input.inputSchema !== undefined && !isPlainRecord(input.inputSchema)) {
@@ -974,6 +1248,13 @@ function validateDefinitionShape(input: WorkflowDefinitionInput | WorkflowDefini
   return errors;
 }
 
+/**
+ * Merges a definition input with an existing persisted definition: omitted fields fall back to the existing values (then to defaults), the id is preserved or derived deterministically via {@link hashId}, a fresh `version` is assigned, and list-valued fields are deduplicated. Does not persist anything.
+ * @param input - Incoming definition fields; `undefined` fields inherit from `existing`.
+ * @param existing - Previously stored definition to merge onto, or `null` when creating.
+ * @returns A complete definition with `updatedAt` set to now and a new `version`.
+ * @throws Never.
+ */
 function normalizeDefinition(input: WorkflowDefinitionInput, existing: WorkflowDefinition | null): WorkflowDefinition {
   const timestamp = nowIso();
   const name = input.name.trim();
@@ -1002,29 +1283,65 @@ function normalizeDefinition(input: WorkflowDefinitionInput, existing: WorkflowD
   return definition;
 }
 
+/**
+ * {@link WorkflowRegistry} implementation backed by three stores: workflow definitions, frozen definition versions and eval cases. Every upsert assigns the definition a fresh version and freezes it as a new version record; eval cases mirror the definition's embedded tests.
+ */
 class StoreBackedWorkflowRegistry implements WorkflowRegistry {
   private readonly definitions: Store<WorkflowDefinition>;
   private readonly versions: Store<WorkflowVersion>;
   private readonly evalCases: Store<WorkflowEvalCase>;
 
+  /**
+   * Creates a registry over the given stores.
+   * @param definitions - Store holding workflow definitions.
+   * @param versions - Store holding frozen definition version records.
+   * @param evalCases - Store holding stored eval cases.
+   * @throws Never.
+   */
   constructor(definitions: Store<WorkflowDefinition>, versions: Store<WorkflowVersion>, evalCases: Store<WorkflowEvalCase>) {
     this.definitions = definitions;
     this.versions = versions;
     this.evalCases = evalCases;
   }
 
+  /**
+   * Derives the deterministic definition id for a workspace/name pair (see {@link hashId}).
+   * @param workspaceId - Owning workspace id.
+   * @param name - Definition name; normalized before hashing.
+   * @returns Deterministic id of the form `workflow-definition:<hash>`.
+   * @throws Never.
+   */
   stableWorkflowId(workspaceId: string, name: string): string {
     return hashId('workflow-definition', [workspaceId, normalizeName(name)]);
   }
 
+  /**
+   * Derives the deterministic version-record id for a workflow id and definition version.
+   * @param workflowId - Definition id.
+   * @param workflowVersion - Definition version string.
+   * @returns Deterministic id of the form `workflow-version:<hash>`.
+   * @throws Never.
+   */
   stableWorkflowVersionId(workflowId: string, workflowVersion: string): string {
     return hashId('workflow-version', [workflowId, workflowVersion]);
   }
 
+  /**
+   * Validates a definition input or persisted definition against the structural rules of {@link validateDefinitionShape}.
+   * @param input - Definition to validate.
+   * @returns Validation errors; empty when the definition is valid.
+   * @throws Never.
+   */
   validateDefinition(input: WorkflowDefinitionInput | WorkflowDefinition): ValidationError[] {
     return validateDefinitionShape(input);
   }
 
+  /**
+   * Creates or updates a definition and freezes it as a new version. The merged candidate is validated first; when invalid, nothing is persisted and a preview version (not stored) is returned alongside the errors. When valid, the definition, its version record and one eval case per embedded test are written, each with a freshly generated version.
+   * @param input - Definition fields; omitted fields are inherited from the stored definition.
+   * @returns The persisted (or rejected candidate) definition, its version, and the validation errors.
+   * @throws Never.
+   */
   async upsertDefinition(input: WorkflowDefinitionInput): Promise<{ definition: WorkflowDefinition; version: WorkflowVersion; validation: ValidationError[] }> {
     const candidateId = input.id ?? this.stableWorkflowId(input.workspaceId, input.name);
     const existing = await this.definitions.get(candidateId);
@@ -1051,14 +1368,33 @@ class StoreBackedWorkflowRegistry implements WorkflowRegistry {
     return { definition, version, validation };
   }
 
+  /**
+   * Fetches the current definition by id.
+   * @param id - Definition id.
+   * @returns The definition, or `null` when unknown.
+   * @throws Never.
+   */
   getDefinition(id: string): Promise<WorkflowDefinition | null> {
     return this.definitions.get(id);
   }
 
+  /**
+   * Fetches a frozen version record by id.
+   * @param id - Version-record id (see {@link stableWorkflowVersionId}).
+   * @returns The version record, or `null` when unknown.
+   * @throws Never.
+   */
   getVersion(id: string): Promise<WorkflowVersion | null> {
     return this.versions.get(id);
   }
 
+  /**
+   * Resolves a definition by workspace and exact (trimmed) name, falling back to the deterministic stable id when the query yields no match.
+   * @param workspaceId - Owning workspace id.
+   * @param name - Definition name.
+   * @returns The definition, or `null` when unknown.
+   * @throws Never.
+   */
   async definitionByName(workspaceId: string, name: string): Promise<WorkflowDefinition | null> {
     const definitions = await this.queryDefinitions({
       where: {
@@ -1072,18 +1408,42 @@ class StoreBackedWorkflowRegistry implements WorkflowRegistry {
     return definitions[0] ?? this.definitions.get(this.stableWorkflowId(workspaceId, name));
   }
 
+  /**
+   * Queries stored definitions.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching definitions in the store/query-determined order.
+   * @throws Never.
+   */
   queryDefinitions(query?: StoreQuery): Promise<WorkflowDefinition[]> {
     return queryAll(this.definitions, query);
   }
 
+  /**
+   * Queries stored version records.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching version records in the store/query-determined order.
+   * @throws Never.
+   */
   queryVersions(query?: StoreQuery): Promise<WorkflowVersion[]> {
     return queryAll(this.versions, query);
   }
 
+  /**
+   * Queries stored eval cases.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching eval cases in the store/query-determined order.
+   * @throws Never.
+   */
   queryEvalCases(query?: StoreQuery): Promise<WorkflowEvalCase[]> {
     return queryAll(this.evalCases, query);
   }
 
+  /**
+   * Builds the version record for a definition without persisting it; the record's own `version` is freshly randomized on every call.
+   * @param definition - Definition to version.
+   * @returns An unpersisted {@link WorkflowVersion}.
+   * @throws Never.
+   */
   private previewVersion(definition: WorkflowDefinition): WorkflowVersion {
     return {
       id: this.stableWorkflowVersionId(definition.id, definition.version),
@@ -1097,6 +1457,9 @@ class StoreBackedWorkflowRegistry implements WorkflowRegistry {
   }
 }
 
+/**
+ * {@link WorkflowRunner} implementation persisting runs, run events, approvals and shadow comparisons to stores. Every mutation assigns the run a fresh version before writing, and run events are sequenced per run and mirrored to the optional observability sink. The source and connector registries are optional: without a source registry evidence degrades to bare source-id references, and without a connector registry capability falls back to input-shape inference.
+ */
 class StoreBackedWorkflowRunner implements WorkflowRunner {
   private readonly registry: WorkflowRegistry;
   private readonly runs: Store<WorkflowRun>;
@@ -1107,6 +1470,18 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
   private readonly connectorRegistry: ConnectorRegistryLike | undefined;
   private readonly observability: () => ObservabilityLike | undefined;
 
+  /**
+   * Wires the runner to its stores and optional registry services.
+   * @param registry - Registry used to resolve definitions and versions.
+   * @param runs - Store for workflow runs.
+   * @param events - Store for run events.
+   * @param approvals - Store for approval requests.
+   * @param shadowComparisons - Store for shadow comparisons.
+   * @param sourceRegistry - Optional source registry for evidence resolution and access recording; omitted means bare source-id references.
+   * @param connectorRegistry - Optional connector registry for capability/connector resolution; omitted means inference from tool-call input.
+   * @param observability - Lookup returning the observability sink to mirror run events to, re-evaluated per event; may yield `undefined`.
+   * @throws Never.
+   */
   constructor(
     registry: WorkflowRegistry,
     runs: Store<WorkflowRun>,
@@ -1127,6 +1502,12 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     this.observability = observability;
   }
 
+  /**
+   * Starts a workflow run: resolves the definition, persists the created run, validates inputs against the definition's input schema (failing the run on error), resolves evidence, normalizes proposals, then either completes immediately (dry-run/shadow), requests approvals per the definition's gates (approval-gated/execute), or marks the run ready for execution when no gate triggers. The run mode defaults to the definition's `dryRunDefault` (`dry_run` or `approval_gated`).
+   * @param input - Workflow, workspace, mode, inputs, evidence sources, proposals, labels and trace ids; `workflowId` and `workflowName` are alternative resolution paths.
+   * @returns The run in its post-start state (`succeeded`, `waiting_for_approval`, `running` or `failed`).
+   * @throws Error - When the definition cannot be resolved, belongs to another workspace, or the requested version is unknown.
+   */
   async startRun(input: StartWorkflowInput): Promise<WorkflowRun> {
     const definition = await this.resolveDefinition(input);
     const mode = input.mode ?? (definition.dryRunDefault ? 'dry_run' : 'approval_gated');
@@ -1211,6 +1592,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return run;
   }
 
+  /**
+   * Approves one pending approval (by id) or, when `approvalId` is omitted, all pending approvals of the run; the deciding principal is taken from the ambient security scope. Matching proposals become `approved`. The run returns to `waiting_for_approval` while other approvals remain, moves to `running`/`approved_pending_execution` otherwise, and finishes `succeeded` when nothing remains to execute. Emits `approval_approved` and, when complete, `approvals_completed` or `run_succeeded`.
+   * @param runId - Run whose approvals are decided.
+   * @param approvalId - Specific pending approval to approve; `undefined` approves every pending approval.
+   * @param reason - Optional decision reason recorded on the approvals.
+   * @returns The updated run and the approvals decided by this call.
+   * @throws Error - When the run does not exist or no matching pending approval is found.
+   */
   async approveRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
     const run = await this.requireRun(runId);
     const pending = await this.pendingApprovals(runId, approvalId);
@@ -1253,6 +1642,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { run: updatedRun, approvals: decided };
   }
 
+  /**
+   * Rejects one pending approval (by id) or all pending approvals when `approvalId` is omitted; the deciding principal is taken from the ambient security scope. Matching proposals become `rejected` and the run is finished as `cancelled` regardless of any remaining approvals. Emits an `approval_rejected` event.
+   * @param runId - Run whose approvals are decided.
+   * @param approvalId - Specific pending approval to reject; `undefined` rejects every pending approval.
+   * @param reason - Optional decision reason recorded on the approvals.
+   * @returns The cancelled run and the approvals rejected by this call.
+   * @throws Error - When the run does not exist or no matching pending approval is found.
+   */
   async rejectRun(runId: string, approvalId?: string, reason?: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
     const run = await this.requireRun(runId);
     const pending = await this.pendingApprovals(runId, approvalId);
@@ -1289,6 +1686,13 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { run: updatedRun, approvals: rejected };
   }
 
+  /**
+   * Escalates a run: every pending approval becomes `escalated` and the run finishes with status and completion state `escalated`. Emits a `run_escalated` event.
+   * @param runId - Run to escalate.
+   * @param reason - Human-readable escalation reason recorded on the approvals and the event.
+   * @returns The escalated run and the approvals escalated by this call (empty when none were pending).
+   * @throws Error - When the run does not exist.
+   */
   async escalateRun(runId: string, reason: string): Promise<{ run: WorkflowRun; approvals: WorkflowApproval[] }> {
     const run = await this.requireRun(runId);
     const timestamp = nowIso();
@@ -1318,6 +1722,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { run: updatedRun, approvals: escalated };
   }
 
+  /**
+   * Records the business outcome of a run and finishes it: `verified_completed` maps to completion state `business_outcome_verified` (status `succeeded`), `estimated_completed` to `action_succeeded` (status `succeeded`), and `failed`/`cancelled`/`escalated` map directly to the same-named states. Emits a `business_outcome_recorded` event.
+   * @param runId - Run to finish.
+   * @param outcomeId - External outcome identifier recorded on the run.
+   * @param status - Business-level completion verdict.
+   * @returns The finished run.
+   * @throws Error - When the run does not exist.
+   */
   async recordBusinessOutcome(runId: string, outcomeId: string, status: 'verified_completed' | 'estimated_completed' | 'failed' | 'cancelled' | 'escalated'): Promise<WorkflowRun> {
     const run = await this.requireRun(runId);
     const timestamp = nowIso();
@@ -1336,6 +1748,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return updatedRun;
   }
 
+  /**
+   * Adds human labels to a shadow-mode run (deduplicated with existing ones), appends a `shadow_result_labeled` event and upserts the run's shadow comparison.
+   * @param runId - Shadow-mode run to label.
+   * @param labels - Raw label strings; normalized before storage.
+   * @param note - Optional reviewer note stored on the comparison; an existing note is kept when omitted.
+   * @returns The updated run.
+   * @throws Error - When the run does not exist or is not a shadow-mode run.
+   */
   async labelShadowResult(runId: string, labels: string[], note?: string): Promise<WorkflowRun> {
     const run = await this.requireRun(runId);
     if (run.mode !== 'shadow') throw new Error(`Workflow run "${runId}" is not a shadow-mode run.`);
@@ -1349,6 +1769,14 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return updatedRun;
   }
 
+  /**
+   * Labels (when new labels are supplied) and classifies a shadow-mode run, upserting its per-run shadow comparison and appending `shadow_result_labeled`/`shadow_result_compared` events. Repeating an identical decision (no new labels, an existing comparison, no note) is idempotent and returns the stored comparison without emitting new events.
+   * @param runId - Shadow-mode run to compare.
+   * @param labels - Additional human labels; defaults to none (re-classifies the existing labels).
+   * @param note - Optional reviewer note; replaces an existing note only when supplied.
+   * @returns The (possibly label-updated) run and the upserted comparison.
+   * @throws Error - When the run does not exist or is not a shadow-mode run.
+   */
   async compareShadowRun(runId: string, labels: string[] = [], note?: string): Promise<{ run: WorkflowRun; comparison: WorkflowShadowComparison }> {
     const run = await this.requireRun(runId);
     if (run.mode !== 'shadow') throw new Error(`Workflow run "${runId}" is not a shadow-mode run.`);
@@ -1380,15 +1808,33 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { run: updatedRun, comparison };
   }
 
+  /**
+   * Queries stored shadow comparisons.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching comparisons in the store/query-determined order.
+   * @throws Never.
+   */
   shadowComparisons(query?: StoreQuery): Promise<WorkflowShadowComparison[]> {
     return queryAll(this.shadowComparisonsStore, query);
   }
 
+  /**
+   * Aggregates shadow comparisons into acceptance statistics: outcome counts and acceptance rate overall, plus a per-workflow breakdown sorted by descending comparison count, then workflow id.
+   * @param query - Optional filter selecting the comparisons to aggregate; matches everything when omitted.
+   * @returns The aggregate summary; all zeros when no comparisons match.
+   * @throws Never.
+   */
   async shadowSummary(query?: StoreQuery): Promise<WorkflowShadowSummary> {
     const comparisons = await this.shadowComparisons(query);
     if (comparisons.length === 0) return emptyShadowSummary();
     const summary = emptyShadowSummary();
     const byWorkflow = new Map<string, WorkflowShadowSummary['byWorkflow'][number]>();
+    /**
+     * Bins one comparison outcome into the given outcome counters.
+     * @param outcome - Outcome to count.
+     * @param target - Outcome counters to increment.
+     * @throws Never.
+     */
     const count = (outcome: ShadowComparisonOutcome, target: Pick<WorkflowShadowSummary, 'accepted' | 'rejected' | 'mixed' | 'unlabeled'>): void => {
       if (outcome === 'accepted') target.accepted++;
       else if (outcome === 'rejected') target.rejected++;
@@ -1424,6 +1870,16 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return summary;
   }
 
+  /**
+   * Records the execution of an approved proposal's tool call: appends an executed-action entry (hashing the result; on failure, truncating its serialization to 1000 characters as the error text), marks the proposal `executed` and advances the run — a failed execution fails the run, and the last successful execution finishes it as `succeeded`/`action_succeeded`. Silent no-op when the run is unknown or no approved proposal matches the tool name. Emits `tool_executed`/`tool_execution_failed` and possibly `run_succeeded` events.
+   * @param runId - Run whose proposal was executed.
+   * @param toolName - Name of the executed tool; matched against approved proposals.
+   * @param result - Raw tool result (success payload or error), hashed into the ledger.
+   * @param isError - Whether the tool call failed.
+   * @param durationMs - Optional execution duration in milliseconds, recorded on the event.
+   * @returns Promise resolving once the run ledger and events are written.
+   * @throws Never.
+   */
   async recordToolResult(runId: string, toolName: string, result: unknown, isError: boolean, durationMs?: number): Promise<void> {
     const run = await this.runs.get(runId);
     if (run === null) return;
@@ -1460,6 +1916,12 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     if (!isError && allExecutableFinished) await this.appendEvent(updatedRun, 'run_succeeded', { reason: 'All approved actions executed successfully.' });
   }
 
+  /**
+   * Loads a run together with its full event history (in sequence order) and approval records.
+   * @param runId - Run to inspect.
+   * @returns The run (`null` when unknown), its events ordered by sequence, and its approvals in store order.
+   * @throws Never.
+   */
   async inspectRun(runId: string): Promise<{ run: WorkflowRun | null; events: WorkflowRunEvent[]; approvals: WorkflowApproval[] }> {
     const run = await this.runs.get(runId);
     return {
@@ -1469,14 +1931,34 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     };
   }
 
+  /**
+   * Queries stored runs.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching runs in the store/query-determined order.
+   * @throws Never.
+   */
   listRuns(query?: StoreQuery): Promise<WorkflowRun[]> {
     return queryAll(this.runs, query);
   }
 
+  /**
+   * Queries stored approval requests.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching approvals in the store/query-determined order.
+   * @throws Never.
+   */
   listApprovals(query?: StoreQuery): Promise<WorkflowApproval[]> {
     return queryAll(this.approvals, query);
   }
 
+  /**
+   * Decides whether a tool call is allowed under the workflow governing its input (via a `workflowRunId`). Denials (active but not allowed) cover unknown runs or definitions, a calling principal other than the run's submitter (unless the run is owned by `system`), tools or connectors outside the definition allow-lists, non-read calls in dry-run/shadow modes, and non-read calls without an approved or executed proposal. Calls without a workflow run id are allowed and reported as inactive.
+   * @param toolName - Name of the tool being called.
+   * @param input - Tool-call input, scanned for the workflow run id and connector instance id.
+   * @param principal - Calling principal; `undefined` skips the submitter check.
+   * @returns The policy decision, including the resolved capability and the governing run when active.
+   * @throws Never.
+   */
   async evaluateToolPolicy(toolName: string, input: unknown, principal?: Principal): Promise<WorkflowPolicyDecision> {
     const workflowRunId = extractWorkflowRunId(input);
     if (workflowRunId === undefined) return { allowed: true, active: false };
@@ -1515,6 +1997,13 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { allowed: true, active: true, run, capability };
   }
 
+  /**
+   * Builds and persists the shadow comparison for a shadow-mode run: classifies the run's normalized labels, hashes the recommendation (workflow, inputs, proposals) into a stable per-run comparison id, and preserves the original creation timestamp and note across updates.
+   * @param run - Shadow-mode run (must be mode `shadow`).
+   * @param note - Optional reviewer note; an existing note is kept when omitted.
+   * @returns The persisted comparison.
+   * @throws Error - When the run is not a shadow-mode run.
+   */
   private async upsertShadowComparison(run: WorkflowRun, note?: string): Promise<WorkflowShadowComparison> {
     if (run.mode !== 'shadow') throw new Error(`Workflow run "${run.id}" is not a shadow-mode run.`);
     const id = hashId('workflow-shadow-comparison', [run.id]);
@@ -1564,6 +2053,12 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return comparison;
   }
 
+  /**
+   * Resolves the definition a run should execute: by `workflowId` when given, otherwise by `workflowName` within the workspace; a requested `workflowVersion` swaps in that frozen version's definition. The resolved definition must belong to the requested workspace.
+   * @param input - Start-run input carrying the resolution keys and target workspace.
+   * @returns The resolved definition (possibly a historical version's snapshot).
+   * @throws Error - When no definition resolves, the workspace mismatches, or the requested version is unknown.
+   */
   private async resolveDefinition(input: StartWorkflowInput): Promise<WorkflowDefinition> {
     const definition = input.workflowId !== undefined
       ? await this.registry.getDefinition(input.workflowId)
@@ -1581,6 +2076,13 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return definition;
   }
 
+  /**
+   * Resolves the run's evidence sources into citation references, warning (never failing) on unmet `minCitations`, out-of-allow-list or cross-workspace sources, unhealthy/stale sources and unresolvable citations. With a source registry, citations are resolved, the newest observed version is preferred and a `read` access is recorded (registry call failures are swallowed); without one, bare source-id references are returned.
+   * @param definition - Definition supplying the evidence requirements and source allow-list.
+   * @param run - Run whose `evidenceSourceIds` are resolved.
+   * @returns One reference per evidence source in input order, plus the accumulated warnings.
+   * @throws Never.
+   */
   private async resolveEvidence(definition: WorkflowDefinition, run: WorkflowRun): Promise<{ references: EvidenceReference[]; warnings: string[] }> {
     const warnings: string[] = [];
     const references: EvidenceReference[] = [];
@@ -1636,12 +2138,27 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return { references, warnings };
   }
 
+  /**
+   * Finds the most recently observed version of a source via the source registry's optional `sourceVersions` capability.
+   * @param sourceId - Source to inspect.
+   * @returns The newest version by `observedAt`, or `undefined` when the registry lacks the capability or the lookup fails.
+   * @throws Never.
+   */
   private async latestSourceVersion(sourceId: string): Promise<{ id: string; observedAt: string } | undefined> {
     if (this.sourceRegistry?.sourceVersions === undefined) return undefined;
     const versions = await this.sourceRegistry.sourceVersions(sourceId).catch(() => []);
     return versions.sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0];
   }
 
+  /**
+   * Converts raw action proposals into run-scoped proposals: injects `workflowRunId` into each input, resolves capability and connector instance via the connector registry (falling back to {@link inferCapability}) under the run's principal, blocks proposals whose tool or connector is outside the definition allow-lists, and marks every unblocked non-read proposal as requiring approval.
+   * @param definition - Definition supplying the tool/connector allow-lists.
+   * @param run - Run the proposals belong to; its id and principal are stamped onto each proposal.
+   * @param proposals - Raw proposals from the start-run input.
+   * @param mode - Run mode; accepted for call-site symmetry but not used by the normalization itself.
+   * @returns Normalized proposals in input order.
+   * @throws Never.
+   */
   private async normalizeProposals(
     definition: WorkflowDefinition,
     run: WorkflowRun,
@@ -1683,9 +2200,23 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return normalized;
   }
 
+  /**
+   * Creates pending approval requests for a run according to the definition's gates: per-proposal action gates (any non-blocked action when an action gate exists or the action itself requires approval), low-confidence and cost gates when a proposal falls below or exceeds the gate thresholds, plus run-level risk and expert-review gates (both keyed on the gate's required risk level) and a stale-source gate (when evidence warnings exist). Each request is persisted with a due date from {@link approvalDueAt}.
+   * @param definition - Definition supplying the approval gates.
+   * @param run - Run whose proposals and principal the requests reference.
+   * @param evidenceWarnings - Evidence resolution warnings that trigger stale-source gates.
+   * @returns The persisted requests in creation order.
+   * @throws Never.
+   */
   private async createApprovalRequests(definition: WorkflowDefinition, run: WorkflowRun, evidenceWarnings: string[]): Promise<WorkflowApproval[]> {
     const requests: WorkflowApproval[] = [];
     const timestamp = nowIso();
+    /**
+     * Builds and persists one pending approval, filling in the run-derived identity fields and the computed due date.
+     * @param input - Approval payload without the run-derived fields.
+     * @returns Promise resolving once the approval is stored.
+     * @throws Never.
+     */
     const addRequest = async (input: Omit<WorkflowApproval, 'id' | 'version' | 'runId' | 'workflowId' | 'status' | 'requestedAt' | 'updatedAt'>): Promise<void> => {
       const approval = withOptional(withOptional(withOptional({
         id: randomUUID(),
@@ -1761,18 +2292,39 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return requests;
   }
 
+  /**
+   * Persists a run snapshot, assigning it a fresh version so concurrent writers are detectable.
+   * @param run - Run state to persist (already merged by the caller).
+   * @returns The persisted run with its new version.
+   * @throws Never.
+   */
   private async updateRun(run: WorkflowRun): Promise<WorkflowRun> {
     const updated = { ...run, version: randomUUID() };
     await this.runs.set(updated.id, updated);
     return updated;
   }
 
+  /**
+   * Loads a run or fails.
+   * @param runId - Run id.
+   * @returns The stored run.
+   * @throws Error - When the run does not exist.
+   */
   private async requireRun(runId: string): Promise<WorkflowRun> {
     const run = await this.runs.get(runId);
     if (run === null) throw new Error(`Unknown workflow run "${runId}".`);
     return run;
   }
 
+  /**
+   * Appends a run event with the next per-run sequence number and mirrors it to the observability sink (`start` phase for `run_created`, `end` for terminal event types, `error` status for failures). Sink failures are logged and swallowed — event persistence always completes first.
+   * @param run - Run the event belongs to; its trace ids and principal are copied onto the event.
+   * @param eventType - Machine-readable event type.
+   * @param payload - Structured event payload.
+   * @param sourceIds - Optional evidence source ids associated with the event.
+   * @returns The persisted event.
+   * @throws Never.
+   */
   private async appendEvent(run: WorkflowRun, eventType: string, payload: Record<string, unknown>, sourceIds?: string[]): Promise<WorkflowRunEvent> {
     const existing = await this.eventsForRun(run.id);
     const event: WorkflowRunEvent = {
@@ -1812,32 +2364,67 @@ class StoreBackedWorkflowRunner implements WorkflowRunner {
     return event;
   }
 
+  /**
+   * Loads all events of a run sorted by sequence number.
+   * @param runId - Run id.
+   * @returns The run's events in ascending sequence order.
+   * @throws Never.
+   */
   private async eventsForRun(runId: string): Promise<WorkflowRunEvent[]> {
     const events = await queryAll(this.events, { where: { op: 'eq', field: 'runId', value: runId } });
     return events.sort((left, right) => left.sequence - right.sequence);
   }
 
+  /**
+   * Loads all approval records of a run.
+   * @param runId - Run id.
+   * @returns The run's approvals in store order.
+   * @throws Never.
+   */
   private async approvalsForRun(runId: string): Promise<WorkflowApproval[]> {
     return queryAll(this.approvals, { where: { op: 'eq', field: 'runId', value: runId } });
   }
 
+  /**
+   * Loads a run's still-pending approvals, optionally narrowed to one id.
+   * @param runId - Run id.
+   * @param approvalId - Restricts the result to this approval when given.
+   * @returns Pending approvals in store order (a single item when narrowed).
+   * @throws Never.
+   */
   private async pendingApprovals(runId: string, approvalId?: string): Promise<WorkflowApproval[]> {
     const approvals = await this.approvalsForRun(runId);
     return approvals.filter(approval => approval.status === 'pending' && (approvalId === undefined || approval.id === approvalId));
   }
 }
 
+/**
+ * {@link WorkflowCompiler} implementation persisting compilations to a store. Compilation ids are content-derived (see {@link stableCompilationId}), so repeated identical inputs update the same record rather than creating duplicates.
+ */
 class StoreBackedWorkflowCompiler implements WorkflowCompiler {
   private readonly registry: WorkflowRegistry;
   private readonly runner: WorkflowRunner;
   private readonly compilations: Store<WorkflowCompilation>;
 
+  /**
+   * Wires the compiler to its registry, runner and compilation store.
+   * @param registry - Registry validating and publishing compiled definitions.
+   * @param runner - Runner executing compiled dry runs.
+   * @param compilations - Store for compilation records.
+   * @throws Never.
+   */
   constructor(registry: WorkflowRegistry, runner: WorkflowRunner, compilations: Store<WorkflowCompilation>) {
     this.registry = registry;
     this.runner = runner;
     this.compilations = compilations;
   }
 
+  /**
+   * Derives the deterministic compilation id for an input: workspace, normalized workflow name and a hash over the purpose, transcript, messages, sources, tool calls, input hints and sample inputs. Identical inputs therefore share one compilation record.
+   * @param input - Compilation input.
+   * @returns Deterministic id of the form `workflow-compilation:<hash>`.
+   * @throws Never.
+   */
   stableCompilationId(input: WorkflowCompileInput): string {
     return hashId('workflow-compilation', [
       input.workspaceId,
@@ -1854,6 +2441,12 @@ class StoreBackedWorkflowCompiler implements WorkflowCompiler {
     ]);
   }
 
+  /**
+   * Compiles (and optionally publishes and dry-runs) a workflow definition. The draft is always compiled and persisted as an up-to-date record; with `publish: true` and a valid draft the definition is upserted into the registry; with `dryRun: true` and a successful publish, a dry run of the compiled sample inputs is started (its failures are captured as warnings, never thrown). The recorded status tracks the furthest stage reached: `drafted`, `published`, `dry_run_completed` or `failed`.
+   * @param input - Compilation input including the publish/dry-run switches.
+   * @returns The compilation record plus the draft definition, validation errors, and the published definition/version and dry run when applicable.
+   * @throws Never.
+   */
   async compile(input: WorkflowCompileInput): Promise<WorkflowCompileResult> {
     const existing = await this.compilations.get(this.stableCompilationId(input));
     const timestamp = nowIso();
@@ -1928,15 +2521,33 @@ class StoreBackedWorkflowCompiler implements WorkflowCompiler {
     };
   }
 
+  /**
+   * Fetches a compilation record by id.
+   * @param id - Compilation id (see {@link stableCompilationId}).
+   * @returns The compilation, or `null` when unknown.
+   * @throws Never.
+   */
   getCompilation(id: string): Promise<WorkflowCompilation | null> {
     return this.compilations.get(id);
   }
 
+  /**
+   * Queries stored compilation records.
+   * @param query - Optional filter/sort; matches everything when omitted.
+   * @returns Matching compilations in the store/query-determined order.
+   * @throws Never.
+   */
   queryCompilations(query?: StoreQuery): Promise<WorkflowCompilation[]> {
     return queryAll(this.compilations, query);
   }
 }
 
+/**
+ * Infers a connector capability from a tool-call input: `write` when the stringified `action` field matches a mutating verb (write, update, delete, create, set_, configure, approve, reject, execute, reindex, upsert, register), otherwise `read`. Non-record inputs are always `read`.
+ * @param input - Tool-call input, of any shape.
+ * @returns Inferred capability.
+ * @throws Never.
+ */
 function inferCapability(input: unknown): ConnectorCapability {
   if (!isPlainRecord(input)) return 'read';
   const action = String(input['action'] ?? '').toLowerCase();
@@ -1944,6 +2555,12 @@ function inferCapability(input: unknown): ConnectorCapability {
   return 'read';
 }
 
+/**
+ * Extracts the workflow run id governing a tool call, from either a top-level `workflowRunId` field or a nested `workflow.runId` record.
+ * @param input - Tool-call input, of any shape.
+ * @returns The run id, or `undefined` when the input is not workflow-scoped.
+ * @throws Never.
+ */
 function extractWorkflowRunId(input: unknown): string | undefined {
   if (!isPlainRecord(input)) return undefined;
   if (typeof input['workflowRunId'] === 'string') return input['workflowRunId'];
@@ -1951,12 +2568,21 @@ function extractWorkflowRunId(input: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Extracts a connector instance id from the top-level `connectorInstanceId` field of a tool-call input.
+ * @param input - Tool-call input, of any shape.
+ * @returns The connector instance id, or `undefined` when absent.
+ * @throws Never.
+ */
 function extractConnectorInstanceId(input: unknown): string | undefined {
   if (!isPlainRecord(input)) return undefined;
   if (typeof input['connectorInstanceId'] === 'string') return input['connectorInstanceId'];
   return undefined;
 }
 
+/**
+ * Arguments of the `workflow_action` tool: the action discriminator plus the flattened fields of the compile, start-run and decision operations it dispatches to.
+ */
 interface WorkflowActionInput {
   action: string;
   compile?: WorkflowCompileInput;
@@ -1992,6 +2618,14 @@ interface WorkflowActionInput {
   query?: StoreQuery;
 }
 
+/**
+ * Builds the `workflow_action` tool exposing the registry, runner and compiler services to the LLM. The tool's execute generator dispatches on the required `action` field (compile, draft, validate, start, approve, reject, escalate, shadow labeling/reporting, inspect and list operations), yielding `result` events on success and `error` events for missing parameters, unknown actions and failures thrown by the underlying services — the generator itself never throws.
+ * @param registry - Registry used by the draft/validate operations.
+ * @param runner - Runner used by the run lifecycle operations.
+ * @param compiler - Compiler used by the compile/compilation-query operations.
+ * @returns The `workflow_action` tool definition.
+ * @throws Never.
+ */
 function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRunner, compiler: WorkflowCompiler): Tool {
   return {
     name: 'workflow_action',
@@ -2125,6 +2759,12 @@ function createWorkflowActionTool(registry: WorkflowRegistry, runner: WorkflowRu
   };
 }
 
+/**
+ * Builds a {@link WorkflowCompileInput} from `workflow_action` arguments: the nested `compile` object wins when present; otherwise the flat top-level compile fields are assembled.
+ * @param parsed - Parsed tool-call arguments.
+ * @returns The compilation input.
+ * @throws Error - When neither `compile` nor `workspaceId` was supplied.
+ */
 function workflowCompileInputFromAction(parsed: WorkflowActionInput): WorkflowCompileInput {
   if (parsed.compile !== undefined) return parsed.compile;
   if (parsed.workspaceId === undefined) throw new Error('workflow_action compile requires "workspaceId" or nested "compile.workspaceId".');
@@ -2147,6 +2787,12 @@ function workflowCompileInputFromAction(parsed: WorkflowActionInput): WorkflowCo
   };
 }
 
+/**
+ * Copies the tool call's tracing identifiers (traceId, rootTraceId, parentSpanId) into a partial start-run input so workflow runs correlate with the calling turn.
+ * @param ctx - Tool-call context carrying the trace identifiers.
+ * @returns Trace fields, each present only when defined.
+ * @throws Never.
+ */
 function toolTraceInput(ctx: ToolContext): Pick<StartWorkflowInput, 'traceId' | 'rootTraceId' | 'parentSpanId'> {
   return {
     ...(ctx.traceId !== undefined ? { traceId: ctx.traceId } : {}),
@@ -2155,6 +2801,13 @@ function toolTraceInput(ctx: ToolContext): Pick<StartWorkflowInput, 'traceId' | 
   };
 }
 
+/**
+ * Builds a {@link StartWorkflowInput} from `workflow_action` arguments, applying the given run mode and defaulting inputs, evidence sources, proposals and labels to empty collections.
+ * @param parsed - Parsed tool-call arguments.
+ * @param mode - Run mode to force; `undefined` keeps the parsed `mode` (or the definition default) untouched.
+ * @returns The start-run input.
+ * @throws Error - When `workspaceId` was not supplied.
+ */
 function startInput(parsed: WorkflowActionInput, mode?: WorkflowRunMode): StartWorkflowInput {
   if (parsed.workspaceId === undefined) throw new Error('workflow_action start requires "workspaceId".');
   return {
@@ -2170,18 +2823,38 @@ function startInput(parsed: WorkflowActionInput, mode?: WorkflowRunMode): StartW
   };
 }
 
+/**
+ * Evaluates the tool-call policy for a workflow-scoped tool call and produces a hook rejection when the call is denied. Calls outside any workflow run (no `workflowRunId` in the input) are always allowed.
+ * @param runner - Runner providing the policy evaluation.
+ * @param ctx - Tool-call hook context for the pending call.
+ * @returns `{ rejectTool }` with the denial reason when policy blocks the call, or `undefined` when the call may proceed.
+ * @throws Never.
+ */
 async function rejectIfWorkflowDenied(runner: WorkflowRunner, ctx: ToolCallContext): Promise<{ rejectTool: { message: string } } | undefined> {
   const decision = await runner.evaluateToolPolicy(ctx.toolCall.name, ctx.toolCall.input, tryCurrentPrincipal() ?? undefined);
   if (!decision.active || decision.allowed) return undefined;
   return { rejectTool: { message: decision.reason ?? `Workflow policy denied tool "${ctx.toolCall.name}".` } };
 }
 
+/**
+ * Hook helper that records an executed tool result against the workflow run governing the tool call. No-op when the call is not workflow-scoped, the run is unknown, or no approved proposal matches the tool name.
+ * @param runner - Runner receiving the recorded result.
+ * @param ctx - Tool-result hook context (result payload, error flag, duration).
+ * @returns Promise resolving once the run ledger (when touched) is updated.
+ * @throws Never.
+ */
 async function recordWorkflowToolResult(runner: WorkflowRunner, ctx: ToolResultContext): Promise<void> {
   const workflowRunId = extractWorkflowRunId(ctx.toolCall.input);
   if (workflowRunId === undefined) return;
   await runner.recordToolResult(workflowRunId, ctx.toolCall.name, ctx.result, ctx.isError, ctx.durationMs);
 }
 
+/**
+ * Registers the plugin's toolcall and toolresult hooks: a `toolcall` hook (priority 15) rejecting workflow-denied calls via {@link rejectIfWorkflowDenied}, and a `toolresult` hook (priority 25) recording executed workflow actions via {@link recordWorkflowToolResult}.
+ * @param runner - Runner providing policy evaluation and result recording.
+ * @param services - Runtime machine whose hook registry receives the handlers.
+ * @throws Never.
+ */
 function registerWorkflowHooks(runner: WorkflowRunner, services: MatbotMachine): void {
   services.hooks.register({
     on: 'toolcall',
@@ -2204,6 +2877,7 @@ function registerWorkflowHooks(runner: WorkflowRunner, services: MatbotMachine):
  * Builds the store-backed {@link WorkflowRegistry}.
  * @param services - Runtime machine providing stores.
  * @returns The registry instance.
+ * @throws Never.
  */
 export function createWorkflowRegistry(services: MatbotMachine): WorkflowRegistry {
   return new StoreBackedWorkflowRegistry(
@@ -2219,6 +2893,7 @@ export function createWorkflowRegistry(services: MatbotMachine): WorkflowRegistr
  * @param services - Runtime machine providing stores.
  * @param registry - Registry resolving definitions and versions.
  * @returns The runner instance.
+ * @throws Never.
  */
 export function createWorkflowRunner(services: MatbotMachine, registry: WorkflowRegistry): WorkflowRunner {
   const sourceRegistry = services.get('SourceRegistry' as never) as SourceRegistryLike | undefined;
@@ -2235,6 +2910,14 @@ export function createWorkflowRunner(services: MatbotMachine, registry: Workflow
   );
 }
 
+/**
+ * Builds the store-backed {@link WorkflowCompiler}, persisting compilations to the shared compilation store.
+ * @param services - Runtime machine providing stores.
+ * @param registry - Registry validating and publishing compiled definitions.
+ * @param runner - Runner executing compiled dry runs.
+ * @returns The compiler instance.
+ * @throws Never.
+ */
 export function createWorkflowCompiler(services: MatbotMachine, registry: WorkflowRegistry, runner: WorkflowRunner): WorkflowCompiler {
   return new StoreBackedWorkflowCompiler(
     registry,
@@ -2254,6 +2937,13 @@ export const plugin: MatbotPluginSpec = {
   manifest: {
     description: 'Registers WorkflowRegistry, WorkflowRunner, WorkflowCompiler, workflow_action, and workflow-scoped connector policy hooks.',
   },
+  /**
+   * Registers the web UI contribution, the three workflow services, the
+   * `workflow_action` tool and the toolcall/toolresult policy hooks.
+   * @param services - Runtime machine to register into.
+   * @returns Promise resolving once all registrations complete.
+   * @throws Never.
+   */
   async setup(services: MatbotMachine) {
     services.contributions?.register('webui','workflows',uiContribution);
     const registry = createWorkflowRegistry(services);

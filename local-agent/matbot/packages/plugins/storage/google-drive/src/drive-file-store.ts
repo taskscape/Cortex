@@ -5,6 +5,10 @@ const DATA_SUFFIX = '.data';
 const META_SUFFIX = '.meta.json';
 const JSON_MIME   = 'application/json';
 
+/**
+ * Sidecar metadata persisted beside each blob as `<id>.meta.json` (same shape
+ * as the OPFS browser store).
+ */
 interface DriveFileMeta {
   id:         string;
   version:    string;
@@ -18,12 +22,22 @@ interface DriveFileMeta {
   allowed?:   boolean;
 }
 
+/**
+ * In-memory pairing of a file's metadata with the Drive ids of its blob and
+ * sidecar, cached after the initial folder load.
+ */
 interface Slot {
   meta:       DriveFileMeta;
   dataFileId: string;
   metaFileId: string;
 }
 
+/**
+ * Buffers an async byte iterable into one contiguous array.
+ * @param data - Byte chunks to concatenate, in stream order.
+ * @returns All chunks joined in order.
+ * @throws Propagates errors thrown by `data`.
+ */
 async function collect(data: AsyncIterable<Uint8Array>): Promise<Uint8Array<ArrayBuffer>> {
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -39,12 +53,8 @@ async function collect(data: AsyncIterable<Uint8Array>): Promise<Uint8Array<Arra
  * `<id>.meta.json` sidecar (the same shape as the OPFS browser store). Metadata is read into memory
  * once on first access so `list`/`get`/`getByName` don't re-walk Drive; blob bytes are fetched on
  * demand when a handle is streamed. Uploads buffer the full blob in memory before sending — adequate
- * for the chat-attachment sizes this serves, not for very large files.
- */
-/**
- * A {@link FileStore} storing each file in Drive as a `.data` blob plus a
- * `.meta.json` sidecar, namespaced under per-namespace subfolders. Watchers
- * are not supported (no push events in this backend).
+ * for the chat-attachment sizes this serves, not for very large files. Watchers are not supported
+ * (no push events in this backend).
  */
 export class DriveFileStore implements FileStore {
   private readonly drive:    DriveClient;
@@ -53,11 +63,27 @@ export class DriveFileStore implements FileStore {
   private loaded?: Promise<void>;
   private chain:   Promise<unknown> = Promise.resolve();
 
+  /**
+   * Creates the store; nothing touches Drive until the first operation loads
+   * the folder index.
+   * @param drive - Drive client for all blob and sidecar traffic.
+   * @param folderId - Promise of the store folder's id; resolved lazily and
+   *   shared with the creator (typically the backend).
+   * @throws Never.
+   */
   constructor(drive: DriveClient, folderId: Promise<string>) {
     this.drive    = drive;
     this.folderId = folderId;
   }
 
+  /**
+   * Loads the folder's `.data`/`.meta.json` pairs into the slot cache on first
+   * use, skipping orphaned sidecars. Memoised: a failure (listing, read, or
+   * JSON parse) is re-raised by every later call rather than retried.
+   * @returns The memoised load promise.
+   * @throws Propagates {@link DriveClient} or parse errors from the initial
+   *   load.
+   */
   private ensureLoaded(): Promise<void> {
     if (this.loaded !== undefined) return this.loaded;
     this.loaded = (async () => {
@@ -79,17 +105,42 @@ export class DriveFileStore implements FileStore {
     return this.loaded;
   }
 
+  /**
+   * Serialises mutations through a single store-wide promise-chain mutex, so
+   * concurrent writes cannot interleave Drive updates or cache changes.
+   * @typeParam R - Result type of the serialised operation.
+   * @param fn - Operation to run once the lock is held.
+   * @returns `fn`'s result.
+   * @throws Propagates a rejection of `fn` to the caller; the chain is released
+   *   either way.
+   */
   private lock<R>(fn: () => Promise<R>): Promise<R> {
     const run = this.chain.then(fn, fn);
     this.chain = run.catch(() => {});
     return run;
   }
 
+  /**
+   * Builds a {@link FileHandle} spreading the metadata plus a `stream` that
+   * fetches the blob bytes on demand. The stream yields nothing when the file
+   * has been deleted or the signal is already aborted, re-checks the signal
+   * after the fetch, and surfaces Drive read errors to the stream consumer.
+   * @param meta - Metadata to expose on the handle.
+   * @returns The handle.
+   * @throws Never synchronously.
+   */
   private makeHandle(meta: DriveFileMeta): FileHandle {
     const drive = this.drive;
     const slots = this.slots;
     return {
       ...meta,
+      /**
+       * Fetches the blob's bytes on demand (a single Drive read).
+       * @param signal - Abort signal honoured before and after the fetch.
+       * @yields The blob bytes, or nothing when the file is gone or the signal
+       *   is already aborted.
+       * @throws Propagates Drive read errors.
+       */
       async *stream(signal?: AbortSignal): AsyncIterable<Uint8Array> {
         const slot = slots.get(meta.id);
         if (slot === undefined || signal?.aborted) return;
@@ -101,13 +152,18 @@ export class DriveFileStore implements FileStore {
   }
 
   /**
-   * Stores (or replaces) a file and its metadata sidecar in Drive.
-   * @param name - File name/id.
+   * Stores (or replaces) a file and its metadata sidecar in Drive. When `name`
+   * is given the file is upserted by name (+ namespace), matching the OPFS
+   * store's semantics — id and `createdAt` are preserved and a fresh `version`
+   * is minted; otherwise a new UUID id is used. Buffers the whole blob in
+   * memory first.
+   * @param name - File name/id; `undefined` means anonymous (fresh UUID id).
    * @param mimeType - MIME type of the content.
    * @param data - Byte chunks making up the file.
    * @param opts - Optional namespace/session/message linkage.
    * @returns The handle for the stored file.
-   * @throws When the Drive uploads fail.
+   * @throws When the Drive uploads fail, the folder cannot be resolved, or
+   *   `data` throws while being buffered.
    */
   async put(
     name:     string | undefined,
@@ -157,6 +213,13 @@ export class DriveFileStore implements FileStore {
     });
   }
 
+  /**
+   * Resolves a file handle by id from the cached index.
+   * @param id - File identifier.
+   * @returns The handle, or null when not found.
+   * @throws Propagates index-load errors (see
+   *   {@link DriveFileStore.ensureLoaded}).
+   */
   async get(id: string): Promise<FileHandle | null> {
     await this.ensureLoaded();
     const slot = this.slots.get(id);
@@ -164,8 +227,12 @@ export class DriveFileStore implements FileStore {
   }
 
   /**
-   * Resolves a file handle by name within an optional namespace folder.
+   * Resolves a file handle by name within an optional namespace.
+   * @param name - File name.
+   * @param namespace - Constrains the match when given; undefined matches any
+   *   namespace.
    * @returns The handle, or null when not found.
+   * @throws Propagates index-load errors.
    */
   async getByName(name: string, namespace?: string): Promise<FileHandle | null> {
     await this.ensureLoaded();
@@ -173,6 +240,14 @@ export class DriveFileStore implements FileStore {
     return slot !== undefined ? this.makeHandle(slot.meta) : null;
   }
 
+  /**
+   * Linear scan of the cached slots for an exact name (and namespace, when
+   * given).
+   * @param name - File name to match exactly.
+   * @param namespace - Constrain the match when given; undefined matches any.
+   * @returns The matching slot, or undefined.
+   * @throws Never.
+   */
   private findByName(name: string, namespace?: string): Slot | undefined {
     for (const slot of this.slots.values()) {
       if (slot.meta.name === name && (namespace === undefined || slot.meta.namespace === namespace)) return slot;
@@ -180,6 +255,16 @@ export class DriveFileStore implements FileStore {
     return undefined;
   }
 
+  /**
+   * Deletes a file's blob and sidecar from Drive and drops its slot. The two
+   * deletions run via `Promise.allSettled`, so one failure does not block the
+   * other and deletion failures are swallowed (the slot is removed
+   * regardless); a 404 is already tolerated by
+   * {@link DriveClient.deleteFile}.
+   * @param id - File identifier.
+   * @returns Resolves once both deletions have settled.
+   * @throws Propagates index-load errors.
+   */
   async delete(id: string): Promise<void> {
     await this.ensureLoaded();
     await this.lock(async () => {
@@ -193,6 +278,15 @@ export class DriveFileStore implements FileStore {
     });
   }
 
+  /**
+   * Streams handles for all cached files matching the filter, in slot
+   * (insertion) order. Filter fields left undefined impose no constraint;
+   * `mimeType` matches by prefix and the date bounds compare ISO strings.
+   * @param filter - Optional criteria on namespace, session, MIME prefix or
+   *   creation dates.
+   * @yields Matching {@link FileHandle}s.
+   * @throws Propagates index-load errors.
+   */
   async *list(filter?: FileFilter): AsyncIterable<FileHandle> {
     await this.ensureLoaded();
     for (const slot of this.slots.values()) {
@@ -207,15 +301,26 @@ export class DriveFileStore implements FileStore {
   }
 
   /**
-   * Stores a temporary (root-namespaced) file.
+   * Stores a temporary (root-namespaced) file: delegates to
+   * {@link DriveFileStore.put} with no namespace/session linkage.
+   * @param name - File name.
+   * @param mimeType - MIME type of the content.
+   * @param data - Byte chunks making up the file.
    * @returns The handle for the stored file.
+   * @throws Under the same conditions as {@link DriveFileStore.put}.
    */
   async putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle> {
     return this.put(name, mimeType, data);
   }
 
-  // Drive has no cheap push change-feed; watch() yields nothing and resolves when the signal fires
-  // (same as the OPFS store).
+  /**
+   * Drive has no cheap push change-feed, so this yields nothing and resolves
+   * once the signal aborts (same as the OPFS store). Without a signal it
+   * completes immediately.
+   * @param signal - Abort signal ending the stream.
+   * @yields Nothing.
+   * @throws Never.
+   */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
     if (signal === undefined || signal.aborted) return;
     await new Promise<void>(resolve => { signal.addEventListener('abort', () => resolve(), { once: true }); });

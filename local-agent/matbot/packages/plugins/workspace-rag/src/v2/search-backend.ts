@@ -116,8 +116,12 @@ export interface OpenSearchAdoptionGateResult {
 /**
  * Deterministically decides whether OpenSearch should be adopted based on
  * measured recall/latency against the Postgres baseline and thresholds.
+ * Promotion requires at least one Postgres trigger and zero failed safety
+ * gates.
  * @param input - Measurements, baseline, and thresholds.
- * @returns The adoption verdict with reasons.
+ * @returns The adoption verdict with trigger/safety-gate reasons and a
+ *   structured snapshot of the input measurements.
+ * @throws Never.
  */
 export function evaluateOpenSearchAdoption(
   input: OpenSearchAdoptionGateInput,
@@ -179,28 +183,74 @@ export class PostgresHybridSearchBackend implements HybridSearchBackend {
   private readonly signature: string;
   private readonly dimensions: number;
 
+  /**
+   * Captures the repository and vectorizer identity used by all searches.
+   * @param repository - Repository providing the actual search execution.
+   * @param signature - Vectorizer signature reported to the repository on
+   *   dense searches.
+   * @param dimensions - Embedding dimensionality reported to the repository.
+   * @throws Never.
+   */
   constructor(repository: RagV2Repository, signature: string, dimensions: number) {
     this.repository = repository;
     this.signature = signature;
     this.dimensions = dimensions;
   }
 
+  /**
+   * Intentionally unsupported: PostgreSQL generation indexing is performed
+   * transactionally by {@link RagV2Repository}.
+   * @param _batch - Unused; the repository indexes generations itself.
+   * @returns A promise that never resolves normally.
+   * @throws Error - always.
+   */
   async indexGeneration(_batch: SearchRecordBatch): Promise<void> {
     throw new Error('PostgreSQL generation indexing is performed transactionally by RagV2Repository.');
   }
 
+  /**
+   * Always reports valid: PostgreSQL validation is owned by the repository's
+   * own {@link RagV2Repository.validateGeneration}.
+   * @param generationId - Generation id echoed back in the report.
+   * @returns A report with `valid: true` and a record count of 0.
+   * @throws Never.
+   */
   async validateGeneration(generationId: string): Promise<SearchBackendValidationReport> {
     return { valid: true, generationId, records: 0, errors: [] };
   }
 
+  /**
+   * Intentionally unsupported: PostgreSQL publication requires workspace and
+   * context and is managed by {@link RagV2Repository}.
+   * @param _generationId - Unused.
+   * @returns A promise that never resolves normally.
+   * @throws Error - always.
+   */
   async publishGeneration(_generationId: string): Promise<void> {
     throw new Error('PostgreSQL publication requires workspace and context and is managed by RagV2Repository.');
   }
 
+  /**
+   * Delegates to the repository's passage-level lexical search using the
+   * plan's original query text.
+   * @param plan - Plan supplying the query text.
+   * @param scope - Authorization and result-size bounds.
+   * @returns Repository-ranked hits.
+   * @throws Error - if the repository search fails.
+   */
   async lexicalSearch(plan: RagV2RetrievalPlan, scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     return this.repository.lexicalSearch('passage', plan.originalQuery, scope);
   }
 
+  /**
+   * Delegates to the repository's passage-level dense search, identifying the
+   * vectorizer by this backend's signature and dimensionality.
+   * @param _plan - Unused; the vector alone drives the search.
+   * @param queryVector - Query embedding to match.
+   * @param scope - Authorization and result-size bounds.
+   * @returns Repository-ranked hits.
+   * @throws Error - if the repository search fails.
+   */
   async denseSearch(
     _plan: RagV2RetrievalPlan,
     queryVector: readonly number[],
@@ -219,15 +269,34 @@ export class PostgresHybridSearchBackend implements HybridSearchBackend {
     );
   }
 
+  /**
+   * Delegates to the repository's exact search over the plan's extracted
+   * references and quoted phrases.
+   * @param plan - Plan supplying the reference/quote strings.
+   * @param scope - Authorization and result-size bounds.
+   * @returns Repository-ranked hits.
+   * @throws Error - if the repository search fails.
+   */
   async exactSearch(plan: RagV2RetrievalPlan, scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     return this.repository.exactSearch([...plan.exactReferences, ...plan.quotedPhrases], scope);
   }
 
+  /**
+   * No-op: PostgreSQL retirement is controlled by the publication catalog and
+   * the retention job.
+   * @param _generationId - Unused.
+   * @returns A promise that resolves immediately.
+   * @throws Never.
+   */
   async deleteRetiredGeneration(_generationId: string): Promise<void> {
     // PostgreSQL retirement is controlled by the publication catalog and retention job.
   }
 }
 
+/**
+ * Connection settings for the OpenSearch cluster: endpoint, optional index
+ * name prefix, and optional basic-auth credentials.
+ */
 interface OpenSearchOptions {
   baseUrl: string;
   indexPrefix?: string;
@@ -244,6 +313,13 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
   private readonly indexPrefix: string;
   private readonly authorization: string | undefined;
 
+  /**
+   * Normalizes the endpoint URL and index prefix (invalid characters become
+   * `-`) and prepares optional basic-auth credentials.
+   * @param options - Cluster endpoint, optional index prefix (defaults to
+   *   `cortex-rag-v2`), and optional username/password.
+   * @throws TypeError - if `options.baseUrl` is not a valid absolute URL.
+   */
   constructor(options: OpenSearchOptions) {
     this.baseUrl = new URL(options.baseUrl);
     this.indexPrefix = (options.indexPrefix ?? 'cortex-rag-v2').replace(/[^a-z0-9_-]/giu, '-').toLowerCase();
@@ -252,6 +328,16 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
       : undefined;
   }
 
+  /**
+   * Ensures the generation/level index exists (deriving the vector field's
+   * dimensionality from the first record that has an embedding), then writes
+   * the batch as one NDJSON bulk request without refreshing.
+   * @param batch - Records to index for one generation and level.
+   * @param signal - Optional abort signal forwarded to the HTTP request.
+   * @returns A promise resolving once the bulk response is accepted.
+   * @throws Error - on any HTTP failure, or when the bulk response reports
+   *   per-item errors.
+   */
   async indexGeneration(batch: SearchRecordBatch, signal?: AbortSignal): Promise<void> {
     const index = this.indexName(batch.generationId, batch.level);
     await this.ensureIndex(index, batch.records.find(record => record.embedding)?.embedding?.length);
@@ -269,6 +355,14 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     if (result.errors) throw new Error('OpenSearch bulk indexing reported item failures.');
   }
 
+  /**
+   * Counts records in each per-level index for the generation, collecting
+   * per-level request failures as errors instead of throwing; the generation
+   * is invalid if any error occurs or no records were found.
+   * @param generationId - Generation to validate.
+   * @returns The validation report with the summed record count and errors.
+   * @throws Error - if a count response body is not valid JSON.
+   */
   async validateGeneration(generationId: string): Promise<SearchBackendValidationReport> {
     let records = 0;
     const errors: string[] = [];
@@ -286,6 +380,13 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     return { valid: errors.length === 0, generationId, records, errors };
   }
 
+  /**
+   * Atomically repoints each level's `<prefix>-<level>-read` alias to the
+   * generation's index via a single `_aliases` request.
+   * @param generationId - Generation to publish.
+   * @returns A promise resolving once the alias swap is committed.
+   * @throws Error - on HTTP failure.
+   */
   async publishGeneration(generationId: string): Promise<void> {
     const actions: unknown[] = [];
     for (const level of ['document', 'section', 'passage'] as const) {
@@ -300,6 +401,14 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     });
   }
 
+  /**
+   * Runs a boosted multi-match lexical query (`title`, `headingPath`, `text`)
+   * against the passage read alias, filtered by the scope.
+   * @param plan - Plan supplying the query text.
+   * @param scope - Authorization and result-size bounds.
+   * @returns Hits in OpenSearch relevance order, ranked per lane.
+   * @throws Error - on HTTP failure.
+   */
   async lexicalSearch(plan: RagV2RetrievalPlan, scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     return this.search('passage', scope, {
       size: scope.limit,
@@ -318,6 +427,14 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     }, 'passage_lexical');
   }
 
+  /**
+   * Runs a k-NN query against the passage read alias with the scope filters.
+   * @param _plan - Unused; the vector alone drives the search.
+   * @param queryVector - Query embedding to match.
+   * @param scope - Authorization and result-size bounds; `limit` sets `k`.
+   * @returns Hits in OpenSearch similarity order, ranked per lane.
+   * @throws Error - on HTTP failure.
+   */
   async denseSearch(
     _plan: RagV2RetrievalPlan,
     queryVector: readonly number[],
@@ -341,6 +458,14 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     }, 'passage_dense');
   }
 
+  /**
+   * Runs a phrase-match query over the plan's references and quoted phrases;
+   * returns no hits when neither list contributes a value.
+   * @param plan - Plan supplying the reference/quote strings.
+   * @param scope - Authorization and result-size bounds.
+   * @returns Hits containing at least one phrase, in relevance order.
+   * @throws Error - on HTTP failure.
+   */
   async exactSearch(plan: RagV2RetrievalPlan, scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     const values = [...plan.exactReferences, ...plan.quotedPhrases];
     if (values.length === 0) return [];
@@ -356,12 +481,29 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     }, 'exact_reference');
   }
 
+  /**
+   * Deletes the document, section, and passage indexes of the generation.
+   * @param generationId - Generation whose indexes are removed.
+   * @returns A promise resolving once all three deletions complete.
+   * @throws Error - on HTTP failure.
+   */
   async deleteRetiredGeneration(generationId: string): Promise<void> {
     for (const level of ['document', 'section', 'passage'] as const) {
       await this.request(`/${this.indexName(generationId, level)}`, { method: 'DELETE' });
     }
   }
 
+  /**
+   * Creates the index with a strict mapping when it does not exist; the
+   * `resource_already_exists_exception` failure is tolerated while any other
+   * failure propagates.
+   * @param index - Fully qualified index name.
+   * @param dimensions - Optional embedding dimensionality; when supplied, an
+   *   on-disk cosine-similarity k-NN vector field is mapped.
+   * @returns A promise resolving once the mapping is applied.
+   * @throws Error - if index creation fails for any reason other than the
+   *   index already existing.
+   */
   private async ensureIndex(index: string, dimensions?: number): Promise<void> {
     const mapping = {
       settings: { index: { knn: true } },
@@ -413,6 +555,15 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     });
   }
 
+  /**
+   * Builds the OpenSearch filter clauses shared by all query types: tenant
+   * identity, ACL tokens, optional id/type/jurisdiction terms, and — when an
+   * as-of date is set — temporal validity over the publication and validity
+   * windows (records without dates always pass).
+   * @param scope - The search scope to translate.
+   * @returns An array of OpenSearch filter clause objects.
+   * @throws Never.
+   */
   private filters(scope: RagV2SearchScope): unknown[] {
     return [
       { term: { workspaceId: scope.workspaceId } },
@@ -459,6 +610,18 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     ];
   }
 
+  /**
+   * Posts a prebuilt query body to the level's read alias and maps the
+   * response into ranked hits with 1-based ranks.
+   * @param level - Level whose read alias is queried.
+   * @param _scope - Unused; filters and size are embedded in `body` by the
+   *   callers.
+   * @param body - The OpenSearch query body.
+   * @param retriever - Lane name recorded on every hit.
+   * @returns Hits in OpenSearch relevance order; missing source fields become
+   *   empty strings or are omitted.
+   * @throws Error - on HTTP failure.
+   */
   private async search(
     level: RagV2Level,
     scope: RagV2SearchScope,
@@ -500,11 +663,29 @@ export class OpenSearchHybridSearchBackend implements HybridSearchBackend {
     });
   }
 
+  /**
+   * Builds the per-generation index name, sanitizing the generation id to
+   * `[a-z0-9_-]` with `-` replacements.
+   * @param generationId - Raw generation id.
+   * @param level - Level component of the name.
+   * @returns The `<prefix>-<level>-<generation>` index name.
+   * @throws Never.
+   */
   private indexName(generationId: string, level: RagV2Level): string {
     const generation = generationId.replace(/[^a-z0-9_-]/giu, '-').toLowerCase();
     return `${this.indexPrefix}-${level}-${generation}`;
   }
 
+  /**
+   * Performs one authenticated HTTP request against the cluster with a 30
+   * second timeout, combining the caller's signal with the timeout signal.
+   * @param pathname - Path appended to the base URL.
+   * @param init - Fetch init; an authorization header is injected when
+   *   credentials were configured.
+   * @returns The raw response once the status is 2xx.
+   * @throws Error - on non-2xx status (with up to 1,000 characters of the
+   *   body), network failure, timeout, or abort.
+   */
   private async request(pathname: string, init: RequestInit): Promise<Response> {
     const url = new URL(pathname, this.baseUrl);
     const headers = new Headers(init.headers);

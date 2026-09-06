@@ -7,6 +7,13 @@ import type { VaultSpec } from './types.js';
  * The dedup step (returning an existing name for a value already stored) technically lets a
  * caller confirm a name for a value they already hold — but holding the value already grants
  * everything that confirmation would, so it leaks nothing.
+ *
+ * @param spec - The vault's spec primitives (`hasKey`, optional `findByValue`, `writeSecret`).
+ * @param name - The requested key name.
+ * @param value - The secret value to store.
+ * @returns The name callers must reference: `value` itself when it is already a stored key, the
+ *          first key already holding the same value, or `name` after a fresh write.
+ * @throws Forwards any error raised by the underlying `VaultSpec` operations.
  */
 export async function applyCreateSecret(
   spec:  VaultSpec,

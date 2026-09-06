@@ -62,11 +62,21 @@ for (const level of ['log', 'warn', 'error'] as const) {
       orig(`[${new Date().toISOString()} ${_pid}] ${label}`, ...args);
   };
 }
+/**
+ * Write a progress/status line to stderr, or drop it when running as a background sub-agent
+ * (IS_SUB_AGENT=1) so child output does not interleave with the parent's terminal.
+ * @param text - Text to write; no trailing newline is added.
+ * @returns Nothing.
+ * @throws Never.
+ */
 const write = isBackground ? (text: string) => {} : (text: string) => process.stderr.write(text);
 
 /**
  * Given a package exports field (or any nested value), return the first
  * string entry point, preferring "import" > "default" > first value.
+ * @param value - A package.json `exports` value, or any nested sub-object of one.
+ * @returns The first string entry point found, or `undefined` when the value contains none.
+ * @throws Never.
  */
 function resolveExportsEntry(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
@@ -94,6 +104,10 @@ function resolveExportsEntry(value: unknown): string | undefined {
  *             name passes through if not yet on disk so loadPlugins can emit the warning.
  *
  * This is the single funnel for both startup and runtime (`plugin add` / hot-load) resolution.
+ * @param specifiers - Raw plugin specifiers in config order.
+ * @param configDir - Project directory that paths, `.plugins/`, and node module resolution anchor against.
+ * @returns One load request per input, in input order; unresolvable specifiers pass through unchanged so the loader can surface the failure.
+ * @throws TypeError - When a `file:` specifier is malformed (via {@link readPluginMeta}).
  */
 async function resolvePluginSpecifiers(specifiers: readonly string[], configDir: string): Promise<PluginLoadRequest[]> {
   const req = createRequire(path.join(configDir, '_'));
@@ -142,7 +156,13 @@ async function resolvePluginSpecifiers(specifiers: readonly string[], configDir:
   return results;
 }
 
-/** Walk up from `start` until we find a file named `filename`, or return null. */
+/**
+ * Walk up from `start` until we find a file named `filename`, or return null.
+ * @param filename - File name to look for in each directory.
+ * @param start - Directory to start from; defaults to the process cwd.
+ * @returns The absolute path of the first match, or `null` when the filesystem root is reached.
+ * @throws Never.
+ */
 async function findUp(filename: string, start = process.cwd()): Promise<string | null> {
   let dir = path.resolve(start);
   while (true) {
@@ -154,14 +174,33 @@ async function findUp(filename: string, start = process.cwd()): Promise<string |
   }
 }
 
+/**
+ * Check whether a filesystem path exists.
+ * @param filePath - Path to test.
+ * @returns `true` when the path is accessible, `false` otherwise (including on any access error).
+ * @throws Never.
+ */
 async function exists(filePath: string): Promise<boolean> {
   try { await access(filePath); return true; } catch { return false; }
 }
 
+/**
+ * Resolve after a delay.
+ * @param ms - Delay in milliseconds.
+ * @returns Resolves once the timer fires.
+ * @throws Never.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Resolve every `${NAME}` placeholder in a credentials record through the vault.
+ * @param credentials - Map of credential name to raw placeholder text.
+ * @param vault - Vault used to resolve placeholders (the live forwarding proxy).
+ * @returns A new record with each value resolved.
+ * @throws MissingSecretError - When a placeholder names a secret the vault cannot resolve.
+ */
 async function resolveCredentials(
   credentials: Record<string, string>,
   vault: Vault,
@@ -173,10 +212,18 @@ async function resolveCredentials(
   return resolved;
 }
 
-// Bootstrap path: the provider credential is needed before any LLM exists, so it cannot
-// be gathered lazily via the `plugin store-key` tool. On a MissingSecretError, prompt
-// out-of-band for the unresolved keys, store them in the vault (which persists to .env),
-// and retry until every placeholder resolves.
+/**
+ * Resolve provider credentials at boot, prompting on the terminal for unresolved secrets.
+ *
+ * The bootstrap path needs the provider credential before any LLM exists, so it cannot
+ * be gathered lazily via the `plugin store-key` tool. On a MissingSecretError, prompt
+ * out-of-band for the unresolved keys, store them in the vault (which persists to .env),
+ * and retry until every placeholder resolves.
+ * @param credentials - Map of credential name to raw placeholder text.
+ * @param vault - Vault to resolve against and to persist prompted secrets into.
+ * @returns A record with every placeholder resolved.
+ * @throws Error - When the user provides no value for a required secret; other vault errors propagate unchanged.
+ */
 async function resolveCredentialsInteractive(
   credentials: Record<string, string>,
   vault: Vault,
@@ -206,6 +253,11 @@ const NEVER_ABORT_SIGNAL = new AbortController().signal;
 
 // ── Arg parsing ────────────────────────────────────────────────────────────────
 
+/**
+ * Parsed command-line options for a matbot invocation. `config` always has a value
+ * (defaulting to `./matbot.yaml`); every other field is present only when the corresponding
+ * flag was supplied.
+ */
 interface CliOpts {
   provider?:   string;
   session?:    string;
@@ -216,6 +268,13 @@ interface CliOpts {
   principal?:  string;
 }
 
+/**
+ * Parse process.argv into options plus a positional prompt. Unknown flags are ignored;
+ * bare positionals are collected in order and joined as the prompt.
+ * @param argv - The full `process.argv` array; the first two entries are ignored.
+ * @returns The parsed options and the joined positional prompt (`undefined` when there are none).
+ * @throws Never - A `--help` flag prints usage via {@link printHelp} and exits the process.
+ */
 function parseArgs(argv: string[]): { opts: CliOpts; prompt: string | undefined } {
   const args = argv.slice(2);
   const opts: CliOpts = { config: './matbot.yaml', ephemeral: false };
@@ -240,8 +299,13 @@ function parseArgs(argv: string[]): { opts: CliOpts; prompt: string | undefined 
   return { opts, prompt: positional.length ? positional.join(' ') : undefined };
 }
 
-// A principal supplied as a CLI flag or env var: either a bare id (type "user") or the JSON
-// `{"id","type"}` that spawners (e.g. the background plugin) write to MATBOT_PRINCIPAL.
+/**
+ * Parse a principal supplied as a CLI flag or env var: either a bare id (type "user") or the JSON
+ * `{"id","type"}` that spawners (e.g. the background plugin) write to MATBOT_PRINCIPAL.
+ * @param raw - Raw flag/env value.
+ * @returns The parsed principal, or `undefined` when the value is empty or not a valid id/JSON principal.
+ * @throws Never.
+ */
 function parsePrincipalArg(raw: string): Principal | undefined {
   const s = raw.trim();
   if (s === '') return undefined;
@@ -258,10 +322,16 @@ function parsePrincipalArg(raw: string): Principal | undefined {
   return { id: s, type: 'user' };
 }
 
-// The process boot identity, resolved once at the entry. Precedence, most specific first:
-//   --principal flag  →  MATBOT_PRINCIPAL env  →  config principal:  →  system.
-// The env slot is the cross-process transport: a parent (pod/sandbox, or the background plugin
-// delegating its creator) sets it; the child re-establishes that identity here.
+/**
+ * The process boot identity, resolved once at the entry. Precedence, most specific first:
+ *   --principal flag  →  MATBOT_PRINCIPAL env  →  config principal:  →  system.
+ * The env slot is the cross-process transport: a parent (pod/sandbox, or the background plugin
+ * delegating its creator) sets it; the child re-establishes that identity here.
+ * @param opts - Parsed CLI options; `opts.principal` wins when present.
+ * @param config - Loaded matbot config supplying the `principal:` fallback.
+ * @returns The boot principal.
+ * @throws Error - When `--principal` or `MATBOT_PRINCIPAL` is present but invalid.
+ */
 function resolveBootPrincipal(opts: CliOpts, config: import('./config.js').MatbotConfig): Principal {
   if (opts.principal !== undefined) {
     const p = parsePrincipalArg(opts.principal);
@@ -280,10 +350,25 @@ function resolveBootPrincipal(opts: CliOpts, config: import('./config.js').Matbo
 
 // ── Cortex workspaces ────────────────────────────────────────────────────────
 
+/**
+ * Check whether a value looks like a filesystem path rather than a bare package specifier.
+ * @param value - Raw specifier text.
+ * @returns `true` for relative, absolute, or drive-letter paths on any platform.
+ * @throws Never.
+ */
 function isPathLikeSpecifier(value: string): boolean {
   return value.startsWith('.') || value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(value);
 }
 
+/**
+ * Absolutize a Node CLI option value against `baseDir`, converting path-like values to `file:`
+ * URLs for the module-loading flags.
+ * @param flag - The option flag the value belongs to; `--import`/`--loader`/`--experimental-loader` get `file:` URLs, others get absolute paths.
+ * @param value - The option value; returned unchanged when not path-like.
+ * @param baseDir - Directory relative paths resolve against.
+ * @returns The absolutized (possibly URL-form) value.
+ * @throws Never.
+ */
 function absolutizeNodeOptionValue(flag: string, value: string, baseDir: string): string {
   if (!isPathLikeSpecifier(value)) return value;
   const absolute = path.isAbsolute(value) ? value : path.resolve(baseDir, value);
@@ -292,6 +377,15 @@ function absolutizeNodeOptionValue(flag: string, value: string, baseDir: string)
     : absolute;
 }
 
+/**
+ * Rewrite a Node `execArgv` so every path-bearing option (`--env-file`, `--import`, `--loader`,
+ * `--require`, and aliases) is absolutized against `baseDir`, surviving a child process that
+ * runs from a different working directory.
+ * @param args - Original execArgv entries (values may be attached with `=` or follow the flag).
+ * @param baseDir - Directory relative paths resolve against.
+ * @returns A new array with path values absolutized; non-path entries pass through unchanged.
+ * @throws Never.
+ */
 function absolutizeNodeExecArgv(args: readonly string[], baseDir: string): string[] {
   const pathValueFlags = new Set([
     '--env-file',
@@ -320,6 +414,15 @@ function absolutizeNodeExecArgv(args: readonly string[], baseDir: string): strin
   return out;
 }
 
+/**
+ * Express the CLI's own entry point as a specifier the child process can resolve from its own
+ * working directory: a relative path when possible, otherwise an absolute `file:` URL.
+ * @param entryArg - The current entry (typically `process.argv[1]`), a path or `file:` URL.
+ * @param baseDir - Directory relative entry paths resolve against.
+ * @param childCwd - Working directory the child will run in.
+ * @returns A relative path or `file:` URL usable as the child's entry argument.
+ * @throws Never.
+ */
 function nodeEntrySpecifier(entryArg: string, baseDir: string, childCwd: string): string {
   const absolute = entryArg.startsWith('file:')
     ? fileURLToPath(entryArg)
@@ -328,6 +431,13 @@ function nodeEntrySpecifier(entryArg: string, baseDir: string, childCwd: string)
   return relative !== '' && !path.isAbsolute(relative) ? relative : pathToFileURL(absolute).href;
 }
 
+/**
+ * Compute the out/err log file paths for a spawned replacement process, creating the shared
+ * `logs` directory (sibling of the workspace registry's parent directory) if needed.
+ * @param registryPath - Path of the cortex-workspaces registry file.
+ * @returns Paths of `matbot.out.log` and `matbot.err.log` inside the logs directory.
+ * @throws Error - When the logs directory cannot be created.
+ */
 function matbotLogPaths(registryPath: string): { out: string; err: string } {
   const logsDir = path.resolve(path.dirname(registryPath), '..', 'logs');
   mkdirSync(logsDir, { recursive: true });
@@ -337,6 +447,11 @@ function matbotLogPaths(registryPath: string): { out: string; err: string } {
   };
 }
 
+/**
+ * Print CLI usage to stderr.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function printHelp(): void {
   process.stderr.write(`
 matbot — AI CLI
@@ -368,8 +483,18 @@ If [prompt] and --prompt-file are both omitted, starts an interactive REPL.
 
 // ── Setup wizard ───────────────────────────────────────────────────────────────
 
+/**
+ * A provider adapter package discovered in the monorepo, pairing its directory name (`type`)
+ * with its package `name` and location on disk.
+ */
 interface ProviderPackage { type: string; name: string; dir: string; }
 
+/**
+ * Scan the monorepo's provider plugin directory (resolved relative to this module's location)
+ * for packages with a readable package.json.
+ * @returns One entry per discovered provider package, in directory listing order; empty when the directory is missing or unreadable.
+ * @throws Never.
+ */
 async function discoverProviders(): Promise<ProviderPackage[]> {
   const thisDir      = path.dirname(fileURLToPath(import.meta.url));
   const providersDir = path.resolve(thisDir, '../../../packages/plugins/providers');
@@ -386,6 +511,12 @@ async function discoverProviders(): Promise<ProviderPackage[]> {
   return results;
 }
 
+/**
+ * Probe an endpoint with a HEAD request (5s timeout) to sanity-check the URL entered during setup.
+ * @param url - Endpoint URL to test.
+ * @returns `false` when reachable, otherwise a diagnostic message — including a credentials hint for 401/403 responses.
+ * @throws Never.
+ */
 async function testEndpointReachable(url: string): Promise<string | false> {
   try {
     const { status, statusText } = (await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(5000) }));
@@ -395,9 +526,24 @@ async function testEndpointReachable(url: string): Promise<string | false> {
   }
 }
 
+/**
+ * Interactive first-run wizard: prompts (stdin/stderr) for a provider type, name, model,
+ * endpoint, and API key; appends the key to `<configDir>/.env`; writes a minimal matbot.yaml
+ * with a relative module path; and returns the equivalent in-memory config. Declining an
+ * unreachable-endpoint warning exits the process with code 1.
+ * @param configPath - Path the generated matbot.yaml is written to.
+ * @returns A config containing just the newly created provider.
+ * @throws Error - When no provider packages can be discovered.
+ */
 async function runSetupWizard(configPath: string): Promise<import('./config.js').MatbotConfig> {
   const rl  = createInterface({ input: process.stdin, output: process.stderr });
-  const ask = async (question: string): Promise<string> => {
+    /**
+     * Prompt on stderr and return the trimmed answer.
+     * @param question - Question text (a `: ` suffix is appended).
+     * @returns The trimmed user input.
+     * @throws Error - Propagates readline errors when stdin closes or fails.
+     */
+    const ask = async (question: string): Promise<string> => {
     const answer = await rl.question(`${question}: `);
     return answer.trim();
   };
@@ -501,6 +647,15 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
   }
 }
 
+/**
+ * CLI entry point: dispatch the `install` subcommand, load configuration (from stdin via
+ * `--config -`, or from disk through the workspace manager, falling back to the setup wizard),
+ * establish the ambient principal carrier and boot principal, assemble the service machine
+ * (vault, stores, storage pre-scan, deferred-swap machinery), load plugins, and hand off to
+ * server mode or the interactive/single-turn CLI frontend.
+ * @returns Resolves when the CLI frontend finishes (the runtime is released afterwards); in server mode it resolves once SIGINT/SIGTERM shutdown handlers are wired and the process waits on them.
+ * @throws Error - On boot failures: invalid `--principal`/`MATBOT_PRINCIPAL`, unreadable or invalid config, `--config -` without a prompt, an unknown provider, a missing CLI frontend, or a frontend plugin that failed to load in server mode.
+ */
 async function main(): Promise<void> {
   const initialCwd = process.cwd();
   const serverMode = process.argv[2] === 'start';
@@ -685,11 +840,18 @@ async function main(): Promise<void> {
   // web bundle) backed by a mutable `current` target. Callers may freely capture references — all
   // method calls route through the proxy to whichever backend is current. register('StorageBackend',
   // …) calls each proxy's swap fn.
+  /** Any {@link Store} regardless of document type; the erase target for the per-namespace proxies. */
   type AnyStore = Store<{ id: string; version: string }>;
 
   // One proxy per namespace, including 'sessions'. Keyed by namespace string.
   const storeProxies = new Map<string, [AnyStore, SwapFn<AnyStore>]>();
 
+  /**
+   * Create the concrete store for one namespace against the current storage state.
+   * @param namespace - Namespace name (e.g. 'sessions').
+   * @returns A {@link MemoryStore} when ephemeral, otherwise the active backend's store or the filesystem fallback.
+   * @throws Error - Propagated from a configured backend's `createStore` (see {@link createWorkspaceStore}).
+   */
   const makeStoreForNamespace = (namespace: string): AnyStore => createWorkspaceStore({
     ephemeral: isEphemeral,
     namespace,
@@ -698,6 +860,14 @@ async function main(): Promise<void> {
     ...(activeStorageBackend === undefined ? {} : { backend: activeStorageBackend }),
   });
 
+  /**
+   * Create (or reuse) the forwarding-proxy store for a namespace. One proxy exists per namespace
+   * for the life of the process, so every caller captures the same swap-safe reference.
+   * @typeParam T - Document type the caller reads and writes through the proxy.
+   * @param namespace - Namespace name keying the proxy.
+   * @returns The shared proxy store for the namespace, typed to `T`.
+   * @throws Error - Propagated from store creation (see {@link makeStoreForNamespace}).
+   */
   const createStore = <T extends { id: string; version: string }>(namespace: string): Store<T> => {
     let entry = storeProxies.get(namespace);
     if (entry === undefined) {
@@ -720,13 +890,19 @@ async function main(): Promise<void> {
   // The live file proxy starts on the pre-scanned backend (if any), falling back to the host base.
   const [fileStore, swapFiles] = makeSwappable<FileStore>(activeStorageBackend?.fileStore ?? bootFileStore);
 
-  // Re-point every store proxy + the file proxy at `next` (or the host base when undefined). Returns
-  // whether anything actually changed, so the caller can skip a redundant `mounted` emit. Synchronous:
-  // the repoint completes before this returns, so readers see `next` at once and the `mounted` emit can
-  // fire immediately. The displaced backend is closed in the *background* — a slow or throwing close()
-  // (e.g. node:sqlite's db.close() rejecting on a still-open statement) must never gate the swap or
-  // suppress the mounted notification, which was the cause of a swap that "only took on the 2nd try".
-  // Driven only from the quiescent-edge flush below — never mid-turn.
+  /**
+   * Re-point every store proxy and the file proxy at `next` (or the host base when undefined).
+   *
+   * Returns whether anything actually changed, so the caller can skip a redundant `mounted` emit.
+   * Synchronous: the repoint completes before this returns, so readers see `next` at once and the
+   * `mounted` emit can fire immediately. The displaced backend is closed in the *background* — a
+   * slow or throwing close() (e.g. node:sqlite's db.close() rejecting on a still-open statement)
+   * must never gate the swap or suppress the mounted notification, which was the cause of a swap
+   * that "only took on the 2nd try". Driven only from the quiescent-edge flush — never mid-turn.
+   * @param next - Incoming backend, or `undefined` to revert every proxy to the host base.
+   * @returns Whether any proxy actually changed targets.
+   * @throws Never - The displaced backend's `close()` is settled in the background; failures are logged, never propagated.
+   */
   const swapStorage = (next: StorageBackend | undefined): boolean => {
     const removed = activeStorageBackend;
     if (removed === next) return false;
@@ -747,6 +923,14 @@ async function main(): Promise<void> {
   // single remount. Notification timing is deliberately unspecified — see the `Mounted` contract.
   const mountTable = createMountTable(() => services);
   let pendingSwap: { next: StorageBackend | undefined } | undefined;
+  /**
+   * Stage the desired `StorageBackend` for the deferred swap (last write wins — only the final
+   * intent matters, so a slot, not a queue) and ask the context-switch machinery to apply it at
+   * the next quiescent edge.
+   * @param next - Backend to apply, or `undefined` to revert to the host base.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const stageSwap = (next: StorageBackend | undefined): void => {
     pendingSwap = { next };
     flushIfQuiescent();
@@ -760,7 +944,12 @@ async function main(): Promise<void> {
     mountTable.flush();
   });
 
-  // Swap the KnowledgeIndex, draining the displaced impl's entries into the incoming one.
+  /**
+   * Swap the KnowledgeIndex, draining the displaced impl's entries into the incoming one.
+   * @param next - Incoming implementation; a no-op when it is already the current one.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const swapKnowledge = (next: KnowledgeIndex): void => {
     const prev = knowledgeImpl;
     if (prev === next) return;
@@ -783,19 +972,39 @@ async function main(): Promise<void> {
   let sessionRunner: SessionRunner | undefined;
 
   const baseServices: MatbotMachine = {
-    // Plugins always receive the plugin-scoped override built in setupPlugin; the base is never the
-    // one a plugin calls. Core reads its reserved settings doc via makePluginSettings directly.
+    /**
+     * Placeholder settings accessor on the base machine.
+     *
+     * Plugins always receive the plugin-scoped override built in setupPlugin; the base is never the
+     * one a plugin calls. Core reads its reserved settings doc via makePluginSettings directly.
+     * @returns Never returns.
+     * @throws Error - Always; use the services instance passed to `setup()`.
+     */
     settings(): PluginSettings {
       throw new Error('settings() is only available within a plugin scope (use the services passed to setup()).');
     },
 
     createStore,
 
+    /**
+     * Read a non-core service from the plain service registry.
+     * @param key - Registry key (the interface name).
+     * @returns The registered value (typed as `never` so augmentation narrows at the call site), or `undefined` when absent.
+     * @throws Never.
+     */
     get(key) { return serviceRegistry.get(key as string) as never; },
+    /**
+     * Register a service implementation, special-casing the swappable core members.
+     *
+     * StorageBackend is the system of record: it is staged and the quiescent edge applies it (idle →
+     * now; mid-turn → at turn end) — its mount notification is marked dirty there, after the swap
+     * lands. The other swap-keys repoint immediately, then mark dirty so the edge multicasts the mount.
+     * @param key - Service key; `StorageBackend`, `KnowledgeIndex`, and `Vault` are handled specially.
+     * @param value - Implementation to register (a backend instance for the swap-keys).
+     * @returns Nothing.
+     * @throws Error - When ephemeral and the incoming backend's `close()` fails.
+     */
     async register(key, value) {
-      // StorageBackend is the system of record: stage it and let the quiescent edge apply it (idle →
-      // now; mid-turn → at turn end) — its mount notification is marked dirty there, after the swap
-      // lands. The other swap-keys repoint immediately, then mark dirty so the edge multicasts the mount.
       if (key === 'StorageBackend') {
         if (isEphemeral) await (value as StorageBackend).close?.();
         else stageSwap(value as StorageBackend);
@@ -805,9 +1014,15 @@ async function main(): Promise<void> {
       else serviceRegistry.set(key as string, value);
       if (key !== 'StorageBackend') { mountTable.markDirty(key); flushIfQuiescent(); }
     },
-    // Symmetric with register: a swap-key reverts to the app's captured boot default instead of
-    // dangling on the unloaded plugin's impl; everything else is a plain registry delete. Marking dirty
-    // lets the edge deliver a committed unload (or, if re-registered before the edge, a single remount).
+    /**
+     * Remove a service, symmetric with {@link register}: a swap-key reverts to the app's captured
+     * boot default instead of dangling on the unloaded plugin's impl; everything else is a plain
+     * registry delete. Marking dirty lets the edge deliver a committed unload (or, if re-registered
+     * before the edge, a single remount).
+     * @param key - Service key to remove.
+     * @returns Nothing.
+     * @throws Never.
+     */
     unregister(key: string) {
       if (key === 'StorageBackend') {
         if (!isEphemeral) stageSwap(bootBackend);
@@ -817,8 +1032,22 @@ async function main(): Promise<void> {
       else serviceRegistry.delete(key);
       if (key !== 'StorageBackend') { mountTable.markDirty(key as keyof MatbotServices); flushIfQuiescent(); }
     },
+    /**
+     * No-op on the base machine; real transport binding happens per plugin in setupPlugin's scopedServices.
+     * @returns Nothing.
+     * @throws Never.
+     */
     registerFrontend() { /* bound per-plugin in setupPlugin's scopedServices; base is a no-op */ },
 
+    /**
+     * Run a single non-interactive completion: resolve the named provider's config (credentials and
+     * endpoint through the vault), stream the response, and aggregate text plus token usage. An
+     * optional `system` prompt is prepended as a system message; a missing signal defaults to a
+     * never-aborted one.
+     * @param req - Completion request naming a configured provider.
+     * @returns The full response text with input/output token usage.
+     * @throws Error - When the provider name is unknown, a credential cannot be resolved ({@link MissingSecretError}), or the provider adapter fails.
+     */
     async complete(req) {
       const rawCfg = matbotConfig.providers.get(req.provider);
       if (rawCfg === undefined) {
@@ -853,9 +1082,22 @@ async function main(): Promise<void> {
       }
       return { text, usage: { inputTokens, outputTokens } };
     },
+    /**
+     * Run a single turn from a single-turn request shape, delegating to {@link complete}.
+     * @param req - Single-turn request (prompt plus optional system/session bits).
+     * @returns The aggregated response text and usage.
+     * @throws Error - Same conditions as {@link complete}.
+     */
     async singleTurn(req) {
       return this.complete(singleTurnRequest(req));
     },
+    /**
+     * Hot-load a plugin by specifier, bypassing the module cache and throwing on failure.
+     * @param specifier - Plugin specifier (path, `file:` URL, or package name).
+     * @param prompt - Optional user-prompt function handed to the plugin during setup.
+     * @returns The freshly loaded plugin.
+     * @throws Error - When resolution fails, the plugin fails to load (`onLoadError: 'throw'`), or no plugin results.
+     */
     async loadPlugin(specifier: string, prompt?: PromptFn) {
       const resolved = await resolvePluginSpecifiers([specifier], path.dirname(configPath));
       const plugins  = await loadPluginsWithDescriptions(resolved, services, path.dirname(configPath), /* bustCache */ true, prompt, /* onLoadError */ 'throw');
@@ -863,9 +1105,14 @@ async function main(): Promise<void> {
       if (plugin === undefined) throw new Error(`No plugin loaded for specifier "${specifier}"`);
       return plugin;
     },
+    /**
+     * Unload a plugin by its config-level specifier (the matbot.yaml entry) or its canonical name;
+     * no re-resolution is needed because `plugin.specifier` records the original specifier.
+     * @param specifier - Config specifier or canonical plugin name.
+     * @returns Whether a matching loaded plugin was found and unloaded; `false` (with a warning) when none matches.
+     * @throws Error - Propagates unload-path failures from the core loader.
+     */
     async unloadPlugin(specifier: string): Promise<boolean> {
-      // A loaded plugin records its config-level specifier (= the matbot.yaml entry) and its canonical
-      // name; accept either. (No re-resolution needed — `plugin.specifier` is the original specifier.)
       const name = getPluginNameForSpecifier(specifier)
         ?? (getRegisteredPlugins().some(p => p.name === specifier) ? specifier : undefined);
       if (name === undefined) {
@@ -877,8 +1124,18 @@ async function main(): Promise<void> {
     resolver:  nodePluginResolver(path.dirname(configPath)),
     providers: matbotConfig.providers,
     mounted:   mountTable.mounted,
+    /**
+     * Current storage backend, or `undefined` when none is active (ephemeral boot, no pre-scan hit).
+     * @returns The live backend proxy, or `undefined` when none is active.
+     * @throws Never.
+     */
     get StorageBackend() { return activeStorageBackend === undefined ? undefined : storageBackendProxy; },
     sessions:  store,
+    /**
+     * The shared {@link SessionRunner} frontends submit and observe through.
+     * @returns The runner once constructed (just after the services object), `undefined` before that.
+     * @throws Never.
+     */
     get run() { return sessionRunner; },
     files:     fileStore,
     Vault:     vault,
@@ -887,7 +1144,17 @@ async function main(): Promise<void> {
     systemContext:  systemContextReg,
     workdir:    workDir,
     configPath,
+    /**
+     * Report whether this process runs as a background sub-agent.
+     * @returns `true` when launched with `IS_SUB_AGENT=1`.
+     * @throws Never.
+     */
     isSubAgent: () => isBackground,
+    /**
+     * Live {@link KnowledgeIndex} proxy; always present (defaults to LookupKnowledgeIndex).
+     * @returns The live knowledge-index proxy.
+     * @throws Never.
+     */
     get KnowledgeIndex() { return knowledgeProxy; },
   };
   const services: MatbotMachine = unifyServices(baseServices);
@@ -895,10 +1162,15 @@ async function main(): Promise<void> {
   serviceRegistry.set('ToolInvocationPolicy',freezeInvocationPolicy(matbotConfig.permissions??{defaultAction:'allow'}));
   if (capabilityProfile !== 'minimal') serviceRegistry.set('FileAccessSelection',{mode:capabilityProfile==='compatibility'?'http':'local'});
 
-  // Shut the runtime down and give up its ports, but never let the shutdown itself become the reason
-  // the process lingers: a hung teardown (a server close waiting on a keep-alive socket, a backend
-  // that will not settle) used to leave the old process holding the web port forever, so the
-  // replacement could never bind. Past the deadline we stop waiting and exit anyway.
+  /**
+   * Shut the runtime down and give up its ports, but never let the shutdown itself become the reason
+   * the process lingers: a hung teardown (a server close waiting on a keep-alive socket, a backend
+   * that will not settle) used to leave the old process holding the web port forever, so the
+   * replacement could never bind. Past the {@link SHUTDOWN_DEADLINE_MS} deadline we stop waiting and
+   * resolve anyway.
+   * @returns Resolves once teardown finishes or the deadline fires, whichever comes first.
+   * @throws Never - Teardown failures are logged, never propagated.
+   */
   const releaseRuntime = async (): Promise<void> => {
     let timer: NodeJS.Timeout | undefined;
     const deadline = new Promise<void>(resolve => {
@@ -978,8 +1250,14 @@ async function main(): Promise<void> {
     ], path.dirname(configPath)), services, path.dirname(configPath));
   }
 
-  // resolveProvider reads matbotConfig.providers lazily (per turn), so it sees both the
-  // canonicalised module names set below and any live `provider add/remove` edits.
+  /**
+   * Resolve a provider name to an adapter plus fully resolved config, reading
+   * matbotConfig.providers lazily (per call), so it sees both the canonicalised module names and
+   * any live `provider add/remove` edits.
+   * @param name - Provider key from the config.
+   * @returns The adapter and resolved config, or `null` when the name is unknown.
+   * @throws MissingSecretError - When a credential placeholder cannot be resolved via the vault.
+   */
   const resolveProvider = async (name: string): Promise<{ adapter: ProviderAdapter; config: ProviderConfig } | null> => {
     const cfg = matbotConfig.providers.get(name);
     if (cfg === undefined) return null;
@@ -991,9 +1269,15 @@ async function main(): Promise<void> {
     return { adapter: resolveProviderFactory(resolved.module)(resolved), config: resolved };
   };
 
-  // One runner per store: frontends share this one over the persistent sessions store, but the CLI
-  // can instantiate its own over an ephemeral MemoryStore (see main). That a SessionRunner composes
-  // over *any* Store is the point — nothing about the agentic loop is bound to a single backend.
+  /**
+   * One runner per store: frontends share this one over the persistent sessions store, but the CLI
+   * can instantiate its own over an ephemeral {@link MemoryStore} (see main). That a SessionRunner
+   * composes over *any* Store is the point — nothing about the agentic loop is bound to a single
+   * backend.
+   * @param sessionStore - Store the runner reads and writes sessions through.
+   * @returns A runner wired to the shared tools, hooks, providers, and stores.
+   * @throws Never.
+   */
   const makeRunner = (sessionStore: Store<Session>): SessionRunner => createSessionRunner({
     store:         sessionStore,
     resolveProvider,
@@ -1032,6 +1316,13 @@ async function main(): Promise<void> {
   // specifiers, and so `provider add` writes a path the loader can resolve — never
   // the bare package name of a local plugin, which crashes startup.
   const pluginNameToOrigPath = new Map<string, string>();
+  /**
+   * Record each original specifier's plugin name into pluginNameToOrigPath (first occurrence wins).
+   * plugin.specifier === the original config entry, so the name is looked up by that entry directly.
+   * @param origs - Original config-level specifiers (provider modules, config plugins).
+   * @returns Nothing.
+   * @throws Never.
+   */
   const recordOrigPaths = (origs: readonly string[]): void => {
     // plugin.specifier === the original config entry, so look up the name by that entry directly.
     for (const orig of origs) {
@@ -1082,6 +1373,11 @@ async function main(): Promise<void> {
       ? 'EPHEMERAL — sessions and remembered facts will be lost when this process exits'
       : `persistent (${dotData})`}\n`);
     process.stderr.write(`[${new Date().toISOString()} ${_pid}] [matbot] server running — press Ctrl+C to stop\n`);
+    /**
+     * Initiate a clean shutdown on SIGINT/SIGTERM: release the runtime, then exit 0.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const shutdown = (): void => {
       process.stderr.write('\n[matbot] shutting down…\n');
       void releaseRuntime().then(() => process.exit(0));

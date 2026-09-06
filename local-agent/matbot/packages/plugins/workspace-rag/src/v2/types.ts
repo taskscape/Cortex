@@ -72,6 +72,13 @@ export interface RagV2VectorizerInfo {
 /** Embeds texts for query or document purposes. */
 export interface RagV2Embedder {
   readonly info: RagV2VectorizerInfo;
+  /**
+   * Embeds a batch of texts for one purpose.
+   * @param texts - Texts to embed.
+   * @param purpose - Whether the texts are queries or indexed document content.
+   * @param signal - Optional signal cancelling the embedding request.
+   * @returns One vector per input text, in input order.
+   */
   embed(
     texts: readonly string[],
     purpose: RagV2EmbeddingPurpose,

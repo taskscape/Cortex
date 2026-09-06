@@ -7,6 +7,13 @@ const REF_RE = /\$\{([^}]+)\}/g;
 // spread), so base64 encoding goes through fixed 32 KiB chunks.
 const BASE64_CHUNK = 0x8000;
 
+/**
+ * Base64-encode bytes, chunked because `String.fromCharCode` is argument-count-limited in some
+ * engines and stack-bound when spread.
+ * @param bytes - Raw bytes to encode.
+ * @returns The base64 (btoa) encoding of the input.
+ * @throws Never.
+ */
 function toBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i += BASE64_CHUNK) {
@@ -26,6 +33,11 @@ function toBase64(bytes: Uint8Array): string {
 export class WebCryptoVault implements Vault {
   private readonly plain = new Map<string, string>();
 
+  /**
+   * Optionally seed the in-memory secret map.
+   * @param secrets - Initial name-to-secret entries; omitted starts empty.
+   * @throws Never.
+   */
   constructor(secrets?: Record<string, string>) {
     if (secrets) {
       for (const [k, v] of Object.entries(secrets)) {
@@ -49,6 +61,8 @@ export class WebCryptoVault implements Vault {
    * Writes or overwrites a secret in the in-memory map.
    * @param name Secret name.
    * @param value Secret value.
+   * @returns Resolves once the secret is stored.
+   * @throws Never.
    */
   async writeSecret(name: string, value: string): Promise<void> {
     this.plain.set(name, value);
@@ -58,6 +72,7 @@ export class WebCryptoVault implements Vault {
    * Checks whether a secret exists.
    * @param name Secret name.
    * @returns `true` if the vault holds a value for `name`.
+   * @throws Never.
    */
   hasKey(name: string): boolean {
     return this.plain.has(name);
@@ -67,6 +82,7 @@ export class WebCryptoVault implements Vault {
    * Reverse lookup: finds the first secret name whose value matches.
    * @param value Value to search for.
    * @returns The matching secret name, or `undefined`.
+   * @throws Never.
    */
   findByValue(value: string): string | undefined {
     for (const [k, v] of this.plain) if (v === value) return k;
@@ -99,6 +115,7 @@ export class WebCryptoVault implements Vault {
    * Redacts every stored secret value (4+ chars) found in the given text.
    * @param text Text that may contain secret values.
    * @returns The text with matching secret values replaced by `[REDACTED]`.
+   * @throws Never.
    */
   scrub(text: string): string {
     let result = text;
@@ -113,6 +130,13 @@ export class WebCryptoVault implements Vault {
   // ── Encryption helpers (standalone; not used by this class — see the class
   // doc. Available for a future encrypted mode, e.g. persisting via IndexedDB.) ──
 
+  /**
+   * Derive an AES-GCM key from a passphrase via PBKDF2 (100,000 iterations, SHA-256).
+   * @param passphrase - Human-supplied passphrase to derive from.
+   * @param salt - Salt bytes for the KDF.
+   * @returns A non-extractable CryptoKey restricted to encrypt/decrypt use.
+   * @throws DOMException - Key derivation fails (unsupported algorithm, invalid key material).
+   */
   private static async deriveKey(passphrase: string, salt: ArrayBuffer): Promise<CryptoKey> {
     const base = await crypto.subtle.importKey(
       'raw',
@@ -135,6 +159,7 @@ export class WebCryptoVault implements Vault {
    * @param passphrase Passphrase to derive the encryption key from.
    * @param plaintext Text to encrypt.
    * @returns Base64 blob of `[salt(16)] [iv(12)] [ciphertext]`.
+   * @throws DOMException - Key derivation or AES-GCM encryption fails.
    */
   static async encrypt(passphrase: string, plaintext: string): Promise<string> {
     const saltBuf = crypto.getRandomValues(new Uint8Array(16)).buffer as ArrayBuffer;
@@ -156,6 +181,8 @@ export class WebCryptoVault implements Vault {
    * @param passphrase Passphrase the blob was encrypted with.
    * @param encoded Base64 `[salt][iv][ciphertext]` blob.
    * @returns The decrypted plaintext.
+   * @throws DOMException - `encoded` is malformed base64 (atob), or key derivation or AES-GCM
+   *          decryption fails (wrong passphrase, truncated or tampered blob).
    */
   static async decrypt(passphrase: string, encoded: string): Promise<string> {
     const bytes  = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));

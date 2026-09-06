@@ -513,3 +513,66 @@ test("applySort compares booleans numerically, numbers numerically, missing last
     "numbers must compare numerically, not lexicographically",
   );
 });
+
+for (const completedRounds of [0, 1, 2]) {
+  test(`REL-01 provider failure preserves ${completedRounds} completed tool rounds and partial output`, async () => {
+    const store = new MemoryStore();
+    const session = makeSession(`reliability-history-${completedRounds}`);
+    await store.set(session.id, session);
+    let calls = 0, effects = 0;
+    const tool = { name: "change", description: "change", inputSchema: {}, executor: {
+      async *execute() { effects++; yield { type: "result", value: { changed: effects } }; },
+    } };
+    const provider = makeProvider(async function* () {
+      if (calls++ < completedRounds) {
+        yield { type: "tool-call", id: `call-${calls}`, name: "change", input: { round: calls } };
+      } else {
+        const saved = await store.get(session.id);
+        assert.equal(saved.messages.filter(m => m.role === "tool").length, completedRounds);
+        yield { type: "text-delta", delta: "partial output survives" };
+        throw new Error("provider disconnected");
+      }
+    });
+    const events = [];
+    for await (const event of runSession({ session, store, provider, tools: new Map([[tool.name, tool]]),
+      providerConfig: { name: "test", module: "test", model: "test" }, config: { provider: "test" },
+      signal: new AbortController().signal, async loadPlugin() {}, async unloadPlugin() { return false; },
+    })) events.push(event);
+    assert.equal(effects, completedRounds);
+    assert.equal(events.at(-1).type, "error");
+    const saved = await store.get(session.id);
+    assert.equal(saved.messages.filter(m => m.role === "tool").length, completedRounds);
+    assert.ok(saved.messages.some(m => m.content.some(c => c.text === "partial output survives")));
+    assert.ok(saved.messages.some(m => m.role === "marker" && m.metadata?.providerError));
+    const results = saved.messages.flatMap(m => m.content).filter(c => c.type === "tool-result");
+    const toolCalls = saved.messages.flatMap(m => m.content).filter(c => c.type === "tool-call");
+    assert.deepEqual(results.map(c => c.id), toolCalls.map(c => c.id));
+  });
+}
+
+test("REL-01 persistence failure is explicit and prevents the next provider request", async () => {
+  const session = makeSession("reliability-save-failure");
+  let calls = 0;
+  const events = [];
+  for await (const event of runSession({ session, store: { async set() { throw new Error("disk full"); } },
+    provider: makeProvider(function* () { calls++; yield { type: "tool-call", id: "c", name: "work", input: {} }; }),
+    tools: new Map([["work", { name: "work", description: "work", inputSchema: {}, executor: { async *execute() { yield { type: "result", value: "done" }; } } }]]),
+    providerConfig: { name: "test", module: "test", model: "test" }, config: { provider: "test" },
+    signal: new AbortController().signal, async loadPlugin() {}, async unloadPlugin() { return false; },
+  })) events.push(event);
+  assert.equal(calls, 1);
+  assert.equal(events.at(-1).type, "error");
+  assert.match(events.at(-1).error, /persistence failed.*may not be saved.*disk full/);
+});
+
+test('REL-08 iterator exhaustion is a failed provider completion and preserves partial prose', async () => {
+  const store = new MemoryStore(), session = makeSession('missing-done');
+  const events = [];
+  for await (const event of runSession({ session, store,
+    provider: { async *complete() { yield { type: 'text-delta', delta: 'unfinished' }; } },
+    config: { provider: 'test' }, providerConfig: { name: 'test', module: 'test', model: 'test' },
+    signal: new AbortController().signal, async loadPlugin() {}, async unloadPlugin() { return false; },
+  })) events.push(event);
+  assert.equal(events.at(-1).type, 'error'); assert.match(events.at(-1).error, /terminal done/);
+  assert.ok((await store.get(session.id)).messages.some(m => m.content.some(c => c.text === 'unfinished')));
+});

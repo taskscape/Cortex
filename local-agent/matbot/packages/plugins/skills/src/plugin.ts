@@ -9,7 +9,13 @@ import { createSkillTool, createSkillsConfigTool } from './tools.js';
 import type { SkillDoc } from './types.js';
 
 /** One-shot reachability probe for a pinned provider, used only when forming installationMessage
- *  (install/reload) — never on the hot path. Fails soft: a thrown error becomes `{ ok: false }`. */
+ *  (install/reload) — never on the hot path. Fails soft: a thrown error becomes `{ ok: false }`.
+ *
+ *  @param services - Runtime machine used for the probe `singleTurn` call.
+ *  @param provider - Provider name to probe.
+ *  @returns `{ ok: true }` on any reply, else `{ ok: false, error }` carrying the failure message.
+ *  @throws Never.
+ */
 async function testProvider(services: MatbotMachine, provider: string): Promise<{ ok: boolean; error?: string }> {
   try {
     await services.singleTurn({ provider, prompt: 'Reply with "ok".', signal: AbortSignal.timeout(15000) });
@@ -38,6 +44,11 @@ declare module '@matatbread/matbot-plugin-api' {
  *
  * Returns the manager so a specialization (e.g. the node plugin) can attach a filesystem watch.
  * Uses only web-platform APIs.
+ *
+ * @param services - Runtime machine to wire the manager, tools, contributions and system context into.
+ * @returns The live manager (the already-registered one on re-entry).
+ * @throws Error - Propagates store load failures from the initial {@link SkillManager.load} and
+ *   registration errors.
  */
 export async function setupSkills(services: MatbotMachine): Promise<SkillManager> {
   // Idempotency keyed on the registered service entry, not a module-scoped flag: a re-import would
@@ -87,6 +98,9 @@ export async function setupSkills(services: MatbotMachine): Promise<SkillManager
  * The cross-runtime base skills plugin: content CRUD via `skill_action`, persisted through the active
  * storage backend and indexed into the knowledge subsystem, plus a `skills_config` tool. Runs in both
  * Node and the browser. It has no filesystem watch — that lives in @matatbread/matbot-skills-node.
+ *
+ * @returns The plugin specification.
+ * @throws Never.
  */
 export function createSkillsPlugin(): MatbotPluginSpec {
   let manager:  SkillManager   | undefined;
@@ -103,6 +117,13 @@ export function createSkillsPlugin(): MatbotPluginSpec {
       description: 'Skills (named markdown playbooks) with content CRUD via skill_action, persisted and knowledge-indexed. Cross-runtime (node + browser).',
     },
 
+    /**
+     * Explains how the analysis provider is chosen; when one is pinned, probes it once and
+     * reports the outcome.
+     *
+     * @returns The installation message: base guidance plus provider selection/probe detail.
+     * @throws Error - If the settings read for the pinned provider rejects.
+     */
     async installationMessage() {
       if (!captured) return base;
       const pinned    = await captured.settings().get<string>('analysisProvider');
@@ -121,11 +142,24 @@ export function createSkillsPlugin(): MatbotPluginSpec {
           : `did NOT respond: ${probe.error}. It falls back to the first configured provider until fixed.`);
     },
 
+    /**
+     * Captures the machine for {@link installationMessage} and runs the shared skills setup.
+     *
+     * @param services - Runtime machine passed to {@link setupSkills}.
+     * @returns A promise that resolves once the shared setup completes.
+     * @throws Error - Propagates {@link setupSkills} failures.
+     */
     async setup(services) {
       captured = services;
       manager  = await setupSkills(services);
     },
 
+    /**
+     * Clears the manager from setup (ending its lifecycle subscription and in-flight analyses).
+     *
+     * @returns A promise that resolves once the manager is cleared (a no-op when setup never ran).
+     * @throws Never.
+     */
     async teardown() {
       manager?.clear();
     },

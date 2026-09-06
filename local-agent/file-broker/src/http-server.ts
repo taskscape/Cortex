@@ -1,6 +1,19 @@
 import http from 'node:http';
 import { HttpError, assertLoopbackRequest, assertSharedToken, isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from '@local-agent/http-utils';
 import { FileAccessError, type HostFileAccessService } from './service.js';
+/**
+ * Creates the file-broker HTTP server exposing `HostFileAccessService` over
+ * loopback-only endpoints: `GET /health` (no token required), `GET /list`,
+ * `GET /read`, and `POST /write` (token-gated when a token is configured).
+ * Every request must carry a loopback `Host` header (DNS-rebinding defense).
+ * `FileAccessError` responses are sent with their status and payload; any other
+ * thrown error becomes a generic 500 via {@link sendJsonError}.
+ *
+ * @param service - The backing service; only the health/list/read/write
+ * operations are required.
+ * @param token - Optional shared secret checked on every non-health request.
+ * @returns An `http.Server` the caller must `listen()` itself.
+ */
 export function createFileBrokerServer(service: Pick<HostFileAccessService, 'health' | 'list' | 'read' | 'write'>, token?: string) {
     return http.createServer(async (request, response) => {
         try {

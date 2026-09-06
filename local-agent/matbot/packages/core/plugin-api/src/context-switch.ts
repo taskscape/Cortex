@@ -28,6 +28,8 @@ let flushing = false;
  * idempotent: a no-op when nothing is pending, since the edge is reached after every operation.
  * Returns an unregister fn. A throwing flusher is isolated — one must not block the others or escape
  * into the operation that triggered the edge.
+ *
+ * @param flush - The flusher to register; must be a no-op when nothing is pending.
  */
 export function onContextQuiesce(flush: () => void): () => void {
   quiescers.add(flush);
@@ -57,10 +59,23 @@ export function flushIfQuiescent(): void {
  * Switch into the machine as `principal`: land any pending machine mutation (only safe while idle),
  * then run `fn` under the principal. Mirrors {@link runAs}'s sync/async return — when `fn` is async,
  * the context stays open until its promise settles, so the depth count tracks the real operation.
+ *
+ * @typeParam T - The return type of `fn`.
+ * @param principal - The principal to establish for the extent of `fn`.
+ * @param fn - The operation to run; may be sync or async.
+ * @returns Whatever `fn` returns — a promise stays a promise, with the exit edge (depth decrement
+ *          plus flush) deferred to its settlement.
+ * @throws Forwards any error thrown by `fn` (after the depth is decremented and the exit flush runs).
  */
 export function contextSwitch<T>(principal: Principal, fn: () => T): T {
   flushIfQuiescent();
   depth++;
+  /**
+   * Exit edge: decrement the depth and land any deferred mutation now that the machine may be idle.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   const settle = (): void => { depth--; flushIfQuiescent(); };
   let result: T;
   try {

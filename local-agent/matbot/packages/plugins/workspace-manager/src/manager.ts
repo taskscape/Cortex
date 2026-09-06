@@ -1,6 +1,12 @@
 import path from 'node:path';
 import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import type { WorkspaceManager, WorkspaceDeleteReadiness, WorkspaceLifecycleParticipant, WorkspaceDeletionLease } from '@matatbread/matbot-workspace-manager-types';
+/**
+ * Checks whether a path exists and is accessible.
+ *
+ * @param filePath Path to test.
+ * @returns True when `access` succeeds, false on any failure.
+ */
 async function exists(filePath: string): Promise<boolean> { try {
     await access(filePath);
     return true;
@@ -8,6 +14,9 @@ async function exists(filePath: string): Promise<boolean> { try {
 catch {
     return false;
 } }
+/**
+ * One registry entry: a named workspace directory with its config location and timestamps.
+ */
 interface CortexWorkspaceRecord {
     id: string;
     name: string;
@@ -15,13 +24,23 @@ interface CortexWorkspaceRecord {
     createdAt: string;
     updatedAt: string;
 }
+/**
+ * On-disk shape of `cortex-workspaces.json`: the active workspace id plus its records.
+ */
 interface CortexWorkspaceRegistry {
     active: string;
     workspaces: CortexWorkspaceRecord[];
 }
+/**
+ * A {@link CortexWorkspaceRecord} annotated with whether it is the active workspace.
+ */
 interface CortexWorkspaceSummary extends CortexWorkspaceRecord {
     active: boolean;
 }
+/**
+ * Internal subset of the public {@link WorkspaceManager} contract, typed against
+ * the manager's own summary/record shapes.
+ */
 interface CortexWorkspaceManager {
     current(): Promise<CortexWorkspaceSummary>;
     list(): Promise<{
@@ -70,12 +89,33 @@ export interface FileWorkspaceManagerOptions {
     /** Sink for deletion audit messages; defaults to console.info. */
     deletionLogger?: (message: string) => void;
 }
+/**
+ * Renders a value as a YAML single-quoted scalar, doubling embedded single quotes.
+ *
+ * @param value Value to quote.
+ * @returns The YAML-safe single-quoted string.
+ */
 function yamlSingleQuoted(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
 }
+/**
+ * Normalizes a path for YAML output by replacing backslashes with forward slashes.
+ *
+ * @param value Path to normalize.
+ * @returns The forward-slashed path string.
+ */
 function yamlPath(value: string): string {
     return value.replace(/\\/g, '/');
 }
+/**
+ * Derives a directory-safe workspace id from a human-readable name.
+ *
+ * Lower-cases, collapses non-alphanumeric runs to `-`, trims edge dashes, and
+ * caps at 48 characters; falls back to a timestamp-based id when the result is empty.
+ *
+ * @param name Human-readable workspace name.
+ * @returns The slug used as the workspace id (made unique by callers).
+ */
 function slugifyWorkspaceName(name: string): string {
     const slug = name.trim().toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
@@ -83,10 +123,28 @@ function slugifyWorkspaceName(name: string): string {
         .slice(0, 48);
     return slug || `workspace-${Date.now().toString(36)}`;
 }
+/**
+ * Path-containment check: true when `child` equals `parent` or lies beneath it,
+ * using `path.relative` so sibling prefixes are rejected.
+ *
+ * @param child Candidate descendant path.
+ * @param parent Candidate ancestor path.
+ * @returns True when `child` is `parent` or inside it.
+ */
 function pathIsInsideOrEqual(child: string, parent: string): boolean {
     const relative = path.relative(parent, child);
     return relative === '' || (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
 }
+/**
+ * Rewrites root-relative plugin specifiers in a config text to absolute paths so
+ * cloned workspace configs keep resolving plugins against the root directory.
+ * Matches bare list entries (`- ./x`) and `module:` values that start with `./`
+ * or `../`; comments and line suffixes are preserved.
+ *
+ * @param text Config file contents.
+ * @param configDir Directory the config's relative specifiers resolve against.
+ * @returns The rewritten config text.
+ */
 function absolutizeLocalConfigSpecifiers(text: string, configDir: string): string {
     return text.replace(/^(\s*(?:-\s+|module:\s+))(['"]?)(\.{1,2}[\\/][^#\r\n'"]+)\2(\s*(?:#.*)?$)/gm, (_whole, prefix: string, _quote: string, spec: string, suffix: string) => {
         const abs = yamlPath(path.resolve(configDir, spec.trim()));
@@ -103,6 +161,14 @@ function absolutizeLocalConfigSpecifiers(text: string, configDir: string): strin
 export class FileWorkspaceManager implements WorkspaceManager {
     private readonly participants = new Map<string, WorkspaceLifecycleParticipant>();
     private mutation = Promise.resolve();
+    /**
+     * Registers a deletion-lifecycle participant under its unique id.
+     *
+     * @param participant Participant whose `readiness` and `acquireDeletion` are
+     *   consulted by {@link deleteCheck} and {@link delete}.
+     * @returns An unsubscribe function that removes the participant if it is still the one registered under its id.
+     * @throws Error - When a participant with the same id is already registered.
+     */
     registerParticipant(participant: WorkspaceLifecycleParticipant): () => void {
         if (this.participants.has(participant.id))
             throw new Error('Duplicate workspace participant: ' + participant.id);
@@ -110,6 +176,15 @@ export class FileWorkspaceManager implements WorkspaceManager {
         return () => { if (this.participants.get(participant.id) === participant)
             this.participants.delete(participant.id); };
     }
+    /**
+     * Serializes all mutating registry operations through a single promise chain,
+     * so only one create/rename/delete/switch runs at a time on this manager.
+     *
+     * @typeParam T - Result type of the serialized operation.
+     * @param operation Async work to run while holding the mutation chain.
+     * @returns The result of `operation`.
+     * @throws `Error` - Whatever `operation` throws; the chain always advances.
+     */
     private async mutate<T>(operation: () => Promise<T>): Promise<T> {
         const previous = this.mutation;
         let release!: () => void;
@@ -122,6 +197,15 @@ export class FileWorkspaceManager implements WorkspaceManager {
             release();
         }
     }
+    /**
+     * Reports whether a workspace can currently be deleted, without mutating
+     * anything. Blocks unknown ids, the active workspace, the last remaining
+     * workspace, and any participant that reports it is not ready.
+     *
+     * @param id Id of the workspace to check.
+     * @returns The first blocking participant's readiness verdict, or a synthesized one.
+     * @throws Error - If the workspace registry cannot be loaded.
+     */
     async deleteCheck(id: string): Promise<WorkspaceDeleteReadiness> {
         const registry = await this.load();
         if (!registry.workspaces.some(w => w.id === id))
@@ -137,12 +221,44 @@ export class FileWorkspaceManager implements WorkspaceManager {
         }
         return { canDelete: true, locked: false };
     }
+    /**
+     * Creates a workspace; see {@link FileWorkspaceManager.createOwned}.
+     *
+     * @param name Human-readable workspace name; must be non-empty.
+     * @returns The created workspace summary.
+     * @throws Error - As thrown by {@link FileWorkspaceManager.createOwned}.
+     */
     async create(name: string): Promise<CortexWorkspaceSummary> { return this.mutate(() => this.createOwned(name)); }
+    /**
+     * Renames a workspace; see {@link FileWorkspaceManager.renameOwned}.
+     *
+     * @param id Id of the workspace to rename.
+     * @param name New human-readable name; must be non-empty.
+     * @returns The updated workspace summary.
+     * @throws Error - As thrown by {@link FileWorkspaceManager.renameOwned}.
+     */
     async rename(id: string, name: string): Promise<CortexWorkspaceSummary> { return this.mutate(() => this.renameOwned(id, name)); }
+    /**
+     * Activates a workspace; see {@link FileWorkspaceManager.switchOwned}.
+     *
+     * @param id Id of the workspace to activate.
+     * @returns The new active id and whether a restart was performed.
+     * @throws Error - As thrown by {@link FileWorkspaceManager.switchOwned}.
+     */
     async switch(id: string): Promise<{
         active: string;
         restarting: boolean;
     }> { return this.mutate(() => this.switchOwned(id)); }
+    /**
+     * Deletes a workspace after checking readiness and acquiring every
+     * participant's deletion lease. Leases are released (in reverse acquisition
+     * order) whether or not the deletion succeeds; committed leases only take
+     * effect once the registry commit has succeeded.
+     *
+     * @param id Id of the workspace to delete.
+     * @returns The deletion result with its audit log.
+     * @throws Error - With the blocking `reason` when {@link deleteCheck} reports the workspace cannot be deleted, or as thrown by the underlying deletion.
+     */
     async delete(id: string): Promise<WorkspaceDeletionResult> {
         return this.mutate(async () => {
             const readiness = await this.deleteCheck(id);
@@ -180,19 +296,29 @@ export class FileWorkspaceManager implements WorkspaceManager {
     /**
      * Register the restart callback used by {@link switch} to relaunch the runtime
      * after the active workspace changes.
+     *
      * @param restarter Async callback receiving the id of the newly activated workspace.
+     * @returns Nothing.
+     * @throws Never.
      */
     setRestarter(restarter: (id: string) => Promise<void>): void {
         this.restarter = restarter;
     }
     /**
-     * @returns The path of the registry file backing this manager.
+     * Reports the registry file backing this manager.
+     *
+     * @returns The path of the registry file (`cortex-workspaces.json`).
+     * @throws Never.
      */
     getRegistryPath(): string {
         return this.registryPath;
     }
     /**
+     * Summarizes the currently active workspace, falling back to the first
+     * registry entry when the active id has no record.
+     *
      * @returns The currently active workspace summary.
+     * @throws Error - If the workspace registry cannot be loaded.
      */
     async current(): Promise<CortexWorkspaceSummary> {
         const registry = await this.load();
@@ -200,7 +326,10 @@ export class FileWorkspaceManager implements WorkspaceManager {
         return this.summarize(current, current.id === registry.active);
     }
     /**
+     * Lists every registered workspace in registry order.
+     *
      * @returns The active workspace id plus a summary of every registered workspace.
+     * @throws Error - If the workspace registry cannot be loaded.
      */
     async list(): Promise<{
         active: string;
@@ -292,6 +421,13 @@ export class FileWorkspaceManager implements WorkspaceManager {
             throw new Error('Cannot delete the only workspace.');
         }
         const cleanupLog: string[] = [];
+        /**
+         * Appends an audit message to the result log and forwards it to the
+         * configured deletion logger.
+         *
+         * @param operation Short description of the audit step performed.
+         * @returns Nothing.
+         */
         const audit = (operation: string): void => {
             const message = `[workspace-delete] workspace=${id} ${operation}`;
             cleanupLog.push(message);
@@ -359,10 +495,13 @@ export class FileWorkspaceManager implements WorkspaceManager {
         return { active: id, restarting: true };
     }
     /**
-     * Pick the config file the process should boot: the workspace named by
-     * `CORTEX_WORKSPACE_ID` if valid, otherwise the active (or first) workspace.
-     * The selection is persisted as the registry's active entry.
+     * Picks the boot config, preferring the workspace named by the
+     * `CORTEX_WORKSPACE_ID` environment variable when it exists, then the
+     * registry's active entry, then the first entry. The selection is persisted
+     * as the registry's active entry.
+     *
      * @returns Absolute path of the selected workspace's matbot.yaml.
+     * @throws Error - If the registry cannot be loaded or saved.
      */
     async selectConfigPath(): Promise<string> {
         const registry = await this.load();
@@ -377,9 +516,13 @@ export class FileWorkspaceManager implements WorkspaceManager {
     /**
      * Ensure a root-relative plugin specifier appears in the `plugins:` list of every
      * workspace config, inserting it before `options.before` when given. Non-root
-     * workspaces get the specifier absolutized to the root directory.
+     * workspaces get the specifier absolutized to the root directory. Workspaces
+     * whose config file is missing are skipped.
+     *
      * @param rootRelativeSpecifier Root-relative path of the plugin to add.
      * @param options Optional `before` specifier anchoring insertion order in each config.
+     * @returns Nothing.
+     * @throws Error - If the registry cannot be loaded or a workspace config cannot be read or written.
      */
     async ensurePluginInAllWorkspaces(rootRelativeSpecifier: string, options: {
         before?: string;
@@ -401,9 +544,24 @@ export class FileWorkspaceManager implements WorkspaceManager {
             await addPluginToConfigIfMissing(configPath, specifier, beforeSpecifier);
         }
     }
+    /**
+     * Copies a registry record and stamps it with the active flag.
+     *
+     * @param record Registry entry to project.
+     * @param active Whether the entry is the active workspace.
+     * @returns The record's summary form.
+     */
     private summarize(record: CortexWorkspaceRecord, active: boolean): CortexWorkspaceSummary {
         return { ...record, active };
     }
+    /**
+     * Derives the workspace directory this record owns, trusting the record only
+     * when the id-derived directory lies under `workspaces/` and the record's
+     * config directory lies inside it; otherwise deletion staging is refused.
+     *
+     * @param record Registry entry to locate on disk.
+     * @returns The expected workspace directory, or `undefined` when the record is not trusted.
+     */
     private ownedWorkspaceDirectory(record: CortexWorkspaceRecord): string | undefined {
         const rootDir = path.dirname(this.rootConfigPath);
         const workspacesDir = path.resolve(rootDir, 'workspaces');
@@ -416,6 +574,15 @@ export class FileWorkspaceManager implements WorkspaceManager {
             return undefined;
         return expectedWorkspaceDir;
     }
+    /**
+     * Loads the workspace registry, creating a default single-workspace registry
+     * file on first use and repairing a dangling active id by falling back to
+     * the first entry.
+     *
+     * @returns The parsed registry.
+     * @throws SyntaxError - If the registry file contains invalid JSON.
+     * @throws Error - If the registry file is unreadable or structurally invalid (no workspaces), or the freshly created registry cannot be saved.
+     */
     private async load(): Promise<CortexWorkspaceRegistry> {
         if (!(await exists(this.registryPath))) {
             const nowIso = new Date().toISOString();
@@ -440,6 +607,14 @@ export class FileWorkspaceManager implements WorkspaceManager {
             registry.active = registry.workspaces[0]!.id;
         return registry;
     }
+    /**
+     * Persists the registry atomically: writes a unique temp sibling, renames it
+     * over the registry file, and always removes the temp file afterwards.
+     *
+     * @param registry Registry state to write.
+     * @returns Nothing.
+     * @throws Error - If the registry directory cannot be created or the write/rename fails.
+     */
     private async save(registry: CortexWorkspaceRegistry): Promise<void> {
         await mkdir(path.dirname(this.registryPath), { recursive: true });
         const temporary = this.registryPath + '.' + crypto.randomUUID() + '.tmp';
@@ -452,6 +627,18 @@ export class FileWorkspaceManager implements WorkspaceManager {
         }
     }
 }
+/**
+ * Inserts a plugin specifier into a config's `plugins:` list unless already
+ * present, trying in order: directly above the `beforeSpecifier` entry (keeping
+ * its indentation), inside the existing `plugins:` block, or as a new block
+ * appended to the file.
+ *
+ * @param configPath Path of the workspace config to edit in place.
+ * @param specifier Plugin specifier to insert (already quoted/absolutized when needed).
+ * @param beforeSpecifier Optional specifier anchoring the insertion point.
+ * @returns Nothing.
+ * @throws Error - If the config cannot be read or written.
+ */
 async function addPluginToConfigIfMissing(configPath: string, specifier: string, beforeSpecifier?: string): Promise<void> {
     const text = await readFile(configPath, 'utf8');
     if (text.includes(`- ${specifier}`))
@@ -477,6 +664,12 @@ async function addPluginToConfigIfMissing(configPath: string, specifier: string,
     }
     await writeFile(configPath, updated, 'utf8');
 }
+/**
+ * Escapes regular-expression metacharacters in a string.
+ *
+ * @param value Text to escape.
+ * @returns A string safe to embed in a `RegExp` as a literal.
+ */
 function escapeRegExp(value: string): string {
     return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
 }

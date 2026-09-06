@@ -14,20 +14,27 @@ export interface ExtraPlugins {
   /**
    * Lists persisted user-added plugin specifiers.
    * @returns The stored specifiers, in insertion order.
+   * @throws Error - Propagates persistence failures from the settings store.
    */
   list(): Promise<string[]>;
   /**
    * Persists a plugin specifier for auto-load on future boots.
    * @param specifier Specifier to persist (ignored if already stored).
+   * @throws Error - Propagates persistence failures from the settings store.
    */
   add(specifier: string): Promise<void>;
   /**
    * Removes a plugin specifier from the persisted set.
    * @param specifier Specifier to forget.
+   * @throws Error - Propagates persistence failures from the settings store.
    */
   remove(specifier: string): Promise<void>;
 }
 
+/**
+ * Discriminated input payload for the `plugin` tool; `action` selects the operation and the
+ * remaining fields carry its arguments (validated at runtime by the executor).
+ */
 type PluginInput =
   | { action: 'list' }
   | { action: 'discover_local' }
@@ -38,12 +45,27 @@ type PluginInput =
 
 // Baked-but-idle plugins the assembler inlined (config.availablePlugins): present in the artifact +
 // import map but not auto-loaded. The browser analogue of node's on-disk `packages/plugins` scan.
+/**
+ * A baked-but-idle plugin entry as inlined by the assembler into `__MB__.config.availablePlugins`.
+ */
 interface AvailablePlugin { name: string; specifier: string; matbotRuntime?: string[]; description?: string }
+/**
+ * Read the assembler's baked-but-idle plugin list from the global `__MB__` payload.
+ * @returns The available plugin entries, or an empty array when the payload is absent.
+ * @throws Never.
+ */
 function bakedAvailablePlugins(): AvailablePlugin[] {
   const mb = (globalThis as unknown as { __MB__?: { config?: { availablePlugins?: AvailablePlugin[] } } }).__MB__;
   return mb?.config?.availablePlugins ?? [];
 }
 
+/**
+ * Ask the user to confirm a privileged action out-of-band, breaking the LLM's execution chain.
+ * @param ctx - Tool execution context used to prompt.
+ * @param label - Confirmation question rendered to the user.
+ * @returns True only when the user answered the affirmative constant.
+ * @throws Error - The prompt fails.
+ */
 async function confirmAction(ctx: ToolContext, label: string): Promise<boolean> {
   const field: FormField = { name: 'confirm', label, type: 'confirm', default: CONFIRM_NO };
   const answer = await ctx.prompt(field);
@@ -52,6 +74,15 @@ async function confirmAction(ctx: ToolContext, label: string): Promise<boolean> 
 
 // Reflect every channel a plugin contributes through (mirrors the node plugin tool) so `list` reports
 // the complete type set, not just the static fields.
+/**
+ * Classify the channels a plugin contributes so `list` reports the complete type set, not just
+ * the static manifest fields.
+ * @param p - Loaded plugin to classify.
+ * @param registeredToolPlugins - Names of plugins that registered tools (registry state).
+ * @returns Deduplicated type labels, including the plugin's registered service keys, with
+ *          `extension` as the fallback when the plugin contributes nothing else.
+ * @throws Never.
+ */
 function pluginTypes(p: MatbotPlugin, registeredToolPlugins: Set<string>): string[] {
   const t: string[] = [];
   const serviceKeys = getRegisteredServiceKeys(p.name);
@@ -73,9 +104,22 @@ function pluginTypes(p: MatbotPlugin, registeredToolPlugins: Set<string>): strin
  * manager — there is neither in the browser. `add`/`remove`/`reload` work purely against live
  * specifiers (URL paths or import-map / inlined synthetic ids resolved by the host loader), and the
  * added set is persisted via the injected `extras` store so it survives a realm reload.
+ * @param extras - Persistence for user-added specifiers, supplied by the bootstrap.
+ * @returns The `plugin` tool definition with its multi-action executor.
+ * @throws Never — action failures are reported as `error` tool events.
  */
 export function createBrowserPluginTool(extras: ExtraPlugins): Tool {
   const executor = {
+    /**
+     * Execute a plugin-management action, reporting progress and outcomes as tool events.
+     * Errors are normally surfaced as `error`/`stderr` events; only awaits outside the guarded
+     * branches propagate.
+     * @param input - Action payload, discriminated by `action` (shapes in the tool description).
+     * @param ctx - Tool execution context (prompting, vault, plugin load/unload).
+     * @returns Yields `stdout`/`stderr` progress chunks and one final `result` or `error` event.
+     * @throws Error - From unguarded awaits: the store-key vault write, reload's plugin load,
+     *          and installation-message generation.
+     */
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       const { action } = input as PluginInput;
 

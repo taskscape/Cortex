@@ -89,6 +89,20 @@ let freshSeq = 0;
  *   config. `'throw'` is for an explicit, single, user-initiated load (the `plugin`/`provider`
  *   tools via `services.loadPlugin`): the user named *this* plugin, so a silent skip would surface
  *   only as a confusing empty-result error downstream — fail loudly with the reason instead.
+ * @param specifiers - Plugin entries to load. A string is both imported and recorded as the
+ *   plugin's `specifier`; the object form splits those concerns (see above) and may also carry
+ *   a pre-derived `name` and pre-read `runtimes`.
+ * @param services - Host machine; its optional `resolver` supplies runtime declarations and
+ *   canonical plugin names, and its registry receives the registered plugins.
+ * @returns The plugins that loaded, registered, and set up successfully, in specifier order;
+ *   skipped entries never appear.
+ * @throws IncompatibleRuntimeError - Under `onLoadError: 'throw'`, when a plugin's declared
+ *   `matbotRuntime` excludes this host runtime.
+ * @throws NotAPluginError - Under `onLoadError: 'throw'`, when a module imports but is not
+ *   plugin-shaped.
+ * @throws Error - Under `onLoadError: 'throw'`, when an import rejects. Under `'skip'` every
+ *   such failure is warned and skipped instead; registration/setup errors are contained by
+ *   rollback and never propagate in either mode.
  */
 export async function loadPlugins(
   specifiers: readonly (string | { spec: string; importSpec?: string; name?: string; runtimes?: readonly Runtime[] })[],
@@ -151,6 +165,18 @@ export async function loadPlugins(
   // from a `'load'` failure (import rejection — a bad path, a syntax error). Only the former is
   // permanently-not-a-plugin: it throws NotAPluginError so the `add` flow can roll back the config
   // write, where an import failure may be a fixable typo and is left in config.
+  /**
+   * Report a failed plugin load according to the `onLoadError` policy: throw for an explicit
+   * single load, warn-and-skip for the startup batch.
+   *
+   * @param spec - Specifier of the plugin that failed to load.
+   * @param reason - Human-readable failure reason, included in the error or warning.
+   * @param kind - `'shape'` marks a module that imported cleanly but is not a plugin (raises
+   *   {@link NotAPluginError}); `'load'` marks an import rejection (plain Error).
+   * @returns Nothing.
+   * @throws NotAPluginError - For a `'shape'` failure when `onLoadError` is `'throw'`.
+   * @throws Error - For a `'load'` failure when `onLoadError` is `'throw'`.
+   */
   const failLoad = (spec: string, reason: string, kind: 'load' | 'shape' = 'load'): void => {
     if (onLoadError === 'throw') throw kind === 'shape' ? new NotAPluginError(spec, reason) : new Error(reason);
     console.warn(`[matbot] Skipping plugin "${spec}": ${reason}`);
@@ -254,22 +280,14 @@ export async function loadPlugins(
 }
 
 /**
- * Stamp a plugin entry URL with a unique `${FRESH_PARAM}` value to force a fresh
- * evaluation (and, with the node resolve hook, a fresh subtree — see FRESH_PARAM).
- *
- * Diagnostics: cache-busting silently degrades in two ways that are
- * indistinguishable from "it worked" at the call site, so both are logged here.
- *   1. import.meta.resolve throws (e.g. a cwd-relative spec that does not resolve
- *      relative to *this* module's URL) — we fall back to the bare spec, which
- *      re-imports the *cached* module. No busting happens at all.
- *   2. Resolution succeeds but no resolve hook is installed: only the entry is
- *      re-evaluated, while everything it statically imports stays cached. We can
- *      detect (1) here; (2) is noted at the call site.
- */
-/**
  * Classify how a specifier resolves to code, from its shape alone (platform-neutral; no fs).
  * github shorthand is only recognised via the explicit `github:` prefix — a bare `owner/repo`
  * is indistinguishable from a scoped npm package and is treated as npm.
+ *
+ * @param spec - Plugin specifier to classify.
+ * @returns `'cdn'` for http(s) URLs, `'github'` for `github:`-prefixed specs, `'local'` for
+ *   `file:` URLs and absolute/relative paths, otherwise `'npm'`.
+ * @throws Never.
  */
 function sourceOf(spec: string): PluginSource | undefined {
   if (/^https?:\/\//.test(spec))                                    return 'cdn';
@@ -284,6 +302,11 @@ function sourceOf(spec: string): PluginSource | undefined {
  * own identity; anything path/URL-shaped collapses to its last segment (query and extension
  * stripped). Real hosts inject a resolver that walks package.json (node) or parses the CDN URL
  * (browser); this exists so a resolver-less host still loads rather than crashing.
+ *
+ * @param spec - Plugin specifier to derive a name from.
+ * @returns For npm-shaped specs the spec itself; otherwise the last path segment with query and
+ *   extension stripped (falling back to the query-stripped spec when nothing remains).
+ * @throws Never.
  */
 function defaultIdentify(spec: string): string {
   if (sourceOf(spec) === 'npm') return spec;
@@ -307,6 +330,13 @@ function defaultIdentify(spec: string): string {
  * Carve-out: a `blob:` importSpec (the browser bundle's import-map entries) is left untouched — a
  * `?query` on a blob URL does not resolve to the blob, and the browser busts by reloading the whole
  * realm anyway. Any non-file:, non-blob: scheme is also passed through unstamped.
+ *
+ * @param spec - Recorded specifier, used when no `importSpec` is supplied.
+ * @param importSpec - Host-pre-resolved URL to import, when resolution already happened.
+ * @param bustCache - When true, apply a freshness stamp: to a `file:` `importSpec` in place,
+ *   otherwise to `spec` via {@link toFreshUrl}.
+ * @returns The URL to actually import.
+ * @throws TypeError - If a supplied `file:` `importSpec` is not a parseable URL.
  */
 function freshImportSpec(spec: string, importSpec: string | undefined, bustCache: boolean): string {
   if (!bustCache) return importSpec ?? spec;
@@ -319,12 +349,41 @@ function freshImportSpec(spec: string, importSpec: string | undefined, bustCache
   return importSpec;
 }
 
+/**
+ * Append a unique `${FRESH_PARAM}` query value to a URL, forcing the module cache to miss.
+ *
+ * The stamp is `<Date.now() ms>.<sequence>`; the process-wide `freshSeq` counter keeps stamps
+ * unique within one millisecond. The input URL is not mutated — only the returned copy carries
+ * the query.
+ *
+ * @param url - Absolute URL to stamp.
+ * @returns The URL with the freshness query parameter set.
+ * @throws TypeError - If `url` is not a parseable absolute URL.
+ */
 function stampFresh(url: string): string {
   const u = new URL(url);
   u.searchParams.set(FRESH_PARAM, `${Date.now()}.${++freshSeq}`);
   return u.href;
 }
 
+/**
+ * Stamp a plugin entry URL with a unique `${FRESH_PARAM}` value to force a fresh
+ * evaluation (and, with the node resolve hook, a fresh subtree — see FRESH_PARAM).
+ *
+ * Diagnostics: cache-busting silently degrades in two ways that are
+ * indistinguishable from "it worked" at the call site, so both are logged here.
+ *   1. import.meta.resolve throws (e.g. a cwd-relative spec that does not resolve
+ *      relative to *this* module's URL) — we fall back to the bare spec, which
+ *      re-imports the *cached* module. No busting happens at all.
+ *   2. Resolution succeeds but no resolve hook is installed: only the entry is
+ *      re-evaluated, while everything it statically imports stays cached. We can
+ *      detect (1) here; (2) is noted at the call site.
+ *
+ * @param spec - Bare specifier to resolve and stamp; must resolve relative to this module or be
+ *   a bare package name.
+ * @returns The stamped URL, or the original `spec` unchanged when resolution fails.
+ * @throws Never - Resolution failures are caught, warned, and degraded to a cached re-import.
+ */
 function toFreshUrl(spec: string): string {
   try {
     const fresh = stampFresh(import.meta.resolve(spec));

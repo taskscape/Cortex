@@ -7,6 +7,12 @@ import { backfillPluginDescription }    from './plugin-description.js';
 
 // ── Package manager detection ───────────────────────��─────────────────────────
 
+/**
+ * Detect the project's package manager by probing for its lockfile.
+ * @param dir - Project directory to probe.
+ * @returns 'pnpm', 'yarn', or 'bun' when their lockfile exists; 'npm' otherwise (the default).
+ * @throws Never.
+ */
 async function detectPackageManager(dir: string): Promise<string> {
   for (const [pm, lockfile] of [['pnpm', 'pnpm-lock.yaml'], ['yarn', 'yarn.lock'], ['bun', 'bun.lockb']] as const) {
     try { await access(path.join(dir, lockfile)); return pm; } catch { /* not present */ }
@@ -16,6 +22,15 @@ async function detectPackageManager(dir: string): Promise<string> {
 
 // ── Shell runner ───────────────────────��───────────────────────────────���──────
 
+/**
+ * Run a command in a directory, inheriting the parent's stdio. Uses the shell on Windows so
+ * `.cmd` shims (npm/pnpm/yarn/bun) resolve without an explicit extension.
+ * @param cmd - Executable to run (e.g. the detected package manager).
+ * @param args - Command-line arguments passed verbatim.
+ * @param cwd - Working directory for the child process.
+ * @returns Resolves when the child exits with code 0.
+ * @throws Error - Rejects when the child exits with a non-zero code.
+ */
 function runCommand(cmd: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' });
@@ -28,6 +43,16 @@ function runCommand(cmd: string, args: string[], cwd: string): Promise<void> {
 
 // ── matbot.yaml updater ──────────────────────────��────────────────────────────
 
+/**
+ * Add a plugin specifier to the `plugins:` list of a matbot.yaml file. A no-op (with a stderr
+ * notice) when the specifier is already listed; otherwise the specifier is inserted into the
+ * existing `plugins:` block, a new block is created before `providers:`, or a new block is
+ * prepended to the file, which is then rewritten.
+ * @param configPath - Path to the matbot.yaml to update.
+ * @param specifier - Plugin specifier to add (exactly as it should appear in the YAML).
+ * @returns Resolves once the file has been written (or the specifier was already present).
+ * @throws Error - When the config file cannot be read or written.
+ */
 async function addToPluginsList(configPath: string, specifier: string): Promise<void> {
   const text = await readFile(configPath, 'utf8');
 
@@ -65,7 +90,8 @@ async function addToPluginsList(configPath: string, specifier: string): Promise<
  * @param specifier Plugin specifier — a local path or an npm package name.
  * @param configPath Path to the matbot.yaml to update.
  * @returns Resolves when installation completes; throws if the package manager command fails.
- * @exception Error When the package-manager invocation exits non-zero.
+ * @throws Error When the package-manager invocation exits non-zero.
+ * @throws Error When matbot.yaml cannot be read or updated.
  */
 export async function installPlugin(specifier: string, configPath: string): Promise<void> {
   const projectDir = path.dirname(configPath);

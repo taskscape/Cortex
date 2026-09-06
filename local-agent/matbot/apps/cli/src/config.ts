@@ -6,6 +6,13 @@ import type { MatbotConfig } from '@matatbread/matbot-config';
 /** The parsed matbot configuration type, re-exported from the config package. */
 export type { MatbotConfig };
 
+/**
+ * Parse config text and, when it declares `extends:`, read that base file from disk.
+ * @param text - Raw YAML config text.
+ * @param fromDir - Directory `extends:` paths resolve against; also the fallback project directory.
+ * @returns The base config text (`undefined` when there is no `extends:`) and the project directory (the base file's directory when extending).
+ * @throws Error - When the YAML fails to parse or the base file cannot be read.
+ */
 async function loadBase(
   text:    string,
   fromDir: string,
@@ -23,7 +30,7 @@ async function loadBase(
  * directory becomes the project root.
  * @param configPath Path to the matbot.yaml file.
  * @returns The parsed config plus the project directory (the base config's dir when `extends:` is used).
- * @exception Error When the file cannot be read or the YAML fails to parse/validate.
+ * @throws Error When the file cannot be read or the YAML fails to parse/validate.
  */
 export async function loadConfig(
   configPath: string,
@@ -40,7 +47,7 @@ export async function loadConfig(
  * @param text Raw YAML config text.
  * @param fromDir Directory `extends:` paths resolve against; defaults to the process cwd.
  * @returns The parsed config plus the project directory.
- * @exception Error When the base file cannot be read or parsing/validation fails.
+ * @throws Error When the base file cannot be read or parsing/validation fails.
  */
 export async function loadConfigFromText(
   text:    string,
@@ -50,6 +57,14 @@ export async function loadConfigFromText(
   return { config: parseConfig(text, baseText), projectDir };
 }
 
+/**
+ * Parse `.env`-style text into a flat key/value record. Skips blank lines and `#` comment lines,
+ * strips an optional `export ` prefix, removes matching surrounding quotes, and trims unquoted
+ * values at the first inline comment (a whitespace-`#` sequence).
+ * @param text - Raw .env file contents.
+ * @returns Parsed variables in file order; later duplicate keys overwrite earlier ones.
+ * @throws Never.
+ */
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const raw of text.split('\n')) {
@@ -79,6 +94,7 @@ function parseDotEnv(text: string): Record<string, string> {
  * variables already set in the real environment.
  * @param dir Directory containing the .env file.
  * @returns The set of variable names that were newly applied (missing file ⇒ empty set).
+ * @throws Never - A missing or unreadable .env file yields an empty set.
  */
 export async function loadDotEnv(dir: string): Promise<Set<string>> {
   let text: string;

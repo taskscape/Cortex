@@ -7,6 +7,7 @@ export interface LocalFileIndexClientOptions {
   baseUrl: string;
 }
 
+/** One snippet result returned by the file-index search service. */
 interface FileSearchResult {
   path: string;
   relativePath?: string;
@@ -21,6 +22,7 @@ interface FileSearchResult {
  */
 export class LocalFileIndexClient {
   /**
+   * Creates a client pointing at the file-index service.
    * @param options Client options; only `baseUrl` is required.
    */
   constructor(private readonly options: LocalFileIndexClientOptions) {}
@@ -61,12 +63,25 @@ export class LocalFileIndexClient {
   }
 }
 
+/**
+ * Build entity strings from a result's paths: `relativePath` then `path`, keeping
+ * non-empty strings and deduplicating.
+ * @param result Search result to inspect.
+ * @returns Unique non-empty path entities, `relativePath` first when present.
+ * @throws Never.
+ */
 function extractEntities(result: FileSearchResult): string[] {
   const entities = [result.relativePath, result.path]
     .filter((value): value is string => typeof value === "string" && value.length > 0);
   return [...new Set(entities)];
 }
 
+/**
+ * Extract string tags from a result's metadata.
+ * @param metadata Free-form metadata record from the search result.
+ * @returns Non-empty string tags; empty when `metadata.tags` is missing or malformed.
+ * @throws Never.
+ */
 function metadataTags(metadata: Record<string, unknown>): string[] {
   const tags = metadata.tags;
   if (!Array.isArray(tags)) {

@@ -1,9 +1,15 @@
 import type { Tool, ToolContext } from '@matatbread/matbot-plugin-api';
 import { defineTool } from './define.js';
 
+/** Lifecycle state of a {@link Todo}: `pending` before work starts, `in_progress` while active, `completed` when done, `cancelled` when abandoned. */
 export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled';
+/** Relative importance of a {@link Todo}: `high`, `medium`, or `low`. */
 export type TodoPriority = 'high' | 'medium' | 'low';
 
+/**
+ * One task in a session's todo list: a short imperative description plus its
+ * tracking state and importance.
+ */
 export interface Todo {
   content: string;
   status:  TodoStatus;
@@ -15,15 +21,34 @@ const PRIORITIES: readonly TodoPriority[] = ['high', 'medium', 'low'];
 
 const todosBySession = new Map<string, Todo[]>();
 
-/** Current todo list for a session (UI/tests). */
+/**
+ * Current todo list for a session (UI/tests).
+ *
+ * Returns the list last written by {@link todowriteTool}, or an empty list when
+ * the session has none; the returned array is readonly and shared.
+ *
+ * @param sessionId Session whose list to fetch.
+ * @returns The session's todos in written order.
+ */
 export function getSessionTodos(sessionId: string): readonly Todo[] {
   return todosBySession.get(sessionId) ?? [];
 }
 
+/**
+ * Drops a session's stored todo list.
+ *
+ * @param sessionId Session whose list to discard.
+ * @returns Nothing.
+ * @throws Never.
+ */
 export function clearSessionTodos(sessionId: string): void {
   todosBySession.delete(sessionId);
 }
 
+/**
+ * Raw input of the `todowrite` tool: a loosely typed todo array that is fully
+ * validated (and defaults applied) before it replaces the session's list.
+ */
 interface WriteInput { todos: Array<{ content?: unknown; status?: unknown; priority?: unknown }> }
 
 export const todowriteTool: Tool = defineTool({

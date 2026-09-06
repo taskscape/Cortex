@@ -180,6 +180,14 @@ export async function indexRoot(options: IndexOptions, existing: IndexStore): Pr
   };
 }
 
+/**
+ * Tests whether a canonical path equals or lies beneath a canonical root.
+ * Assumes both inputs were produced by {@link normalizeWindowsPath}.
+ *
+ * @param candidate - Canonical path to test.
+ * @param root - Canonical root path.
+ * @returns True if `candidate` is the root itself or starts with `root\`.
+ */
 function isWithinRoot(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}\\`);
 }
@@ -199,6 +207,20 @@ export function summarize(store: IndexStore): IndexSummary {
   };
 }
 
+/**
+ * Recursively yields candidate file paths under `dir`, skipping excluded
+ * directories before descending. Symlinked directories are never followed
+ * (readdir does not resolve them), which keeps the walk inside the real
+ * subtree the index root authorization approved. Unreadable directories are
+ * recorded in `skipped` and the walk continues.
+ *
+ * @param dir - Directory currently being walked.
+ * @param base - The original index root, used to compute relative paths for
+ * exclusion matching.
+ * @param excluded - Indexing-only exclusion glob patterns.
+ * @param skipped - Accumulator for skipped files/directories and reasons.
+ * @returns Yields absolute paths of non-directory entries (files and links).
+ */
 async function* walk(
   dir: string,
   base: string,

@@ -16,6 +16,19 @@ import { createAskInnerVoiceTool, createCognitionConfigTool, INNER_VOICE_PROVIDE
 import type { SkillManager } from '@matatbread/matbot-skills';
 import type { Triggers } from '@matatbread/matbot-triggers';
 
+/**
+ * Seeds cognition's built-in skills and trigger wiring, all create-if-absent so an
+ * install that already holds them keeps its own copy. For each {@link COGNITION_SKILLS}
+ * entry it imports the skill content and — when the Triggers service is present and
+ * the skill declares conditions — imports one trigger invoking
+ * `skill_action({ action: 'use' })` for that skill. It then ensures exactly one
+ * trigger fires the `remember_fact` tool with the canonical conditions: legacy
+ * triggers still loading the retired "Remember this" skill are repointed in place
+ * (converting old installs), otherwise the canonical trigger is imported if absent.
+ * A no-op when no SkillManager is registered; Triggers is used opportunistically.
+ * @param services - The matbot machine; {@link SkillManager} and {@link Triggers} are read off the registry and both are optional.
+ * @throws If skill or trigger persistence fails.
+ */
 async function seedCognition(services: MatbotMachine): Promise<void> {
   const skills: SkillManager | undefined = services.SkillManager;
   if (!skills) return;
@@ -50,6 +63,14 @@ async function seedCognition(services: MatbotMachine): Promise<void> {
   }
 }
 
+/**
+ * Idempotently defines the `dream_runs` store (via {@link defineStore}), which backs
+ * the dream_time tool's observability: one structured record per consolidation pass
+ * (outcome, primary fact, routing decision, merges, contradictions, timings). A
+ * re-seed on restart preserves existing run history.
+ * @param services - The matbot machine the store is defined against.
+ * @throws If defining the store fails.
+ */
 async function seedDreamRunsStore(services: MatbotMachine): Promise<void> {
   // The `dream_runs` store backs the `dream_time` tool's observability story: every pass writes a
   // structured record here (outcome, primary fact, routed-to skill, contradictions, timings) so
@@ -102,8 +123,16 @@ async function seedDreamRunsStore(services: MatbotMachine): Promise<void> {
  * `ask_inner_voice` tool, which falls back to the current turn's model when none is pinned via
  * `cognition_config` (a same-lineage self-critique — degraded, but it still fires).
  */
-/** The inner-voice paragraph of installationMessage, reflecting whether a provider is pinned and, if so,
- *  whether it responds to a test prompt. The probe runs only here (install/reload), never on the hot path. */
+/**
+ * The inner-voice paragraph of the installation message, reflecting whether a
+ * provider is pinned and, if so, whether it responds to a test prompt (one
+ * `singleTurn` call with a 15-second timeout; failures are caught and reported in
+ * the text rather than propagated). The probe runs only here (install/reload),
+ * never on the hot path.
+ * @param services - The machine captured at setup, or undefined before setup has run (yields the short unpinned fallback sentence).
+ * @returns A sentence describing the pin state and, when pinned, the probe outcome.
+ * @throws If reading the pinned provider from settings fails.
+ */
 async function innerVoiceStatus(services: MatbotMachine | undefined): Promise<string> {
   if (!services) return 'It uses the current turn\'s model unless you pin a different one with the cognition_config tool.';
   const pinned    = await services.settings().get<string>(INNER_VOICE_PROVIDER_KEY);
@@ -127,6 +156,7 @@ async function innerVoiceStatus(services: MatbotMachine | undefined): Promise<st
  * tools, seeds the built-in skills, arms the dream-time scheduler, and exposes
  * a health-check installation message.
  * @returns A fresh plugin specification (call once per plugin instance).
+ * @throws Never - All substantive work happens in the returned spec's `setup`, not in this factory.
  */
 export function createCognitionPlugin(): MatbotPluginSpec {
   let captured: MatbotMachine | undefined;   // captured in setup() so installationMessage() can probe
@@ -138,6 +168,14 @@ export function createCognitionPlugin(): MatbotPluginSpec {
       description: 'Cognitive services: seeds the Inner voice skill and dream_time tool, the remember_fact tool (with its trigger), and the dream_time tool. Home for further cognitive skills and tools.',
     },
 
+    /**
+     * Builds the install-time health report: what cognition seeds, the inner-voice
+     * provider status (via {@link innerVoiceStatus}, including a live probe of any
+     * pinned provider), how remember_fact and its trigger behave silently, and how
+     * dream_time consolidates facts into skills. Runs only at install/reload.
+     * @returns The multi-paragraph installation message.
+     * @throws If reading the inner-voice pin from settings fails.
+     */
     async installationMessage() {
       return `Cognition is active. It seeds the Inner voice skill and dream_time tool into the skills
 service — if no skills service is configured yet, they are seeded automatically once one is — and
@@ -169,6 +207,16 @@ The store is idempotent: a re-seed on restart keeps the existing data.
 `;
     },
 
+    /**
+     * Registers the web-UI, configuration-contributor, and retrieval contributions;
+     * defines the remembered_facts and dream_runs stores (both idempotent on restart);
+     * registers the four cognition tools unconditionally (they resolve their
+     * dependencies per call); and subscribes — with replay — to the SkillManager
+     * mount so seeding runs now if a skills provider is present and again on each
+     * remount, until teardown aborts the lifecycle signal.
+     * @param services - The machine this plugin instance is attached to; captured for the installation message.
+     * @throws If defining either store fails.
+     */
     async setup(services) {
     services.contributions?.register('webui','memory',uiContribution);
     const pins=['innerVoiceProvider','dreamRankerProvider','dreamMergerProvider'];
@@ -223,6 +271,11 @@ The store is idempotent: a re-seed on restart keeps the existing data.
       );
     },
 
+    /**
+     * Aborts the lifecycle signal, ending the SkillManager mount subscription armed
+     * in `setup` so no seeding fires after teardown.
+     * @throws Never.
+     */
     async teardown() {
       lifecycle.abort();
     },

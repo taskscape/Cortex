@@ -3,6 +3,13 @@ import type { TriggerManager } from './manager.js';
 import type { TriggerCondition, TriggerKind } from './types.js';
 
 const KINDS: readonly TriggerKind[] = ['ephemeral', 'contextual', 'retract', 'followup'];
+/**
+ * Type guard for {@link TriggerKind}.
+ *
+ * @param x - The value to test.
+ * @returns True when `x` is one of the four recognised kind strings.
+ * @throws Never.
+ */
 const isKind = (x: unknown): x is TriggerKind => typeof x === 'string' && (KINDS as readonly string[]).includes(x);
 
 const GUIDANCE =
@@ -33,6 +40,12 @@ const GUIDANCE =
   'applies the skill as a directive (the firing case). (`{ action: "load" }` returns raw content for ' +
   'reading/editing, not for firing — a `load` result is bare text the model may misread as the user speaking.)';
 
+/**
+ * Discriminated union of `trigger_action` tool inputs, one variant per action
+ * (`list`/`query`/`get`/`add`/`update`/`remove`). The tool's `inputSchema` is deliberately loose
+ * (`required: ['action']`); the executor validates the per-action fields and answers malformed input
+ * with a tool error event.
+ */
 type TriggerActionInput =
   | { action: 'list' }
   | { action: 'query';  tool?: string; params?: unknown }
@@ -41,7 +54,13 @@ type TriggerActionInput =
   | { action: 'update'; id: string; conditions?: TriggerCondition[]; tool?: string; params?: unknown; enabled?: boolean }
   | { action: 'remove'; id: string };
 
-// A condition is valid if it has a recognised `kind` and a string `rule`.
+/**
+ * A condition is valid if it has a recognised `kind` and a string `rule`.
+ *
+ * @param x - The value to validate.
+ * @returns True when `x` is an array whose every element carries a valid `kind` and a string `rule`.
+ * @throws Never.
+ */
 function validConditions(x: unknown): x is TriggerCondition[] {
   return Array.isArray(x) && x.every(c =>
     c !== null && typeof c === 'object' &&
@@ -173,6 +192,10 @@ export function createTriggerActionTool(manager: TriggerManager): Tool {
  * one of the already-configured providers, not a new one: unset, the classifier uses the current turn's
  * own provider (so triggers work with zero config); set it to pin a small/fast model. Resolved per
  * evaluation, so a change takes effect on the next turn without a restart.
+ *
+ * @param services - The machine providing the settings store and the configured provider list.
+ * @returns The `triggers_config` tool; `set` rejects unknown providers with a normal tool error.
+ * @throws Never.
  */
 export function createTriggersConfigTool(services: MatbotMachine): Tool {
   const KEY = 'classifierProvider';

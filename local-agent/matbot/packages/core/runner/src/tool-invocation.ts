@@ -6,13 +6,26 @@ import { evaluatePermission } from './permissions.js';
 import { validateAgainstSchema, formatValidationIssues } from './schema-validator.js';
 import { DEFAULT_OUTPUT_LIMITS, truncateToolResult } from './truncate.js';
 import type { FormField } from './types.js';
-/** Permission answers and prompt serialization live for one invocation group/turn. */
+/**
+ * Permission answers and prompt serialization live for one invocation group/turn: a promise chain
+ * serializing permission-gate entry across a parallel batch (so mid-batch "always allow" answers
+ * are visible to sibling calls before they prompt), plus the `always allow` rules approved so far.
+ *
+ * @returns A fresh, mutable invocation state; share one instance across the calls of a group/turn.
+ * @throws Never.
+ */
 export function createInvocationState() { return { chain: Promise.resolve(), approved: [] as PermissionRule[] }; }
+/** Outcome of one validated, permission-gated tool invocation. */
 export interface ToolInvocationResult {
     result: unknown;
     isError: boolean;
     abortReason?: string;
 }
+/**
+ * Everything one tool invocation needs: the turn context (session, config, signal, wiring shared
+ * with {@link RunSessionOpts}), the call and resolved tool, and optional invocation-scoped state,
+ * progress, marker, and span plumbing.
+ */
 export interface ToolInvocationOptions extends Pick<RunSessionOpts, 'session' | 'config' | 'signal' | 'vault' | 'prompt' | 'hooks' | 'permissions' | 'toolOutput' | 'files' | 'workdir' | 'configPath' | 'loadPlugin' | 'unloadPlugin'> {
     call: {
         id: string;
@@ -29,7 +42,23 @@ export interface ToolInvocationOptions extends Pick<RunSessionOpts, 'session' | 
     spanId?: string;
     observe?: (event: Omit<ObservabilityEvent, 'traceId' | 'rootTraceId' | 'timestamp'>) => Promise<void>;
 }
-/** Shared validated, permission-gated execution for model turns and direct frontends. */
+/**
+ * Shared validated, permission-gated execution for model turns and direct frontends. Validates
+ * `call.input` against the tool's schema (spec R3), evaluates permission rules with
+ * session-approved (`always allow`) rules appended last, serializes `ask` gates across a parallel
+ * batch through the shared {@link createInvocationState} chain, runs the `toolcall`/`toolresult`
+ * hooks, truncates the result to the output limits, and records guardrail/tool spans. Tool
+ * failures are captured as error results, never rethrown.
+ *
+ * @param opts - The invocation's context, call, and resolved tool; `vault` is required.
+ * @param push - Sink for `permission:ask`/`permission:reply` and tool stdout/stderr/file events;
+ *               defaults to a no-op.
+ * @returns The invocation outcome: the (possibly truncated) result, its error flag, and the abort
+ *          reason when a `toolcall` hook or cancelled permission prompt requested abort.
+ * @throws Error - When `opts.vault` is missing.
+ * @throws The abort signal's reason if abort lands after the gates but just before executor
+ *          dispatch (aborts while the executor streams are captured as error results instead).
+ */
 export async function executeToolInvocation(opts: ToolInvocationOptions, push: (event: PipelineEvent) => void = () => { }): Promise<ToolInvocationResult> {
     const { session, config, tool } = opts;
     const signal = tool.signal ? AbortSignal.any([opts.signal, tool.signal]) : opts.signal;
@@ -41,6 +70,13 @@ export async function executeToolInvocation(opts: ToolInvocationOptions, push: (
     const toolSpanId = opts.spanId ?? tc.id;
     const toolStartedAt = Date.now();
     const state = opts.state ?? createInvocationState();
+    /**
+     * Effective permission rules: configured rules first, then session-approved (`always allow`)
+     * rules appended last so they win under last-match evaluation.
+     *
+     * @returns A fresh array of the rules in force.
+     * @throws Never.
+     */
     const permissionRules = () => [...(opts.permissions?.rules ?? []), ...state.approved];
     const hookReg = opts.hooks ?? new HookRegistry();
     const toolMarkers = opts.markers ?? [];
@@ -54,9 +90,36 @@ export async function executeToolInvocation(opts: ToolInvocationOptions, push: (
     let approval: ToolContext['approval'];
     let outcome: ToolInvocationResult = { result: undefined, isError: false };
     let processed = false;
+    /**
+     * Local skip recorder: the shared invocation has no pipeline queue or span of its own for
+     * skipped calls (caller-side gate bookkeeping already covered those), so it only records the
+     * error outcome.
+     *
+     * @param _call - Ignored call descriptor.
+     * @param _index - Ignored call index.
+     * @param _span - Ignored span id.
+     * @param _started - Ignored span start (epoch ms).
+     * @param result - Error payload recorded as the outcome.
+     * @param _push - Ignored event sink.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const finishSkipped = (_call: unknown, _index: number, _span: string, _started: number, result: unknown, _push: unknown): void => {
         outcome = { result, isError: true };
     };
+    /**
+     * Run the gate pipeline for one call and (when approved) the tool executor, recording the
+     * outcome in `outcome` and any abort request in `abortReason`. Gates: pre-execution abort
+     * check, input schema validation, permission evaluation (deny, or interactive `ask` with
+     * serialized gate entry and `always allow` learning), then `toolcall` hooks. The executor's
+     * events stream through `push`; executor failures are captured as error results. `processed`
+     * marks that the success path already ran the `toolresult` hooks and truncation, so the
+     * caller must not run them again on a skipped outcome.
+     *
+     * @returns Resolves when the call has a recorded outcome.
+     * @throws The abort signal's reason if abort lands after the gates but just before executor
+     *           dispatch (aborts during streaming are captured as error results instead).
+     */
     const execute = async (): Promise<void> => {
         if (signal.aborted) {
             outcome = { result: { error: 'Invocation cancelled.', code: 'aborted' }, isError: true };
@@ -263,12 +326,34 @@ export async function executeToolInvocation(opts: ToolInvocationOptions, push: (
         outcome.abortReason = abortReason;
     return outcome;
 }
-/** Adapt the common invocation to a frontend's tool-event stream; results are emitted after result hooks. */
+/**
+ * Adapt the common invocation to a frontend's tool-event stream; results are emitted after result
+ * hooks. Runs {@link executeToolInvocation} in the background, translating its pipeline push
+ * events (stdout/stderr/file) and progress callbacks into {@link ToolEvent}s buffered in arrival
+ * order, followed by any collected markers, then the terminal event. Consumption is lazy — events
+ * are pulled as the consumer iterates — and aborting `ctx.signal`, or leaving the iterator early,
+ * cancels the underlying execution.
+ *
+ * @param tool - The tool to invoke.
+ * @param input - Raw call input (validated inside the invocation).
+ * @param ctx - Tool context supplying session, vault, provider, ids, signal, and plugin wiring.
+ * @param options - Optional hooks, permissions, output limits, interactivity, and span observer;
+ *                  defaults to non-interactive.
+ * @returns The tool-event stream: zero or more progress/stdout/stderr/file events in arrival
+ *          order, then markers, then exactly one `error` or `result`.
+ * @throws Never - Execution failures surface as a terminal `error` event.
+ */
 export async function* invokeToolEvents(tool: Tool, input: unknown, ctx: ToolContext, options: Pick<ToolInvocationOptions, 'hooks' | 'permissions' | 'toolOutput' | 'interactive' | 'observe'> = {}): AsyncIterable<ToolEvent> {
     const controller = new AbortController();
     const events: ToolEvent[] = [];
     let wake: (() => void) | undefined;
     let done = false;
+    /**
+     * Wake a parked consumer, if any.
+     *
+     * @returns Nothing.
+     * @throws Never.
+     */
     const notify = () => { wake?.(); wake = undefined; };
     const markers: MessageContent[] = [];
     const task = executeToolInvocation({ ...options, tool, call: { id: ctx.callId, name: tool.name, input },
@@ -314,7 +399,16 @@ export async function* invokeToolEvents(tool: Tool, input: unknown, ctx: ToolCon
         controller.abort();
     }
 }
-/** Copy and freeze the host policy before loading any capability plugins. */
+/**
+ * Copy and freeze the host policy before loading any capability plugins, so a plugin can neither
+ * mutate the live rules nor observe later mutation of them. The envelope, the rules array, and
+ * each rule are frozen individually.
+ *
+ * @param policy - The host's invocation policy (rules plus defaults).
+ * @returns A frozen copy of the policy.
+ * @throws DOMException - `DataCloneError` if the policy cannot be structured-cloned (e.g. it
+ *          carries functions or other non-cloneable values).
+ */
 export function freezeInvocationPolicy(policy: NonNullable<MatbotMachine['ToolInvocationPolicy']>) {
     const copy = structuredClone(policy);
     for (const rule of copy.rules ?? [])
@@ -323,12 +417,42 @@ export function freezeInvocationPolicy(policy: NonNullable<MatbotMachine['ToolIn
         Object.freeze(copy.rules);
     return Object.freeze(copy);
 }
-/** Bind host services without capturing replaceable feature services. */
+/**
+ * Bind host services without capturing replaceable feature services: the returned invoker reads
+ * `hooks`, `Observability`, and `ToolInvocationPolicy` from the live machine on each call, so
+ * plugin reloads and service swaps are honored. Each invocation requires the host policy (a
+ * missing policy yields a `policy_unavailable` error event) and is observed as a tool span whose
+ * end status reflects failure, abort, and completion.
+ *
+ * @param services - The live machine whose services back each invocation.
+ * @returns An invoker yielding the tool-event stream for one call, with `error` events for
+ *          policy and execution failures.
+ * @throws Never - Failures are yielded as `error` events.
+ */
 export function createToolInvoker(services: MatbotMachine) {
-    return { async *invoke(tool: Tool, input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
+    return {
+        /**
+         * Invoke one tool against the host's live services.
+         *
+         * @param tool - The tool to execute.
+         * @param input - Raw call input (validated inside the invocation).
+         * @param ctx - Tool context for this call (session, vault, ids, signal).
+         * @returns The tool-event stream, ending with `result` or `error`; when the host policy
+         *           is unavailable, the stream is a single `policy_unavailable` error event.
+         * @throws Never - Failures surface as `error` events.
+         */
+        async *invoke(tool: Tool, input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
             const started = Date.now(), spanId = ctx.callId;
             let failed = false;
             let completed = false;
+            /**
+             * Record a span event against the machine's observability sink, stamping the call's
+             * trace ids; sink failures are swallowed (they neither authorize nor block execution).
+             *
+             * @param event - Span event without correlation fields; the timestamp is filled in.
+             * @returns Resolves once the sink has been invoked (or the failure swallowed).
+             * @throws Never.
+             */
             const observe = async (event: Omit<ObservabilityEvent, 'traceId' | 'rootTraceId' | 'timestamp'>) => { try {
                 await services.Observability?.record({ ...event, traceId: ctx.traceId ?? ctx.callId, rootTraceId: ctx.rootTraceId ?? ctx.callId, timestamp: new Date().toISOString() });
             }

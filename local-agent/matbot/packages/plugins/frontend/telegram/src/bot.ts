@@ -24,10 +24,30 @@ const SEND_MAX_ATTEMPTS = 3;
 const ACTION_TIMEOUT_MS = 5_000;
 const POLL_SLACK_MS     = 10_000;
 
+/**
+ * Waits for a fixed delay.
+ *
+ * @param ms - Milliseconds to wait.
+ * @returns Resolves once the delay has elapsed; not abortable.
+ * @throws Never.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * POSTs a JSON payload to the Bot API, retrying on 429 rate-limit responses.
+ *
+ * Each attempt is bounded by a 15-second timeout in addition to any caller signal. On 429 the
+ * server-advised `retry_after` (clamped to 1–30 seconds) is awaited before the next attempt, up to
+ * three attempts in total; any other status is returned for the caller to judge.
+ *
+ * @param url - Absolute Bot API endpoint URL.
+ * @param payload - Value serialised as the JSON request body.
+ * @param signal - Optional caller cancellation signal, combined with the per-attempt timeout.
+ * @returns The final `Response`, which may still be a non-2xx.
+ * @throws Error - If the fetch itself fails (network error, timeout, or caller abort).
+ */
 async function postWithRetry(
   url: string,
   payload: unknown,
@@ -59,6 +79,7 @@ async function postWithRetry(
  * @param chatId Target chat id.
  * @param text Text to send.
  * @param signal Optional cancellation signal.
+ * @returns Resolves once every chunk has been accepted by the Bot API.
  * @throws If the API returns a non-OK response for any chunk.
  */
 export async function sendMessage(
@@ -81,6 +102,8 @@ export async function sendMessage(
  * @param botToken Bot API token.
  * @param chatId Target chat id.
  * @param action Action name; defaults to "typing".
+ * @returns Resolves once the request has been sent; the response status is not checked.
+ * @throws TypeError - On network failure, or an abort error if the 5-second timeout elapses.
  */
 export async function sendChatAction(
   botToken: string,
@@ -95,6 +118,7 @@ export async function sendChatAction(
   });
 }
 
+/** Envelope of the Bot API `getUpdates` call: the usual `ok` flag plus the update list. */
 interface GetUpdatesResponse { ok: boolean; result: TelegramUpdate[] }
 
 /**
@@ -135,6 +159,18 @@ export async function getUpdates(
 }
 
 // Telegram limits messages to 4096 UTF-16 code units.
+/**
+ * Splits text into chunks of at most 4096 UTF-16 code units (Telegram's message limit).
+ *
+ * Chunks break at the last space, newline, or tab before the limit; when no such boundary exists
+ * within the window (or it would produce an empty chunk), the chunk is cut hard at the limit so
+ * progress is always made.
+ *
+ * @param text - Text to split; returned unchanged as a single chunk when within the limit.
+ * @param max - Chunk size cap in UTF-16 code units; defaults to 4096.
+ * @returns The chunks, in order, each within `max` and concatenating back to `text`.
+ * @throws Never.
+ */
 function *splitText(text: string, max = 4096): Iterable<string> {
   if (text.length <= max) {
     yield text;

@@ -11,6 +11,12 @@ const PLUGIN_NAME = 'frontend-telegram';
 const SETTINGS_KEY_PROVIDER = 'provider';
 const SETTINGS_KEY_KNOWN = 'knownChats';
 
+/**
+ * The provider the Telegram frontend currently drives turns with.
+ *
+ * Couples the provider's registry name with its adapter and a config whose `${…}` credential
+ * placeholders have already been resolved through the vault.
+ */
 interface ActiveProvider {
   name:   string;
   adapter: ProviderAdapter;
@@ -25,6 +31,18 @@ let botTokenRef:   string | undefined;
 const knownChats = new Set<number>(); // populated as chats interact with the bot
 let openDoor = 0;
 
+/**
+ * Instantiates a provider adapter from its registry configuration.
+ *
+ * Resolves every `${NAME}` credential placeholder in the provider config through the vault, then
+ * constructs the adapter from the config's module specifier.
+ *
+ * @param name - Provider name as registered in `services.providers`.
+ * @param services - Machine providing the provider registry and the vault.
+ * @returns The active provider: name, constructed adapter, and credential-resolved config.
+ * @throws Error - When no provider with that name is configured, a credential cannot be resolved,
+ *                 or the adapter factory cannot be constructed from `config.module`.
+ */
 async function buildProvider(name: string, services: MatbotMachine): Promise<ActiveProvider> {
   const rawConfig = services.providers.get(name);
   if (!rawConfig) throw new Error(`Provider "${name}" not found`);
@@ -69,6 +87,19 @@ export const plugin: MatbotPluginSpec = {
         },
       },
       executor: {
+        /**
+         * Reports the active provider name, or switches to another one.
+         *
+         * `get` returns the current provider name (`null` when the plugin is not active — module
+         * state is unset before setup and after teardown). `set` builds the new provider (resolving
+         * its credentials), persists the choice in settings so it survives a restart, and reports
+         * failure as an `error` event rather than throwing.
+         *
+         * @param input - Expected `{ action: 'get' }` or `{ action: 'set', provider: string }`.
+         * @yields A `result` event with `{ provider }` (name or `null`), or an `error` event for an
+         *                 unknown action, an inactive plugin, a missing provider name, or a failed switch.
+         * @throws Never - Failures are reported as `error` events.
+         */
         async *execute(input: unknown) {
           const act = input as { action: 'get' | 'set'; provider?: string };
 
@@ -101,6 +132,15 @@ export const plugin: MatbotPluginSpec = {
       description: 'Open the door for new chats to join the bot channel. The door remains open for 30 seconds or until the first message from a new user is received, whichever comes first.',
       inputSchema: { type: 'object', properties: {} },
       executor: {
+        /**
+         * Opens a 30-second admission window for previously unknown chats.
+         *
+         * Stamps the module-level door timestamp consulted by the message handler; the first message
+         * from a new chat closes the door immediately.
+         *
+         * @returns Yields a `result` event whose `open_until` is the ISO instant the door closes.
+         * @throws Never.
+         */
         async *execute() {
           openDoor = Date.now();
           yield { type: 'result' as const, value: { open_until: new Date(openDoor + 30_000).toISOString() } };
@@ -119,6 +159,18 @@ export const plugin: MatbotPluginSpec = {
         required: ['text'],
       },
       executor: {
+        /**
+         * Sends an out-of-band notification outside any session.
+         *
+         * Targets one chat id, or broadcasts to every chat that has previously contacted the bot.
+         * The text is prefixed with a bell emoji; a per-chat send failure is reported on stderr and
+         * does not abort the remaining targets.
+         *
+         * @param input - Expected `{ text: string, chatId?: number }`; omitting `chatId` broadcasts.
+         * @returns Yields a `result` event with `{ sent }` (delivered count; `0` when there are no
+         *                 known chats), plus a `stderr` event per failed target.
+         * @throws Never - An absent bot token yields an `error` event; send failures go to stderr.
+         */
         async *execute(input: unknown) {
           const token = botTokenRef;
           if (!token) { yield { type: 'error' as const, message: 'Telegram plugin not active' }; return; }
@@ -147,6 +199,24 @@ export const plugin: MatbotPluginSpec = {
     },
   ],
 
+  /**
+   * Activates the bot: restores chat/provider state and starts (or skips) the long-poll loop.
+   *
+   * Resolves `TELEGRAM_API_KEY` from the vault — when unset the plugin skips activation entirely
+   * (with a warning, not a throw). Otherwise it registers the frontend, restores known chats and the
+   * persisted provider (falling back to the first configured provider), and starts a long-poll loop
+   * over Bot API `getUpdates`. Each inbound text message is dispatched under `runAs` with a
+   * principal derived from the immutable numeric sender id, so session and settings access inside
+   * the handler runs under the sender's identity (the turn itself is scoped by the runner's pump).
+   * Sub-agent processes skip polling — two concurrent `getUpdates` long-polls on one token make
+   * Telegram return 409 Conflict — but keep a live setup so `telegram_send` still works.
+   *
+   * @param services - Machine providing sessions, runner, vault, settings, and providers.
+   * @returns Resolves once state is restored and polling has been started (fire-and-forget); it
+   *                 does not wait for the poll loop.
+   * @throws Error - When `services.sessions` or `services.run` is missing, no provider is
+   *                 configured, or the initial provider cannot be built.
+   */
   async setup(services: MatbotMachine) {
     let botToken: string;
     try {
@@ -186,6 +256,26 @@ export const plugin: MatbotPluginSpec = {
     const ac   = new AbortController();
     teardownAc = ac;
 
+    /**
+     * Handles one inbound chat message: admits the chat, resolves its session, and runs a turn.
+     *
+     * Unknown chats are admitted only as the first-ever chat or while the door is open (see
+     * `telegram_open_door`), and the admission is persisted. The chat's session is looked up
+     * (a non-active session counts as gone and is recreated, titled after the sender), a typing
+     * indicator is kept alive for the turn's duration, and the submission runs through the session
+     * runner with the active provider name snapshotted up front. Assistant text is sent once per
+     * completed turn, including robo turns descended from ours; concurrent messages for the same
+     * chat queue via the runner, so no per-chat lock is needed. Runs under the ambient message
+     * principal established by the poll loop; interactive prompts are deliberately stubbed to
+     * auto-accept defaults.
+     *
+     * @param chatId - Telegram chat the message came from; also keys the persisted session id.
+     * @param text - Message text submitted as the user turn.
+     * @param senderName - Display name used only for the session title; never for identity.
+     * @param senderId - Immutable numeric sender id used for the principal; falls back to `chatId`.
+     * @returns Resolves once the turn (and any descendant turns) have been drained and sent.
+     * @throws Never - All failures are logged and reported to the chat as a generic error message.
+     */
     async function handleMessage(chatId: number, text: string, senderName?: string, senderId?: number): Promise<void> {
       if (!knownChats.has(chatId)) {
         // A new user. Admit them only as the first-ever chat, or while the door is open.
@@ -351,6 +441,17 @@ export const plugin: MatbotPluginSpec = {
     console.warn(`[frontend-telegram] Bot started (provider: ${initialName})\n`);
   },
 
+  /**
+   * Aborts the poll loop and any in-flight turn, and clears module state.
+   *
+   * Aborting the shared signal cancels the long-poll and the turns opened under it; known chats and
+   * the service/token references are dropped, so the tools report the plugin as inactive until the
+   * next setup.
+   *
+   * @returns Resolves once the signal has been aborted and the references cleared; in-flight
+   *                 handlers wind down on their own.
+   * @throws Never.
+   */
   async teardown() {
     // Aborting the shared signal cancels any in-flight turn via the runner.
     teardownAc?.abort();

@@ -463,10 +463,10 @@ test("workspace RAG V2 checkpoint publications leave an interrupted scan queryab
 
   const interrupted = await interruptedRun(repository, root, docs, 4);
   assert.ok(interrupted.job.publishedCheckpoints >= 1, "checkpoints publish while the scan runs");
-  assert.equal(
+  assert.notEqual(
     interrupted.status.activeGenerationId,
     interrupted.generationId,
-    "the partially scanned generation is published rather than abandoned",
+    "the checkpoint is separate from the resumable staging generation",
   );
   assert.ok(interrupted.status.activeState.startsWith("active_"));
   assert.ok(interrupted.status.indexedDocuments >= 2, "the published checkpoint holds the completed files");
@@ -1257,4 +1257,152 @@ test("workspace RAG V2 creates versioned semantic routing summaries and routes a
   assert.match(result.evidence[0].text, /EPOCH-TOKEN/);
   assert.ok(result.evidence.every(item => item.passageId && item.sectionId));
   assert.ok(result.evidence.every(item => !item.retrievalReasons.some(reason => /summary/iu.test(reason))));
+});
+
+for (const failurePhase of ["rebuildCollections", "validateGeneration", "publishGeneration"]) {
+  test(`REL-02 failed ${failurePhase} cannot mutate an active checkpoint`, async t => {
+    const previous = process.env.CORTEX_RAG_V2_CHECKPOINT_FILES;
+    process.env.CORTEX_RAG_V2_CHECKPOINT_FILES = "1";
+    t.after(() => { if (previous === undefined) delete process.env.CORTEX_RAG_V2_CHECKPOINT_FILES; else process.env.CORTEX_RAG_V2_CHECKPOINT_FILES = previous; });
+    const { root, docs } = await corpus("cortex-rag-checkpoint-failure-", ["a", "b"]);
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const repository = new MemoryRagV2Repository();
+    const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+    t.after(() => manager.close());
+    const { workspace, context } = refs(root, docs);
+    manager.startIngestion(workspace, context);
+    await manager.waitForIngestion(workspace.id, context.id);
+    await unlink(path.join(docs, "b.md"));
+    let staging;
+    const original = repository[failurePhase].bind(repository);
+    repository[failurePhase] = async (...args) => {
+      if (args[2] === staging) throw new Error(`synthetic ${failurePhase} failure`);
+      return original(...args);
+    };
+    const job = manager.startIngestion(workspace, context, "manual", [], true);
+    staging = job.generationId;
+    await manager.waitForIngestion(workspace.id, context.id);
+    const status = await manager.status("primary", workspace, context);
+    assert.equal(status.job.state, "retryable_failure");
+    assert.ok(job.publishedCheckpoints >= 1);
+    assert.notEqual(status.activeGenerationId, staging);
+    const activeFiles = (await repository.listFingerprints(workspace.id, context.id)).map(f => path.basename(f.path)).sort();
+    assert.deepEqual(activeFiles, ["a.md", "b.md"]);
+    assert.equal((await repository.listFingerprints(workspace.id, context.id, staging)).length, 1);
+    const search = await manager.search(workspace, context, "RESUME-EVIDENCE-B", { variant: "lexical_only" });
+    assert.ok(search.evidence.some(e => e.text.includes("RESUME-EVIDENCE-B")));
+  });
+}
+
+test('REL-05 full summary queues cancel and close without waiting for the summarizer', { timeout: 3000 }, async t => {
+  const previous = { limit: process.env.CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT, concurrency: process.env.CORTEX_RAG_V2_SUMMARY_CONCURRENCY };
+  process.env.CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT = '16'; process.env.CORTEX_RAG_V2_SUMMARY_CONCURRENCY = '1';
+  t.after(() => { for (const [key, value] of [['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT', previous.limit], ['CORTEX_RAG_V2_SUMMARY_CONCURRENCY', previous.concurrency]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  const { root, docs } = await corpus('cortex-summary-cancel-', ['many']);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(docs, 'many.md'), '# Many\n\n' + Array.from({ length: 30 }, (_, i) => `## Heading ${i}\n\nEvidence for section ${i}.\n\n`).join(''));
+  let release, summarySignal;
+  const gate = new Promise(resolve => release = resolve);
+  const repository = new MemoryRagV2Repository();
+  let closed = false, lateWrites = 0;
+  const putSummary = repository.putRoutingSummary.bind(repository);
+  repository.putRoutingSummary = async (...args) => { if (closed) lateWrites++; return putSummary(...args); };
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, { summarizerSignature: 'held', async summarize(_input, signal) { summarySignal = signal; await gate; return 'late summary'; } });
+  t.after(() => { release(); return manager.close(); });
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context);
+  while (manager.summarySpaceWaiters.length === 0) await new Promise(r => setTimeout(r, 5));
+  await manager.cancel(workspace.id, context.id);
+  assert.equal(manager.summarySpaceWaiters.length, 0);
+  assert.equal(summarySignal.aborted, false, 'one ingestion cancellation must not cancel unrelated summary workers');
+  await manager.close(); closed = true;
+  assert.equal(summarySignal.aborted, true);
+  assert.throws(() => manager.startIngestion(workspace, context), /closing/);
+  release(); await new Promise(r => setTimeout(r, 10));
+  assert.equal(lateWrites, 0);
+});
+
+test('REL-05 summary deadline drains even an uncooperative summarizer', { timeout: 3000 }, async t => {
+  const previous = process.env.CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS;
+  process.env.CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS = '20';
+  t.after(() => { if (previous === undefined) delete process.env.CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS; else process.env.CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS = previous; });
+  const { root, docs } = await corpus('cortex-summary-deadline-', ['a']);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const manager = new WorkspaceRagV2Manager(new MemoryRagV2Repository(), testEmbedder(), undefined, { summarizerSignature: 'stalled', async summarize() { return new Promise(() => {}); } });
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  await manager.waitForSummaries();
+  const status = await manager.status('primary', workspace, context);
+  assert.ok(status.summaries.failed > 0); assert.equal(status.summaries.active, 0); assert.equal(status.summaries.queued, 0);
+});
+
+for (const phase of ['initialize', 'createJob', 'listFingerprints', 'availableMarkdownRoots', 'countMarkdown', 'beginGeneration', 'pruneStagingGenerations']) {
+  test(`REL-10 ${phase} setup failure is terminal and observable`, async t => {
+    const { root, docs } = await corpus('cortex-setup-failure-', ['a']);
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const repository = new MemoryRagV2Repository();
+    const { filesystemSource } = await import('../local-agent/matbot/packages/plugins/workspace-rag/src/v2/source-filesystem.ts');
+    const source = { ...filesystemSource };
+    const target = phase in source ? source : repository;
+    target[phase] = async () => { throw new Error(`synthetic ${phase} failure`); };
+    const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), undefined, undefined, undefined, source);
+    t.after(() => manager.close());
+    const { workspace, context } = refs(root, docs);
+    manager.startIngestion(workspace, context);
+    const completed = await manager.waitForIngestion(workspace.id, context.id);
+    const status = await manager.status('primary', workspace, context);
+    assert.equal(completed.state, 'retryable_failure');
+    assert.match(completed.message, new RegExp(phase));
+    assert.equal(status.job.state, completed.state); assert.equal(manager.runs.size, 0);
+    if (phase !== 'initialize') assert.equal((await repository.currentJob(workspace.id, context.id)).state, completed.state);
+  });
+}
+
+test('REL-10 cancellation during setup persists a cancelled terminal job', async t => {
+  const { root, docs } = await corpus('cortex-setup-cancel-', ['a']);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = new MemoryRagV2Repository();
+  let release, entered;
+  const gate = new Promise(r => release = r), ready = new Promise(r => entered = r);
+  const begin = repository.beginGeneration.bind(repository);
+  repository.beginGeneration = async (...args) => { entered(); await gate; return begin(...args); };
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => { release(); return manager.close(); });
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context); await ready;
+  const cancellation = manager.cancel(workspace.id, context.id); release(); await cancellation;
+  assert.equal((await manager.waitForIngestion(workspace.id, context.id)).state, 'cancelled');
+  assert.equal((await repository.currentJob(workspace.id, context.id)).state, 'cancelled');
+  assert.equal(manager.runs.size, 0); assert.equal(await repository.activePublication(workspace.id, context.id), undefined);
+});
+
+test('REL-10 repository outage retains failure details and later ingestion recovers orphaned work', async t => {
+  const { root, docs } = await corpus('cortex-setup-outage-', ['a']);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = new MemoryRagV2Repository();
+  const begin = repository.beginGeneration.bind(repository), update = repository.updateJob.bind(repository), active = repository.activePublication.bind(repository);
+  let outage = false;
+  repository.beginGeneration = async () => { outage = true; throw new Error('database disconnected during setup'); };
+  repository.updateJob = async job => { if (outage) throw new Error('database offline'); return update(job); };
+  repository.activePublication = async (...args) => { if (outage) throw new Error('database offline'); return active(...args); };
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  const failed = manager.startIngestion(workspace, context);
+  const terminal = await manager.waitForIngestion(workspace.id, context.id);
+  assert.match(terminal.message, /database disconnected.*Terminal state could not be saved: database offline/);
+  const unavailable = await manager.status('primary', workspace, context);
+  assert.equal(unavailable.available, false); assert.equal(unavailable.job.state, 'retryable_failure');
+  assert.match(unavailable.message, /database offline/); assert.equal(manager.runs.size, 0);
+  assert.equal((await repository.currentJob(workspace.id, context.id)).state, 'discovered');
+  outage = false; repository.beginGeneration = begin;
+  assert.equal((await manager.status('primary', workspace, context)).job.state, 'retryable_failure');
+  let recoveredPrevious;
+  repository.updateJob = async job => { if (job.id === failed.id) recoveredPrevious = structuredClone(job); return update(job); };
+  manager.startIngestion(workspace, context);
+  assert.equal((await manager.waitForIngestion(workspace.id, context.id)).state, 'active_hybrid_complete');
+  assert.equal(recoveredPrevious.state, 'retryable_failure'); assert.match(recoveredPrevious.message, /interrupted/);
+  assert.equal((await manager.status('primary', workspace, context)).available, true);
 });

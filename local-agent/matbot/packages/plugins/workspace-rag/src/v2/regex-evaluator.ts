@@ -9,6 +9,9 @@ const QUANTIFIER = /^[+*?]|\{\d+(?:,\d*)?\}/u;
  * Detects a quantifier applied directly to a group that itself contains a
  * quantifier anywhere inside it — the shape that makes backtracking
  * exponential (for example ((a+)b)+c or (?:x+)*).
+ * @param pattern - Candidate pattern; escapes and character classes are skipped.
+ * @returns True when such a nested quantifier group exists, false otherwise.
+ * @throws Never.
  */
 function containsNestedQuantifierGroup(pattern: string): boolean {
   const quantified: boolean[] = [false];
@@ -67,6 +70,8 @@ function containsNestedQuantifierGroup(pattern: string): boolean {
 /**
  * Validates an LLM-supplied regex before any lane executes it.
  * @param pattern - Candidate pattern.
+ * @returns Nothing.
+ * @throws Error - When the pattern is empty or longer than 256 characters, contains a backreference or lookbehind, nests a quantifier inside a quantified group, or is not a valid `u`-mode RegExp.
  */
 export function assertSafeRegex(pattern: string): void {
   if (!pattern || pattern.length > 256) {
@@ -101,9 +106,11 @@ parentPort.postMessage(matches);
  * thread with a hard timeout. A catastrophic pattern blocks only the worker,
  * which is terminated on breach; the caller receives a clear error instead of
  * a frozen event loop.
- * @param params - Validated pattern and candidate texts.
- * @param timeoutMs - Wall-clock budget for the whole evaluation.
- * @returns Indices of texts that match.
+ * @param pattern - Validated pattern; should already have passed {@link assertSafeRegex}.
+ * @param texts - Candidate texts; matching is case-insensitive and unanchored.
+ * @param timeoutMs - Wall-clock budget for the whole evaluation in milliseconds; defaults to {@link REGEX_EVALUATION_TIMEOUT_MS}.
+ * @returns 0-based indices, in input order, of the texts that match.
+ * @throws Error - When evaluation exceeds `timeoutMs`, or when the worker fails.
  */
 export async function evaluateRegexMatchesBounded(
   pattern: string,

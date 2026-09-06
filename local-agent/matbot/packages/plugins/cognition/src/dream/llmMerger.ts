@@ -60,11 +60,29 @@ COHERENCE if resulting skill content has made pre-existing facts anomalous, you 
 
 Do not include any prose outside the JSON object. Do not wrap it in code fences. The "content" string must be the entire skill markdown, not a diff or a fragment.`;
 
+/**
+ * Extracts the outermost JSON-looking block from a model reply: the substring from the first `{`
+ * to the last `}`. Deliberately permissive — it tolerates leading or trailing prose and code
+ * fences the prompt forbade; actual well-formedness is left to the caller's JSON.parse.
+ * @param text The full model reply text.
+ * @returns The brace-delimited substring, or `undefined` if the text contains no braces.
+ * @throws Never.
+ */
 function extractJsonObject(text: string): string | undefined {
   const m = text.match(/\{[\s\S]*\}/);
   return m ? m[0] : undefined;
 }
 
+/**
+ * Parses a model reply into a {@link MergeResult}. Requires the extracted JSON object to carry a
+ * string `content` and a `contradictions` array of `{ location, note }` rows with string fields;
+ * any structural deviation rejects the whole reply rather than being partially accepted. The
+ * model's `anomalies` array is intentionally ignored here — anomalies live in the prose.
+ * @param raw The full model reply text.
+ * @returns The parsed merge result, or `undefined` if no JSON block is present or it fails
+ *          structural validation.
+ * @throws Never.
+ */
 function parseMergeResult(raw: string): MergeResult | undefined {
   const block = extractJsonObject(raw);
   if (block === undefined) return undefined;
@@ -94,6 +112,20 @@ function parseMergeResult(raw: string): MergeResult | undefined {
  */
 export function createLlmMerger(services: MatbotMachine, provider: string): Merger {
   return {
+    /**
+     * Splices one fact into the skill markdown via one `singleTurn` call. Each call's output is
+     * meant to be threaded by the pipeline as the next call's input, so contradictions inserted
+     * for an earlier fact are visible when later facts are considered.
+     * @param skillName Name of the target skill (prompt context only; not round-tripped).
+     * @param skillContent Current complete skill markdown.
+     * @param fact The fact to splice in.
+     * @param signal Cancellation signal forwarded to the provider call.
+     * @returns The complete updated markdown plus any contradiction notes; the returned content
+     *          is guaranteed not shorter than `skillContent`.
+     * @throws Error - If the response is unparseable or the returned content is shorter than the
+     *          input (a refusal to overwrite good material with a truncated version). Transport
+     *          errors and aborts propagate from `singleTurn`.
+     */
     async merge(
       skillName:    string,
       skillContent: string,

@@ -8,6 +8,8 @@ const DEFAULT_MAX_BACKUPS = 20;
 /**
  * Maximum backups kept per target file, overridable via
  * `CORTEX_FILE_BROKER_MAX_BACKUPS` (values below 1 fall back to the default).
+ *
+ * @returns The retention limit; at least 1.
  */
 function maxBackupsPerFile(): number {
   const raw = Number(process.env.CORTEX_FILE_BROKER_MAX_BACKUPS);
@@ -46,7 +48,13 @@ export async function createBackup(targetPath: string, backupRoot: string): Prom
   return backupPath;
 }
 
-/** Flattens a target path into its backup filename suffix. */
+/**
+ * Flattens a target path into its backup filename suffix.
+ *
+ * @param targetPath - The backed-up file's path.
+ * @returns The resolved path with `:`, `\`, and `/` replaced by `_`, so every
+ * backup of one target shares a stable, filesystem-safe name fragment.
+ */
 function safeBackupName(targetPath: string): string {
   return path.resolve(targetPath).replace(/[:\\\/]/g, "_");
 }
@@ -55,6 +63,12 @@ function safeBackupName(targetPath: string): string {
  * Deletes the oldest backups of one target beyond the retention limit. Backup
  * names begin with an ISO-8601 timestamp, so lexicographic order is
  * chronological order.
+ *
+ * @param backupRoot - Directory holding the timestamped backup files.
+ * @param safeName - Filename suffix identifying the target's backups (see
+ * {@link safeBackupName}).
+ * @returns A promise resolving once pruning completes; individual deletion
+ * failures are swallowed (best-effort retention).
  */
 async function pruneOldBackups(backupRoot: string, safeName: string): Promise<void> {
   const max = maxBackupsPerFile();

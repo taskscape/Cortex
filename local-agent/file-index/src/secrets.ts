@@ -16,6 +16,15 @@ const ASSIGNED_SECRET = /([\w.$-]*(?:password|passwd|api[_-]?key|secret|token|cr
 // Values that are obviously stand-ins rather than credentials.
 const PLACEHOLDER = /^(?:replace[_-]?me|change[_-]?me|your[_-]?.*|x{3,}|todo|none|null|nil|undefined|example|sample|test|dummy|string|number|boolean|<.*>|\$\{.*\}|\{\{.*\}\}|%\w+%)$/i;
 
+/**
+ * Decides whether an assigned value is plausibly a real credential rather than
+ * a type, placeholder, or prose fragment: it must be at least 12 characters,
+ * not match a known placeholder shape, and be a single opaque run of token
+ * characters.
+ *
+ * @param value - The captured right-hand-side value (quotes stripped).
+ * @returns True when the value should be redacted.
+ */
 function looksLikeSecretValue(value: string): boolean {
   // Short values are types, placeholders, or prose — never credentials worth withholding.
   if (value.length < 12) return false;

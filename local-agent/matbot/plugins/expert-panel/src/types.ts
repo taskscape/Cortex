@@ -60,11 +60,20 @@ export type StoreFilter =
 
 /** Minimal versioned document store used for durable expert review records. */
 export interface Store<T extends { id: string; version: string }> {
-  /** @param id Document identifier. @returns The document, or null when absent. */
+  /**
+   * Retrieve a document by its identifier.
+   * @param id Document identifier. @returns The document, or null when absent.
+   */
   get(id: string): Promise<T | null>;
-  /** @param id Document identifier. @param value Full document to store. */
+  /**
+   * Store a full document under the given id, replacing any prior value.
+   * @param id Document identifier. @param value Full document to store.
+   */
   set(id: string, value: T): Promise<void>;
-  /** @param query Optional filter/sort/limit. @returns Matching items plus total count before limit. */
+  /**
+   * List documents matching an optional filter/sort/limit query.
+   * @param query Optional filter/sort/limit. @returns Matching items plus total count before limit.
+   */
   query(query?: StoreQuery): Promise<{ items: T[]; total: number }>;
 }
 

@@ -1,6 +1,7 @@
 import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 
+/** Input accepted by the `http` tool: request target plus optional method, headers, body, and response parsing preference. */
 interface HttpInput {
   url:           string;
   method?:       string;
@@ -11,6 +12,13 @@ interface HttpInput {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * Extract a human-readable message from an unknown thrown value.
+ *
+ * @param e - The caught value.
+ * @returns `e.message` for `Error` instances, otherwise `String(e)`.
+ * @throws Never.
+ */
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }

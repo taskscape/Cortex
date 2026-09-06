@@ -27,7 +27,14 @@ export interface WorkspaceConfig {
   excludedPatterns?: string[];
 }
 
-/** The indexing exclusions in force, tolerating the pre-rename config key. */
+/**
+ * Returns the indexing exclusions in force, tolerating the pre-rename config
+ * key so existing `excludedPatterns` configs keep working.
+ *
+ * @param config - The loaded workspace configuration.
+ * @returns The `indexExcludedPatterns`, falling back to the legacy
+ * `excludedPatterns`, or an empty array when neither is set.
+ */
 export function indexExclusions(config: WorkspaceConfig): string[] {
   return config.indexExcludedPatterns ?? config.excludedPatterns ?? [];
 }

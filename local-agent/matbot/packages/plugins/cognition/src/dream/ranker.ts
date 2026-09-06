@@ -43,13 +43,16 @@ import type { RememberedFact, SkillCandidate, Score, MergeResult } from './types
  * propagates aborts (from the tool-call cancellation path) down.
  */
 export interface Ranker {
-  /**
-   * Scores every (fact, skill) pair in the cross-product of the inputs.
-   * @param facts Still-unassigned facts, capped pipeline-side.
-   * @param skills Non-blocklisted skill metadata views.
-   * @param signal Cancellation signal; must be honoured.
-   * @returns One Score per (fact, skill) pair, in any order; missing pairs count as 0.
-   */
+   /**
+    * Scores every (fact, skill) pair in the cross-product of the inputs.
+    * @param facts Still-unassigned facts, capped pipeline-side.
+    * @param skills Non-blocklisted skill metadata views.
+    * @param signal Cancellation signal; must be honoured.
+    * @returns One Score per (fact, skill) pair, in any order; missing pairs count as 0.
+    * @throws Error - If the implementation fails (transport error, provider error, or the
+    *          signal aborted). The pipeline catches the rejection and records the pass as an
+    *          `error` {@link DreamRun}; it is never treated as a per-fact zero.
+    */
   rank(
     facts:  readonly RememberedFact[],
     skills: readonly SkillCandidate[],
@@ -78,6 +81,11 @@ export interface Merger {
    * @param fact The fact to splice in.
    * @param signal Cancellation signal; must be honoured.
    * @returns The complete updated markdown plus any contradiction notes.
+   * @throws Error - If the implementation fails (e.g. an unparseable or content-shrinking
+   *          response, or the signal aborted). The pipeline quarantines the offending fact via
+   *          {@link DREAM_SKILL_ERROR} and records the pass as an `error` {@link DreamRun}; the
+   *          skill itself is left untouched because it is saved only after the whole cluster
+   *          merges successfully.
    */
   merge(
     skillName:    string,

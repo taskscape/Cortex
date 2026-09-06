@@ -1,10 +1,16 @@
 import type { MatbotMachine, Session, ToolContext, PromptFn, FormField, MessageContent } from '@matatbread/matbot-plugin-api';
 import type { Trigger } from './types.js';
 
-// Fallback when the firing hook carries no interactive prompt (cron/background run, or a frontend
-// that supplied none): a tool that tries to prompt resolves to a rejection it surfaces as a normal
-// tool error. When the hook DOES carry a prompt (a live interactive session behind this turn), it is
-// forwarded instead, so a trigger can invoke an interactive tool (e.g. `ask_user`) for real.
+/**
+ * Fallback when the firing hook carries no interactive prompt (cron/background run, or a frontend
+ * that supplied none): a tool that tries to prompt resolves to a rejection it surfaces as a normal
+ * tool error. When the hook DOES carry a prompt (a live interactive session behind this turn), it is
+ * forwarded instead, so a trigger can invoke an interactive tool (e.g. `ask_user`) for real.
+ *
+ * @param p - The prompt request: a plain label string, or a form field whose `label` is presented.
+ * @returns A promise that always rejects, so the requesting tool surfaces a normal tool error.
+ * @throws Never — the rejection is delivered through the returned promise, not thrown.
+ */
 const rejectingPrompt: PromptFn = (((p: string | FormField): Promise<string> => {
   const label = typeof p === 'string' ? p : p.label;
   return Promise.reject(new Error(`Non-interactive context: cannot prompt for "${label}"`));
@@ -26,6 +32,16 @@ export interface DispatchOutcome {
  * caller injects it); a tool that yields none is a silent side-effect (the model never wakes). Any
  * `marker` events the tool emits are collected for the caller to persist, and a tool that errors or
  * throws — or names an absent tool — is recorded as an error marker rather than vanishing into a log.
+ *
+ * @param services - The matbot machine, used to resolve the trigger's tool and build its ToolContext.
+ * @param trigger - The fired trigger; `invoke.tool` must name a registered tool, or the firing is
+ *   skipped and recorded as a failed marker (fail-soft).
+ * @param ctx - The firing context: the session under evaluation, the turn's abort signal, the turn's
+ *   provider id, and the hook's interactive prompt when one exists (undefined in non-interactive runs).
+ * @returns The outcome: `hadResult`/`result` decide whether the model is woken with injected text,
+ *   and `markers` carries the tool's own markers plus a synthesised error marker on any failure.
+ * @throws Never — every failure path (absent tool, tool error event, thrown error) is captured into
+ *   an error marker; the promise always resolves.
  */
 export async function dispatchTrigger(
   services: MatbotMachine,
@@ -90,6 +106,11 @@ export async function dispatchTrigger(
  * with a string `content` field (the shape `skill_action(load)` and other prose-producing tools
  * return) uses that; anything else is shown as JSON. (Rendering fidelity for arbitrary tools is a
  * known rough edge — see the slice notes.)
+ *
+ * @param value - The tool result: a string (used verbatim), an object with a string `content` field
+ *   (that string is used), or anything else (pretty-printed JSON).
+ * @returns The text to inject for the model.
+ * @throws Never — non-string values are assumed JSON-serializable.
  */
 export function renderResult(value: unknown): string {
   if (typeof value === 'string') return value;

@@ -64,16 +64,25 @@ Output ONLY a JSON array of strings — each one self-contained fact, normalised
 about the user where relevant ("my neighbours are X" -> "The user's neighbours are X"). Split
 distinct facts into separate elements. Nothing durable -> [].`;
 
+/**
+ * Concatenates a message's text blocks with newlines.
+ * @param msg - The message to read, or undefined when the session holds no genuine user/assistant message.
+ * @returns The joined text content, or '' when the message is undefined or contains no text blocks.
+ * @throws Never.
+ */
 function textOf(msg: Message | undefined): string {
   return msg?.content.filter(c => c.type === 'text').map(c => c.text).join('\n') ?? '';
 }
 
 /**
- * Constructs the `remember` trigger tool: extracts durable facts from the
- * message that fired it (via an LLM pass) and writes them to the
- * remembered_facts store for later dream-time routing.
- * @param services The matbot machine.
- * @returns The `remember` tool.
+ * Constructs the `remember_fact` tool: extracts durable facts from the message
+ * that fired it (the latest genuine user or assistant message, via one
+ * `singleTurn` LLM pass) and writes them to the remembered_facts store for later
+ * dream-time routing. Yields no result — a trigger firing it runs as a silent
+ * side-effect — and emits a durable `marker` recording what was captured.
+ * @param services - The matbot machine, used for single-turn completion and the fact store.
+ * @returns The `remember_fact` tool.
+ * @throws Never - Extraction failures and empty results surface as yielded events or console warnings, not throws.
  */
 export function createRememberFactTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {

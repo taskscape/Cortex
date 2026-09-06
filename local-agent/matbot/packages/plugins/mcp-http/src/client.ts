@@ -5,7 +5,9 @@ const CLIENT_INFO = { name: 'matbot', version: '0.1.0' };
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_SSE_BUFFER_CHARS = 1_048_576;
 
+/** JSON-RPC 2.0 request carrying a numeric id; responses are matched back by that id. */
 interface JsonRpcRequest  { jsonrpc: '2.0'; id: number; method: string; params: unknown }
+/** JSON-RPC 2.0 response; `error` carries the server-reported failure when present. */
 interface JsonRpcResponse { jsonrpc: string; id?: unknown; result?: unknown; error?: { code: number; message: string } }
 
 /**
@@ -22,9 +24,12 @@ export class HttpMCPClient implements MCPClient {
   private readonly requestTimeoutMs: number;
 
   /**
+   * Store connection parameters; no network I/O happens here.
+   *
    * @param endpoint The MCP server URL (JSON-RPC POST target).
    * @param extraHeaders Extra HTTP headers sent with every request (e.g. auth).
    * @param requestTimeoutMs Per-request timeout in milliseconds; non-positive or non-finite values fall back to the default.
+   * @throws Never.
    */
   constructor(endpoint: string, extraHeaders?: Record<string, string>, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.endpoint = endpoint;
@@ -37,6 +42,9 @@ export class HttpMCPClient implements MCPClient {
   /**
    * Best-effort MCP initialize handshake; captures the server's `instructions` if offered.
    * Never throws — a stateless server that rejects initialize must not block the connection.
+   *
+   * @returns Nothing; {@link instructions} is populated when the server supplies them.
+   * @throws Never.
    */
   async initialize(): Promise<void> {
     try {
@@ -49,6 +57,20 @@ export class HttpMCPClient implements MCPClient {
     } catch { /* stateless server / no initialize support */ }
   }
 
+  /**
+   * POST one JSON-RPC request to the endpoint and return the response's `result` field.
+   *
+   * Sends `Accept: application/json, text/event-stream`; when the server answers with an SSE
+   * stream, the response is consumed via {@link readSseResponse}. The caller's abort signal is
+   * forwarded, and an independent per-request timeout aborts on its own.
+   *
+   * @param method - The JSON-RPC method name.
+   * @param params - The `params` payload; defaults to an empty object.
+   * @param signal - Optional abort signal; aborting rejects with the signal's abort reason.
+   * @returns The `result` value of the matching JSON-RPC response.
+   * @throws Error - On non-2xx HTTP status, JSON-RPC error response, timeout after
+   *           `requestTimeoutMs`, caller abort, or SSE stream failure.
+   */
   private async post(method: string, params: unknown = {}, signal?: AbortSignal): Promise<unknown> {
     const id = this.nextId++;
     const body: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
@@ -91,12 +113,32 @@ export class HttpMCPClient implements MCPClient {
     }
   }
 
+  /**
+   * Read an SSE-framed JSON-RPC response and return the first `data:` message whose JSON-RPC id
+   * matches. Buffered input is capped at {@link MAX_SSE_BUFFER_CHARS} characters; the reader is
+   * always cancelled and released, even on failure.
+   *
+   * @param resp - The streaming HTTP response to consume.
+   * @param id - The JSON-RPC request id the response message must match.
+   * @returns The `result` value of the matching response message.
+   * @throws Error - If the response has no body, the matching message carries a JSON-RPC error,
+   *           the buffer overflows without a match, or the stream ends without a match.
+   */
   private async readSseResponse(resp: Response, id: number): Promise<unknown> {
     if (!resp.body) throw new Error('MCP SSE response has no body');
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
+    /**
+     * Inspect one SSE line and decide whether it is the response being awaited.
+     *
+     * @param line - A raw line from the SSE stream (without its newline).
+     * @returns `matched: true` with the message's `result` when the line is a `data:` payload
+     *          with the awaited id; `matched: false` for non-data lines, unparseable payloads,
+     *          and other ids.
+     * @throws Error - If the matching message carries a JSON-RPC error.
+     */
     const acceptLine = (line: string): { matched: boolean; result?: unknown } => {
       const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
       if (!normalized.startsWith('data:')) return { matched: false };
@@ -156,7 +198,12 @@ export class HttpMCPClient implements MCPClient {
     return await this.post('tools/call', { name, arguments: args }, signal) as MCPToolResult;
   }
 
-  /** No-op: HTTP is stateless. */
+  /**
+   * No-op: HTTP is stateless.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   close(): void { /* HTTP is stateless */ }
 }
 

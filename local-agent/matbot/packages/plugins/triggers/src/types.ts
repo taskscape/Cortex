@@ -106,13 +106,43 @@ export interface TriggerSpec {
  * triggers plugin, which owns the hooks that drive them.
  */
 export interface Triggers {
+  /**
+   * Every stored trigger.
+   *
+   * @returns All triggers, in insertion order.
+   */
   all(): Trigger[];
+  /**
+   * Looks a trigger up by id.
+   *
+   * @param id - Trigger identifier.
+   * @returns The trigger, or undefined when absent.
+   */
   get(id: string): Trigger | undefined;
   /** Triggers whose invocation matches the filter — `tool` (if given) equals `invoke.tool`, `params`
    *  (if given) deep-equals `invoke.params`. The "which trigger(s) fire tool X" lookup. */
   query(filter: { tool?: string; params?: unknown }): Trigger[];
+  /**
+   * Creates and persists a new trigger.
+   *
+   * @param spec - Conditions, invocation, and enabled flag.
+   * @returns The stored trigger with its fresh id and version.
+   */
   add(spec: TriggerSpec): Promise<Trigger>;
+  /**
+   * Applies a partial update to a trigger.
+   *
+   * @param id - Trigger identifier.
+   * @param patch - Fields to change; omitted fields stay untouched.
+   * @returns The updated trigger, or undefined when the id is unknown.
+   */
   update(id: string, patch: Partial<TriggerSpec>): Promise<Trigger | undefined>;
+  /**
+   * Deletes a trigger by id.
+   *
+   * @param id - Trigger identifier.
+   * @returns True if the trigger existed and was removed.
+   */
   remove(id: string): Promise<boolean>;
   /** Seed idempotently: no-op (returns the existing trigger) when one with the same `invoke`
    *  (tool + params) is already stored. Identity is the invocation, since triggers carry no name. */

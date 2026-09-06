@@ -7,9 +7,12 @@ import type { ExpertConfig, ExpertPanelConfig } from "./types.js";
  * Load and validate the expert panel configuration (experts.json or the file named by
  * `EXPERT_PANEL_CONFIG`): normalizes each expert, resolves knowledge roots against the
  * config directory, and verifies they are accessible.
+ * @param snapshot Optional in-memory override; when provided, its `text` is parsed
+ *        instead of reading `configPath` from disk.
  * @returns The validated panel config with absolutized roots.
- * @throws When the config is missing required fields, defines no experts, contains
- *         duplicate expert ids (case-insensitive), or a knowledge root is inaccessible.
+ * @throws Error when the config cannot be read or parsed, is missing required fields,
+ *         defines no experts, contains duplicate expert ids (case-insensitive), or a
+ *         knowledge root is inaccessible.
  */
 export async function loadExpertConfig(snapshot?: { configPath: string; text: string }): Promise<ExpertPanelConfig> {
   const configPath = snapshot?.configPath ?? expertConfigPath();
@@ -33,6 +36,13 @@ export async function loadExpertConfig(snapshot?: { configPath: string; text: st
   };
 }
 
+/**
+ * Resolve the experts.json path: the absolute `EXPERT_PANEL_CONFIG` env override when
+ * set, otherwise a default `config/experts.json` resolved four directory levels above
+ * this module's directory.
+ * @returns Absolute config file path.
+ * @throws Never.
+ */
 export function expertConfigPath(): string {
   if (process.env.EXPERT_PANEL_CONFIG) {
     return path.resolve(process.env.EXPERT_PANEL_CONFIG);
@@ -42,6 +52,16 @@ export function expertConfigPath(): string {
   return path.resolve(here, "../../../../config/experts.json");
 }
 
+/**
+ * Validate and normalize one expert entry: require non-empty id/title/description/
+ * systemPrompt, require at least one knowledge root, resolve roots against the config
+ * directory, and verify each root exists as a file or directory.
+ * @param expert Raw expert entry from the parsed config.
+ * @param configDir Directory containing the config file; relative roots resolve against it.
+ * @returns A trimmed copy of the expert with absolutized roots.
+ * @throws Error when a required field is missing or empty, no roots are defined, or a
+ *         root is inaccessible.
+ */
 async function normalizeExpert(expert: ExpertConfig, configDir: string): Promise<ExpertConfig> {
   for (const key of ["id", "title", "description", "systemPrompt"] as const) {
     if (typeof expert[key] !== "string" || expert[key].trim() === "") {

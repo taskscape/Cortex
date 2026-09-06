@@ -18,9 +18,13 @@ export interface KnowledgeEntry {
  * and search it with term/context pairs.
  */
 export interface KnowledgeIndex {
-  /** @param entry Entry to add to the index. */
+  /**
+   * Persist an entry to the index.
+   * @param entry Entry to add to the index.
+   */
   index(entry: KnowledgeEntry): Promise<void>;
   /**
+   * Search the index with term/context pairs.
    * @param terms Terms to search for, each with optional context.
    * @param signal Cancellation signal.
    * @returns Matching entries, ranked and deduplicated by the implementation.

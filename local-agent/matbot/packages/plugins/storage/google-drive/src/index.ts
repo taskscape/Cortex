@@ -15,6 +15,14 @@ const ROOT_KEY      = 'matbot.gdrive.rootFolder';
 // migrate any secrets entered before Drive was activated (the Vault interface has no enumerate).
 const LOCAL_VAULT_KEY = 'matbot.vault';
 
+/**
+ * Reads the browser plugin's localStorage vault (read directly because the
+ * Vault interface has no enumerate) to migrate secrets entered before Drive
+ * was activated.
+ * @returns The stored key/value pairs, or an empty object when absent or
+ *   malformed.
+ * @throws Never.
+ */
 function readLocalVaultSecrets(): Record<string, string> {
   try {
     const raw = globalThis.localStorage?.getItem(LOCAL_VAULT_KEY);
@@ -22,18 +30,36 @@ function readLocalVaultSecrets(): Record<string, string> {
   } catch { return {}; }
 }
 
+/**
+ * Reads a `localStorage` key, treating an unavailable store as absence.
+ * @param key - Storage key.
+ * @returns The stored value, or undefined when absent or unavailable.
+ * @throws Never.
+ */
 function readLocal(key: string): string | undefined {
   try { return globalThis.localStorage?.getItem(key) ?? undefined; } catch { return undefined; }
 }
+/**
+ * Best-effort `localStorage` write; storage failures are swallowed (these
+ * values are convenience config, not durable state).
+ * @param key - Storage key.
+ * @param value - Value to store.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function writeLocal(key: string, value: string): void {
   try { globalThis.localStorage?.setItem(key, value); } catch { /* unavailable */ }
 }
 
 /**
- * Authorise Drive and build the backend. Fast path: if a non-expired token is already cached for the
+ * Authorises Drive and builds the backend. Fast path: if a non-expired token is already cached for the
  * known client ID, reuse it silently (no popup, no dialog). Otherwise show the setup overlay, which
  * collects/confirms the client ID + folder and drives Google sign-in from a real button click (the
- * gesture Chrome requires to open the consent popup — a boot-time popup is blocked).
+ * gesture Chrome requires to open the consent popup — a boot-time popup is blocked). The chosen
+ * client ID and folder are persisted to `localStorage` for the next boot.
+ * @returns The backend bound to the authorised client.
+ * @throws Error when the user cancels the setup dialog or when not running in
+ *   a browser.
  */
 async function authoriseAndBuild(): Promise<GoogleDriveStorageBackend> {
   const clientId   = readLocal(CLIENT_ID_KEY);
@@ -64,16 +90,23 @@ async function authoriseAndBuild(): Promise<GoogleDriveStorageBackend> {
  * plugin then replays on every boot). On node there is no `document`, so it throws and the host keeps
  * its filesystem backend.
  */
-/**
- * Google Drive storage backend plugin (browser): runs first-run setup,
- * mounts a Drive-backed StorageBackend/Vault, and syncs remote plugins.
- *
- * @returns The plugin specification.
- */
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
   manifest:   { description: 'Persist matbot sessions, settings, files and secrets to a folder in your Google Drive (browser).' },
 
+  /**
+   * Activates the Drive backend: authorises (cached token or setup overlay),
+   * probes Drive readiness before swapping anything in, registers the
+   * backend, migrates and registers the Drive vault, shadows the `plugin`
+   * tool with the Drive-synced one, and restores the synced plugin set
+   * (individual restore failures are warned, never fatal). No-op when this
+   * backend is already active.
+   * @param services - Runtime machine used for registration and plugin loads.
+   * @returns Resolves once activation completes.
+   * @throws Error when the user cancels sign-in or when the Drive readiness
+   *   probe fails — nothing is registered in either case, so the previous
+   *   backend stays in force.
+   */
   async setup(services: MatbotMachine): Promise<void> {
     if (services.StorageBackend instanceof GoogleDriveStorageBackend) return;
     const backend = await authoriseAndBuild();
@@ -122,6 +155,13 @@ export const plugin: MatbotPluginSpec = {
 
   // Shown after a successful activation — confirms what happened and records the one-time Google
   // setup steps in the chat, so they're to hand when reconnecting on a new browser or Google project.
+  /**
+   * Shown after a successful activation — confirms what happened and records
+   * the one-time Google setup steps in the chat, so they're to hand when
+   * reconnecting on a new browser or Google project.
+   * @returns The markdown confirmation message.
+   * @throws Never.
+   */
   async installationMessage(): Promise<string> {
     const folder = readLocal(ROOT_KEY) ?? 'matbot';
     return [

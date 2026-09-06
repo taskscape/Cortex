@@ -141,8 +141,12 @@ export interface RagV2Repository {
   initialize(vectorizer: RagV2VectorizerInfo): Promise<void>;
   close(): Promise<void>;
 
-  /** Idempotent: adopting the generation an interrupted run left behind must not reset it. */
-  beginGeneration(workspaceId: string, contextId: string, generationId: string): Promise<void>;
+  /**
+   * Starts staging from an explicit generation, or from the active publication
+   * when omitted. Idempotent: adopting the generation an interrupted run left
+   * behind must not reset it.
+   */
+  beginGeneration(workspaceId: string, contextId: string, generationId: string, sourceGenerationId?: string): Promise<void>;
   activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined>;
   generation(workspaceId: string, contextId: string, generationId: string): Promise<RagV2Publication | undefined>;
   /** Drops staging generations abandoned by earlier interrupted runs. Returns how many were removed. */

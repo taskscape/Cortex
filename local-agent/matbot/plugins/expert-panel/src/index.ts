@@ -25,6 +25,7 @@ import {FileExpertDefinitionSource,fileExpertKnowledge,RagExpertKnowledge} from 
 import type {ExpertDefinitionSource,ExpertKnowledgeFactory,ExpertKnowledgeSource} from './providers.js';
 export * from './providers.js';
 
+/** Parsed input for the `expert_panel` tool; every field is optional before parsing applies defaults. */
 interface ExpertPanelInput {
   action?: "list" | "ask" | "review" | "get_review" | "list_reviews";
   question?: string;
@@ -43,11 +44,13 @@ interface ExpertPanelInput {
   synthesize?: boolean;
 }
 
+/** One expert paired with its knowledge source, ready for panel execution. */
 interface ExpertRuntime {
   config: ExpertConfig;
   knowledge: ExpertKnowledgeSource;
 }
 
+/** Panel ask result: per-expert opinions plus the optional synthesis. */
 interface ExpertPanelResult {
   question: string;
   mode: string;
@@ -56,17 +59,31 @@ interface ExpertPanelResult {
   synthesisProviderResolution?: ExpertProviderResolution;
 }
 
+/** One link in the provider fallback chain before availability is evaluated. */
 interface ProviderCandidate {
   source: Exclude<ExpertProviderSource, "first_available">;
   provider: string | undefined;
 }
 
+/**
+ * Runs the configured expert panel: selects experts, retrieves grounded knowledge per
+ * expert, issues single-turn LLM calls, resolves providers via a fallback chain, and
+ * persists structured review records to the review store.
+ */
 class ExpertPanel {
   private readonly services: MatbotMachine;
   private readonly experts: ExpertRuntime[];
   private readonly reviews: Store<ExpertReviewRecord>;
   private readonly defaultProvider: string | undefined;
 
+  /**
+   * Creates a panel over the given experts.
+   * @param services Host machine used for single-turn calls and provider lookup.
+   * @param experts Configured experts paired with their knowledge sources.
+   * @param reviews Durable store for expert review records.
+   * @param defaultProvider Panel-level provider fallback used after the per-expert and
+   *        per-turn candidates.
+   */
   constructor(
     services: MatbotMachine,
     experts: ExpertRuntime[],
@@ -79,10 +96,27 @@ class ExpertPanel {
     this.defaultProvider = defaultProvider;
   }
 
+  /**
+   * List the configured experts.
+   * @returns Expert configs in configuration order.
+   * @throws Never.
+   */
   list(): ExpertConfig[] {
     return this.experts.map(expert => expert.config);
   }
 
+  /**
+   * Ask the selected experts the same question concurrently and optionally synthesize
+   * the panel. Experts run independently; a failure of one expert's knowledge source
+   * or LLM call rejects the whole panel.
+   * @param input Parsed tool input; `question` is required, `mode`/`synthesize` are
+   *        defaulted during parsing, `maxCitationsPerExpert` is clamped to 1-12
+   *        (default 5).
+   * @param ctx Tool context providing the turn's provider and cancellation signal.
+   * @returns Per-expert opinions plus the synthesis when requested.
+   * @throws Error when requested expert ids are unknown, no provider is available, or
+   *         a knowledge search or LLM call fails.
+   */
   async askPanel(input: Required<Pick<ExpertPanelInput, "question" | "mode" | "synthesize">> & ExpertPanelInput, ctx: ToolContext): Promise<ExpertPanelResult> {
     const selected = this.selectExperts(input.experts);
     const citationLimit = clamp(input.maxCitationsPerExpert ?? 5, 1, 12);
@@ -106,6 +140,17 @@ class ExpertPanel {
     return result;
   }
 
+  /**
+   * Run the panel, structure each opinion (recommendation, confidence, risks, blockers,
+   * mitigations, approval checklist), derive consensus/disagreements and the risk
+   * register, and persist the record to the review store.
+   * @param input Parsed tool input; `question`, `mode`, `reviewMode`, and `targetType`
+   *        are required (defaults applied during parsing).
+   * @param ctx Tool context providing the turn's provider and cancellation signal.
+   * @returns The stored review record plus the underlying panel result.
+   * @throws Error under the same conditions as `askPanel`, plus review-store write
+   *         failures.
+   */
   async createReview(input: Required<Pick<ExpertPanelInput, "question" | "mode" | "synthesize" | "reviewMode" | "targetType">> & ExpertPanelInput, ctx: ToolContext): Promise<{
     review: ExpertReviewRecord;
     panel: ExpertPanelResult;
@@ -142,15 +187,34 @@ class ExpertPanel {
     return { review, panel };
   }
 
+  /**
+   * Fetch one stored review by id.
+   * @param id Review record id.
+   * @returns The record, or null when absent.
+   * @throws Whatever the underlying review store throws.
+   */
   getReview(id: string): Promise<ExpertReviewRecord | null> {
     return this.reviews.get(id);
   }
 
+  /**
+   * List stored reviews.
+   * @param query Optional filter/sort/limit; the store's `total` is discarded.
+   * @returns Matching review records in store order.
+   * @throws Whatever the underlying review store throws.
+   */
   async listReviews(query?: StoreQuery): Promise<ExpertReviewRecord[]> {
     const result = await this.reviews.query(query);
     return result.items;
   }
 
+  /**
+   * Resolve the experts to run: all configured experts when `ids` is empty or
+   * undefined, otherwise a case-insensitive id match in configuration order.
+   * @param ids Requested expert ids; empty or undefined selects everyone.
+   * @returns Selected expert runtimes.
+   * @throws Error naming the unknown ids and the available experts.
+   */
   private selectExperts(ids?: string[]): ExpertRuntime[] {
     if (!ids || ids.length === 0) {
       return this.experts;
@@ -168,6 +232,20 @@ class ExpertPanel {
     return selected;
   }
 
+  /**
+   * Answer one expert: resolve its provider chain (expert → turn → panel default),
+   * search its knowledge source, build the mode-specific prompt, and issue a
+   * single-turn LLM call.
+   * @param expert Expert runtime to consult.
+   * @param question Question to ask.
+   * @param mode Panel mode controlling prompt instructions.
+   * @param citationLimit Maximum grounded sources shown to this expert.
+   * @param ctx Tool context providing the turn's provider and cancellation signal.
+   * @returns The expert's formatted answer with citations, warnings, provider
+   *          resolution, and usage.
+   * @throws Error when no provider is available or the knowledge search or LLM call
+   *         fails; aborts propagate.
+   */
   private async askExpert(expert: ExpertRuntime, question: string, mode: string, citationLimit: number, ctx: ToolContext): Promise<ExpertOpinion> {
     const providerResolution = this.resolveProvider([
       { source: "expert", provider: expert.config.provider },
@@ -202,6 +280,16 @@ class ExpertPanel {
     };
   }
 
+  /**
+   * Run the orchestrator pass collating expert opinions into consensus, disagreements,
+   * risks, and a final recommendation. Provider chain: turn provider → panel default.
+   * @param question Original panel question.
+   * @param mode Panel mode the opinions were produced under.
+   * @param opinions Collected expert opinions.
+   * @param ctx Tool context providing the turn's provider and cancellation signal.
+   * @returns Trimmed synthesis text plus the provider resolution audit.
+   * @throws Error when no provider is available or the LLM call fails; aborts propagate.
+   */
   private async synthesize(question: string, mode: string, opinions: ExpertOpinion[], ctx: ToolContext): Promise<{
     text: string;
     providerResolution: ExpertProviderResolution;
@@ -232,6 +320,16 @@ class ExpertPanel {
     return { text: response.text.trim(), providerResolution };
   }
 
+  /**
+   * Evaluate provider candidates in order against the host's registered providers and
+   * pick the first available one; if none is available, fall back to the first
+   * registered provider. Fallbacks are logged via `console.info` with the evaluated
+   * chain.
+   * @param candidates Ordered candidate list to evaluate.
+   * @param scope Label used in fallback log lines.
+   * @returns The selected provider, its source, the fallback flag, and the audited chain.
+   * @throws Error when no provider is configured at all.
+   */
   private resolveProvider(candidates: ProviderCandidate[], scope: string): ExpertProviderResolution {
     const chain = candidates.map(candidate => ({
       ...candidate,
@@ -272,11 +370,22 @@ class ExpertPanel {
  * store, registers an `ExpertPanel` service, and exposes the `expert_panel` tool for
  * listing experts, running grounded panel asks, and creating/inspecting structured
  * expert review records.
+ * @param options Optional overrides: `definitions` replaces the file-based config
+ *        source; `knowledge` replaces the per-expert knowledge factory (without it,
+ *        `CORTEX_EXPERT_KNOWLEDGE` selects `file` or `workspace-rag`).
+ * @returns The plugin spec for the matbot loader.
  */
 export function createExpertPanelPlugin(options:{definitions?:ExpertDefinitionSource;knowledge?:ExpertKnowledgeFactory}={}):MatbotPluginSpec {
  return {apiVersion:'0.1',async setup(services){
   const definitions=options.definitions??new FileExpertDefinitionSource();const selected=process.env.CORTEX_EXPERT_KNOWLEDGE??'file';if(!options.knowledge&&!['file','workspace-rag'].includes(selected))throw new Error('Unknown expert knowledge source: '+selected);const knowledge=options.knowledge??(selected==='workspace-rag'?(expert=>new RagExpertKnowledge(expert,()=>services.WorkspaceRagManager)):fileExpertKnowledge);const reviewStore=createReviewStore(services);
   let current:{version:string;panel:ExpertPanel}|undefined;let refresh:Promise<ExpertPanel>|undefined;
+  /**
+   * Resolve the current panel, coalescing concurrent refreshes into one in-flight
+   * reload and rebuilding the panel only when the config version (content hash)
+   * changes.
+   * @returns The up-to-date panel.
+   * @throws Error when the definition source fails to load or validate the config.
+   */
   const snapshot=async()=>{
    if(refresh)return refresh;
    const run=(async()=>{const next=await definitions.snapshot();if(!current||current.version!==next.version)current={version:next.version,panel:new ExpertPanel(services,next.config.experts.map(expert=>({config:expert,knowledge:knowledge(expert)})),reviewStore,next.config.defaultProvider)};return current.panel;})();refresh=run;try{return await run;}finally{if(refresh===run)refresh=undefined;}
@@ -291,6 +400,14 @@ export const plugin=createExpertPanelPlugin();
 
 export default plugin;
 
+/**
+ * Build the `expert_panel` tool descriptor. The executor snapshots the current panel
+ * (picking up config reloads) on each invocation, handles list/get_review/list_reviews
+ * inline, and reports ask/review failures as tool error events.
+ * @param snapshot Resolves the current {@link ExpertPanel}, refreshing config as needed.
+ * @returns The tool descriptor for registration.
+ * @throws Never.
+ */
 function createExpertPanelTool(snapshot:()=>Promise<ExpertPanel>): Tool {
   return {
     name: "expert_panel",
@@ -409,6 +526,15 @@ function createExpertPanelTool(snapshot:()=>Promise<ExpertPanel>): Tool {
   };
 }
 
+/**
+ * Normalize and validate raw tool input, applying defaults: `action` → "ask", `mode` →
+ * "parallel", `reviewMode` → "quick_review", `targetType` → "chat", `synthesize` →
+ * true. Unknown enum values fall back to the defaults; non-string or empty expert ids
+ * are dropped; optional string fields are kept only when present.
+ * @param input Raw executor input.
+ * @returns Parsed input with `mode` and `synthesize` always set.
+ * @throws Never.
+ */
 function parseInput(input: unknown): ExpertPanelInput & { mode: "parallel" | "review" | "debate"; synthesize: boolean } {
   const value = input !== null && typeof input === "object" ? input as Record<string, unknown> : {};
   const mode = value.mode === "review" || value.mode === "debate" || value.mode === "parallel" ? value.mode : "parallel";
@@ -440,6 +566,15 @@ function parseInput(input: unknown): ExpertPanelInput & { mode: "parallel" | "re
   };
 }
 
+/**
+ * Build one expert's grounded prompt: the question, panel mode instruction, response
+ * section contract, and the numbered grounded sources (or a no-sources note).
+ * @param question Question to answer.
+ * @param mode Panel mode controlling the instruction block.
+ * @param sources Grounded sources retrieved for this expert.
+ * @returns The full prompt text.
+ * @throws Never.
+ */
 function expertPrompt(question: string, mode: string, sources: ExpertSource[]): string {
   return [
     `Question:\n${question}`,
@@ -452,6 +587,13 @@ function expertPrompt(question: string, mode: string, sources: ExpertSource[]): 
   ].join("\n\n");
 }
 
+/**
+ * Mode-specific required-section instruction: review sections for "review", debate
+ * sections for "debate", independence for anything else.
+ * @param mode Panel mode.
+ * @returns The instruction sentence.
+ * @throws Never.
+ */
 function expertModeInstruction(mode: string): string {
   if (mode === "review") {
     return "Required review sections: Strengths, Risks, Omissions, Practical concerns.";
@@ -462,6 +604,15 @@ function expertModeInstruction(mode: string): string {
   return "Answer independently; do not assume access to another expert's answer.";
 }
 
+/**
+ * Validate an expert answer against its mode's required markdown sections
+ * (case-insensitive heading match) and append placeholder sections for any that are
+ * missing, so downstream structuring always finds them.
+ * @param mode Panel mode determining the schema name and required sections.
+ * @param answer Raw provider answer (already trimmed).
+ * @returns The completed answer plus the applied `modeFormat` audit data.
+ * @throws Never.
+ */
 function formatExpertModeAnswer(mode: string, answer: string): {
   answer: string;
   modeFormat: ExpertOpinion["modeFormat"];
@@ -482,6 +633,13 @@ function formatExpertModeAnswer(mode: string, answer: string): {
   return { answer: completed, modeFormat: { schema, requiredSections } };
 }
 
+/**
+ * Format one grounded source as a numbered citation block.
+ * @param source Source to format.
+ * @param index Zero-based position; rendered 1-based.
+ * @returns The formatted block.
+ * @throws Never.
+ */
 function formatSource(source: ExpertSource, index: number): string {
   return [
     `[${index + 1}] ${source.title}`,
@@ -492,10 +650,24 @@ function formatSource(source: ExpertSource, index: number): string {
   ].join("\n");
 }
 
+/**
+ * Floor a value and clamp it into an inclusive range.
+ * @param value Value to clamp (floored first).
+ * @param min Inclusive lower bound.
+ * @param max Inclusive upper bound.
+ * @returns The clamped integer.
+ * @throws Never.
+ */
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
+/**
+ * Type guard for {@link ExpertReviewMode} values.
+ * @param value Value to test.
+ * @returns True when `value` is a known review mode.
+ * @throws Never.
+ */
 function isReviewMode(value: unknown): value is ExpertReviewMode {
   return value === "quick_review"
     || value === "full_approval_review"
@@ -504,6 +676,12 @@ function isReviewMode(value: unknown): value is ExpertReviewMode {
     || value === "post_incident_review";
 }
 
+/**
+ * Type guard for {@link ExpertReviewTargetType} values.
+ * @param value Value to test.
+ * @returns True when `value` is a known target type.
+ * @throws Never.
+ */
 function isTargetType(value: unknown): value is ExpertReviewTargetType {
   return value === "decision_dossier"
     || value === "workflow"
@@ -514,6 +692,15 @@ function isTargetType(value: unknown): value is ExpertReviewTargetType {
     || value === "other";
 }
 
+/**
+ * Enrich one opinion with structured review data: risks/blockers/mitigations extracted
+ * from answer lines by keyword matching, a heuristic recommendation and confidence,
+ * evidence ids from citations, and the mode-appropriate approval checklist.
+ * @param opinion Raw expert opinion to structure.
+ * @param reviewMode Review mode selecting checklist items.
+ * @returns The structured opinion (a superset of the input).
+ * @throws Never.
+ */
 function structureOpinion(opinion: ExpertOpinion, reviewMode: ExpertReviewMode): StructuredExpertOpinion {
   const risks = extractLines(opinion.answer, ["risk", "concern", "exposure", "downside"]);
   const blockers = extractLines(opinion.answer, ["blocker", "must not", "cannot approve", "reject"]);
@@ -530,6 +717,15 @@ function structureOpinion(opinion: ExpertOpinion, reviewMode: ExpertReviewMode):
   };
 }
 
+/**
+ * Heuristic verdict from the answer text: "block" when blockers exist or blocking
+ * language appears, "needs_more_evidence" without citations or with missing-evidence
+ * language, "approve_with_changes" when risk/concern language appears, else "approve".
+ * @param opinion Expert opinion to classify.
+ * @param blockers Blocker lines already extracted from the answer.
+ * @returns The recommendation.
+ * @throws Never.
+ */
 function recommendationForOpinion(opinion: ExpertOpinion, blockers: string[]): ExpertRecommendation {
   const lower = opinion.answer.toLowerCase();
   if (blockers.length > 0 || /\b(block|reject|do not approve|cannot approve)\b/.test(lower)) return "block";
@@ -538,6 +734,13 @@ function recommendationForOpinion(opinion: ExpertOpinion, blockers: string[]): E
   return "approve";
 }
 
+/**
+ * Heuristic confidence: 0.45 without citations, 0.55 with uncertainty language,
+ * otherwise 0.65 plus 0.08 per citation capped at 0.95.
+ * @param opinion Expert opinion to score.
+ * @returns Confidence between 0.45 and 0.95.
+ * @throws Never.
+ */
 function confidenceForOpinion(opinion: ExpertOpinion): number {
   const lower = opinion.answer.toLowerCase();
   if (opinion.citations.length === 0) return 0.45;
@@ -545,11 +748,25 @@ function confidenceForOpinion(opinion: ExpertOpinion): number {
   return Math.min(0.95, 0.65 + opinion.citations.length * 0.08);
 }
 
+/**
+ * Placeholder risk used when no risk lines were extracted from an answer.
+ * @param opinion Opinion the fallback is for.
+ * @returns A no-evidence note when the opinion has no citations, else empty.
+ * @throws Never.
+ */
 function fallbackRisk(opinion: ExpertOpinion): string[] {
   if (opinion.citations.length === 0) return [`${opinion.title}: no expert-specific evidence was retrieved.`];
   return [];
 }
 
+/**
+ * Build the per-expert approval checklist: three base items plus one mode-specific
+ * item (rollback, abuse scenarios, approval authority, or corrective action).
+ * @param opinion Opinion the checklist belongs to.
+ * @param reviewMode Review mode selecting the extra item.
+ * @returns Checklist item strings, base items first.
+ * @throws Never.
+ */
 function approvalChecklistForOpinion(opinion: ExpertOpinion, reviewMode: ExpertReviewMode): string[] {
   const base = [
     `${opinion.title}: evidence reviewed`,
@@ -563,6 +780,15 @@ function approvalChecklistForOpinion(opinion: ExpertOpinion, reviewMode: ExpertR
   return base;
 }
 
+/**
+ * Extract answer lines matching any keyword, case-insensitively: text is split on
+ * newlines and sentence boundaries (`.`/`;`), list markers are stripped, duplicates
+ * removed, and results capped at 5.
+ * @param text Answer text to scan.
+ * @param keywords Lowercase substrings to match against each line.
+ * @returns Up to 5 unique matching lines.
+ * @throws Never.
+ */
 function extractLines(text: string, keywords: string[]): string[] {
   const lines = text.split(/\r?\n|[.;]/)
     .map(line => line.replace(/^[-*\d.)\s]+/, "").trim())
@@ -571,6 +797,14 @@ function extractLines(text: string, keywords: string[]): string[] {
   return unique(matches).slice(0, 5);
 }
 
+/**
+ * Derive the review lifecycle status from expert verdicts, worst verdict first: any
+ * "block" → rejected, any "needs_more_evidence" → needs_changes, any
+ * "approve_with_changes" → under_review, else approved.
+ * @param experts Structured opinions to summarize.
+ * @returns The derived status.
+ * @throws Never.
+ */
 function reviewStatus(experts: StructuredExpertOpinion[]): ExpertReviewStatus {
   if (experts.some(expert => expert.recommendation === "block")) return "rejected";
   if (experts.some(expert => expert.recommendation === "needs_more_evidence")) return "needs_changes";
@@ -578,12 +812,26 @@ function reviewStatus(experts: StructuredExpertOpinion[]): ExpertReviewStatus {
   return "approved";
 }
 
+/**
+ * One-line consensus summary: unanimous when all recommendations match, otherwise a
+ * mixed-recommendations listing.
+ * @param experts Structured opinions to summarize.
+ * @returns A single consensus line.
+ * @throws Never.
+ */
 function consensusForExperts(experts: StructuredExpertOpinion[]): string[] {
   const recommendations = unique(experts.map(expert => expert.recommendation));
   if (recommendations.length === 1) return [`All selected experts returned recommendation: ${recommendations[0]}.`];
   return [`Experts returned mixed recommendations: ${recommendations.join(", ")}.`];
 }
 
+/**
+ * Group expert ids by recommendation; empty when all experts agree.
+ * @param experts Structured opinions to compare.
+ * @returns One "recommendation: ids" line per distinct recommendation, in first-seen
+ *          order; empty when unanimous.
+ * @throws Never.
+ */
 function disagreementsForExperts(experts: StructuredExpertOpinion[]): string[] {
   const byRecommendation = new Map<ExpertRecommendation, string[]>();
   for (const expert of experts) {
@@ -593,6 +841,14 @@ function disagreementsForExperts(experts: StructuredExpertOpinion[]): string[] {
   return [...byRecommendation.entries()].map(([recommendation, expertIds]) => `${recommendation}: ${expertIds.join(", ")}`);
 }
 
+/**
+ * Flatten every expert's risk lines into one register: severity derived from the
+ * expert's recommendation (block → high, needs_more_evidence → medium, else low) and
+ * the expert's first mitigation attached when present.
+ * @param experts Structured opinions to harvest.
+ * @returns Register items in expert order, risks in extraction order.
+ * @throws Never.
+ */
 function riskRegisterForExperts(experts: StructuredExpertOpinion[]): ExpertReviewRecord["riskRegister"] {
   return experts.flatMap(expert => expert.risks.map((risk, index) => ({
     id: stableId(`${expert.expertId}:${index}:${risk}`),
@@ -603,29 +859,73 @@ function riskRegisterForExperts(experts: StructuredExpertOpinion[]): ExpertRevie
   })));
 }
 
+/**
+ * Trim strings, drop empties, and deduplicate preserving first-occurrence order.
+ * @param values Values to normalize.
+ * @returns Unique non-empty trimmed values.
+ * @throws Never.
+ */
 function unique(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Derive a stable short identifier from arbitrary text.
+ * @param input Text to hash.
+ * @returns First 16 hex characters of the SHA-256 digest.
+ * @throws Never.
+ */
 function stableId(input: string): string {
   return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
+/**
+ * Create the durable review store: the host's namespaced store when available, else an
+ * in-memory fallback (non-durable, process-local).
+ * @param services Host machine.
+ * @returns A store of review records.
+ * @throws Never.
+ */
 function createReviewStore(services: MatbotMachine): Store<ExpertReviewRecord> {
   return services.createStore?.<ExpertReviewRecord>("expert_panel_reviews") ?? new MemoryReviewStore();
 }
 
+/**
+ * In-memory fallback {@link Store} for review records, used when the host offers no
+ * `createStore`. Data is process-local and lost on restart; queries run against the
+ * full record set.
+ */
 class MemoryReviewStore implements Store<ExpertReviewRecord> {
   private readonly docs = new Map<string, ExpertReviewRecord>();
 
+  /**
+   * Retrieve a review by id.
+   * @param id Document identifier.
+   * @returns The record, or null when absent.
+   * @throws Never.
+   */
   async get(id: string): Promise<ExpertReviewRecord | null> {
     return this.docs.get(id) ?? null;
   }
 
+  /**
+   * Insert or replace a review record.
+   * @param id Document identifier.
+   * @param value Full record to store.
+   * @throws Never.
+   */
   async set(id: string, value: ExpertReviewRecord): Promise<void> {
     this.docs.set(id, value);
   }
 
+  /**
+   * Filter, sort, and limit the stored records in memory. Each sort key is applied in
+   * reverse so the first key dominates; comparisons are string-based via
+   * `localeCompare`, with missing fields treated as empty strings.
+   * @param query Optional filter/sort/limit.
+   * @returns Matching records plus `total` counted before the limit is applied.
+   * @throws Never.
+   */
   async query(query?: StoreQuery): Promise<{ items: ExpertReviewRecord[]; total: number }> {
     let items = [...this.docs.values()];
     if (query?.where !== undefined) items = items.filter(item => matchesFilter(item, query.where!));
@@ -645,12 +945,27 @@ class MemoryReviewStore implements Store<ExpertReviewRecord> {
   }
 }
 
+/**
+ * Evaluate a filter tree against a record: equality leaves compare strictly, "and"
+ * clauses are all-required, "or" clauses any-required.
+ * @param item Record to test.
+ * @param filter Filter tree.
+ * @returns True when the record matches.
+ * @throws Never.
+ */
 function matchesFilter(item: unknown, filter: StoreFilter): boolean {
   if (filter.op === "eq") return fieldValue(item, filter.field) === filter.value;
   if (filter.op === "and") return filter.clauses.every(clause => matchesFilter(item, clause));
   return filter.clauses.some(clause => matchesFilter(item, clause));
 }
 
+/**
+ * Resolve a field path against a nested object.
+ * @param item Object to traverse.
+ * @param field Field path; a string is a single segment, an array successive segments.
+ * @returns The value at the path, or undefined when traversal leaves an object.
+ * @throws Never.
+ */
 function fieldValue(item: unknown, field: string | string[]): unknown {
   const parts = Array.isArray(field) ? field : [field];
   let value = item;

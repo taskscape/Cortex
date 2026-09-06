@@ -64,6 +64,13 @@ export function makeKnowledgeEntry(input: EntryInput): KnowledgeEntry {
   return entry;
 }
 
+/**
+ * Derive a one-line summary: whitespace collapsed and capped at 240 characters with a
+ * trailing "..." (237 content characters) when longer.
+ * @param content Entry content to summarize.
+ * @returns The summary line.
+ * @throws Never.
+ */
 function summarize(content: string): string {
   const singleLine = content.replace(/\s+/g, " ").trim();
   return singleLine.length <= 240 ? singleLine : `${singleLine.slice(0, 237)}...`;

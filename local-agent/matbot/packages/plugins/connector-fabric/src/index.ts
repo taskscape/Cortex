@@ -399,19 +399,52 @@ const AUDIT_STORE = 'connector_audit_events';
 
 const SYSTEM_PRINCIPAL: Principal = { id: 'system', type: 'system' };
 
+/**
+ * Current wall-clock time as an ISO-8601 UTC timestamp.
+ *
+ * @returns The timestamp, e.g. `2026-01-01T00:00:00.000Z`.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Derives a deterministic, collision-resistant id from ordered identity parts.
+ *
+ * The parts are NUL-joined, SHA-256 hashed, and truncated to 32 hex characters, so equal
+ * parts always yield the same id.
+ *
+ * @param prefix - Id namespace, used verbatim before the colon.
+ * @param parts - Ordered identity parts; their order determines the id.
+ * @returns `${prefix}:<32 hex chars>`.
+ * @throws Never.
+ */
 function hashId(prefix: string, parts: readonly string[]): string {
   const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
   return `${prefix}:${hash}`;
 }
 
+/**
+ * SHA-256 hash of the canonical JSON encoding of a value, used for audit input/result hashes.
+ *
+ * @param value - JSON-safe value to hash (typically tool-call input or a redacted result).
+ * @returns Full-length hex digest.
+ * @throws TypeError - If `value` is not string-encodable JSON (e.g. top-level `undefined`).
+ * @throws RangeError - If `value` contains a reference cycle (see {@link canonicalJson}).
+ */
 function hashPayload(value: unknown): string {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
+/**
+ * Serializes a value to JSON with object keys sorted recursively, so structurally equal
+ * values always produce identical text regardless of key insertion order.
+ *
+ * @param value - JSON-safe value; `undefined` serializes to `undefined` (not a string).
+ * @returns Canonical JSON text.
+ * @throws RangeError - If `value` contains a reference cycle (there is no recursion guard).
+ */
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`;
@@ -419,22 +452,53 @@ function canonicalJson(value: unknown): string {
   return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
 }
 
+/**
+ * Trims, drops empties, and de-duplicates string values.
+ *
+ * @param values - Raw values; may contain duplicates and surrounding whitespace.
+ * @returns Unique, trimmed, non-empty values in first-occurrence order.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Whether an expiry timestamp has passed.
+ *
+ * @param expiresAt - ISO timestamp; `undefined` means the grant never expires.
+ * @param at - Reference time in epoch milliseconds; defaults to now.
+ * @returns `true` when `expiresAt` parses to a finite time at or before `at`.
+ * @throws Never.
+ */
 function isExpired(expiresAt: string | undefined, at = Date.now()): boolean {
   if (expiresAt === undefined) return false;
   const time = Date.parse(expiresAt);
   return Number.isFinite(time) && time <= at;
 }
 
+/**
+ * Reads a non-blank string action field from a tool-call input object.
+ *
+ * @param input - Raw tool-call input; non-object inputs yield `undefined`.
+ * @param field - Field name to read; defaults to `'action'`.
+ * @returns The action string, or `undefined` when the field is absent, blank, or not a string.
+ * @throws Never.
+ */
 function actionFromInput(input: unknown, field = 'action'): string | undefined {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const value = (input as Record<string, unknown>)[field];
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+/**
+ * Extracts a workflow run id from tool-call input, from the top-level `workflowRunId`
+ * field or, failing that, from `workflow.runId`.
+ *
+ * @param input - Raw tool-call input; non-object inputs yield `undefined`.
+ * @returns The first non-blank run id found, or `undefined`.
+ * @throws Never.
+ */
 function workflowRunIdFromInput(input: unknown): string | undefined {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const record = input as Record<string, unknown>;
@@ -447,6 +511,16 @@ function workflowRunIdFromInput(input: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Resolves the capability a call requires: the action's mapped capability when the input's
+ * action field names an entry in the binding's `actionCapabilities`, otherwise the binding's
+ * base capability.
+ *
+ * @param binding - Binding whose capability mapping applies.
+ * @param input - Raw tool-call input, read at the binding's `inputActionField` (default `'action'`).
+ * @returns The effective capability, plus the action name when one is present.
+ * @throws Never.
+ */
 function resolveCapability(binding: ConnectorToolBinding, input: unknown): { capability: ConnectorCapability; action?: string } {
   const action = actionFromInput(input, binding.inputActionField ?? 'action');
   const mapped = action !== undefined ? binding.actionCapabilities?.[action] : undefined;
@@ -456,6 +530,18 @@ function resolveCapability(binding: ConnectorToolBinding, input: unknown): { cap
   };
 }
 
+/**
+ * Whether a grant's tool pattern covers a tool name and optional action.
+ *
+ * Pattern forms: `*` (everything), an exact tool name, `tool:action` (that action only),
+ * or a trailing `*` as a prefix wildcard.
+ *
+ * @param pattern - Pattern from a grant's allowed/denied tool list.
+ * @param toolName - Registered tool name.
+ * @param action - Action within the tool, when known.
+ * @returns `true` when the pattern covers the tool/action pair.
+ * @throws Never.
+ */
 function toolMatchesPattern(pattern: string, toolName: string, action?: string): boolean {
   if (pattern === '*') return true;
   if (pattern === toolName) return true;
@@ -464,41 +550,123 @@ function toolMatchesPattern(pattern: string, toolName: string, action?: string):
   return false;
 }
 
+/**
+ * Whether a grant applies to a principal. The wildcard principal `'*'` matches any principal.
+ *
+ * @param grant - Grant to test.
+ * @param principal - Effective call principal.
+ * @returns `true` when the grant's principal id equals the principal's id or is `'*'`.
+ * @throws Never.
+ */
 function grantMatchesPrincipal(grant: ConnectorGrant, principal: Principal): boolean {
   return grant.principalId === principal.id || grant.principalId === '*';
 }
 
+/**
+ * Whether the grant's `deniedTools` patterns cover the tool. Checked before allow lists,
+ * so a denial wins over any matching allow pattern.
+ *
+ * @param grant - Grant to test.
+ * @param toolName - Registered tool name.
+ * @param action - Action within the tool, when known.
+ * @returns `true` when any deny pattern matches.
+ * @throws Never.
+ */
 function grantDeniesTool(grant: ConnectorGrant, toolName: string, action?: string): boolean {
   return grant.deniedTools.some(pattern => toolMatchesPattern(pattern, toolName, action));
 }
 
+/**
+ * Whether the grant's `allowedTools` patterns cover the tool.
+ *
+ * @param grant - Grant to test.
+ * @param toolName - Registered tool name.
+ * @param action - Action within the tool, when known.
+ * @returns `true` when any allow pattern matches.
+ * @throws Never.
+ */
 function grantAllowsTool(grant: ConnectorGrant, toolName: string, action?: string): boolean {
   return grant.allowedTools.some(pattern => toolMatchesPattern(pattern, toolName, action));
 }
 
+/**
+ * Whether the grant's scopes satisfy every required scope. The wildcard scope `'*'`
+ * covers all scopes.
+ *
+ * @param grant - Grant to test.
+ * @param requiredScopes - Scopes the call requires; every one must be held.
+ * @returns `true` when the grant holds every required scope.
+ * @throws Never.
+ */
 function grantAllowsScopes(grant: ConnectorGrant, requiredScopes: readonly string[]): boolean {
   if (grant.scopes.includes('*')) return true;
   return requiredScopes.every(scope => grant.scopes.includes(scope));
 }
 
+/**
+ * Whether the grant permits a call gated behind an approval policy. Calls without a policy
+ * are always permitted; the wildcard rule `'*'` covers every policy.
+ *
+ * @param grant - Grant to test.
+ * @param approvalPolicyId - Policy gating the call, or `undefined` when ungated.
+ * @returns `true` when the call may proceed.
+ * @throws Never.
+ */
 function grantAllowsApproval(grant: ConnectorGrant, approvalPolicyId: string | undefined): boolean {
   if (approvalPolicyId === undefined) return true;
   return grant.approvalRules.includes('*') || grant.approvalRules.includes(approvalPolicyId);
 }
 
+/**
+ * Scopes a call requires: the effective capability itself plus the binding's extra
+ * `requiredScopes`, de-duplicated.
+ *
+ * @param binding - Binding governing the tool.
+ * @param capability - Effective capability of the call.
+ * @returns Required scope names.
+ * @throws Never.
+ */
 function requiredScopesFor(binding: ConnectorToolBinding, capability: ConnectorCapability): string[] {
   return uniq([capability, ...(binding.requiredScopes ?? [])]);
 }
 
+/**
+ * Resolves the principal a policy decision attributes a call to: the explicit principal
+ * when given, otherwise the ambient principal if one is established, otherwise the
+ * `'system'` principal. Unlike the ambient carrier's `currentPrincipal`, never throws
+ * outside a principal scope.
+ *
+ * @param principal - Explicit principal carried by the call, if any.
+ * @returns The effective principal; never `undefined`.
+ * @throws Never.
+ */
 function effectivePrincipal(principal?: Principal): Principal {
   return principal ?? tryCurrentPrincipal() ?? SYSTEM_PRINCIPAL;
 }
 
+/**
+ * Runs a store query and returns just the matching records.
+ *
+ * @typeParam T - Record type; must carry `id` and `version`.
+ * @param store - Store to query.
+ * @param query - Optional filter/sort/paging query; omitted means match all.
+ * @returns Matching records in store order.
+ * @throws Error - When the store query fails.
+ */
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   const result = await store.query(query ?? {});
   return result.items;
 }
 
+/**
+ * Queries a connector-scoped store, optionally restricted to one connector instance.
+ *
+ * @typeParam T - Record type; must carry `id`, `version`, and `connectorInstanceId`.
+ * @param store - Store to query.
+ * @param connectorInstanceId - Instance to filter on; `undefined` matches all instances.
+ * @returns Matching records.
+ * @throws Error - When the store query fails.
+ */
 async function queryByConnector<T extends { id: string; version: string; connectorInstanceId: string }>(
   store: Store<T>,
   connectorInstanceId?: string,
@@ -507,6 +675,16 @@ async function queryByConnector<T extends { id: string; version: string; connect
   return queryAll(store, { where: { op: 'eq', field: 'connectorInstanceId', value: connectorInstanceId } });
 }
 
+/**
+ * Recursively collects `sourceId` / `sourceIds` values from a nested value, walking arrays
+ * and object properties to a bounded depth with a bounded result size.
+ *
+ * @param value - Value to walk (typically a redacted tool result).
+ * @param out - Set to accumulate into; a fresh set when omitted.
+ * @param depth - Current recursion depth; callers normally omit it.
+ * @returns The accumulated set of source ids.
+ * @throws Never.
+ */
 function collectSourceIds(value: unknown, out = new Set<string>(), depth = 0): Set<string> {
   if (depth > 8 || out.size >= 100) return out;
   if (value === null || typeof value !== 'object') return out;
@@ -527,6 +705,17 @@ function collectSourceIds(value: unknown, out = new Set<string>(), depth = 0): S
   return out;
 }
 
+/**
+ * Recursively replaces values of object fields whose names match one of the given field
+ * names (case-insensitively) with `'[redacted]'`, to a bounded depth. Arrays are traversed;
+ * non-object leaves pass through unchanged.
+ *
+ * @param value - Value to redact (typically a tool result).
+ * @param fieldNames - Field names whose values must be redacted; empty means no redaction.
+ * @param depth - Current recursion depth; callers normally omit it.
+ * @returns A structurally copied value with matching fields redacted.
+ * @throws Never.
+ */
 function redactDeep(value: unknown, fieldNames: readonly string[], depth = 0): unknown {
   if (depth > 8 || fieldNames.length === 0) return value;
   if (value === null || typeof value !== 'object') return value;
@@ -539,6 +728,12 @@ function redactDeep(value: unknown, fieldNames: readonly string[], depth = 0): u
   return out;
 }
 
+/**
+ * {@link ConnectorRegistry} implementation backed by seven dedicated stores, one per record
+ * kind. Every upsert consults the existing record to preserve omitted fields and `createdAt`,
+ * and mints a fresh random `version` on write; reads and queries delegate straight to the
+ * stores.
+ */
 class StoreBackedConnectorRegistry implements ConnectorRegistry {
   private readonly definitions: Store<ConnectorDefinition>;
   private readonly instances: Store<ConnectorInstance>;
@@ -548,6 +743,18 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
   private readonly health: Store<ConnectorHealthEvent>;
   private readonly audit: Store<ConnectorAuditEvent>;
 
+  /**
+   * Captures the pre-created stores; no I/O occurs at construction.
+   *
+   * @param definitions - Store for {@link ConnectorDefinition} records.
+   * @param instances - Store for {@link ConnectorInstance} records.
+   * @param grants - Store for {@link ConnectorGrant} records.
+   * @param bindings - Store for {@link ConnectorToolBinding} records.
+   * @param cursors - Store for {@link ConnectorSyncCursor} records.
+   * @param health - Store for {@link ConnectorHealthEvent} records.
+   * @param audit - Store for {@link ConnectorAuditEvent} records.
+   * @throws Never.
+   */
   constructor(
     definitions: Store<ConnectorDefinition>,
     instances: Store<ConnectorInstance>,
@@ -566,22 +773,65 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     this.audit = audit;
   }
 
+  /**
+   * Deterministic store id for a definition of the given type.
+   *
+   * @param type - Connector type.
+   * @returns `connector-definition:<type>`.
+   * @throws Never.
+   */
   stableConnectorDefinitionId(type: string): string {
     return `connector-definition:${type}`;
   }
 
+  /**
+   * Hash-derived stable id for the instance identified by workspace, type, and display name.
+   *
+   * @param workspaceId - Owning workspace.
+   * @param type - Connector type.
+   * @param displayName - Instance display name.
+   * @returns `connector-instance:<32 hex chars>`.
+   * @throws Never.
+   */
   stableConnectorInstanceId(workspaceId: string, type: string, displayName: string): string {
     return hashId('connector-instance', [workspaceId, type, displayName]);
   }
 
+  /**
+   * Hash-derived stable id for the grant of a principal on an instance. Wildcard and
+   * effective-user variants derive distinct ids.
+   *
+   * @param connectorInstanceId - Target connector instance.
+   * @param principalId - Granted principal, or `'*'` for all principals.
+   * @param effectiveUserId - Optional on-behalf-of user; omitted means none.
+   * @returns `connector-grant:<32 hex chars>`.
+   * @throws Never.
+   */
   stableConnectorGrantId(connectorInstanceId: string, principalId: string, effectiveUserId?: string): string {
     return hashId('connector-grant', [connectorInstanceId, principalId, effectiveUserId ?? '']);
   }
 
+  /**
+   * Hash-derived stable id for the binding identified by instance plus tool name/prefix.
+   *
+   * @param input - Binding identity fields; unset tool name/prefix hash as empty strings.
+   * @returns `connector-tool-binding:<32 hex chars>`.
+   * @throws Never.
+   */
   stableConnectorToolBindingId(input: Pick<ConnectorToolBindingInput, 'connectorInstanceId' | 'toolName' | 'toolNamePrefix'>): string {
     return hashId('connector-tool-binding', [input.connectorInstanceId, input.toolName ?? '', input.toolNamePrefix ?? '']);
   }
 
+  /**
+   * Creates or updates a definition, deriving its id from the input or the stable-id
+   * derivation. Omitted optional fields keep the existing record's values (new-record
+   * defaults: `capabilities` `['read']`, no description); `createdAt` is preserved on
+   * update and a fresh random `version` is minted.
+   *
+   * @param input - Field values.
+   * @returns The stored definition.
+   * @throws Error - When the definition store read or write fails.
+   */
   async upsertDefinition(input: ConnectorDefinitionInput): Promise<ConnectorDefinition> {
     const id = input.id ?? this.stableConnectorDefinitionId(input.type);
     const existing = await this.definitions.get(id);
@@ -602,6 +852,16 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return definition;
   }
 
+  /**
+   * Creates or updates an instance, deriving its id from the input or the stable-id
+   * derivation. Omitted optional fields keep the existing record's values (new-record
+   * defaults: owner `'system'`, auth mode `'none'`, read enabled, write disabled, health
+   * `'unknown'`); `createdAt` is preserved and a fresh random `version` is minted.
+   *
+   * @param input - Field values.
+   * @returns The stored instance.
+   * @throws Error - When the instance store read or write fails.
+   */
   async upsertInstance(input: ConnectorInstanceInput): Promise<ConnectorInstance> {
     const id = input.id ?? this.stableConnectorInstanceId(input.workspaceId, input.type, input.displayName);
     const existing = await this.instances.get(id);
@@ -630,6 +890,15 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return instance;
   }
 
+  /**
+   * Creates or updates a grant, deriving its id from the input or the stable-id derivation.
+   * Omitted optional fields keep the existing record's values (empty lists for new grants);
+   * `createdAt` is preserved and a fresh random `version` is minted.
+   *
+   * @param input - Field values.
+   * @returns The stored grant.
+   * @throws Error - When the grant store read or write fails.
+   */
   async upsertGrant(input: ConnectorGrantInput): Promise<ConnectorGrant> {
     const id = input.id ?? this.stableConnectorGrantId(input.connectorInstanceId, input.principalId, input.effectiveUserId);
     const existing = await this.grants.get(id);
@@ -653,6 +922,17 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return grant;
   }
 
+  /**
+   * Creates or updates a tool binding, deriving its id from the input or the stable-id
+   * derivation. Omitted optional fields keep the existing record's values (default
+   * sensitivity `'internal'`); `createdAt` is preserved and a fresh random `version` is
+   * minted.
+   *
+   * @param input - Field values; must yield `toolName` or `toolNamePrefix` after merging.
+   * @returns The stored binding.
+   * @throws Error - When neither `toolName` nor `toolNamePrefix` is set.
+   * @throws Error - When the binding store read or write fails.
+   */
   async upsertToolBinding(input: ConnectorToolBindingInput): Promise<ConnectorToolBinding> {
     const id = input.id ?? this.stableConnectorToolBindingId(input);
     const existing = await this.bindings.get(id);
@@ -682,6 +962,15 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return binding;
   }
 
+  /**
+   * Creates or updates a sync cursor, deriving its id from the instance, cursor kind, and
+   * partition key. No existing record is consulted: the cursor value is replaced wholesale
+   * and `updatedAt` is set to now.
+   *
+   * @param input - Cursor fields.
+   * @returns The stored cursor.
+   * @throws Error - When the cursor store write fails.
+   */
   async upsertSyncCursor(input: ConnectorSyncCursorInput): Promise<ConnectorSyncCursor> {
     const id = input.id ?? hashId('connector-sync-cursor', [
       input.connectorInstanceId,
@@ -701,22 +990,58 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return cursor;
   }
 
+  /**
+   * Fetches a definition by id.
+   *
+   * @param id - Record id.
+   * @returns The definition, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getDefinition(id: string): Promise<ConnectorDefinition | null> {
     return this.definitions.get(id);
   }
 
+  /**
+   * Fetches an instance by id.
+   *
+   * @param id - Record id.
+   * @returns The instance, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getInstance(id: string): Promise<ConnectorInstance | null> {
     return this.instances.get(id);
   }
 
+  /**
+   * Fetches a grant by id.
+   *
+   * @param id - Record id.
+   * @returns The grant, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getGrant(id: string): Promise<ConnectorGrant | null> {
     return this.grants.get(id);
   }
 
+  /**
+   * Fetches a tool binding by id.
+   *
+   * @param id - Record id.
+   * @returns The binding, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getToolBinding(id: string): Promise<ConnectorToolBinding | null> {
     return this.bindings.get(id);
   }
 
+  /**
+   * Resolves the binding governing a tool: exact `toolName` matches win; otherwise the
+   * longest `toolNamePrefix` that the tool name starts with.
+   *
+   * @param toolName - Registered tool name.
+   * @returns The best-matching binding, or `null` when the tool is not connector-bound.
+   * @throws Error - When the binding query fails.
+   */
   async getBindingForTool(toolName: string): Promise<ConnectorToolBinding | null> {
     const bindings = await this.queryToolBindings();
     const exact = bindings.find(binding => binding.toolName === toolName);
@@ -727,26 +1052,70 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return prefixes[0] ?? null;
   }
 
+  /**
+   * Queries stored definitions.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   queryDefinitions(query?: StoreQuery): Promise<ConnectorDefinition[]> {
     return queryAll(this.definitions, query);
   }
 
+  /**
+   * Queries stored instances.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   queryInstances(query?: StoreQuery): Promise<ConnectorInstance[]> {
     return queryAll(this.instances, query);
   }
 
+  /**
+   * Queries stored grants.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   queryGrants(query?: StoreQuery): Promise<ConnectorGrant[]> {
     return queryAll(this.grants, query);
   }
 
+  /**
+   * Queries stored tool bindings.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   queryToolBindings(query?: StoreQuery): Promise<ConnectorToolBinding[]> {
     return queryAll(this.bindings, query);
   }
 
+  /**
+   * Queries stored sync cursors.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   querySyncCursors(query?: StoreQuery): Promise<ConnectorSyncCursor[]> {
     return queryAll(this.cursors, query);
   }
 
+  /**
+   * Records a health event and, when the instance exists, updates its current health state
+   * (plain overwrite: fresh `version`, `updatedAt` set to now). When the instance is absent
+   * only the event is stored.
+   *
+   * @param input - Health observation; `checkedAt` defaults to now.
+   * @returns The persisted event, with a fresh random id and version.
+   * @throws Error - When the instance or health store write fails.
+   */
   async recordHealth(input: ConnectorHealthInput): Promise<ConnectorHealthEvent> {
     const instance = await this.instances.get(input.connectorInstanceId);
     if (instance !== null) {
@@ -770,10 +1139,25 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return event;
   }
 
+  /**
+   * Lists recorded health events, optionally restricted to one instance.
+   *
+   * @param connectorInstanceId - Instance to filter on; `undefined` matches all instances.
+   * @returns Matching events.
+   * @throws Error - When the store query fails.
+   */
   healthEvents(connectorInstanceId?: string): Promise<ConnectorHealthEvent[]> {
     return queryByConnector(this.health, connectorInstanceId);
   }
 
+  /**
+   * Appends an immutable audit event for a connector tool call. Source ids are trimmed and
+   * de-duplicated; unset optional fields are omitted from the record.
+   *
+   * @param input - Audit observation; `timestamp` defaults to now.
+   * @returns The persisted event, with a fresh random id and version.
+   * @throws Error - When the audit store write fails.
+   */
   async recordAudit(input: ConnectorAuditInput): Promise<ConnectorAuditEvent> {
     const event: ConnectorAuditEvent = {
       id: randomUUID(),
@@ -804,10 +1188,30 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
     return event;
   }
 
+  /**
+   * Queries stored audit events.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching events.
+   * @throws Error - When the store query fails.
+   */
   auditEvents(query?: StoreQuery): Promise<ConnectorAuditEvent[]> {
     return queryAll(this.audit, query);
   }
 
+  /**
+   * Evaluates whether a tool call may proceed. Unbound tools are allowed with `bound: false`.
+   * For bound tools it checks, in order: the instance exists, the connector is not down, the
+   * instance's read/write flags cover the effective capability, and an unexpired grant for
+   * the principal exists that does not deny, and does allow, the tool/action with the
+   * required scopes and approval policy. The principal falls back to the ambient principal,
+   * then to `'system'`.
+   *
+   * @param input - Tool name, raw call input, and optional explicit principal.
+   * @returns The decision; `binding`, `connectorInstance`, and `grant` are set when bound,
+   *   and `reason` explains any denial.
+   * @throws Error - When the binding, instance, or grant queries fail.
+   */
   async evaluateToolCall(input: ConnectorPolicyInput): Promise<ConnectorPolicyDecision> {
     const principal = effectivePrincipal(input.principal);
     const binding = await this.getBindingForTool(input.toolName);
@@ -886,6 +1290,10 @@ class StoreBackedConnectorRegistry implements ConnectorRegistry {
   }
 }
 
+/**
+ * Parsed input shape accepted by the `connector_action` tool; fields beyond `action` are
+ * consumed by the matching action (see {@link createConnectorActionTool}).
+ */
 interface ConnectorActionInput {
   action: string;
   id?: string;
@@ -899,6 +1307,17 @@ interface ConnectorActionInput {
   message?: string;
 }
 
+/**
+ * Builds the `connector_action` admin tool over a registry: list/get of definitions,
+ * instances, grants, and bindings, grant and sync-cursor writes, health listing and
+ * synthetic health tests, and audit listing. Validation failures, unknown actions, and
+ * registry errors are reported as `error` events rather than thrown.
+ *
+ * @param registry - Registry the tool operates on.
+ * @param services - Machine used to resolve registered tools for the `test_health` action.
+ * @returns The tool definition.
+ * @throws Never.
+ */
 function createConnectorActionTool(registry: ConnectorRegistry, services: MatbotMachine): Tool {
   return {
     name: 'connector_action',
@@ -1015,6 +1434,15 @@ function createConnectorActionTool(registry: ConnectorRegistry, services: Matbot
   };
 }
 
+/**
+ * Writes a `denied` audit event for a connector-bound call rejected by policy. No-op when
+ * the decision lacks a resolved instance, binding, or capability.
+ *
+ * @param registry - Registry the audit event is written to.
+ * @param ctx - Tool-call hook context; supplies tool identity, input hash, trace id, and provider.
+ * @param decision - Denying decision from {@link ConnectorRegistry.evaluateToolCall}.
+ * @throws Error - When the audit write fails.
+ */
 async function auditDeniedToolCall(registry: ConnectorRegistry, ctx: ToolCallContext, decision: ConnectorPolicyDecision): Promise<void> {
   const instance = decision.connectorInstance;
   const binding = decision.binding;
@@ -1041,6 +1469,19 @@ async function auditDeniedToolCall(registry: ConnectorRegistry, ctx: ToolCallCon
   });
 }
 
+/**
+ * Audits an executed connector-bound tool call and returns the result to hand downstream.
+ * Sensitive fields from the binding and the allowing grant are redacted before hashing and
+ * before the result is returned; source ids are harvested from the redacted result. The
+ * status is `error` for failed calls, `allowed` otherwise. No-op (the result is returned
+ * unchanged) when the decision lacks a resolved instance, binding, or capability.
+ *
+ * @param registry - Registry the audit event is written to.
+ * @param ctx - Tool-result hook context; supplies the result, duration, trace id, and provider.
+ * @param decision - Allowing decision from {@link ConnectorRegistry.evaluateToolCall}.
+ * @returns The redacted result, or the original result when the call is not audited.
+ * @throws Error - When the audit write or payload hashing fails.
+ */
 async function auditToolResult(registry: ConnectorRegistry, ctx: ToolResultContext, decision: ConnectorPolicyDecision): Promise<unknown> {
   const instance = decision.connectorInstance;
   const binding = decision.binding;
@@ -1073,6 +1514,17 @@ async function auditToolResult(registry: ConnectorRegistry, ctx: ToolResultConte
   return result;
 }
 
+/**
+ * Installs `toolcall` and `toolresult` hooks (priority 20) that enforce connector grants
+ * and write audit events for connector-bound tools. Denied calls are audited, reported to
+ * the Observability service when a trace id is present, and rejected; allowed results are
+ * redacted and audited. Observability failures are logged, never propagated; hook handlers
+ * report rejections via their return value, not by throwing.
+ *
+ * @param registry - Registry used for policy evaluation and audit writes.
+ * @param services - Machine providing hook registration and the optional Observability service.
+ * @throws Never.
+ */
 function registerPolicyHooks(registry: ConnectorRegistry, services: MatbotMachine): void {
   services.hooks.register({
     on: 'toolcall',
@@ -1141,6 +1593,16 @@ function registerPolicyHooks(registry: ConnectorRegistry, services: MatbotMachin
   });
 }
 
+/**
+ * Seeds the built-in connector fabric: eight definitions (source registry, workspace RAG,
+ * file broker, MCP, read-only Postgres, workflow governance, context graph, evaluation and
+ * observability), their `local`-workspace instances, ten tool bindings for the built-in
+ * connector tools, and permissive wildcard grants. Idempotent: every record upserts by
+ * stable id, so reseeding preserves `createdAt` and refreshes `updatedAt`.
+ *
+ * @param registry - Registry to seed.
+ * @throws Error - When any seed record fails to persist.
+ */
 async function seedDefaultConnectors(registry: ConnectorRegistry): Promise<void> {
   const definitions = [
     {
@@ -1528,6 +1990,13 @@ export const plugin: MatbotPluginSpec = {
   manifest: {
     description: 'Registers ConnectorRegistry, connector_action, connector grant enforcement, and connector audit hooks.',
   },
+  /**
+   * Plugin entry point: creates and seeds the registry, then registers the
+   * `ConnectorRegistry` service, the `connector_action` tool, and the policy hooks.
+   *
+   * @param services - Machine to register into.
+   * @throws Error - When seeding or registration fails.
+   */
   async setup(services: MatbotMachine) {
     const registry = createConnectorRegistry(services);
     await seedDefaultConnectors(registry);

@@ -165,3 +165,86 @@ test("skills-node watcher creates a missing skills dir at startup", async () => 
 
   assert.ok(existsSync(dir), "watcher should mkdir -p the skill dir at startup");
 });
+
+const fileFs = await import('node:fs/promises').then(m => m.default);
+const { syncBuiltinESMExports } = await import('node:module');
+const { FilesystemFileStore } = await import('../local-agent/matbot/packages/plugins/files/src/store.ts');
+async function readHandle(handle) {
+  const chunks = []; for await (const chunk of handle.stream()) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+for (const phase of ['stream', 'blob-rename', 'manifest-write', 'manifest-rename']) {
+  test(`REL-03 failed ${phase} preserves contents and metadata across restart`, async t => {
+    const root = await fileFs.mkdtemp(join(tmpdir(), 'cortex-file-transaction-'));
+    t.after(() => fileFs.rm(root, { recursive: true, force: true }));
+    const store = new FilesystemFileStore(root);
+    const before = await store.put('report.txt', 'text/plain', streamOf([Buffer.from('old')]), { allowed: true, namespace: 'workspace' });
+    const rename = fileFs.rename, write = fileFs.writeFile;
+    fileFs.rename = async (from, to) => {
+      if ((phase === 'blob-rename' && String(to).endsWith('.blob')) || (phase === 'manifest-rename' && String(to).endsWith('.meta.json'))) throw new Error('injected rename failure');
+      return rename(from, to);
+    };
+    fileFs.writeFile = async (file, ...args) => {
+      if (phase === 'manifest-write' && String(file).includes('.meta.json.')) throw new Error('injected metadata write failure');
+      return write(file, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      async function* data() { yield Buffer.from('new'); if (phase === 'stream') throw new Error('injected stream failure'); }
+      await assert.rejects(store.put('report.txt', 'application/json', data(), { allowed: false }), /injected/);
+    } finally { fileFs.rename = rename; fileFs.writeFile = write; syncBuiltinESMExports(); }
+    const after = await new FilesystemFileStore(root).get('report.txt');
+    assert.equal(await readHandle(after), 'old'); assert.equal(after.mimeType, 'text/plain'); assert.equal(after.allowed, true);
+    assert.equal(after.version, before.version);
+    assert.equal((await fileFs.readdir(join(root, '.cortex-versions'))).length, 1, 'failed writes leave no version or temporary blob');
+  });
+}
+
+test('REL-03 manifests publish consistent versions, preserve names, and serialize put/delete across instances', async t => {
+  const root = await fileFs.mkdtemp(join(tmpdir(), 'cortex-file-versions-'));
+  t.after(() => fileFs.rm(root, { recursive: true, force: true }));
+  const store = new FilesystemFileStore(root), second = new FilesystemFileStore(root);
+  const first = await store.put('folder/report.txt', 'text/plain', streamOf([Buffer.from('first')]));
+  const updated = await second.put('folder/report.txt', 'application/json', streamOf([Buffer.from('second')]));
+  assert.equal(updated.id, first.id); assert.equal(updated.createdAt, first.createdAt);
+  assert.equal(await readHandle(first), 'first'); assert.equal(await readHandle(updated), 'second');
+  assert.equal((await store.getByName(first.name)).version, updated.version);
+  let release, started;
+  const gate = new Promise(r => release = r), begun = new Promise(r => started = r);
+  async function* blocked() { started(); await gate; yield Buffer.from('third'); }
+  const writing = store.put(first.name, 'text/plain', blocked());
+  await begun;
+  const deleting = second.delete(first.name);
+  release(); await writing; await deleting;
+  assert.equal(await store.get(first.name), null);
+});
+
+test('REL-03 cleanup retains referenced versions and corrupt metadata is reported', async t => {
+  const root = await fileFs.mkdtemp(join(tmpdir(), 'cortex-file-gc-'));
+  t.after(() => fileFs.rm(root, { recursive: true, force: true }));
+  const store = new FilesystemFileStore(root);
+  await store.put('kept', 'text/plain', streamOf([Buffer.from('retained')]));
+  const meta = JSON.parse(await fileFs.readFile(join(root, 'kept.meta.json'), 'utf8'));
+  const orphan = join(root, '.cortex-versions', '00000000-0000-0000-0000-000000000000.blob');
+  await fileFs.writeFile(orphan, 'orphan');
+  const old = new Date(Date.now() - 48 * 3600_000);
+  await fileFs.utimes(join(root, meta.dataFile), old, old); await fileFs.utimes(orphan, old, old);
+  for await (const _ of new FilesystemFileStore(root).list()) {}
+  assert.equal(existsSync(orphan), false); assert.equal(existsSync(join(root, meta.dataFile)), true);
+  await fileFs.writeFile(join(root, 'broken.meta.json'), '{broken');
+  await assert.rejects(store.get('broken'), /Cannot read metadata/);
+});
+
+test('REL-03 legacy named and anonymous entries remain readable and migrate on overwrite', async t => {
+  const root = await fileFs.mkdtemp(join(tmpdir(), 'cortex-file-legacy-'));
+  t.after(() => fileFs.rm(root, { recursive: true, force: true }));
+  await fileFs.writeFile(join(root, 'named.txt'), 'legacy named');
+  await fileFs.writeFile(join(root, 'named.txt.meta.json'), JSON.stringify({ mimeType: 'text/plain' }));
+  await fileFs.writeFile(join(root, 'anon.data'), 'legacy anonymous');
+  await fileFs.writeFile(join(root, 'anon.meta.json'), JSON.stringify({ mimeType: 'text/plain', id: 'anon' }));
+  const store = new FilesystemFileStore(root);
+  assert.equal(await readHandle(await store.get('named.txt')), 'legacy named');
+  assert.equal(await readHandle(await store.get('anon')), 'legacy anonymous');
+  await store.put('named.txt', 'text/plain', streamOf([Buffer.from('updated')]));
+  assert.equal(await readHandle(await store.get('named.txt')), 'updated');
+});

@@ -1,6 +1,14 @@
 import type { KnowledgeIndex, KnowledgeEntry, Store, Vault } from '@matatbread/matbot-plugin-api';
 import { MissingSecretError } from '@matatbread/matbot-plugin-api';
 
+/**
+ * Rethrows helper: maps a rejected vault lookup to `undefined` when the
+ * secret is simply absent, so a missing reranker credential degrades
+ * gracefully instead of failing the search. Any other error propagates.
+ * @param e - The rejection reason from a `vault.resolve` call.
+ * @returns Always `undefined`; the function exists for its control flow.
+ * @throws unknown - Re-throws `e` when it is not a {@link MissingSecretError}.
+ */
 const ifMissing = (e: unknown): undefined => {
   if (e instanceof MissingSecretError) return undefined;
   throw e;
@@ -11,6 +19,17 @@ const ifMissing = (e: unknown): undefined => {
 // long-tail noise. Tune here to widen (higher) or narrow (lower) results.
 const WEIGHT_COVERAGE_THRESHOLD = 0.5;
 
+/**
+ * Selects the top-scoring entries whose cumulative scores cover a fraction
+ * ({@link WEIGHT_COVERAGE_THRESHOLD}) of the total weight, surfacing clear
+ * winners without long-tail noise.
+ *
+ * @typeParam T - Entry type being ranked.
+ * @param scored - Entries with scores, assumed already sorted best-first.
+ * @returns The prefix of `scored` covering the weight threshold; all entries
+ *   when the total score is zero or negative.
+ * @throws Never.
+ */
 function topByWeightCoverage<T>(scored: Array<{ entry: T; score: number }>): T[] {
   const total = scored.reduce((sum, s) => sum + s.score, 0);
   if (total <= 0) return scored.map(s => s.entry);
@@ -25,6 +44,13 @@ function topByWeightCoverage<T>(scored: Array<{ entry: T; score: number }>): T[]
   return top;
 }
 
+/**
+ * Computes a 32-bit FNV-1a hash of a string, used as the content-change
+ * fingerprint for indexed entries.
+ * @param s - Text to hash.
+ * @returns The hash as a lowercase hex string.
+ * @throws Never.
+ */
 function fnv1a(s: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) {
@@ -34,6 +60,14 @@ function fnv1a(s: string): string {
   return (h >>> 0).toString(16);
 }
 
+/**
+ * Normalizes a term or entity for fuzzy matching: lowercased with all
+ * non-alphanumeric characters stripped, so `"Ada Lovelace"` and
+ * `"ada-lovelace"` compare equal.
+ * @param s - Text to normalize.
+ * @returns The normalized text (possibly empty).
+ * @throws Never.
+ */
 function normalizeAlphanum(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -41,12 +75,26 @@ function normalizeAlphanum(s: string): string {
 // Heading weights (H1=20, H2=10, H3=5) are 5x the body-occurrence weight of 1, so a term
 // in an H2 is worth ten plain body mentions. Step 2 sees full content (the reranker only
 // gets the first 1500 chars), so it can afford to count every body hit.
+/**
+ * Weight of a markdown heading occurrence, by heading level (H1 heaviest).
+ * @param level - Heading level (1–3; anything above 3 is treated as 3).
+ * @returns 20 for H1, 10 for H2, 5 otherwise.
+ * @throws Never.
+ */
 function headingWeight(level: number): number {
   if (level === 1) return 20;
   if (level === 2) return 10;
   return 5;
 }
 
+/**
+ * Counts non-overlapping occurrences of a substring in a haystack.
+ * @param haystack - Text to search within.
+ * @param needle - Substring to count; empty needles are not supported and
+ *   would loop, so callers must pass non-empty terms.
+ * @returns The number of occurrences (0 when none).
+ * @throws Never.
+ */
 function countOccurrences(haystack: string, needle: string): number {
   let idx   = 0;
   let count = 0;
@@ -58,6 +106,16 @@ function countOccurrences(haystack: string, needle: string): number {
   }
 }
 
+/**
+ * Scores content against search terms: heading lines (`#`–`###`) contribute
+ * their heading weight per matching term (substring match), body lines
+ * contribute 1 per literal occurrence. Case-insensitive throughout.
+ *
+ * @param content - Entry content, matched line by line.
+ * @param terms - Terms to score; each contributes per occurrence.
+ * @returns The total score (0 when nothing matches).
+ * @throws Never.
+ */
 function scoreContent(content: string, terms: Array<{ term: string }>): number {
   let score = 0;
   for (const line of content.split('\n')) {
@@ -88,7 +146,15 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
   private readonly store: Store<KnowledgeEntry>;
   private readonly vault: Vault;
 
-  /** @param store The `knowledge` store holding entries. @param vault Vault for reranker credentials. */
+  /**
+   * Creates the index over a persistent store with vault-provided reranker
+   * credentials. Reads go through the store proxy, so it follows live
+   * `KnowledgeIndex`-store swaps; nothing is cached at construction.
+   *
+   * @param store The `knowledge` store holding entries.
+   * @param vault Vault for reranker credentials (`SKILL_RANK_API_KEY`,
+   *   `CLOUDFLARE_ACCOUNT_ID`); missing secrets degrade to local scoring.
+   */
   constructor(store: Store<KnowledgeEntry>, vault: Vault) {
     this.store = store;
     this.vault = vault;
@@ -97,6 +163,8 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
   /**
    * Add or update an entry in the index. Writes only when the content hash changed.
    * @param entry The entry to index (its `contentHash` is computed here).
+   * @returns Nothing; the store is written only when the content actually changed.
+   * @throws Error - If the store read or write fails.
    */
   async index(entry: KnowledgeEntry): Promise<void> {
     const hash     = fnv1a(entry.content);
@@ -111,10 +179,19 @@ export class PersistBGEKnowledgeIndex implements KnowledgeIndex {
    * the Cloudflare BGE reranker when scores are close, falling back to local ranking when
    * credentials are missing or the service fails.
    *
-   * @param terms Search terms with optional context.
-   * @param signal Abort signal forwarded to the reranker request.
-   * @returns Matching entries, best first.
-   */
+    * @param terms Search terms with optional context.
+    * @param signal Abort signal forwarded to the reranker request.
+    * @returns Matching entries, best first. Possible outcomes: a single
+    *   unambiguous entity match; the top content score when it clearly wins;
+    *   the BGE-reranked best entries; or the fallback winner when reranking
+    *   is unavailable.
+    * @throws Error - If the store query fails, the reranker HTTP request
+    *   rejects (network failure), or the vault raises an error other than
+    *   {@link MissingSecretError}. Reranker auth/quota failures do not throw —
+    *   they warn and fall back to local ranking.
+    * @throws DOMException - If `signal` aborts or the reranker's built-in 15s
+    *   timeout fires.
+    */
   async search(
     terms:  Array<{ term: string; context?: string }>,
     signal: AbortSignal,

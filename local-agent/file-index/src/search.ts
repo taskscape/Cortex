@@ -55,12 +55,29 @@ export function searchChunks(chunks: IndexedChunk[], query: string, limit: numbe
   return top;
 }
 
+/**
+ * Inserts a result into a list kept sorted by descending score, shifting
+ * lower-scored entries right. Assumes the list is already sorted.
+ *
+ * @param results - The sorted accumulator list, mutated in place.
+ * @param result - The result to insert.
+ */
 function insertByDescendingScore(results: SearchResult[], result: SearchResult): void {
   let index = results.length;
   while (index > 0 && results[index - 1]!.score < result.score) index--;
   results.splice(index, 0, result);
 }
 
+/**
+ * Scores one chunk against the query terms: +2 per term found (case-insensitive
+ * substring) in the chunk content, +3 per term found in the native or relative
+ * path, so filename matches outrank content matches.
+ *
+ * @param chunk - The chunk to score.
+ * @param terms - Lowercased query terms from {@link tokenize}.
+ * @returns The search result with score and snippet, or undefined when no term
+ * matched anything (score 0).
+ */
 function scoreChunk(chunk: IndexedChunk, terms: string[]): SearchResult | undefined {
   const content = chunk.content.toLowerCase();
   const pathText = `${chunk.path} ${chunk.relativePath ?? ""}`.toLowerCase();
@@ -95,6 +112,13 @@ function scoreChunk(chunk: IndexedChunk, terms: string[]): SearchResult | undefi
   };
 }
 
+/**
+ * Splits a query into lowercased terms, keeping word characters plus `_`, `.`,
+ * `:`, `\`, and `-` so paths and identifiers stay intact.
+ *
+ * @param query - Raw free-text query.
+ * @returns Non-empty terms, lowercased; empty when the query has none.
+ */
 function tokenize(query: string): string[] {
   return query
     .toLowerCase()
@@ -103,6 +127,16 @@ function tokenize(query: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Builds a whitespace-collapsed excerpt around the earliest first occurrence
+ * of any term, taking up to 120 characters of lead-in and up to 280 characters
+ * total context.
+ *
+ * @param content - The chunk text the excerpt is drawn from.
+ * @param terms - Lowercased query terms from {@link tokenize}.
+ * @returns The trimmed, single-spaced excerpt; centred on the chunk start when
+ * no term appears (index 0 fallback).
+ */
 function makeSnippet(content: string, terms: string[]): string {
   const lower = content.toLowerCase();
   const firstMatch = terms.map(term => lower.indexOf(term)).filter(index => index >= 0).sort((a, b) => a - b)[0] ?? 0;

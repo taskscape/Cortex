@@ -153,6 +153,12 @@ export interface MarkerData {
   'matbot-hooks': { channel: HookPoint; pluginName?: string; message: string };
 }
 
+/**
+ * A `marker` content block, parameterised by its `creator` key so `data` is typed when the
+ * creator is registered in {@link MarkerData}, falling back to `unknown` otherwise.
+ *
+ * @typeParam K - The creator key (see {@link MarkerData} for per-creator augmentation).
+ */
 export type Marker<K extends string = string> = {
   type:    'marker';
   creator: K;
@@ -268,7 +274,12 @@ export interface SystemContextRegistry {
    * @param pluginName - The plugin whose contributors to drop.
    */
   removeByPlugin(pluginName: string): void;
-  /** Calls all contributors and joins non-null, non-empty results with double newlines. */
+  /**
+   * Calls all contributors and joins non-null, non-empty results with double newlines.
+   *
+   * @param ctx - The session being run and the turn's abort signal.
+   * @returns The joined system-context text, or `null` when no contributor produced output.
+   */
   build(ctx: { session: Session; signal: AbortSignal }): Promise<string | null>;
 }
 
@@ -308,6 +319,7 @@ export type ObservabilityStatus = 'unset' | 'ok' | 'error';
 /** Vendor-neutral event that an optional service can persist and export as OTLP. */
 export interface ObservabilityEvent {
   traceId:        string;
+  /** Trace id at the head of this event's resubmission chain. */
   rootTraceId:    string;
   spanId:         string;
   parentSpanId?:  string;
@@ -387,6 +399,7 @@ export interface ScreenContext {
 }
 /** What a `screen` hook may return: any mix of session replacement, context, markers, or abort. */
 export interface ScreenResult {
+  /** Replacement session persisted in place of the current one (a full swap, not a patch). */
   session?:   Session;
   /** Turn-scoped context appended onto the tail of this turn's outgoing messages (the freshest
    *  input the model reads), never persisted. At the tail, not a system prefix, so a directive
@@ -409,11 +422,14 @@ export interface ScreenResult {
    * you just want to annotate (e.g. a fired trigger's silent tool recording what it did).
    */
   markers?:   MessageContent[];
+  /** Abort the turn before the first provider call, with this reason. */
   abort?:     string;
 }
 
 /** Read-only context handed to a `contribute` hook before every provider call. */
 export interface ContributeContext {
+  /** The message array about to be sent to the provider; return a transformed copy to replace it
+   *  for this call — the stored session is never touched. */
   readonly outgoing: readonly Message[];
   readonly session:  Session;
   config:  RunConfig;
@@ -459,6 +475,8 @@ export interface ToolResultContext {
 /** Context handed to a `followup` hook once per committed turn. */
 export interface FollowupContext {
   readonly session:       Session;
+  /** Resubmit-chain depth of the just-committed turn (a redo carries parent + 1); for the hook's
+   *  own budgeting — the runner hard-caps the chain regardless. */
   readonly resubmitDepth: number;
   config:  RunConfig;
   signal:  AbortSignal;
@@ -473,6 +491,8 @@ export interface FollowupContext {
 }
 /** What a `followup` hook may return: resubmit, retract-and-rerun, append markers, or nothing. */
 export interface FollowupResult {
+  /** Resubmit a robo follow-up turn: head-enqueued to run next as its own real turn, carrying
+   *  these content blocks. The superseding inverse is {@link retractAndRerun}. */
   resubmit?: { content: MessageContent[] };
   /**
    * Retract-and-rerun: supersede the just-committed turn instead of following it. The pump pops the
@@ -635,10 +655,30 @@ export type ToolEvent =
  *     deliberately does NOT engage the session-bound `form`/`form-response` flow.
  */
 export interface PromptFn {
+  /**
+   * Free-text form.
+   *
+   * @param question - The question shown to the user.
+   * @param defaultValue - Returned when the user submits without typing a new answer.
+   * @returns The user's typed answer, or `defaultValue`.
+   * @throws {PromptCancelledError} When the user takes the cancel ("give up") path.
+   */
   (question: string, defaultValue?: string): Promise<string>;
+  /**
+   * Structured form: a capable frontend renders a real control; otherwise `field.label` is
+   * presented as plain text.
+   *
+   * @param field - The single field to prompt for.
+   * @returns The chosen or typed value.
+   * @throws {PromptCancelledError} When the user takes the cancel ("give up") path.
+   */
   (field: FormField): Promise<string>;
 }
 
+/**
+ * Execution context handed to a tool's `execute`: the call's correlation ids, session and abort
+ * signal, service access (vault, files), user prompting, and dynamic plugin load/unload.
+ */
 export interface ToolContext {
   /** Set by the invocation gate after interactive consent, never copied from model input. */
   approval?: { permission: string; patterns: readonly string[] };
@@ -658,12 +698,22 @@ export interface ToolContext {
   files?:      FileStore;
   /** Prompt the user for input. The host provides a readline or form implementation. */
   prompt:      PromptFn;
-  /** Hot-load a plugin by specifier without restarting the process. Returns the loaded plugin. */
+  /**
+   * Hot-load a plugin by specifier without restarting the process.
+   *
+   * @param specifier - Module specifier of the plugin to load.
+   * @returns The loaded plugin.
+   * @throws When the plugin cannot be loaded (unknown specifier, or load/`setup()` failure).
+   */
   loadPlugin(specifier: string): Promise<MatbotPlugin>;
   /**
    * Hot-unload a plugin by specifier, removing its tools, hooks, and system context contributions.
    * Resolves `true` if a plugin was actually resident and unloaded, `false` if there was nothing
    * to unload. A failed `teardown()` (e.g. timeout) still throws — the plugin was resident in that case.
+   *
+   * @param specifier - Module specifier of the plugin to unload.
+   * @returns Whether a resident plugin was found and unloaded.
+   * @throws When the resident plugin's `teardown()` fails.
    */
   unloadPlugin(specifier: string): Promise<boolean>;
 }
@@ -688,8 +738,19 @@ export interface ToolExecutor {
  */
 export interface ToolPermissionDecl {
   action: string;
+  /**
+   * Derive the subject patterns to gate on from a call's input (e.g. file paths, command text, URLs).
+   *
+   * @param input - The parsed tool-call input.
+   * @returns Subject patterns matched against the permission rules.
+   */
   patterns?(input: unknown): string[];
-  /** Requires fresh interactive consent even under an allow policy. */
+  /**
+   * Requires fresh interactive consent even under an allow policy.
+   *
+   * @param input - The parsed tool-call input.
+   * @returns `true` when this call needs interactive approval.
+   */
   requiresApproval?(input: unknown): boolean;
 }
 
@@ -758,14 +819,32 @@ export interface FileFilter {
   createdBefore?: ISODate;
 }
 
+/**
+ * Binary file storage: content puts with optional (name + namespace) upsert, id/name lookup,
+ * listing, deletion, change watching, and ephemeral scratch copies.
+ */
 export interface FileStore {
-  /** Store a file. When `name` is provided, upserts by (name + namespace); otherwise always creates a new entry. */
+  /**
+   * Store a file. When `name` is provided, upserts by (name + namespace); otherwise always creates a new entry.
+   *
+   * @param name - Upsert key; `undefined` always creates a new entry.
+   * @param mimeType - Content MIME type.
+   * @param data - The file's bytes as an async chunk stream.
+   * @param meta - Optional session/message linkage, namespace scope, and public-servability opt-in.
+   * @returns A handle to the stored file.
+   */
   put(
     name:     string | undefined,
     mimeType: MimeType,
     data:     AsyncIterable<Uint8Array>,
     meta?:    { sessionId?: string; messageId?: string; namespace?: string; allowed?: boolean }
   ): Promise<FileHandle>;
+  /**
+   * Fetch one file by id.
+   *
+   * @param id - The file id.
+   * @returns The file handle, or `null` when absent.
+   */
   get(id: string): Promise<FileHandle | null>;
   /**
    * Fetch a file by (name + namespace).
@@ -798,7 +877,12 @@ export interface FileStore {
    * @returns The created file handle.
    */
   putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle>;
-  /** Observe file changes. Implementations that cannot watch their backing store omit this. */
+  /**
+   * Observe file changes. Implementations that cannot watch their backing store omit this.
+   *
+   * @param signal - Optional abort signal that ends the watch stream.
+   * @returns An async iterable of change events, one per change.
+   */
   watch(signal?: AbortSignal): AsyncIterable<FileEvent>;
 }
 
@@ -822,20 +906,49 @@ export interface FrontendInfo {
  * `Vault` (which is `VaultSpec` plus that policy); plugins are handed a `Vault`.
  */
 export interface VaultSpec {
-  /** Resolve ${NAME} placeholders by looking up the named value; throws MissingSecretError for any miss. */
+  /**
+   * Resolve ${NAME} placeholders by looking up the named value; throws MissingSecretError for any miss.
+   *
+   * @param ref - Text containing zero or more `${NAME}` placeholders.
+   * @returns The text with every placeholder replaced by its stored value.
+   * @throws {MissingSecretError} Listing every unresolved placeholder name.
+   */
   resolve(ref: string): Promise<string>;
+  /**
+   * Redact every stored secret value occurring in `text`.
+   *
+   * @param text - Text that may contain literal secret values.
+   * @returns The text with each occurrence replaced by a redaction placeholder.
+   */
   scrub(text: string): string;
-  /** Store `value` under exactly `name`, overwriting. The literal write; no reference/dedup logic. */
+  /**
+   * Store `value` under exactly `name`, overwriting. The literal write; no reference/dedup logic.
+   *
+   * @param name - The exact key to store under.
+   * @param value - The secret value.
+   */
   writeSecret(name: string, value: string): Promise<void>;
-  /** Whether a secret is stored under this exact name. */
+  /**
+   * Whether a secret is stored under this exact name.
+   *
+   * @param name - The exact key to test.
+   * @returns `true` when a value is stored under `name`.
+   */
   hasKey(name: string): boolean;
   /**
    * The name a value is already stored under, if any. Optional: backends that can't (or won't)
    * reverse-index omit it, and `createSecret`'s dedup step is skipped.
+   *
+   * @param value - The secret value to look up.
+   * @returns The key storing `value`, or `undefined` when it is not stored.
    */
   findByValue?(value: string): string | undefined;
 }
 
+/**
+ * The secret vault handed to plugins: the {@link VaultSpec} primitives plus the `createSecret`
+ * policy that disambiguates a typed key-name reference from a literal value to store.
+ */
 export interface Vault extends VaultSpec {
   /**
    * Store a secret coming (often) from a user via the LLM, where we cannot tell a real value
@@ -844,6 +957,10 @@ export interface Vault extends VaultSpec {
    *   - `value` is already a known key name → returns `value` (it was a reference, not a secret)
    *   - `value` already stored under another name → returns that name (dedup)
    *   - otherwise → writes under `name` and returns `name`
+   *
+   * @param name - Key to store under when `value` is a new literal secret.
+   * @param value - Either an existing key-name reference or a literal secret value.
+   * @returns The key name callers must reference (per the cases above).
    */
   createSecret(name: string, value: string): Promise<string>;
 }
@@ -896,8 +1013,13 @@ export interface ToolRegistry {
    * @param pluginName - The plugin whose tools to drop.
    */
   removeByPlugin(pluginName: string): void;
-  /** Observe tool CRUD as it happens. Read-only — observers cannot veto a registration. One event
-   *  per tool (removeByPlugin emits a `removed` per matched tool). The stream ends when `signal` aborts. */
+  /**
+   * Observe tool CRUD as it happens. Read-only — observers cannot veto a registration. One event
+   * per tool (removeByPlugin emits a `removed` per matched tool). The stream ends when `signal` aborts.
+   *
+   * @param signal - Optional abort signal that ends the watch stream.
+   * @returns An async iterable of {@link ToolRegistryEvent}s.
+   */
   watch(signal?: AbortSignal): AsyncIterable<ToolRegistryEvent>;
 }
 
@@ -1009,14 +1131,33 @@ export interface SubmitOpenOpts extends OpenOpts {
  * returns and treats the live `events` stream purely as an optimisation.
  */
 export interface SessionRunner {
+  /**
+   * Open a view onto a session, optionally enqueuing a submission.
+   *
+   * @param opts - Observe-only {@link OpenOpts}, or {@link SubmitOpenOpts} to also submit content.
+   * @returns The session view: authoritative server-side state plus the lazy live event tap.
+   */
   open(opts: OpenOpts | SubmitOpenOpts): Promise<SessionView>;
-  /** Abort the running turn (if any) and drop all queued submissions, emitting `cancelled` for each. */
+  /**
+   * Abort the running turn (if any) and drop all queued submissions, emitting `cancelled` for each.
+   *
+   * @param sessionId - The session whose turn and queue to abort.
+   */
   abort(sessionId: string): void;
-  /** Abandon the running turn (if any) WITHOUT touching the queue — `pump` advances to the next
-   *  queued submission, or idles. The "give up on this turn" path (a prompt cancel); contrast
-   *  `abort`, which also clears the queue. A no-op if nothing is running. */
+  /**
+   * Abandon the running turn (if any) WITHOUT touching the queue — `pump` advances to the next
+   * queued submission, or idles. The "give up on this turn" path (a prompt cancel); contrast
+   * `abort`, which also clears the queue. A no-op if nothing is running.
+   *
+   * @param sessionId - The session whose running turn to abandon.
+   */
   cancelTurn(sessionId: string): void;
-  /** Snapshot of a session's live state: whether a turn is running and how many submissions wait
-   *  behind it. `busy` is `running || queued > 0`. */
+  /**
+   * Snapshot of a session's live state: whether a turn is running and how many submissions wait
+   * behind it. `busy` is `running || queued > 0`.
+   *
+   * @param sessionId - The session to inspect.
+   * @returns The `{ busy, running, queued }` snapshot.
+   */
   status(sessionId: string): { busy: boolean; running: boolean; queued: number };
 }

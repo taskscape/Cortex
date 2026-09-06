@@ -48,8 +48,20 @@ export interface SingleTurnRequest {
 
 /** Scoped key-value store for a single plugin's runtime settings. */
 export interface PluginSettings {
-  /** Atomic document snapshot and replacement for versioned configuration owners. */
+  /**
+   * Atomic document snapshot and replacement for versioned configuration owners.
+   *
+   * @returns The current settings payload with its version string.
+   */
   snapshot?(): Promise<{version:string;data:Record<string,unknown>}>;
+  /**
+   * Atomic document snapshot and replacement for versioned configuration owners.
+   *
+   * @param data - The full replacement payload.
+   * @param expectedVersion - The version the caller last read; the write applies only while it
+   *                          still matches (compare-and-swap).
+   * @returns The post-write version and the stored data.
+   */
   replace?(data:Record<string,unknown>,expectedVersion:string): Promise<{version:string;data:Record<string,unknown>}>;
   /**
    * Read a stored setting.
@@ -106,6 +118,9 @@ export interface PluginResolver {
    * returns a non-empty list that excludes the current runtime; `undefined` falls back to the
    * try-load / catch / rollback path. Reading the declaration is host-specific (walk package.json
    * on node; consult the baked manifest in the browser), so it lives here, not in the core loader.
+   *
+   * @param specifier - The load specifier to inspect.
+   * @returns The declared runtimes, or `undefined` when the declaration is absent ("don't know").
    */
   runtimes?(specifier: string): Promise<readonly Runtime[] | undefined>;
 }
@@ -129,12 +144,15 @@ export interface PluginSelf {
 export interface MatbotServices {
   /** Host-bound, validated direct invocation; shares the model turn pipeline. */
   readonly ToolInvoker?: { invoke(tool: Tool, input: unknown, ctx: import('./types.js').ToolContext): AsyncIterable<import('./types.js').ToolEvent> };
+  /** Optional invocation policy: ordered `permission`/`pattern` rules resolving to `allow`/`ask`/`deny`, with a default action for calls no rule matches. */
   readonly ToolInvocationPolicy?: { rules?: Array<{ permission: string; pattern: string; action: 'allow' | 'ask' | 'deny' }>; defaultAction?: 'allow' | 'ask' | 'deny' };
 
+  /** The active storage backend backing all Store and FileStore creation; a swap of it is deferred to the next quiescent edge. */
   readonly StorageBackend?: StorageBackend | undefined;
   /** The live vault — also the `register('Vault', impl)` swap key. Capture-safe behind a proxy, so a
    *  reference held across a swap keeps resolving to the live backend. Always present (boot default). */
   readonly Vault: Vault;
+  /** The active knowledge index used for contextual retrieval; swapped immediately on register(). */
   readonly KnowledgeIndex: KnowledgeIndex;
   /** Optional durable trace/evaluation sink installed by an observability plugin. */
   readonly Observability?: import('./types.js').ObservabilitySink | undefined;
@@ -163,22 +181,38 @@ export interface MatbotRuntime {
    * Thin convenience over {@link complete}: send a single `prompt` (and optional `system`) to a
    * named provider and get the response, hiding the otherwise-mandatory and meaningless `Message`
    * fields (id/traceId/createdAt) that an out-of-band one-shot call has no use for.
+   *
+   * @param req - The provider key, prompt text, optional system prompt, and abort signal.
+   * @returns The assistant's full text plus token usage.
    */
   singleTurn(req: SingleTurnRequest): Promise<CompletionResponse>;
 
-  /** The calling plugin's own settings store. Scoped to the plugin — it cannot reach another's. */
+  /**
+   * The calling plugin's own settings store. Scoped to the plugin — it cannot reach another's.
+   *
+   * @returns The plugin-scoped {@link PluginSettings} instance.
+   */
   settings(): PluginSettings;
 
   /**
    * Hot-load a plugin by specifier into the running process. Returns the loaded plugin.
    * `prompt`, when supplied, resolves tool-name collisions interactively during the new
    * plugin's setup(); the runner injects the triggering session's prompt automatically.
+   *
+   * @param specifier - The plugin specifier to load (npm name or URL path).
+   * @param prompt - Optional interactive prompt used to resolve tool-name collisions during setup().
+   * @returns The loaded, identity-stamped plugin.
+   * @throws {@link IncompatibleRuntimeError} When the plugin's declared `matbotRuntime` excludes this host.
+   * @throws {@link NotAPluginError} When the module imports cleanly but is not plugin-shaped.
    */
   loadPlugin(specifier: string, prompt?: PromptFn): Promise<MatbotPlugin>;
 
   /**
    * Hot-unload a plugin by specifier, removing its tools, hooks, and system context contributions.
    * Resolves `true` if a plugin was resident and unloaded, `false` if there was nothing to unload.
+   *
+   * @param specifier - The plugin specifier to unload.
+   * @returns `true` when a resident plugin was unloaded; `false` when nothing was resident.
    */
   unloadPlugin(specifier: string): Promise<boolean>;
 
@@ -187,6 +221,10 @@ export interface MatbotRuntime {
    * The backing implementation is determined by the runtime (filesystem by default;
    * a storage plugin may substitute a database backend).
    * Namespaces are isolated: 'schedules' and 'settings' never share documents.
+   *
+   * @typeParam T - The stored document shape (must carry `id` and `version`).
+   * @param namespace - Isolated namespace key (e.g. `'schedules'`, `'settings'`).
+   * @returns A compare-and-swap store over that namespace.
    */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T>;
 
@@ -230,10 +268,21 @@ export interface MatbotRuntime {
    * Then register and retrieve with full type safety:
    *   await services.register('memory', new MemoryManagerImpl(store));
    *   const mem = services.get('memory'); // MemoryManager | undefined
+   *
+   * @typeParam K - The MatbotServices key being registered (the interface name it carries).
+   * @param key - The registry key; well-known keys have the dedicated swap behaviour described above.
+   * @param value - The implementation to register under `key`.
+   * @returns Resolves once the registration has been applied.
    */
   register<K extends keyof MatbotServices>(key: K, value: NonNullable<MatbotServices[K]>): Promise<void>;
 
-  /** Look up a service registered under a MatbotServices key via register(). */
+  /**
+   * Look up a service registered under a MatbotServices key via {@link MatbotRuntime.register}.
+   *
+   * @typeParam K - The MatbotServices key to read.
+   * @param key - The registry key.
+   * @returns The registered service, or `undefined` when nothing is registered under `key`.
+   */
   get<K extends keyof MatbotServices>(key: K): MatbotServices[K] | undefined;
 
   /**
@@ -241,10 +290,17 @@ export interface MatbotRuntime {
    * symmetric with register() — not a static manifest flag. A frontend owns its own I/O; matbot
    * only records that it exists. Multiple frontends may be active at once. Auto-unregistered when
    * the plugin is unloaded.
+   *
+   * @param info - The frontend descriptor to record.
    */
   registerFrontend(info: FrontendInfo): void;
 
-  /** @internal Remove a service entry — called by the runtime when the registering plugin is unloaded. */
+  /**
+   * Remove a service entry — called by the runtime when the registering plugin is unloaded.
+   *
+   * @param key - The registry key to drop.
+   * @internal
+   */
   unregister(key: string): void;
 
   /** Host-injected name deriver, used by the loader to stamp plugin identity. */
@@ -273,6 +329,9 @@ export interface MatbotRuntime {
    * return true). Plugins use it to suppress work that must be singular per bot identity: e.g. a
    * frontend's long-poll loop, which would otherwise contend with the foreground process on the
    * same upstream connection.
+   *
+   * @returns `true` when running as a background sub-agent; `false` for a top-level run (and
+   *          always in the browser realm).
    */
   isSubAgent(): boolean;
 }
@@ -285,6 +344,9 @@ export interface MatbotRuntime {
  * the optional `?` is the single call-site signal of "may be absent, null-check it". Assignment throws,
  * directing callers to `register()` (the swap-aware write path). Applied to both the host services object
  * and the per-plugin scoped object, so plugins see the same surface the host does.
+ *
+ * @param services - The host or per-plugin machine to wrap.
+ * @returns A proxy over `services` with member-style access and registry fallback on misses.
  */
 export function unifyServices(services: MatbotMachine): MatbotMachine {
   return new Proxy(services, {
@@ -315,6 +377,11 @@ export type SwapFn<T extends object> = (next: T) => void;
  * is forwarded so `instanceof` sees the real impl (the StorageBackend identity checks depend on it);
  * ownKeys + getOwnPropertyDescriptor keep object spread faithful. Methods bind to the current impl,
  * not the proxy. A nullish current (an optional service with nothing registered yet) reads as empty.
+ *
+ * @typeParam T - The proxied implementation type.
+ * @param getCurrent - Called on every trap; returns the live implementation, or `undefined` when
+ *                     nothing is registered (traps then behave as if the object were empty).
+ * @returns The capture-safe forwarding proxy.
  */
 export function forwardingProxy<T extends object>(getCurrent: () => T | undefined): T {
   return new Proxy({} as T, {
@@ -340,6 +407,11 @@ export function forwardingProxy<T extends object>(getCurrent: () => T | undefine
 /**
  * Returns [proxy, swap]: the Store/FileStore handle plugins capture, plus the fn register() calls to
  * repoint it at a new backend's store. Built on forwardingProxy so capture-safety is uniform.
+ *
+ * @typeParam T - The swappable handle type.
+ * @param initial - The implementation the proxy starts pointed at.
+ * @returns A `[proxy, swap]` pair: the stable handle to hand out, and the repoint function a
+ *          register()-driven swap calls with the new implementation.
  */
 export function makeSwappable<T extends object>(initial: T): [T, SwapFn<T>] {
   let current = initial;
@@ -352,6 +424,10 @@ export function makeSwappable<T extends object>(initial: T): [T, SwapFn<T>] {
 export type MountedMachine<K extends keyof MatbotServices> =
   MatbotMachine & { readonly [P in K]-?: NonNullable<MatbotServices[P]> };
 
+/**
+ * Options for {@link Mounted.consume}: which key to watch and how the subscription behaves
+ * (replay latch, teardown signal, and dependency-unload callback).
+ */
 export interface MountConsumeOptions<K extends keyof MatbotServices> {
   /** The registry service whose mount transitions this subscription tracks. */
   readonly key:        K;
@@ -386,18 +462,33 @@ export interface Mounted {
  *  its register/unregister and quiescent-edge flush. */
 export interface MountTable {
   readonly mounted: Mounted;
-  /** Record that a key's presence may have changed since the last edge (called by register/unregister). */
+  /**
+   * Record that a key's presence may have changed since the last edge (called by register/unregister).
+   *
+   * @param key - The registry key to mark dirty.
+   */
   markDirty(key: keyof MatbotServices): void;
   /** At a quiescent edge, compute each dirty key's net presence transition and multicast it. */
   flush(): void;
 }
 
+/**
+ * One consumer's subscription to a registry key: its handler, optional unload callback, and
+ * teardown signal.
+ */
 interface MountInterest {
   readonly handler:   (machine: MatbotMachine) => void | Promise<void>;
   readonly onUnmount: ((machine: MatbotMachine) => void | Promise<void>) | undefined;
   readonly signal:    AbortSignal | undefined;
 }
 
+/**
+ * Log a throwing mount-table handler without letting the error escape the dispatch loop.
+ *
+ * @param e - The thrown value (error or anything else).
+ * @returns Nothing.
+ * @throws Never.
+ */
 function reportMountHandlerError(e: unknown): void {
   console.error('[matbot] mounted handler threw:', e instanceof Error ? e.message : e);
 }
@@ -409,14 +500,33 @@ function reportMountHandlerError(e: unknown): void {
  * the last-committed presence per key, so a reload collapses to one remount and a committed unload is
  * well-defined. Presence is read by member access on the unified machine, which resolves both the core
  * getters (StorageBackend/Vault/KnowledgeIndex) and the registry-backed augmented keys.
+ *
+ * @param getMachine - Lazy accessor for the current unified machine, read at consume/flush time.
+ * @returns The mount table: the plugin-facing `mounted` facet plus the host's `markDirty`/`flush`.
  */
 export function createMountTable(getMachine: () => MatbotMachine): MountTable {
   const interests = new Map<string, Set<MountInterest>>();
   const committed = new Map<string, boolean>();   // last-committed presence per key (the clock)
   const dirty     = new Set<string>();
 
+  /**
+   * Whether `key` currently resolves to a value on the live machine — member access, so it covers
+   * both the core getters and the registry-backed augmented keys.
+   *
+   * @param key - The registry key to test.
+   * @returns `true` when the key is present on the machine.
+   * @throws Never.
+   */
   const present = (key: string): boolean => (getMachine() as unknown as Record<string, unknown>)[key] !== undefined;
 
+  /**
+   * Invoke a handler (or onUnmount callback), isolating both sync throws and rejected promises.
+   *
+   * @param fn - The callback to run.
+   * @param machine - The machine snapshot to pass it.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const run = (fn: (machine: MatbotMachine) => void | Promise<void>, machine: MatbotMachine): void => {
     try {
       const r = fn(machine);
@@ -425,6 +535,15 @@ export function createMountTable(getMachine: () => MatbotMachine): MountTable {
   };
 
   const mounted: Mounted = {
+    /**
+     * Implementation of {@link Mounted.consume}: registers the interest, wires `signal` teardown,
+     * and (when `replay`) fires the handler on the next microtask if the key is currently present.
+     *
+     * @param options - Which key to watch, plus `replay`, `signal`, and `onUnmount` behaviour.
+     * @param handler - Invoked with the machine, the watched key narrowed to present.
+     * @returns Nothing.
+     * @throws Never.
+     */
     consume(options, handler) {
       const { key, replay, signal, onUnmount } = options;
       if (signal?.aborted === true) return;
@@ -449,7 +568,23 @@ export function createMountTable(getMachine: () => MatbotMachine): MountTable {
 
   return {
     mounted,
+    /**
+     * Implementation of {@link MountTable.markDirty}: add the key to the pending set; the next
+     * flush commits its actual presence.
+     *
+     * @param key - The registry key to mark dirty.
+     * @returns Nothing.
+     * @throws Never.
+     */
     markDirty(key) { dirty.add(key as string); },
+    /**
+     * Implementation of {@link MountTable.flush}: for each dirty key, commit its current presence
+     * and multicast the net transition — mount/remount to `handler`, or committed unload to
+     * `onUnmount` when the key disappeared without replacement.
+     *
+     * @returns Nothing.
+     * @throws Never.
+     */
     flush() {
       if (dirty.size === 0) return;
       const keys = [...dirty];
@@ -475,6 +610,9 @@ export function createMountTable(getMachine: () => MatbotMachine): MountTable {
  * Build the one-message CompletionRequest for a {@link MatbotRuntime.singleTurn} call, hiding the
  * otherwise-mandatory and meaningless Message fields (id/traceId/createdAt) an out-of-band one-shot
  * has no use for. Pure; the host invokes its own complete() with the result.
+ *
+ * @param req - The single-turn request (provider key, prompt text, optional system prompt and signal).
+ * @returns The one-message {@link CompletionRequest} to pass to the provider call.
  */
 export function singleTurnRequest(req: SingleTurnRequest): CompletionRequest {
   return {
@@ -512,6 +650,10 @@ export type StoreFactory = (
 
 // ── Plugin manifest ───────────────────────────────────────────────────────────
 
+/**
+ * Optional plugin-authored metadata beyond the code contract: how the plugin describes itself
+ * and which `matbot.yaml` extension keys it reads.
+ */
 export interface PluginManifest {
   /** Human-readable description shown by `matbot install` */
   description?: string;
@@ -565,10 +707,34 @@ export interface MatbotPluginSpec {
    * never splits a turn's compare-and-swap across two backends.
    */
   readonly storageBackend?: {
+    /**
+     * Open the backend over the plugin's runtime data directory.
+     *
+     * @param dotData - Path to the plugin's `.data` directory (the runtime state root).
+     * @returns The opened storage backend.
+     */
     open(dotData: string): Promise<StorageBackend>;
   };
+  /**
+   * Optional one-time initialization, called with the machine after load; register tools, hooks,
+   * and services here. A throw marks the load as failed and stays in config (treated as possibly
+   * transient, e.g. a missing secret) rather than being rolled back like a permanent defect.
+   *
+   * @param services - The assembled machine (registry services plus fixed runtime).
+   * @returns Resolves when initialization is complete.
+   */
   setup?(services: MatbotMachine): Promise<void>;
+  /**
+   * Optional teardown, called when the plugin unloads; release what setup() acquired.
+   *
+   * @returns Resolves when cleanup is complete.
+   */
   teardown?(): Promise<void>;
+  /**
+   * Optional message the host surfaces after the plugin is installed.
+   *
+   * @returns The message text.
+   */
   installationMessage?(): Promise<string>;
 }
 

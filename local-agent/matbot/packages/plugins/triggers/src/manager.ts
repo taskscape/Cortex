@@ -9,14 +9,30 @@ const MAX_MSG_CHARS = 1500;
 // overrides it; absent both, the classifier falls back to the turn's own provider.
 const LEGACY_CLASSIFIER = 'skills-classifier';
 
+/**
+ * Clips text to {@link MAX_MSG_CHARS} characters, keeping both ends and eliding the middle, so the
+ * classifier sees the start and the finish of long messages.
+ *
+ * @param text - The text to clip.
+ * @returns The original text when short enough; otherwise head + `...` + tail totalling at most
+ *   {@link MAX_MSG_CHARS} characters.
+ * @throws Never.
+ */
 function clip(text: string): string {
   if (text.length <= MAX_MSG_CHARS) return text;
   const half = Math.floor((MAX_MSG_CHARS - 3) / 2);
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
-/** Stable identity for seed idempotency: a trigger is "the same" if it invokes the same tool with
- *  the same params. Triggers carry no name, so the invocation is the natural key. */
+/**
+ * Stable identity for seed idempotency: a trigger is "the same" if it invokes the same tool with
+ * the same params. Triggers carry no name, so the invocation is the natural key.
+ *
+ * @param t - Any object with an `invoke` (tool name + optional params).
+ * @returns The tool name and the JSON of `params` (null when absent), joined by a NUL separator so
+ *   the key cannot be forged by concatenation.
+ * @throws Never — params are assumed JSON-serializable.
+ */
 function invokeKey(t: { invoke: Trigger['invoke'] }): string {
   return t.invoke.tool + '\u0000' + JSON.stringify(t.invoke.params ?? null);
 }
@@ -33,19 +49,36 @@ export class TriggerManager implements Triggers {
   // Aborts on teardown (clear()), ending the mounted-swap subscription set up in setupTriggers.
   private readonly lifecycle = new AbortController();
 
+  /**
+   * @param store - The swap-following `Store<Trigger>` backing persistence; reads and writes go
+   *   through it live, so a StorageBackend swap is picked up by the next load/query.
+   * @param services - The matbot machine, used for settings/provider resolution and classifier turns.
+   * @throws Never.
+   */
   constructor(store: Store<Trigger>, services: MatbotMachine) {
     this.store    = store;
     this.services = services;
   }
 
-  /** Ends with the manager (teardown). Hand to `services.mounted.consume` so a StorageBackend swap
-   *  re-reads the new backend's triggers, and the loop stops when the plugin unloads. */
+  /**
+   * Ends with the manager (teardown). Hand to `services.mounted.consume` so a StorageBackend swap
+   * re-reads the new backend's triggers, and the loop stops when the plugin unloads.
+   *
+   * @returns The lifecycle abort signal; aborted by {@link TriggerManager.clear}.
+   * @throws Never.
+   */
   get signal(): AbortSignal { return this.lifecycle.signal; }
 
-  // The classifier provider, resolved live per evaluation (so a triggers_config change takes effect on
-  // the next turn): the `classifierProvider` setting if set and valid, else the legacy "skills-classifier"
-  // provider if present, else the current turn's own provider. There is always a turn provider to fall
-  // back to, so the classifier always has a model — triggers work with zero config.
+  /**
+   * The classifier provider, resolved live per evaluation (so a triggers_config change takes effect on
+   * the next turn): the `classifierProvider` setting if set and valid, else the legacy "skills-classifier"
+   * provider if present, else the current turn's own provider. There is always a turn provider to fall
+   * back to, so the classifier always has a model — triggers work with zero config.
+   *
+   * @param turnProvider - The provider the current turn runs on; the ultimate fallback.
+   * @returns The provider id the classifier should use for this evaluation.
+   * @throws If the settings lookup rejects.
+   */
   async resolveClassifierProvider(turnProvider: string): Promise<string> {
     const pinned = await this.services.settings().get<string>('classifierProvider');
     if (pinned !== undefined && this.services.providers.has(pinned)) return pinned;
@@ -56,7 +89,11 @@ export class TriggerManager implements Triggers {
   /** (Re)load persisted triggers into memory. Re-runnable: the initial boot load and every later
    *  StorageBackend swap funnel through here. Reading `this.store` (a swap-following proxy) always hits
    *  the live backend, so a swap re-reads the new backend's triggers. Clears first — the old in-memory
-   *  set belongs to the displaced backend. */
+   *  set belongs to the displaced backend.
+ *
+ * @returns Resolves once the in-memory map mirrors the live store's contents.
+ * @throws If the store query rejects.
+ */
   async load(): Promise<void> {
     this.triggers.clear();
     const { items } = await this.store.query({});
@@ -80,7 +117,13 @@ export class TriggerManager implements Triggers {
 
   /** Triggers whose invocation matches the filter: `tool` (if given) must equal `invoke.tool`, and
    *  `params` (if given) must deep-equal `invoke.params`. The natural "which trigger(s) fire tool X
-   *  (with these args)" lookup — e.g. the one that loads a given skill. */
+   *  (with these args)" lookup — e.g. the one that loads a given skill.
+ *
+ * @param filter - `tool` (if given) must equal `invoke.tool`; `params` (if given) must deep-equal
+ *   `invoke.params` (JSON-serialization equality). Omitted dimensions match anything.
+ * @returns Matching triggers in insertion order.
+ * @throws Never.
+ */
   query(filter: { tool?: string; params?: unknown }): Trigger[] {
     return this.all().filter(t => {
       if (filter.tool !== undefined && t.invoke.tool !== filter.tool) return false;
@@ -143,6 +186,14 @@ export class TriggerManager implements Triggers {
     return true;
   }
 
+  /**
+   * Seeds idempotently: no-op returning the existing trigger when one with the same `invoke`
+   * (tool + params, compared via {@link invokeKey}) is already stored; otherwise adds a new one.
+   *
+   * @param spec - Conditions, invocation, and enabled flag for the seed.
+   * @returns The pre-existing trigger with the same invocation, or the newly created one.
+   * @throws If the backing store write rejects.
+   */
   async importIfAbsent(spec: TriggerSpec): Promise<Trigger> {
     const key      = invokeKey(spec);
     const existing = this.all().find(t => invokeKey(t) === key);
@@ -152,6 +203,9 @@ export class TriggerManager implements Triggers {
 
   /**
    * Drops all in-memory state and aborts the manager lifecycle (teardown only).
+   *
+   * @returns Nothing; the map is emptied and {@link TriggerManager.signal} is aborted.
+   * @throws Never.
    */
   clear(): void { this.lifecycle.abort(); this.triggers.clear(); }
 
@@ -166,6 +220,20 @@ export class TriggerManager implements Triggers {
    * sides of the exchange are passed: `subject` is judged, `context` is what it is paired with — many
    * conditions are relational ("disputes the previous answer") and can only be judged from the pair. No
    * LLM call when there are no candidate conditions or the subject is empty.
+   *
+   * @param surface - Which surface to judge; only conditions whose {@link surfaceOfKind} equals it
+   *   become candidates. Disabled triggers never contribute candidates.
+   * @param subject - The message being judged (`label` names it in the classifier prompt; `text` is
+   *   its content). An empty `text` short-circuits to no firings.
+   * @param context - The message the subject is paired with, for relational conditions; may be empty.
+   * @param signal - Abort signal for the classifier turn.
+   * @param turnProvider - The current turn's provider, used as the classifier unless one is pinned
+   *   (see {@link resolveClassifierProvider}).
+   * @returns One entry per distinct fired trigger (in trigger insertion order), each with the
+   *   trigger, the distinct `kinds` whose conditions matched, and the `matched` conditions in
+   *   candidate order.
+   * @throws If the classifier turn or the settings lookup rejects; a non-JSON classifier reply is
+   *   logged and yields no firings rather than throwing.
    */
   async evaluate(
     surface:      TriggerSurface,
@@ -230,6 +298,17 @@ export class TriggerManager implements Triggers {
     });
   }
 
+  /**
+   * Compare-and-swap mutation loop: applies `mutate` to the current doc and CASes it into the store,
+   * retrying against a freshly read doc while the store reports a version conflict. If the doc was
+   * deleted concurrently (the re-read returns null), the mutated doc is written unconditionally
+   * instead, so the mutation is never lost. The in-memory map is refreshed with the winner either way.
+   *
+   * @param doc - The caller's snapshot to start from (usually the in-memory copy).
+   * @param mutate - Pure function producing the next doc from a current one.
+   * @returns The doc as stored after the successful write.
+   * @throws If the store CAS/read/write rejects; otherwise it retries until the write lands.
+   */
   private async casMutate(doc: Trigger, mutate: (cur: Trigger) => Trigger): Promise<Trigger> {
     let cur = doc;
     for (;;) {

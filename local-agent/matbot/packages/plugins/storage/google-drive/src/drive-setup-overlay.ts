@@ -13,6 +13,16 @@ export interface DriveSetupResult {
   rootFolder: string;
 }
 
+/**
+ * DOM helper creating an element with an inline style string and optional
+ * property assignments.
+ * @typeParam K - Element tag name, narrowed to its DOM interface.
+ * @param tag - Tag name to create.
+ * @param style - Value for `style.cssText`.
+ * @param props - Properties assigned onto the element via `Object.assign`.
+ * @returns The configured element.
+ * @throws Never.
+ */
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   style: string,
@@ -34,12 +44,9 @@ function el<K extends keyof HTMLElementTagNameMap>(
  *    script is preloaded as the dialog mounts so the click handler can open the popup synchronously.
  *
  * Resolves with an authorised {@link DriveAuth} once sign-in succeeds; rejects if the user cancels.
- */
-/**
- * Shows a browser overlay collecting the OAuth client id and root folder,
- * including links to create them in Google Cloud Console.
- * @param initial - Previously saved values to prefill.
- * @returns The entered values once submitted.
+ * @param initial - Previously saved values to prefill the dialog with.
+ * @returns The authorised auth plus the entered client ID and root folder.
+ * @throws Error (via rejection) when the user cancels the dialog.
  */
 export function runDriveSetup(initial: { clientId?: string; rootFolder?: string }): Promise<DriveSetupResult> {
   const httpOrigin = location.protocol === 'http:' || location.protocol === 'https:';
@@ -57,12 +64,30 @@ export function runDriveSetup(initial: { clientId?: string; rootFolder?: string 
     { textContent: 'Store your matbot data — chats, settings, files and secrets — in your own Google Drive, so it follows you between browsers and machines.' });
 
   // ── Step-by-step setup instructions, right in the dialog ────────────────────────────────────
+  /**
+   * Creates an inline-code node for the instruction steps.
+   * @param text - Code text to show.
+   * @returns The styled `<code>` element.
+   * @throws Never.
+   */
   const code = (text: string) => el('code', 'background:#f0f0f0;padding:1px 6px;border-radius:4px;font-size:12px;', { textContent: text });
+  /**
+   * Wraps text in typographic quotes.
+   * @param text - Text to quote.
+   * @returns A text node with the quoted content.
+   * @throws Never.
+   */
   const q = (text: string) => document.createTextNode(`“${text}”`);   // “smart quoted”
 
   const stepsTitle = el('p', 'margin:0 0 8px;font-size:13px;font-weight:600;', { textContent: 'One-time Google setup (≈2 min)' });
   const steps = el('ol', 'margin:0 0 20px;padding-left:22px;font-size:13px;color:#444;');
 
+  /**
+   * Creates a styled `<li>` carrying the given children.
+   * @param nodes - Strings (rendered as text) and nodes to append.
+   * @returns The list item element.
+   * @throws Never.
+   */
   const li = (...nodes: (string | Node)[]) => { const n = el('li', 'margin:0 0 9px;'); n.append(...nodes); return n; };
 
   const link = el('a', 'color:#1a73e8;text-decoration:none;font-weight:600;',
@@ -133,7 +158,19 @@ export function runDriveSetup(initial: { clientId?: string; rootFolder?: string 
   document.body.append(backdrop);
 
   return new Promise<DriveSetupResult>((resolve, reject) => {
+    /**
+     * Removes the overlay from the DOM.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const close = () => backdrop.remove();
+    /**
+     * Writes a message to the status line — green when `ok`, red otherwise.
+     * @param msg - Message to display.
+     * @param ok - Success colouring when true (default false).
+     * @returns Nothing.
+     * @throws Never.
+     */
     const setStatus = (msg: string, ok = false) => { status.textContent = msg; status.style.color = ok ? '#188038' : '#d93025'; };
 
     // Preload the GIS script so the Connect click can open the popup synchronously.

@@ -268,25 +268,26 @@ integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes 
   });
 
   const interruptedJob = interruptedManager.startIngestion(workspace, context);
-  await reachedFiles;
+  await Promise.race([
+    reachedFiles,
+    interruptedManager.waitForIngestion(workspace.id, context.id).then(job => {
+      throw new Error(`Ingestion ended before the checkpoint probe: ${job?.state}: ${job?.message}`);
+    }),
+  ]);
   await interruptedManager.cancel(workspace.id, context.id);
   const interruptedStatus = await interruptedManager.status("primary", workspace, context);
   assert.equal(interruptedStatus.job.discoveryComplete, false);
   assert.ok(interruptedStatus.job.publishedCheckpoints >= 1, "a checkpoint publishes mid-scan");
-  assert.equal(
+  assert.notEqual(
     interruptedStatus.activeGenerationId,
     interruptedJob.generationId,
-    "the interrupted scan leaves a published generation behind",
+    "the interrupted scan keeps its staging generation separate from the published checkpoint",
   );
   assert.ok(interruptedStatus.indexedDocuments >= 2);
   const held = await repository.listFingerprints(
     workspace.id, context.id, interruptedJob.generationId,
   );
-  assert.equal(
-    held.length,
-    interruptedStatus.indexedDocuments,
-    "generation-scoped fingerprints match the documents the generation holds",
-  );
+  assert.ok(held.length >= interruptedStatus.indexedDocuments, "staging may contain work completed after the latest checkpoint");
   assert.equal(
     held.length,
     interruptedStatus.job.processedFiles,
@@ -325,6 +326,28 @@ integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes 
     WHERE workspace_id = $1 AND context_id = $2 AND state = 'staging'
   `, [workspace.id, context.id]);
   assert.equal(staging.rows[0].count, 0, "no abandoned staging generation is left behind");
+
+  // REL-02: deletion is applied to staging even after an independent checkpoint is active.
+  await unlink(path.join(docs, "f.md"));
+  let failedGeneration;
+  const rebuild = repository.rebuildCollections.bind(repository);
+  repository.rebuildCollections = async (...args) => {
+    if (args[2] === failedGeneration) {
+      const concurrentRead = await rescan.search(workspace, context, "PG-RESUME-F", { variant: "lexical_only" });
+      assert.ok(concurrentRead.evidence.some(item => item.text.includes("PG-RESUME-F")));
+      throw new Error("synthetic failure after PostgreSQL reconciliation");
+    }
+    return rebuild(...args);
+  };
+  const failed = rescan.startIngestion(workspace, context, "manual", [], true);
+  failedGeneration = failed.generationId;
+  await rescan.waitForIngestion(workspace.id, context.id);
+  assert.equal(failed.state, "retryable_failure");
+  assert.ok(failed.publishedCheckpoints > 0);
+  const active = await repository.activePublication(workspace.id, context.id);
+  assert.notEqual(active.generationId, failedGeneration);
+  assert.equal((await repository.listFingerprints(workspace.id, context.id)).length, 6);
+  repository.rebuildCollections = rebuild;
 });
 
 integration("workspace RAG V2 enforces RLS through a separate non-owner application role", async t => {
@@ -362,18 +385,12 @@ integration("workspace RAG V2 enforces RLS through a separate non-owner applicat
     "/",
     encodeURIComponent(ownerConfig.database),
   ].join("");
-  const appUrl = [
-    "postgresql://",
-    encodeURIComponent(role),
-    ":",
-    encodeURIComponent(rolePassword),
-    "@",
-    ownerConfig.host || "127.0.0.1",
-    ":",
-    ownerConfig.port || 5432,
-    "/",
-    encodeURIComponent(ownerConfig.database || "mem0"),
-  ].join("");
+  // Preserve the endpoint/database/options when the owner uses a connection URL,
+  // including the random host port used by disposable test databases.
+  const appConnection = new URL(ownerUrl);
+  appConnection.username = role;
+  appConnection.password = rolePassword;
+  const appUrl = appConnection.toString();
   const previous = {
     url: process.env.CORTEX_RAG_POSTGRES_URL,
     migration: process.env.CORTEX_RAG_V2_MIGRATION_POSTGRES_URL,

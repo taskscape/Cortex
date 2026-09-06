@@ -1,5 +1,11 @@
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+/**
+ * Extracts a Node.js-style error code from an unknown thrown value.
+ * @param error - Caught value to inspect.
+ * @returns The `code` property as a string when present, otherwise undefined.
+ * @throws Never.
+ */
 export function errorCode(error: unknown): string | undefined {
     return error && typeof error === 'object' && 'code' in error
         ? String((error as {
@@ -7,20 +13,50 @@ export function errorCode(error: unknown): string | undefined {
         }).code)
         : undefined;
 }
+/**
+ * Wraps an underlying failure into a discovery error with target context.
+ * @param target - Path or root that could not be fully discovered.
+ * @param error - Original failure; its message is embedded in the new error.
+ * @returns A new Error describing the incomplete discovery.
+ * @throws Never.
+ */
 export function discoveryError(target: string, error: unknown): Error {
     const detail = error instanceof Error ? error.message : String(error);
     return new Error(`Workspace RAG V2 could not completely discover ${target}: ${detail}`);
 }
+/**
+ * Resolves a path and normalizes its separators.
+ * @param value - Path to normalize.
+ * @returns The absolute path with backslashes replaced by forward slashes.
+ * @throws Never.
+ */
 export function normalizedPath(value: string): string {
     return path.resolve(value).replace(/\\/gu, '/');
 }
 export const SKIPPABLE_ROOT_ERROR_CODES = new Set([
     'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
 ]);
+/**
+ * Checks whether a path lies at or inside a root.
+ * @param filePath - Path to test.
+ * @param root - Root directory.
+ * @returns True when the path equals the root or is contained by it.
+ * @throws Never.
+ */
 export function isWithinRoot(filePath: string, root: string): boolean {
     const relative = path.relative(root, filePath);
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
+/**
+ * Filters configured roots down to those currently indexable.
+ *
+ * Directories and `.md` files are kept; anything else is skipped, as are
+ * roots whose stat fails with a skippable error code. Other stat failures
+ * are reported as discovery errors.
+ * @param paths - Configured root paths.
+ * @returns Available roots in `paths` and the skipped ones (`skippedPaths`), both absolute.
+ * @throws Error - When a root cannot be stat-ed for a reason outside the skippable set (wrapped by {@link discoveryError}).
+ */
 export async function availableMarkdownRoots(paths: readonly string[]): Promise<{
     paths: string[];
     skippedPaths: string[];
@@ -46,6 +82,21 @@ export async function availableMarkdownRoots(paths: readonly string[]): Promise<
     }
     return { paths: available, skippedPaths: skipped };
 }
+/**
+ * Yields markdown files found under the given roots.
+ *
+ * Traversal is depth-first over sorted directory listings, skipping
+ * `node_modules`, `.git`, and `.data` directories. Only files ending in
+ * `.md` (case-insensitive) are yielded; when `priority` is given, only files
+ * whose {@link discoveryPriority} matches are yielded. Missing files and
+ * missing root `.md` paths are silently skipped; other failures are raised
+ * as discovery errors.
+ * @param paths - Root paths to scan.
+ * @param signal - Abort signal; once aborted, iteration simply completes.
+ * @param priority - Optional priority class to filter yielded files by.
+ * @returns Objects with the normalized absolute `path`, `size` in bytes, and `modifiedAt` ISO timestamp, in deterministic traversal order.
+ * @throws Error - When a required stat or directory listing fails for a non-skippable reason (wrapped by {@link discoveryError}).
+ */
 export async function* discoverMarkdown(paths: readonly string[], signal: AbortSignal, priority?: 'authority' | 'current' | 'archive'): AsyncGenerator<{
     path: string;
     size: number;
@@ -109,6 +160,16 @@ export async function* discoverMarkdown(paths: readonly string[], signal: AbortS
         }
     }
 }
+/**
+ * Counts markdown files under the given roots without full discovery.
+ *
+ * Missing roots and unreadable directories are silently ignored;
+ * `node_modules`, `.git`, and `.data` directories are skipped.
+ * @param paths - Root paths to scan.
+ * @param signal - Abort signal; once aborted, the count so far is returned.
+ * @returns The number of `.md` files (case-insensitive) found.
+ * @throws Never.
+ */
 export async function countMarkdown(paths: readonly string[], signal: AbortSignal): Promise<number> {
     const directories: string[] = [];
     let files = 0;
@@ -150,6 +211,12 @@ export async function countMarkdown(paths: readonly string[], signal: AbortSigna
     }
     return files;
 }
+/**
+ * Classifies a file path into a discovery priority by directory name.
+ * @param filePath - Path to classify (compared case-insensitively).
+ * @returns 'authority' when any path segment is one of authority, official, signed, approved, or executed; 'archive' for archive, archived, history, old, or obsolete; otherwise 'current'.
+ * @throws Never.
+ */
 export function discoveryPriority(filePath: string): 'authority' | 'current' | 'archive' {
     const lower = filePath.toLocaleLowerCase();
     if (/(?:^|\/)(?:authority|official|signed|approved|executed)(?:\/|$)/u.test(lower)) {
@@ -161,4 +228,7 @@ export function discoveryPriority(filePath: string): 'authority' | 'current' | '
     return 'current';
 }
 export const filesystemSource = { availableMarkdownRoots, discoverMarkdown, countMarkdown };
+/**
+ * The filesystem source-acquisition bundle: root validation, discovery, and counting.
+ */
 export type RagSourceAcquisition = typeof filesystemSource;

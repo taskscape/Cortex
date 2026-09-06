@@ -4,11 +4,22 @@ import { getRegisteredPlugins, getSpecifierForPlugin } from '@matatbread/matbot-
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-// Credential env-var naming convention for secrets created by this tool.
+/**
+ * Derives the credential env-var name for secrets created by this tool, per the naming convention
+ * shared with the vault.
+ * @param profileName - Provider profile name; characters outside `A-Z0-9` become underscores.
+ * @returns Uppercase variable name of the form `MATBOT_API_KEY_<NAME>`.
+ * @throws Never.
+ */
 function credEnvVarName(profileName: string): string {
     return `MATBOT_API_KEY_${profileName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 }
 // ── Input types ───────────────────────────────────────────────────────────────
+/**
+ * Discriminated union of `provider` tool inputs, keyed on `action`. `add` carries the profile
+ * fields (`name`, `module`, `model`, plus optional endpoint, credential source, and generation
+ * parameters); `remove` and `list` need little else.
+ */
 type ProviderInput = {
     action: 'list';
 } | {
@@ -25,6 +36,12 @@ type ProviderInput = {
     name: string;
 };
 // ── YAML helpers (read/write only — runtime state comes from liveProviders) ───
+/**
+ * Escapes regular-expression metacharacters in a string.
+ * @param s - Text to escape.
+ * @returns A copy safe to embed literally in a `RegExp` pattern.
+ * @throws Never.
+ */
 function escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -37,17 +54,40 @@ function escapeRegex(s: string): string {
 // resolveProviderFactory, and (b) a specifier the loader can resolve at startup.
 // We never echo the raw input into matbot.yaml — a bare package name for a local
 // plugin is not resolvable at load time and crashes startup.
+/**
+ * Checks whether a specifier text looks like a filesystem path.
+ * @param s - Specifier text to classify.
+ * @returns True for `.`-relative (including `./`, `../`), `/`-prefixed, or platform-absolute
+ *   paths; false otherwise.
+ * @throws Never.
+ */
 const pathLike = (s: string): boolean => s.startsWith('.') || s.startsWith('/') || path.isAbsolute(s);
-// The path part of a resolved specifier, or undefined if it isn't a file: URL.
+/**
+ * The path part of a resolved specifier, or undefined if it isn't a file: URL.
+ *
+ * @param name - Canonical provider plugin name.
+ * @returns Absolute local path of the plugin's resolved entry file (query string stripped), or
+ *   undefined if the plugin has no recorded specifier or it is not a `file:` URL.
+ * @throws Never (registry-recorded `file:` URLs are always well-formed).
+ */
 function resolvedEntryPath(name: string): string | undefined {
     const resolved = getSpecifierForPlugin(name);
     if (resolved?.startsWith('file:'))
         return fileURLToPath((resolved.split('?')[0]) ?? resolved);
     return undefined;
 }
-// Find the already-loaded provider adapter that `mod` refers to, in any of the forms
-// the LLM might use: canonical name, recorded YAML specifier, resolved file URL, or a
-// differently-spelled path (absolute vs relative, trailing slash).
+/**
+ * Finds the already-loaded provider adapter that `mod` refers to, in any of the forms
+ * the LLM might use: canonical name, recorded YAML specifier, resolved file URL, or a
+ * differently-spelled path (absolute vs relative, trailing slash).
+ *
+ * @param mod - Adapter reference in any accepted form (name, specifier, or path).
+ * @param projectDir - Root that relative paths resolve against.
+ * @param pluginNameToOrigPath - Optional map of provider plugin name → original YAML specifier,
+ *   also accepted as a match for `mod`.
+ * @returns The matching loaded plugin that exposes a `provider`, or undefined if none matches.
+ * @throws Never.
+ */
 function findLoadedAdapter(mod: string, projectDir: string, pluginNameToOrigPath?: ReadonlyMap<string, string>): MatbotPlugin | undefined {
     const adapters = getRegisteredPlugins().filter(p => p.provider !== undefined);
     for (const p of adapters) {
@@ -68,9 +108,19 @@ function findLoadedAdapter(mod: string, projectDir: string, pluginNameToOrigPath
     }
     return undefined;
 }
-// The YAML-valid specifier to write for an already-loaded adapter: prefer the exact
-// string from matbot.yaml (portable, human-authored), otherwise derive a relative path
-// from the resolved entry file. Never the bare package name of a local plugin.
+/**
+ * The YAML-valid specifier to write for an already-loaded adapter: prefer the exact
+ * string from matbot.yaml (portable, human-authored), otherwise derive a relative path
+ * from the resolved entry file. Never the bare package name of a local plugin.
+ *
+ * @param name - Canonical provider plugin name.
+ * @param projectDir - Root the derived relative path is expressed against (forward slashes).
+ * @param pluginNameToOrigPath - Optional map of plugin name → original YAML specifier, preferred
+ *   over derivation when it has an entry.
+ * @returns A specifier the loader can resolve at startup, or undefined if the adapter resolved as
+ *   neither a local file nor a recorded npm package.
+ * @throws Never.
+ */
 function yamlSpecifierFor(name: string, projectDir: string, pluginNameToOrigPath?: ReadonlyMap<string, string>): string | undefined {
     const orig = pluginNameToOrigPath?.get(name);
     if (orig !== undefined)
@@ -81,6 +131,15 @@ function yamlSpecifierFor(name: string, projectDir: string, pluginNameToOrigPath
     // No file: URL — the adapter resolved as a real npm package, so its name is valid.
     return getSpecifierForPlugin(name);
 }
+/**
+ * Appends YAML lines for an object's entries to an accumulator, recursing into plain objects and
+ * arrays (arrays render one `- item` line per element). Values are stringified without quoting.
+ * @param obj - Entries to render; nested plain objects and arrays are expanded in place.
+ * @param indent - Indentation prefix for this level (two spaces per depth).
+ * @param lines - Accumulator the rendered lines are pushed onto, in entry order.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function appendYamlFields(obj: Record<string, unknown>, indent: string, lines: string[]): void {
     for (const [k, v] of Object.entries(obj)) {
         if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
@@ -122,6 +181,17 @@ function buildProviderBlock(opts: {
     }
     return lines.join('\n') + '\n';
 }
+/**
+ * Inserts a rendered provider block into the configuration file's `providers:` section. The block
+ * is appended after the last existing profile; when no `providers:` section exists, one is created
+ * before the `plugins:` key (or prepended to the file). The write is atomic and compare-and-swap
+ * guarded via {@link replaceConfigurationFile}.
+ *
+ * @param configPath - Path of the configuration file to edit.
+ * @param block - Rendered block from {@link buildProviderBlock}, ending with a newline.
+ * @returns Resolves once the file is written.
+ * @throws Error - If the file cannot be read or written, or changed on disk since it was read.
+ */
 async function addProviderToConfig(configPath: string, block: string): Promise<void> {
     const text = await readFile(configPath, 'utf8');
     const m = /^providers:[ \t]*\n/m.exec(text);
@@ -146,6 +216,17 @@ async function addProviderToConfig(configPath: string, block: string): Promise<v
     }
     await replaceConfigurationFile(configPath, text, updated);
 }
+/**
+ * Removes a named provider profile and its indented child keys from the `providers:` section of
+ * the configuration file. The whole-profile match is regex-escaped and includes deeply indented
+ * children and blank lines but no sibling keys. The write is atomic and compare-and-swap guarded
+ * via {@link replaceConfigurationFile}.
+ *
+ * @param configPath - Path of the configuration file to edit.
+ * @param name - Exact profile key to remove.
+ * @returns True if the profile was found and the file rewritten; false if nothing matched.
+ * @throws Error - If the file cannot be read or written, or changed on disk since it was read.
+ */
 async function removeProviderFromConfig(configPath: string, name: string): Promise<boolean> {
     const text = await readFile(configPath, 'utf8');
     // Match '  name:\n' plus every following line that does NOT start with '  <non-space>'
@@ -158,6 +239,13 @@ async function removeProviderFromConfig(configPath: string, name: string): Promi
     return true;
 }
 // ── Endpoint reachability check ───────────────────────────────────────────────
+/**
+ * Probes an endpoint's reachability with a single HEAD request (5-second timeout).
+ * @param url - Endpoint base URL to test.
+ * @returns Null when the request succeeds; the failure message (network error, DNS failure, or
+ *   timeout) otherwise.
+ * @throws Never (all fetch failures are captured and returned as a message).
+ */
 async function checkEndpoint(url: string): Promise<string | null> {
     try {
         await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
@@ -168,6 +256,13 @@ async function checkEndpoint(url: string): Promise<string | null> {
     }
 }
 // ── Current provider detection ────────────────────────────────────────────────
+/**
+ * Determines the provider powering the current turn from the session transcript.
+ * @param ctx - Tool execution context whose `session` messages are inspected.
+ * @returns The `providerName` stamped on the most recent assistant message (the runner stamps it
+ *   on every message it produces), or undefined if no assistant message carries one yet.
+ * @throws Never.
+ */
 function currentProviderName(ctx: ToolContext): string | undefined {
     // The runner stamps providerName on every assistant message it produces.
     for (let i = ctx.session.messages.length - 1; i >= 0; i--) {
@@ -178,6 +273,21 @@ function currentProviderName(ctx: ToolContext): string | undefined {
     return undefined;
 }
 // ── Executor ──────────────────────────────────────────────────────────────────
+/**
+ * Builds the `provider` tool's executor, closing over the live provider map and the plugin-name →
+ * original-path map. The returned `execute` generator implements the `list`, `add`, and `remove`
+ * actions: `add` resolves and validates the adapter module, prompts for credentials out-of-band,
+ * checks the endpoint, confirms with the user, then persists to matbot.yaml and hot-updates the
+ * live map; `remove` refuses to delete the current turn's provider or the last remaining profile.
+ *
+ * @param liveProviders - Mutable live provider profile map; `add` inserts and `remove` deletes
+ *   entries so changes apply without a restart.
+ * @param pluginNameToOrigPath - Optional map of provider plugin name → original YAML specifier,
+ *   consulted for module resolution and echoed in listings and error messages.
+ * @returns An executor object whose `execute` yields `ToolEvent`s in action order; operational
+ *   failures are reported as `error` events, not thrown.
+ * @throws Never.
+ */
 function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOrigPath?: ReadonlyMap<string, string>) {
     return {
         async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
@@ -367,7 +477,9 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
  * @param providers - The live provider profile map (mutated by add/remove without a restart).
  * @param pluginNameToOrigPath - Optional map of provider plugin name → original YAML specifier,
  *        used to echo human-authored paths back instead of internal names.
- * @returns The `provider` tool definition.
+ * @returns The `provider` tool definition; its executor reports operational failures as `error`
+ *        events rather than throwing.
+ * @throws Never.
  */
 export function createProviderTool(providers: ReadonlyMap<string, ProviderConfig>, pluginNameToOrigPath?: ReadonlyMap<string, string>): Tool {
     // Cast to mutable so add/remove can update the live map without a restart.

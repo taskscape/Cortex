@@ -77,6 +77,10 @@ export type DataConnectionInput = {
   defaultSchema?: string;
 };
 
+/**
+ * A governed table entry in the catalog: the physical schema/table on a
+ * connection, its access flags, and optional row-level constraint SQL.
+ */
 export interface DataTable {
   id: string;
   version: string;
@@ -110,6 +114,10 @@ export type DataTableInput = {
   columns?: DataColumnInput[];
 };
 
+/**
+ * A governed column of a catalog table: its logical type, analytical role,
+ * and whether query planning may reference it.
+ */
 export interface DataColumn {
   id: string;
   version: string;
@@ -126,6 +134,10 @@ export interface DataColumn {
   updatedAt: string;
 }
 
+/**
+ * Input for upserting a column; omitted fields keep existing values or
+ * default, and `workspaceId` is inferred from the parent table when omitted.
+ */
 export type DataColumnInput = {
   id?: string;
   workspaceId?: string;
@@ -161,6 +173,10 @@ export interface MetricDefinition {
   sourceId?: string;
 }
 
+/**
+ * Input for creating or updating a metric definition; omitted fields keep
+ * existing values on update.
+ */
 export type MetricDefinitionInput = {
   id?: string;
   workspaceId: string;
@@ -176,6 +192,10 @@ export type MetricDefinitionInput = {
   sourceId?: string;
 };
 
+/**
+ * A single semantic filter clause: one comparison against a column approved
+ * for filtering by the metric.
+ */
 export interface SemanticFilter {
   columnId: string;
   op: FilterOperator;
@@ -212,6 +232,10 @@ export interface QueryCostEstimate {
   factors: string[];
 }
 
+/**
+ * A persisted query run lifecycle record: the planned SQL, its hash and
+ * semantic inputs, approval token state, and the execution outcome.
+ */
 export interface QueryRun {
   id: string;
   version: string;
@@ -236,6 +260,11 @@ export interface QueryRun {
   approvalExpiresAt?: string;
 }
 
+/**
+ * The full artifact produced by planning: the persisted run, the resolved
+ * metric and base table, dimension columns, filters, validation outcome, and
+ * a heuristic cost estimate.
+ */
 export interface QueryPlan {
   queryRun: QueryRun;
   metric: MetricDefinition;
@@ -267,18 +296,32 @@ export interface ExecuteQueryResult {
 export interface DataCatalog {
   /**
    * Derives the deterministic id for a connection.
+   * @param workspaceId - Owning workspace.
+   * @param dialect - Connection dialect.
+   * @param displayName - Display name distinguishing same-dialect connections.
+   * @returns Hash-derived stable id.
    */
   stableConnectionId(workspaceId: string, dialect: DataDialect, displayName: string): string;
   /**
    * Derives the deterministic id for a table.
+   * @param connectionId - Parent connection id.
+   * @param schemaName - Database schema name.
+   * @param tableName - Table name within the schema.
+   * @returns Hash-derived stable id.
    */
   stableTableId(connectionId: string, schemaName: string, tableName: string): string;
   /**
    * Derives the deterministic id for a column.
+   * @param tableId - Parent table id.
+   * @param columnName - Physical column name.
+   * @returns Hash-derived stable id.
    */
   stableColumnId(tableId: string, columnName: string): string;
   /**
    * Derives the deterministic id for a metric.
+   * @param workspaceId - Owning workspace.
+   * @param name - Metric name; normalised before hashing.
+   * @returns Hash-derived stable id.
    */
   stableMetricId(workspaceId: string, name: string): string;
   /**
@@ -293,6 +336,7 @@ export interface DataCatalog {
    * registers it as a source-registry source.
    * @param input - Table fields.
    * @returns The stored table.
+   * @throws When the optional source registry rejects the source registration.
    */
   upsertTable(input: DataTableInput): Promise<DataTable>;
   /**
@@ -310,36 +354,58 @@ export interface DataCatalog {
   upsertMetric(input: MetricDefinitionInput): Promise<MetricDefinition>;
   /**
    * Fetches a connection by id.
+   * @param id - Connection id.
    * @returns The connection, or null when absent.
    */
   getConnection(id: string): Promise<DataConnection | null>;
   /**
    * Fetches a table by id.
+   * @param id - Table id.
    * @returns The table, or null when absent.
    */
   getTable(id: string): Promise<DataTable | null>;
   /**
    * Fetches a column by id.
+   * @param id - Column id.
    * @returns The column, or null when absent.
    */
   getColumn(id: string): Promise<DataColumn | null>;
   /**
    * Fetches a metric by id.
+   * @param id - Metric id.
    * @returns The metric, or null when absent.
    */
   getMetric(id: string): Promise<MetricDefinition | null>;
   /**
    * Resolves a metric by its normalised name within a workspace.
+   * @param workspaceId - Workspace to search.
+   * @param name - Metric name; matched after normalisation.
    * @returns The metric, or null when unknown.
    */
   metricByName(workspaceId: string, name: string): Promise<MetricDefinition | null>;
-  /** Queries stored connections. */
+  /**
+   * Queries stored connections.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching connections.
+   */
   queryConnections(query?: StoreQuery): Promise<DataConnection[]>;
-  /** Queries stored tables. */
+  /**
+   * Queries stored tables.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching tables.
+   */
   queryTables(query?: StoreQuery): Promise<DataTable[]>;
-  /** Queries stored columns. */
+  /**
+   * Queries stored columns.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching columns.
+   */
   queryColumns(query?: StoreQuery): Promise<DataColumn[]>;
-  /** Queries stored metrics. */
+  /**
+   * Queries stored metrics.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching metrics.
+   */
   queryMetrics(query?: StoreQuery): Promise<MetricDefinition[]>;
 }
 
@@ -381,18 +447,44 @@ export interface SqlPlanner {
    * @returns Validation outcome including reasons and a normalised SQL hash.
    */
   validateSql(sql: string, options?: { requireLimit?: boolean }): SqlValidationResult;
-  /** Queries stored query runs. */
+  /**
+   * Queries stored query runs.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching runs.
+   */
   queryRuns(query?: StoreQuery): Promise<QueryRun[]>;
   /**
    * Fetches a query run by id.
+   * @param id - Query run id.
    * @returns The run, or null when absent.
    */
   getQueryRun(id: string): Promise<QueryRun | null>;
 }
 
+/**
+ * Minimal SourceRegistry service subset used for provenance: source/version
+ * upserts plus citation resolution. Optional — the catalog and planner work
+ * without it, simply not recording sources.
+ */
 interface SourceRegistryLike {
+  /**
+   * Creates or updates a source record from a loose field bag.
+   * @param input - Source fields as understood by the registry.
+   * @returns The stored source id.
+   */
   upsertSource(input: Record<string, unknown>): Promise<{ id: string }>;
+  /**
+   * Creates or updates a version record for a source.
+   * @param input - Version fields as understood by the registry.
+   * @returns The stored version id.
+   */
   upsertVersion(input: Record<string, unknown>): Promise<{ id: string }>;
+  /**
+   * Resolves display text citing a source (optionally a specific version).
+   * @param sourceId - Source to cite.
+   * @param versionId - Specific version to cite; registry default when undefined.
+   * @returns Citation text.
+   */
   resolveCitation(sourceId: string, versionId?: string): Promise<{ text: string }>;
 }
 
@@ -406,45 +498,107 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_CREDENTIAL_REF = '${CORTEX_STRUCTURED_POSTGRES_URL}';
 const DEFAULT_CONNECTOR_INSTANCE_ID = 'connector-instance:postgres-readonly:local';
 
+/**
+ * Returns the current time as an ISO-8601 UTC string.
+ * @returns Current timestamp in ISO format.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Builds a deterministic prefixed id by hashing its parts with SHA-256.
+ * @param prefix - Id namespace prefix (e.g. `data-connection`).
+ * @param parts - Ordered components joined with a NUL separator before hashing.
+ * @returns `<prefix>:<32 hex chars>` derived from the parts.
+ * @throws Never.
+ */
 function hashId(prefix: string, parts: readonly string[]): string {
   const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
   return `${prefix}:${hash}`;
 }
 
+/**
+ * Computes the full SHA-256 hex digest of a text.
+ * @param text - Text to hash.
+ * @returns 64-character lowercase hex digest.
+ * @throws Never.
+ */
 function hashText(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
+/**
+ * Trims, drops empties, and de-duplicates string values.
+ * @param values - Values to normalise.
+ * @returns New array of unique non-empty trimmed values, in first-occurrence order.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Returns the ambient security principal id, falling back to 'system'.
+ * @returns Current principal id, or 'system' when no principal is in scope.
+ * @throws Never.
+ */
 function principalId(): string {
   return tryCurrentPrincipal()?.id ?? 'system';
 }
 
+/**
+ * Quotes a SQL identifier for Postgres.
+ * @param value - Identifier to quote; must be a plain `[A-Za-z_][A-Za-z0-9_]*` token.
+ * @returns Double-quoted identifier with embedded quotes doubled.
+ * @throws Error - When the value is not a plain SQL identifier.
+ */
 function quoteIdent(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error(`Invalid SQL identifier "${value}".`);
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+/**
+ * Normalises a name to a lowercase identifier-like token: trims, lowercases,
+ * collapses non-alphanumeric runs to underscores, and strips edge underscores.
+ * @param value - Name to normalise.
+ * @returns Normalised name, or 'unnamed' when nothing remains.
+ * @throws Never.
+ */
 function normalizeName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
 }
 
+/**
+ * Type guard for filter parameter values.
+ * @param value - Value to test.
+ * @returns True when the value is a string, number, or boolean.
+ * @throws Never.
+ */
 function scalarValue(value: unknown): value is string | number | boolean {
   return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
 }
 
+/**
+ * Runs a store query and returns its items.
+ * @typeParam T - Stored record shape with `id` and `version`.
+ * @param store - Store to query.
+ * @param query - Filter/sort/paging query; undefined means all records.
+ * @returns Matching records.
+ * @throws Never.
+ */
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   const result = await store.query(query ?? {});
   return result.items;
 }
 
+/**
+ * Store-backed {@link DataCatalog}: upserts merge omitted fields from the
+ * existing record and write with a fresh version via `set` (last write wins,
+ * no compare-and-swap), so concurrent writers can clobber each other.
+ * Ids are deterministic, so re-upserting the same identity updates in place.
+ */
 class StoreBackedDataCatalog implements DataCatalog {
   private readonly connections: Store<DataConnection>;
   private readonly tables: Store<DataTable>;
@@ -452,6 +606,14 @@ class StoreBackedDataCatalog implements DataCatalog {
   private readonly metrics: Store<MetricDefinition>;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
 
+  /**
+   * @param connections - Store for registered connections.
+   * @param tables - Store for catalog tables.
+   * @param columns - Store for catalog columns.
+   * @param metrics - Store for metric definitions.
+   * @param sourceRegistry - Optional source registry used to register tables
+   *   as sources; when undefined, no provenance is recorded.
+   */
   constructor(
     connections: Store<DataConnection>,
     tables: Store<DataTable>,
@@ -466,22 +628,57 @@ class StoreBackedDataCatalog implements DataCatalog {
     this.sourceRegistry = sourceRegistry;
   }
 
+  /**
+   * Derives the deterministic id for a connection.
+   * @param workspaceId - Owning workspace.
+   * @param dialect - Connection dialect.
+   * @param displayName - Display name distinguishing same-dialect connections.
+   * @returns Hash-derived stable id.
+   */
   stableConnectionId(workspaceId: string, dialect: DataDialect, displayName: string): string {
     return hashId('data-connection', [workspaceId, dialect, displayName]);
   }
 
+  /**
+   * Derives the deterministic id for a table.
+   * @param connectionId - Parent connection id.
+   * @param schemaName - Database schema name.
+   * @param tableName - Table name within the schema.
+   * @returns Hash-derived stable id.
+   */
   stableTableId(connectionId: string, schemaName: string, tableName: string): string {
     return hashId('data-table', [connectionId, schemaName, tableName]);
   }
 
+  /**
+   * Derives the deterministic id for a column.
+   * @param tableId - Parent table id.
+   * @param columnName - Physical column name.
+   * @returns Hash-derived stable id.
+   */
   stableColumnId(tableId: string, columnName: string): string {
     return hashId('data-column', [tableId, columnName]);
   }
 
+  /**
+   * Derives the deterministic id for a metric.
+   * @param workspaceId - Owning workspace.
+   * @param name - Metric name; normalised before hashing.
+   * @returns Hash-derived stable id.
+   */
   stableMetricId(workspaceId: string, name: string): string {
     return hashId('data-metric', [workspaceId, normalizeName(name)]);
   }
 
+  /**
+   * Creates or updates a connection, preserving omitted fields from the
+   * existing record and defaulting display name, dialect, limits, and
+   * credential ref.
+   * @param input - Connection fields.
+   * @returns The stored connection.
+   * @throws Error - When the resulting connection is not read-only or its
+   *   dialect is not postgres.
+   */
   async upsertConnection(input: DataConnectionInput): Promise<DataConnection> {
     const displayName = input.displayName ?? `${input.dialect ?? 'postgres'}:${input.workspaceId}`;
     const id = input.id ?? this.stableConnectionId(input.workspaceId, input.dialect ?? 'postgres', displayName);
@@ -508,6 +705,14 @@ class StoreBackedDataCatalog implements DataCatalog {
     return connection;
   }
 
+  /**
+   * Creates or updates a table and any embedded column definitions, then
+   * registers it with the optional source registry.
+   * @param input - Table fields; embedded columns are upserted in order.
+   * @returns The stored table as it was before source registration, so a
+   *   registry-assigned `sourceId` is not reflected in the returned object.
+   * @throws Error - When the source registry rejects the table source registration.
+   */
   async upsertTable(input: DataTableInput): Promise<DataTable> {
     const id = input.id ?? this.stableTableId(input.connectionId, input.schemaName, input.tableName);
     const existing = await this.tables.get(id);
@@ -540,6 +745,13 @@ class StoreBackedDataCatalog implements DataCatalog {
     return table;
   }
 
+  /**
+   * Creates or updates a column of a table, preserving omitted fields from
+   * the existing record.
+   * @param input - Column fields; workspaceId inferred from the table when omitted.
+   * @returns The stored column.
+   * @throws Error - When the workspace cannot be inferred from the table.
+   */
   async upsertColumn(input: DataColumnInput): Promise<DataColumn> {
     const table = await this.tables.get(input.tableId);
     const workspaceId = input.workspaceId ?? table?.workspaceId;
@@ -566,6 +778,13 @@ class StoreBackedDataCatalog implements DataCatalog {
     return column;
   }
 
+  /**
+   * Creates or updates a metric definition, normalising `name` and preserving
+   * omitted fields from the existing record.
+   * @param input - Metric fields.
+   * @returns The stored metric.
+   * @throws Never.
+   */
   async upsertMetric(input: MetricDefinitionInput): Promise<MetricDefinition> {
     const id = input.id ?? this.stableMetricId(input.workspaceId, input.name);
     const existing = await this.metrics.get(id);
@@ -591,11 +810,37 @@ class StoreBackedDataCatalog implements DataCatalog {
     return metric;
   }
 
+  /**
+   * Fetches a connection by id.
+   * @param id - Connection id.
+   * @returns The connection, or null when absent.
+   */
   getConnection(id: string): Promise<DataConnection | null> { return this.connections.get(id); }
+  /**
+   * Fetches a table by id.
+   * @param id - Table id.
+   * @returns The table, or null when absent.
+   */
   getTable(id: string): Promise<DataTable | null> { return this.tables.get(id); }
+  /**
+   * Fetches a column by id.
+   * @param id - Column id.
+   * @returns The column, or null when absent.
+   */
   getColumn(id: string): Promise<DataColumn | null> { return this.columns.get(id); }
+  /**
+   * Fetches a metric by id.
+   * @param id - Metric id.
+   * @returns The metric, or null when absent.
+   */
   getMetric(id: string): Promise<MetricDefinition | null> { return this.metrics.get(id); }
 
+  /**
+   * Resolves a metric by its normalised name within a workspace.
+   * @param workspaceId - Workspace to search.
+   * @param name - Metric name; matched after normalisation.
+   * @returns The first matching metric, or null when unknown.
+   */
   async metricByName(workspaceId: string, name: string): Promise<MetricDefinition | null> {
     const metrics = await this.queryMetrics({
       where: {
@@ -609,11 +854,38 @@ class StoreBackedDataCatalog implements DataCatalog {
     return metrics[0] ?? null;
   }
 
+  /**
+   * Queries stored connections.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching connections.
+   */
   queryConnections(query?: StoreQuery): Promise<DataConnection[]> { return queryAll(this.connections, query); }
+  /**
+   * Queries stored tables.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching tables.
+   */
   queryTables(query?: StoreQuery): Promise<DataTable[]> { return queryAll(this.tables, query); }
+  /**
+   * Queries stored columns.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching columns.
+   */
   queryColumns(query?: StoreQuery): Promise<DataColumn[]> { return queryAll(this.columns, query); }
+  /**
+   * Queries stored metrics.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching metrics.
+   */
   queryMetrics(query?: StoreQuery): Promise<MetricDefinition[]> { return queryAll(this.metrics, query); }
 
+  /**
+   * Registers a table as a structured-data source in the optional source
+   * registry and stores the assigned `sourceId` back onto the table record.
+   * No-op when no registry is wired.
+   * @param table - Table to register.
+   * @throws Error - When the source registry rejects the source upsert.
+   */
   private async registerTableSource(table: DataTable): Promise<void> {
     if (this.sourceRegistry === undefined) return;
     const connection = await this.connections.get(table.connectionId);
@@ -642,12 +914,26 @@ class StoreBackedDataCatalog implements DataCatalog {
   }
 }
 
+/**
+ * Store-backed {@link SqlPlanner}: renders deterministic parameterised SQL
+ * from semantic inputs, validates read-only safety, approves runs with
+ * hashed expiring tokens, and executes approved queries in a read-only
+ * Postgres transaction. Execution re-checks the ambient principal, so calls
+ * must run inside the principal scope that approved the run. Run records are
+ * written with fresh versions via `set` (no compare-and-swap).
+ */
 class StoreBackedSqlPlanner implements SqlPlanner {
   private readonly catalog: DataCatalog;
   private readonly queryRunStore: Store<QueryRun>;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
   private readonly services: MatbotMachine;
 
+  /**
+   * @param catalog - Catalog resolving metrics, tables, columns, and connections.
+   * @param queryRuns - Store persisting query run lifecycle records.
+   * @param sourceRegistry - Optional source registry for result provenance.
+   * @param services - Runtime machine used as fallback Vault for credentials.
+   */
   constructor(catalog: DataCatalog, queryRuns: Store<QueryRun>, sourceRegistry: SourceRegistryLike | undefined, services: MatbotMachine) {
     this.catalog = catalog;
     this.queryRunStore = queryRuns;
@@ -655,6 +941,18 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     this.services = services;
   }
 
+  /**
+   * Plans a query run from a semantic request: resolves the metric by id or
+   * normalised name, verifies workspace ownership and table/connection access,
+   * resolves approved dimension and filter columns, caps the requested row
+   * limit at the connection default, renders parameterised SQL, and validates
+   * it before persisting the run in `planned` status.
+   * @param input - Metric, dimensions, filters and row limit.
+   * @returns The persisted plan (run + validation + cost estimate).
+   * @throws Error - When the metric/table/connection is unknown, denied, or
+   *   non-read-only; a requested column is unknown or unapproved; or the
+   *   generated SQL fails validation.
+   */
   async planQuery(input: QueryPlanInput): Promise<QueryPlan> {
     const metric = input.metricId !== undefined
       ? await this.catalog.getMetric(input.metricId)
@@ -722,6 +1020,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     };
   }
 
+  /**
+   * Approves a planned run, minting a one-time approval token that is stored
+   * only as a hash, with a TTL read from `CORTEX_SQL_APPROVAL_TTL_MS`
+   * (default 5 minutes). The plaintext token is returned once and never
+   * persisted.
+   * @param queryRunId - The planned run to approve.
+   * @returns The updated run plus the approval token (shown once).
+   * @throws Error - When the run is unknown or not in an approvable status
+   *   (`planned` or `approved`).
+   */
   async approveQuery(queryRunId: string): Promise<{ queryRun: QueryRun; approvalToken: string }> {
     const run = await this.queryRunStore.get(queryRunId);
     if (run === null) throw new Error(`Unknown query run "${queryRunId}".`);
@@ -743,6 +1051,22 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     return { queryRun: approved, approvalToken: token };
   }
 
+  /**
+   * Executes an approved run in a read-only Postgres transaction: re-validates
+   * the token hash, owning principal, expiry, connection read-only posture,
+   * and SQL safety, then runs the statement under `BEGIN READ ONLY` with a
+   * statement timeout, truncating rows to the planned limit. On failure the
+   * run is marked `failed` and the error rethrown; on success a result source
+   * and citation are registered when a source registry is wired.
+   * @param queryRunId - Approved run id.
+   * @param approvalToken - Token minted at approval time.
+   * @param ctx - Tool context used to resolve credentials.
+   * @returns Rows (truncated to the run's row limit), field names, the
+   *   succeeded run, and a citation when provenance was recorded.
+   * @throws Error - When the token is invalid/expired, the principal differs,
+   *   SQL fails re-validation, credentials cannot be resolved, or the
+   *   database errors.
+   */
   async executeQuery(queryRunId: string, approvalToken: string, ctx: ToolContext): Promise<ExecuteQueryResult> {
     const run = await this.queryRunStore.get(queryRunId);
     if (run === null) throw new Error(`Unknown query run "${queryRunId}".`);
@@ -821,6 +1145,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     };
   }
 
+  /**
+   * Validates raw SQL for read-only safety without executing it: masks string
+   * literals and comments, then rejects anything that is not a single SELECT
+   * or contains disallowed write, DDL, session, or procedural keywords, or a
+   * CROSS JOIN.
+   * @param sql - SQL to check.
+   * @param options - `requireLimit` forces an explicit LIMIT clause.
+   * @returns Validation outcome including reasons and a normalised SQL hash.
+   * @throws Never.
+   */
   validateSql(sql: string, options: { requireLimit?: boolean } = {}): SqlValidationResult {
     const normalized = stripSql(sql).trim();
     const reasons: string[] = [];
@@ -842,22 +1176,59 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     };
   }
 
+  /**
+   * Queries stored query runs.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching runs.
+   */
   queryRuns(query?: StoreQuery): Promise<QueryRun[]> {
     return queryAll(this.queryRunStore, query);
   }
 
+  /**
+   * Fetches a query run by id.
+   * @param id - Query run id.
+   * @returns The run, or null when absent.
+   */
   getQueryRun(id: string): Promise<QueryRun | null> {
     return this.queryRunStore.get(id);
   }
 
+  /**
+   * Persists a run with a freshly generated version (no compare-and-swap).
+   * @param run - Run record to store; `id` identifies the record.
+   * @throws Never.
+   */
   private async updateRun(run: QueryRun): Promise<void> {
     await this.queryRunStore.set(run.id, { ...run, version: randomUUID() });
   }
 
+  /**
+   * Resolves requested column references to allowed catalog columns.
+   * @param requested - Column ids, names, or display names, in request order.
+   * @param columns - Catalog columns of the metric's base table.
+   * @param allowed - Column ids/names (or '*') approved by the metric.
+   * @param purpose - Role being resolved ('dimension' or 'filter'); used in
+   *   error messages.
+   * @returns Resolved columns in request order.
+   * @throws Error - When a column is unknown, denied, or not approved for the purpose.
+   */
   private resolveColumns(requested: readonly string[], columns: readonly DataColumn[], allowed: readonly string[], purpose: string): DataColumn[] {
     return requested.map(id => this.requireAllowedColumn(id, columns, allowed, purpose));
   }
 
+  /**
+   * Resolves one column by id, name, or normalised display name and enforces
+   * both catalog and metric approvals.
+   * @param id - Column id, name, or display name to resolve.
+   * @param columns - Catalog columns of the base table.
+   * @param allowed - Approved column ids/names; '*' approves every
+   *   catalog-allowed column.
+   * @param purpose - 'dimension' or 'filter'; used in error messages.
+   * @returns The matching column.
+   * @throws Error - When the column is unknown, denied in the catalog, or not
+   *   approved for this purpose on the metric.
+   */
   private requireAllowedColumn(id: string, columns: readonly DataColumn[], allowed: readonly string[], purpose: string): DataColumn {
     const column = columns.find(item => item.id === id || item.name === id || normalizeName(item.displayName) === normalizeName(id));
     if (column === undefined) throw new Error(`Unknown ${purpose} column "${id}".`);
@@ -868,6 +1239,23 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     return column;
   }
 
+  /**
+   * Renders deterministic parameterised SELECT SQL for a metric over its base
+   * table: quoted identifiers, the table's row-level constraint (validated
+   * before inclusion), parameterised filter clauses, and GROUP BY/ORDER BY/
+   * LIMIT for dimensional queries. Filter values become positional parameters
+   * and are never inlined.
+   * @param metric - Metric being planned.
+   * @param table - Base table to select from.
+   * @param columns - Catalog columns of the table.
+   * @param dimensions - Approved dimension columns.
+   * @param filters - Semantic filters to apply.
+   * @param limit - Row limit for dimensional queries; undefined omits LIMIT.
+   * @returns Rendered SQL and the ordered positional parameters.
+   * @throws Error - When the row-level constraint fails validation, the
+   *   metric expression is unsupported, a filter column is unknown or
+   *   unapproved, or a filter value is non-scalar.
+   */
   private renderSql(
     metric: MetricDefinition,
     table: DataTable,
@@ -901,6 +1289,15 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     };
   }
 
+  /**
+   * Renders the metric's aggregation expression over its approved base column.
+   * @param metric - Metric definition to render.
+   * @param columns - Catalog columns of the base table.
+   * @returns Aggregation SQL fragment (e.g. `sum("col")`); `count(*)` when the
+   *   expression is `*`.
+   * @throws Error - When the aggregation is `custom` or `ratio` (not yet
+   *   supported), or the expression references an unknown or denied column.
+   */
   private renderMetric(metric: MetricDefinition, columns: readonly DataColumn[]): string {
     if (metric.aggregation === 'custom' || metric.aggregation === 'ratio') {
       throw new Error(`Metric aggregation "${metric.aggregation}" requires a later semantic expression hardening slice.`);
@@ -923,6 +1320,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     }
   }
 
+  /**
+   * Renders one filter clause with positional `$n` placeholders; values are
+   * appended in order so placeholders match the parameters array.
+   * @param column - Resolved filter column.
+   * @param filter - Semantic filter to render.
+   * @param parameters - Accumulating array of bound values; appended to in place.
+   * @returns SQL fragment comparing the column to bound parameters.
+   * @throws Error - When a filter value is non-scalar, or an `in` filter has
+   *   an empty or non-array value.
+   */
   private renderFilter(column: DataColumn, filter: SemanticFilter, parameters: unknown[]): string {
     const col = quoteIdent(column.name);
     const push = (value: unknown): string => {
@@ -946,6 +1353,17 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     }
   }
 
+  /**
+   * Resolves the connection's credentialRef into a single-connection pool
+   * config carrying the connection's statement/query timeouts. A `${NAME}`
+   * placeholder is resolved from the environment first, then the request
+   * vault, then the machine Vault; a bare ref is treated as an environment
+   * variable name.
+   * @param connection - Connection whose credentials to resolve.
+   * @param ctx - Tool context providing the request-scoped vault.
+   * @returns Pool config bound to the resolved connection string.
+   * @throws Error - When the credential cannot be resolved to a connection string.
+   */
   private async poolConfig(connection: DataConnection, ctx: ToolContext): Promise<PoolConfig> {
     const resolved = await resolveCredentialRef(connection.credentialRef, ctx, this.services);
     if (resolved.startsWith('postgres://') || resolved.startsWith('postgresql://')) {
@@ -968,6 +1386,18 @@ class StoreBackedSqlPlanner implements SqlPlanner {
     throw new Error(`Unable to resolve Postgres credentialRef "${connection.credentialRef}".`);
   }
 
+  /**
+   * Registers the executed query result as a source and version in the
+   * optional source registry and resolves its citation text.
+   * @param run - Executed run (workspace, SQL hash, and semantic source ids).
+   * @param connection - Connection the query ran against.
+   * @param rowCount - Number of rows returned after truncation.
+   * @param executedAt - Execution timestamp (ISO) used for observation metadata.
+   * @returns Source id and citation text, or undefined when no registry is
+   *   wired.
+   * @throws Error - When the registry rejects the source or version upsert;
+   *   citation resolution failures are swallowed.
+   */
   private async recordQueryResultSource(
     run: QueryRun,
     connection: DataConnection,
@@ -1009,6 +1439,16 @@ class StoreBackedSqlPlanner implements SqlPlanner {
   }
 }
 
+/**
+ * Resolves a credential reference to a secret value. A `${NAME}` placeholder
+ * is resolved from the environment; anything else goes through the
+ * request-scoped vault, then the machine Vault, falling back to the raw ref.
+ * @param ref - Credential reference (vault key or `${NAME}` placeholder).
+ * @param ctx - Tool context providing the request-scoped vault.
+ * @param services - Runtime machine providing the fallback Vault.
+ * @returns Resolved secret, or the original ref when every source fails.
+ * @throws Never.
+ */
 async function resolveCredentialRef(ref: string, ctx: ToolContext, services: MatbotMachine): Promise<string> {
   if (ref.startsWith('${') && ref.endsWith('}')) {
     const key = ref.slice(2, -1);
@@ -1026,6 +1466,15 @@ async function resolveCredentialRef(ref: string, ctx: ToolContext, services: Mat
   }
 }
 
+/**
+ * Masks SQL string literals and removes line and block comments so the result
+ * is safe for keyword scanning. Literal contents are replaced with spaces;
+ * double-quoted identifiers are preserved. Input is assumed well-formed
+ * (quotes balanced); malformed input may leak literal text into the scan.
+ * @param sql - SQL text to strip.
+ * @returns Stripped SQL suitable for keyword scanning.
+ * @throws Never.
+ */
 function stripSql(sql: string): string {
   let out = '';
   let i = 0;
@@ -1064,12 +1513,23 @@ function stripSql(sql: string): string {
   return out;
 }
 
+/**
+ * Detects multiple SQL statements by looking for an interior semicolon;
+ * trailing semicolons are allowed.
+ * @param sql - Stripped SQL to inspect.
+ * @returns True when more than one statement is present.
+ * @throws Never.
+ */
 function hasMultipleStatements(sql: string): boolean {
   const trimmed = sql.trim();
   if (!trimmed.includes(';')) return false;
   return trimmed.replace(/;+\s*$/, '').includes(';');
 }
 
+/**
+ * Loose input shape accepted by the `structured_data_action` tool: the fields
+ * relevant to the chosen `action` are required, the rest are ignored.
+ */
 interface StructuredDataActionInput {
   action: string;
   connection?: DataConnectionInput;
@@ -1083,6 +1543,14 @@ interface StructuredDataActionInput {
   query?: StoreQuery;
 }
 
+/**
+ * Builds the `structured_data_action` multi-action tool over a catalog and a
+ * planner. Every action failure — including errors thrown by the catalog or
+ * planner — is yielded as an `error` event rather than propagated.
+ * @param catalog - Catalog backing the catalog/register actions.
+ * @param planner - Planner backing the plan/validate/approve/execute/runs actions.
+ * @returns The tool specification.
+ */
 function createStructuredDataTool(catalog: DataCatalog, planner: SqlPlanner): Tool {
   return {
     name: 'structured_data_action',
@@ -1212,6 +1680,12 @@ export const plugin: MatbotPluginSpec = {
   manifest: {
     description: 'Registers DataCatalog, SqlPlanner, and structured_data_action for governed semantic SQL planning and read-only Postgres execution.',
   },
+  /**
+   * Registers the web UI contribution, builds the catalog and planner, and
+   * registers the DataCatalog/SqlPlanner services plus the
+   * `structured_data_action` tool.
+   * @param services - Runtime machine to register services and tools into.
+   */
   async setup(services: MatbotMachine) {
     services.contributions?.register('webui','sql',uiContribution);
     const catalog = createDataCatalog(services);

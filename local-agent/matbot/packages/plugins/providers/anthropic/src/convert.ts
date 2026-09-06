@@ -2,14 +2,22 @@ import type { Message, Tool, JSONSchema } from '@matatbread/matbot-plugin-api';
 
 // ── Internal Anthropic API types ──────────────────────────────────────────────
 
+/** Anthropic prompt-cache directive marking a cache breakpoint. */
 type CacheControl = { type: 'ephemeral' };
 
+/** A text content block, optionally carrying a cache breakpoint. */
 type AnthropicTextBlock        = { type: 'text';              text: string;           cache_control?: CacheControl };
+/** An extended-thinking block together with its verification signature. */
 type AnthropicThinkingBlock    = { type: 'thinking';          thinking: string; signature: string };
+/** A redacted thinking block carrying opaque provider data. */
 type AnthropicRedactedThinking = { type: 'redacted_thinking'; data: string };
+/** An image content block, either base64-encoded or referenced by URL. */
 type AnthropicImageBlock       = { type: 'image';             source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } };
+/** A tool invocation emitted by the model. */
 type AnthropicToolUse          = { type: 'tool_use';          id: string; name: string; input: unknown };
+/** A tool outcome supplied back to the model inside a user turn. */
 type AnthropicToolResult       = { type: 'tool_result';       tool_use_id: string; content: string; is_error?: boolean };
+/** Union of every content block shape the adapter sends or receives. */
 type AnthropicContent          = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinking | AnthropicImageBlock | AnthropicToolUse | AnthropicToolResult;
 
 /** One message in Anthropic's wire format. */

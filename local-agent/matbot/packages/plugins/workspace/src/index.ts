@@ -26,19 +26,40 @@ const MIME_MAP: Record<string, string> = {
   '.sh':   'application/x-sh',
 };
 
-// Returns a normalised relative path if safe, null if it contains traversal.
+/**
+ * Returns a normalised relative path if safe, null if it contains traversal.
+ *
+ * Backslashes are treated as separators and empty segments dropped; any `..`
+ * segment rejects the whole path. The result is forward-slash-joined.
+ *
+ * @param input Raw path as supplied by the model, relative to the workspace root.
+ * @returns The normalized relative path, or `null` when it would escape the workspace.
+ */
 function safePath(input: string): string | null {
   const parts = input.replace(/\\/g, '/').split('/').filter(Boolean);
   if (parts.some(p => p === '..')) return null;
   return parts.join('/');
 }
 
+/**
+ * Maps a file name to a MIME type via its lower-cased extension.
+ *
+ * @param name File name; only the extension determines the type.
+ * @returns The mapped MIME type (with charset for text formats), or `application/octet-stream` when unknown.
+ */
 function mimeFromName(name: string): string {
   const dot = name.lastIndexOf('.');
   const ext = dot !== -1 ? name.slice(dot).toLowerCase() : '';
   return MIME_MAP[ext] ?? 'application/octet-stream';
 }
 
+/**
+ * Decodes a base64 string into raw bytes.
+ *
+ * @param b64 Base64-encoded content.
+ * @returns The decoded bytes.
+ * @throws Error - When `b64` is not valid base64 (`atob` failure).
+ */
 function base64ToUint8(b64: string): Uint8Array {
   const binary = atob(b64);
   const bytes  = new Uint8Array(binary.length);
@@ -46,12 +67,26 @@ function base64ToUint8(b64: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Encodes raw bytes as a base64 string.
+ *
+ * @param bytes Bytes to encode.
+ * @returns The base64-encoded string.
+ * @throws Never.
+ */
 function uint8ToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
   return btoa(binary);
 }
 
+/**
+ * Concatenates an async byte stream into a single buffer.
+ *
+ * @param stream Chunks to consume, in order.
+ * @returns The concatenated bytes in stream order.
+ * @throws Error - Propagates stream consumption failures (e.g. an aborted read).
+ */
 async function collectStream(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -66,6 +101,10 @@ async function collectStream(stream: AsyncIterable<Uint8Array>): Promise<Uint8Ar
 // without an awkward oneOf the providers honour inconsistently, so the schema stays loose and the
 // description below carries this TypeScript discriminated union — which LLMs read accurately — as
 // the source of truth. The executor enforces it.
+/**
+ * Per-action contract for `workspace_action`; the executor enforces what the
+ * loose JSON schema cannot express. `content` is required only for `write`.
+ */
 type WorkspaceInput =
   | { action: 'read';   path: string; encoding?: 'utf8' | 'base64' }
   | { action: 'write';  path: string; content: string; encoding?: 'utf8' | 'base64' }

@@ -5,6 +5,10 @@ import type {
   RagV2SummaryLevel,
 } from './types.js';
 
+/**
+ * Inputs for one routing-summary generation: hierarchy level, display title,
+ * heading breadcrumb, and the source text to summarize.
+ */
 export interface RagV2SummaryInput {
   level: RagV2SummaryLevel;
   title: string;
@@ -12,6 +16,10 @@ export interface RagV2SummaryInput {
   text: string;
 }
 
+/**
+ * Optional model-backed helpers for query rewriting and summarization; when a
+ * helper is absent, callers fall back to deterministic behavior.
+ */
 export interface RagV2SemanticServices {
   readonly summarizerSignature?: string;
   rewriteQuery?(input: {
@@ -25,23 +33,40 @@ export interface RagV2SemanticServices {
 
 const FOLLOW_UP_PATTERN = /\b(?:it|that|this|those|these|there|then|same|older|newer|previous|former|latter|she|he|they|them|her|his|their|again|also|what about|how about|and what|a co|co z|tam|wtedy|starsz|nowsz|poprzedn|ona|on|oni|sie|dasselbe|älter|neuer|vorher|sie|er)\b/iu;
 
+/**
+ * Collapses all whitespace runs to single spaces, trims, and hard-caps the
+ * result at `limit` characters.
+ * @param value - Text to normalize.
+ * @param limit - Maximum output length in characters.
+ * @returns The normalized text, at most `limit` characters.
+ * @throws Never.
+ */
 function normalizeText(value: string, limit: number): string {
   return value.replace(/\s+/gu, ' ').trim().slice(0, limit);
 }
 
+/**
+ * Computes the SHA-256 hex digest of a string.
+ * @param value - Content to hash.
+ * @returns Lowercase hex digest (64 characters).
+ * @throws Never.
+ */
 function hash(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
 /**
- * Keeps only recent human/model text and caps both per-turn and aggregate size.
- * Retrieved robo context and tool results are deliberately not accepted here.
- */
-/**
- * Compacts recent conversation turns into a bounded context string.
- * @param turns - Turns newest-last.
- * @param maxChars - Character budget for the output.
- * @returns The compacted transcript.
+ * Compacts recent conversation turns into a bounded context string. Keeps
+ * only recent human/model text and caps both per-turn and aggregate size;
+ * retrieved robo context and tool results are deliberately not accepted here.
+ * @param turns - Conversation turns in chronological order, newest last.
+ * @param maxTurns - Maximum number of trailing turns to consider; defaults
+ *   to 6.
+ * @param maxCharacters - Character budget for the output; defaults to 3,000.
+ *   Each turn is additionally capped at 800 characters.
+ * @returns The selected turns (oldest first) and their `role: text`
+ *   transcript joined by newlines.
+ * @throws Never.
  */
 export function compactRagV2Conversation(
   turns: readonly RagV2ConversationTurn[],
@@ -63,6 +88,16 @@ export function compactRagV2Conversation(
   };
 }
 
+/**
+ * Builds a standalone query without a model by appending the compacted
+ * conversation as explicit context for reference resolution.
+ * @param latestQuestion - The current question text.
+ * @param compactConversation - Bounded transcript produced by
+ *   {@link compactRagV2Conversation}.
+ * @returns The question unchanged when there is no context; otherwise the
+ *   question plus a labelled context block, capped at 3,200 characters.
+ * @throws Never.
+ */
 function deterministicRewrite(latestQuestion: string, compactConversation: string): string {
   const context = normalizeText(compactConversation, 2_400);
   if (!context) return latestQuestion;
@@ -72,6 +107,27 @@ function deterministicRewrite(latestQuestion: string, compactConversation: strin
   );
 }
 
+/**
+ * Rewrites the latest question into a standalone query. When the question
+ * looks context-dependent (follow-up pronouns, very short questions, or
+ * lowercase question-shaped text) and prior turns exist, a model-backed
+ * rewrite is attempted first, falling back to a deterministic concatenation
+ * on failure.
+ * @param latestQuestion - The current question text; normalized to 1,200
+ *   characters.
+ * @param turns - Prior conversation turns, newest last; empty means no
+ *   rewriting is needed.
+ * @param services - Optional semantic services; without a `rewriteQuery`
+ *   helper the deterministic rewrite is used.
+ * @param provider - Optional provider name forwarded to the rewrite helper.
+ * @param signal - Optional abort signal forwarded to the rewrite helper; a
+ *   rewrite failure is swallowed unless this signal is aborted.
+ * @returns The rewrite result; `method` reports which path produced
+ *   `standaloneQuery`, and `contextHash` is set whenever conversation context
+ *   was used.
+ * @throws Error - rethrows the rewrite failure when `signal` is aborted
+ *   during the rewrite call.
+ */
 export async function rewriteRagV2ConversationQuery(
   latestQuestion: string,
   turns: readonly RagV2ConversationTurn[] = [],
@@ -127,9 +183,18 @@ export async function rewriteRagV2ConversationQuery(
 }
 
 /**
- * Deterministically decomposes a user question into retriever variants.
- * @param input - Question text, language, and detected references.
- * @returns Weighted {@link RagV2QueryVariant} list feeding the plan.
+ * Deterministically decomposes a user question into follow-up retriever
+ * variants tailored to the intent: comparison subjects and entities,
+ * diagnostic symptom/cause/remediation angles, entity drill-downs for broad
+ * synthesis, or reference/entity recovery. Duplicates and the original query
+ * are dropped, and at most four variants are returned.
+ * @param query - The question text.
+ * @param intent - The plan's detected retrieval intent.
+ * @param exactReferences - Reference strings extracted from the query.
+ * @param entities - Multi-word proper-noun phrases extracted from the query.
+ * @returns At most four `{ query, reason }` variants feeding the plan's
+ *   iterative queries.
+ * @throws Never.
  */
 export function decomposeRagV2Query(
   query: string,
@@ -138,6 +203,14 @@ export function decomposeRagV2Query(
   entities: readonly string[],
 ): Array<{ query: string; reason: string }> {
   const values: Array<{ query: string; reason: string }> = [];
+  /**
+   * Normalizes a candidate query, then appends it with its reason unless it
+   * is empty, equals the original question, or is already present.
+   * @param value - Candidate variant text.
+   * @param reason - Why the variant was generated.
+   * @returns Nothing; appends to `values` in place.
+   * @throws Never.
+   */
   const add = (value: string, reason: string): void => {
     const normalized = normalizeText(value, 800);
     if (!normalized || normalized === query || values.some(item => item.query === normalized)) return;

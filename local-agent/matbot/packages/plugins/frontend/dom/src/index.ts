@@ -23,6 +23,22 @@ const urlForResourceTool: Tool = {
     },
   },
   executor: {
+    /**
+     * Resolves a stored file to a `blob:` URL the user can open.
+     *
+     * Default-deny: a missing file store, an unknown file, or one not marked `allowed` yields
+     * `{ url: null }` rather than an error. A viewable file is fully materialised into memory (its
+     * stream is drained into one `Uint8Array`) because `blob:` URLs are page-scoped and the bytes
+     * must exist up front; the read is cancelled via `ctx.signal`.
+     *
+     * @param input - Expected `{ namespace: string, name: string }`; a missing or empty field
+     *                yields an `error` event.
+     * @param ctx - Tool execution context: `ctx.files` resolves the file handle, `ctx.signal`
+     *                cancels the byte read.
+     * @yields A single `result` event whose `value.url` is the `blob:` URL or `null`.
+     * @throws Error - If the file store or the file stream fails; malformed input and unresolvable
+     *                files are reported by yielding events instead.
+     */
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       const { namespace, name } = input as { namespace?: string; name?: string };
       if (!namespace || !name) { yield { type: 'error', message: 'url_for_resource requires "namespace" and "name".' }; return; }
@@ -51,6 +67,18 @@ export const plugin: MatbotPluginSpec = {
   manifest:   { description: 'Browser chat frontend rendering to the DOM (in-process, no server).' },
   tools:      [urlForResourceTool],
 
+  /**
+   * Registers the frontend and mounts the chat UI.
+   *
+   * Registers a `frontend-dom` frontend with the machine, then mounts {@link ChatUI} into the
+   * `#matbot-root` element (falling back to `document.body`). Runs under the ambient boot
+   * principal — there is no per-request principal in the in-process browser case.
+   *
+   * @param services - The matbot machine (sessions, runner, providers) the UI drives.
+   * @returns Resolves once the UI is mounted and an initial session is selected.
+   * @throws Error - Via {@link ChatUI.mount}, when no session exists yet and no sessions store is
+   *                available to create one.
+   */
   async setup(services: MatbotMachine): Promise<void> {
     services.registerFrontend({ name: 'frontend-dom' });
     const root = document.getElementById('matbot-root') ?? document.body;

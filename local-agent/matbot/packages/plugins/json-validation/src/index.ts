@@ -19,6 +19,18 @@ const ANNOTATIONS = new Set([
 // Walk a schema tree and collect every keyword that affects validation but this
 // validator doesn't enforce (anyOf, $ref, minimum, format, …) → reported so an
 // overreaching tool schema is visible rather than silently passed through.
+/**
+ * Walk a schema tree and collect every keyword that affects validation but this validator doesn't
+ * enforce (anyOf, $ref, minimum, format, …), so an overreaching tool schema is visible rather
+ * than silently passed through.
+ *
+ * @param schema - The schema node to inspect.
+ * @param path - JSON-pointer-style location of `schema` within the root document; `''` at the root.
+ * @param found - Accumulator map of unenforced keyword → first path it was seen at; existing
+ *          entries are kept, so only the first occurrence of each keyword is reported.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function findUnvalidated(schema: JSONSchema, path: string, found: Map<string, string>): void {
   for (const key of Object.keys(schema)) {
     if (!ENFORCED.has(key) && !ANNOTATIONS.has(key) && !found.has(key)) {
@@ -37,6 +49,15 @@ function findUnvalidated(schema: JSONSchema, path: string, found: Map<string, st
   if (additional && typeof additional === 'object') findUnvalidated(additional as JSONSchema, `${path}/*`, found);
 }
 
+/**
+ * Check a value against a single JSON Schema `type` name.
+ *
+ * @param type - A JSON Schema type name; unrecognized names pass (return `true`).
+ * @param value - The value to test.
+ * @returns Whether `value` belongs to `type`. `number` excludes non-finite values; `object`
+ *          excludes arrays and null.
+ * @throws Never.
+ */
 function matches(type: string, value: unknown): boolean {
   switch (type) {
     case 'string':  return typeof value === 'string';
@@ -59,6 +80,21 @@ function matches(type: string, value: unknown): boolean {
 // schemas are ever trusted.
 const MAX_PATTERN_LENGTH = 1000;
 
+/**
+ * Validate `value` against `schema`, appending human-readable violation strings to `errs`.
+ *
+ * Enforced keywords: `type` (single or array), `enum`, `pattern`, `properties`, `required`,
+ * `additionalProperties`, and `items`. An invalid or over-long `pattern` fails closed as a
+ * validation error rather than throwing; other unenforced keywords are ignored here (reported
+ * separately by {@link findUnvalidated}).
+ *
+ * @param schema - The schema node to apply.
+ * @param value - The value being validated.
+ * @param path - Location of `value` within the input, used in error messages; `''` at the root.
+ * @param errs - Accumulator array; violations are appended in traversal order.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function validate(schema: JSONSchema, value: unknown, path: string, errs: string[]): void {
   const at = path || '/';
   const type = schema['type'];
@@ -114,6 +150,14 @@ function validate(schema: JSONSchema, value: unknown, path: string, errs: string
   }
 }
 
+/**
+ * Build the `toolcall` validation hook. The closure remembers which tools have already had their
+ * unenforced-schema-keyword warning emitted, so it fires once per tool.
+ *
+ * @returns A hook that validates each call's input against the tool's `inputSchema` and returns a
+ *          `rejectTool` stop listing the violations; valid input returns nothing.
+ * @throws Never.
+ */
 function makeValidatorHook(): Hook {
   const reported = new Set<string>();
 
@@ -150,6 +194,13 @@ function makeValidatorHook(): Hook {
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Register the validation hook.
+   *
+   * @param services - Machine services; the hook registry is used.
+   * @returns Nothing.
+   * @throws Never.
+   */
   async setup(services) {
     services.hooks.register(makeValidatorHook());
   },

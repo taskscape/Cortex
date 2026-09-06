@@ -47,6 +47,11 @@ import {
  * `cognition_config`'s `set` (see {@link validateDreamSettings}) so the two can never disagree on
  * what counts as valid — this call is the last-resort safety net for settings written outside that
  * tool (or before it existed), surfaced loudly at the start of a run rather than papered over.
+ * @param services The matbot machine whose settings service holds the stored override.
+ * @returns The effective settings: defaults merged with any persisted partial override.
+ * @throws Error - Wrapping {@link validateDreamSettings}'s message plus a repair hint, when the
+ *          effective settings violate cross-field validation. Also propagates settings-store
+ *          read failures.
  */
 async function loadSettings(services: MatbotMachine): Promise<DreamSettings> {
   const stored = await services.settings().get<Partial<DreamSettings>>(DREAM_SETTINGS_KEY);
@@ -78,6 +83,11 @@ async function loadSettings(services: MatbotMachine): Promise<DreamSettings> {
  * facts the pipeline routed `weak` and deferred — they are NOT terminal (no `dreamSkill` is set),
  * but are skipped until their deferral lapses, so a `weak` fact does not get re-ranked (and
  * re-block the queue) on every single pass.
+ * @param store The remembered_facts store to page through.
+ * @param nowIso ISO timestamp of "now"; facts whose `ignoreUntil` is later than it stay deferred.
+ * @returns Every eligible fact, sorted oldest-first (`createdAt` ascending, ties broken by `id`
+ *          ascending); empty when the pool is drained.
+ * @throws Error - Propagates store failures while paging.
  */
 async function fetchUnassignedFacts(store: Store<RememberedFact>, nowIso: string): Promise<RememberedFact[]> {
   const out: RememberedFact[] = [];
@@ -119,6 +129,12 @@ async function fetchUnassignedFacts(store: Store<RememberedFact>, nowIso: string
  * write, and dream-time would not be doing useful work if it ranked against blank summaries. We
  * fail with a clear, actionable message rather than silently dropping skills (which would make
  * routing decisions inscrutable).
+ * @param services The matbot machine; provides the SkillManager service.
+ * @param blocklist Skill names (case-sensitive exact match on the skill name) to exclude.
+ * @returns Candidates in the manager's list order, minus blocklisted skills and skills that
+ *          vanished mid-iteration (raced with a delete).
+ * @throws Error - If no SkillManager service is registered, or if any non-blocklisted skill
+ *          lacks its derived `knowledge` metadata (the error names every offending skill).
  */
 function buildCandidates(
   services: MatbotMachine,
@@ -161,6 +177,14 @@ function buildCandidates(
  * Tie-breaking among equal top scores is by skill name (lexicographic). This is deterministic but
  * arbitrary; in practice ties at three decimal places will be vanishingly rare and a tie at the
  * threshold boundary is itself a signal the thresholds want tuning.
+ * @param factId Id of the fact whose decision is being made.
+ * @param byFact Scores grouped by fact id (see {@link indexScoresByFact}); an absent id is
+ *               treated as "no scores at all".
+ * @param settings Thresholds applied to the top score.
+ * @returns The routing decision. `strong`/`weak` carry the top skill name, score, and reasoning;
+ *          `none` also carries the top score when one existed (so the run record can show how
+ *          close it got), and only bare reasoning when no score did.
+ * @throws Never.
  */
 function decide(
   factId:   string,
@@ -190,7 +214,12 @@ function decide(
   return { decision: 'none', score: top.score, reasoning: top.reasoning };
 }
 
-/** Group flat scores by fact id for O(1) per-fact lookup during decide(). */
+/**
+ * Group flat scores by fact id for O(1) per-fact lookup during decide().
+ * @param scores Flat ranker output (order-agnostic).
+ * @returns Map from fact id to that fact's scores, preserving input order within each group.
+ * @throws Never.
+ */
 function indexScoresByFact(scores: readonly Score[]): Map<string, Score[]> {
   const m = new Map<string, Score[]>();
   for (const s of scores) {
@@ -212,6 +241,13 @@ function indexScoresByFact(scores: readonly Score[]): Map<string, Score[]> {
  * One shared helper for every routing disposition: `{ dreamSkill: <skill> }` (merged),
  * `{ dreamSkill: DREAM_SKILL_NONE }` / `{ dreamSkill: DREAM_SKILL_ERROR }` (terminal retirement),
  * or `{ ignoreUntil }` (a `weak` deferral, leaving `dreamSkill` untouched — not terminal).
+ * @param store The remembered_facts store.
+ * @param factId Id of the fact to patch.
+ * @param patch The fields to overlay onto the current document.
+ * @returns Resolves once the patch is committed, or silently if the fact was deleted underneath
+ *          us (nothing left to patch).
+ * @throws Error - Propagates store failures, and when the compare-and-swap misses on both
+ *          attempts (the initial try plus one re-read-and-retry).
  */
 async function patchFact(
   store:  Store<RememberedFact>,
@@ -235,12 +271,23 @@ async function patchFact(
  *  cleanly once the conversation that produced it disambiguates who or what it refers to. */
 const ENRICHMENT_CONTEXT_MESSAGES = 3;
 
+/**
+ * Type guard narrowing a {@link MessageContent} block to a text block.
+ * @param c The content block to test.
+ * @returns True when the block is a text block (narrowed in the affirmative branch).
+ * @throws Never.
+ */
 function isTextBlock(c: MessageContent): c is MessageContent & { type: 'text'; text: string } {
   return c.type === 'text';
 }
 
-/** Flatten a message's text blocks into one string; non-text content (tool calls, markers,
- *  images, …) is skipped — it is noise for the purpose of disambiguating a fact. */
+/**
+ * Flatten a message's text blocks into one string; non-text content (tool calls, markers,
+ * images, …) is skipped — it is noise for the purpose of disambiguating a fact.
+ * @param m The message to flatten.
+ * @returns The message's text blocks joined with single spaces; empty when it has none.
+ * @throws Never.
+ */
 function textOf(m: Message): string {
   return m.content.filter(isTextBlock).map(c => c.text).join(' ');
 }
@@ -250,7 +297,14 @@ function textOf(m: Message): string {
  * of conversation immediately preceding the fact's origin message. Returns `undefined` when no
  * enrichment is possible — no sessions service, the session or message no longer exists (e.g. the
  * session was since compacted), or there is no text content to add — so the caller falls back to
- * the plain, un-enriched verdict. Read-only: never touches the session.
+ * the plain, un-enriched verdict. Read-only: never mutates the session.
+ * @param services The matbot machine; `sessions` is optional, and its absence means no
+ *                 enrichment is possible.
+ * @param fact The fact whose origin message anchors the context window.
+ * @returns The fact text followed by up to {@link ENRICHMENT_CONTEXT_MESSAGES} preceding
+ *          messages' text under a disambiguation banner, or `undefined` when no enrichment is
+ *          possible (no sessions service, missing session/message, or no text content).
+ * @throws Error - Propagates a failing session read.
  */
 async function buildEnrichedFact(
   services: MatbotMachine,
@@ -283,6 +337,17 @@ async function buildEnrichedFact(
  * locally, recorded as an `error` outcome on the run, and the run record is still returned. It
  * does throw on setup-shaped problems (missing services, invalid settings, missing metadata) —
  * those are bugs the caller should surface, not data points to record.
+ * @param services The matbot machine (settings, stores, SkillManager, sessions).
+ * @param ranker The pluggable scorer for (fact, skill) pairs.
+ * @param merger The pluggable prose editor for merges.
+ * @param signal Cancellation signal propagated to every ranker and merger call.
+ * @returns The fully-assembled run record, NOT persisted; `version` is empty for the store to
+ *          mint on write. On the catch-all `error` path `unassignedRemaining` is `-1`, since the
+ *          remaining count could not be computed.
+ * @throws Error - On setup-shaped failures only: invalid dream-time settings (via
+ *          {@link loadSettings}), a missing SkillManager service, or skill metadata gaps (via
+ *          {@link buildCandidates}). Everything raised after setup is caught and recorded on the
+ *          run record instead.
  */
 export async function runOnce(
   services: MatbotMachine,
@@ -304,6 +369,15 @@ export async function runOnce(
   const candidates = buildCandidates(services, settings.blocklist);
 
   // Helpers that finalise a run record. All exits go through one of these.
+  /**
+   * Assemble a run record from the pass-wide fields, overlaying per-exit extras. Every exit path
+   * from the pipeline funnels through this helper so the base shape stays uniform.
+   * @param outcome Terminal outcome bucket for this pass.
+   * @param unassignedRemaining Count of unassigned facts left after the pass (`-1` on the
+   *        catch-all error path, where it could not be computed).
+   * @param extras Outcome-specific fields layered over the base record.
+   * @returns The completed, not-yet-persisted run record.
+   */
   const finish = (
     outcome:             DreamRunOutcome,
     unassignedRemaining: number,
@@ -475,11 +549,23 @@ export async function runOnce(
 // ── Tiny utilities ────────────────────────────────────────────────────────────
 
 const PREVIEW_LEN = 80;
+/**
+ * Shortens a fact's text to a fixed-width preview for the run record.
+ * @param s The text to preview.
+ * @returns `s` unchanged when it is at most {@link PREVIEW_LEN} characters; otherwise the first
+ *          `PREVIEW_LEN - 1` characters plus an ellipsis.
+ * @throws Never.
+ */
 function preview(s: string): string {
   return s.length <= PREVIEW_LEN ? s : s.slice(0, PREVIEW_LEN - 1) + '…';
 }
 
-/** Node 16+ exposes crypto.randomUUID globally; fall back to a Math.random id for older runtimes. */
+/**
+ * Node 16+ exposes crypto.randomUUID globally; fall back to a Math.random id for older runtimes.
+ * @returns A fresh run id: a random UUID where available, otherwise `dream-<epochMs>-<random>`
+ *          (best-effort uniqueness on the fallback path).
+ * @throws Never.
+ */
 function cryptoRandomId(): string {
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
   if (g.crypto?.randomUUID) return g.crypto.randomUUID();

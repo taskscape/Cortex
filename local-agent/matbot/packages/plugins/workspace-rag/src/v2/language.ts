@@ -8,6 +8,12 @@ const LANGUAGE_MARKERS: Record<string, readonly string[]> = {
   es: [' y ', ' es ', ' no ', ' contrato ', ' conforme ', ' será ', ' con ', ' para ', ' que ', ' por '],
 };
 
+/**
+ * Classifies the text into the first matching Unicode script range.
+ * @param text - Text to scan.
+ * @returns 'Cyrillic', 'Greek', 'Arabic', 'Han', 'Japanese', 'Hangul', or 'Latin', or 'Unknown' when no recognized letter is present.
+ * @throws Never.
+ */
 function scriptFor(text: string): string {
   if (/[\u0400-\u04ff]/u.test(text)) return 'Cyrillic';
   if (/[\u0370-\u03ff]/u.test(text)) return 'Greek';

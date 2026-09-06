@@ -34,6 +34,21 @@ const urlForResourceTool: Tool = {
     },
   },
   executor: {
+    /**
+     * Resolves a stored file to a server-relative URL served by this frontend.
+     *
+     * Default-deny: a missing file store, an unknown file, or one not marked `allowed` yields
+     * `{ url: null }`. The path mirrors the `GET /files/<namespace>/<name>` route in `server.ts`,
+     * with each path segment URI-encoded.
+     *
+     * @param input - Expected `{ namespace: string, name: string }`; a missing or empty field
+     *                yields an `error` event.
+     * @param ctx - Tool execution context; `ctx.files` resolves the file handle.
+     * @yields A `result` event whose `value.url` is the shareable path or `null`, or an `error`
+     *                event for malformed input.
+     * @throws Error - If the file store lookup fails; malformed input and unresolvable files are
+     *                reported by yielding events instead.
+     */
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       const { namespace, name } = input as { namespace?: string; name?: string };
       if (!namespace || !name) { yield { type: 'error', message: 'url_for_resource requires "namespace" and "name".' }; return; }
@@ -55,10 +70,32 @@ const urlForResourceTool: Tool = {
 export const plugin: MatbotPluginSpec = {
   apiVersion:  PLUGIN_API_VERSION,
 
+  /**
+   * Describes how to reach the web UI once the plugin is installed.
+   *
+   * @returns A human-readable instruction containing the configured port's URL.
+   * @throws Never.
+   */
   async installationMessage(): Promise<string> {
     return `Go to http://localhost:${port}/ to access the web interface.`;
   },
 
+  /**
+   * Starts the HTTP+SSE server on loopback and registers the URL tool.
+   *
+   * No-op in sub-agent processes. Builds the server via {@link createWebServer} with per-call
+   * service lookups (skills, workspace RAG, session titler, and the principal resolver are resolved
+   * lazily so plugin load order never pins a stale `undefined`), then binds `MATBOT_WEB_PORT`
+   * (default 19778) on {@link WEB_LISTEN_HOST}. An `EADDRINUSE` bind failure retries every 250 ms
+   * until `MATBOT_WEB_LISTEN_RETRY_TIMEOUT_MS` (default 15 s) elapses, then rejects. Only after the
+   * server is listening is `url_for_resource` registered, so the tool never advertises URLs for a
+   * server that is not serving.
+   *
+   * @param services - Machine whose services are wired into the server dependencies.
+   * @returns Resolves once the server is listening.
+   * @throws Error - When `services.sessions` or `services.run` is missing, or the bind fails for a
+   *                 reason other than a retryable `EADDRINUSE` (or the retry window expires).
+   */
   async setup(services: MatbotMachine) {
     if (services.isSubAgent()) return;
 
@@ -118,7 +155,26 @@ export const plugin: MatbotPluginSpec = {
         process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
         resolve();
       });
+      /**
+       * Attempts to bind the port, retrying while the address is in use.
+       *
+       * Each attempt registers {@link onError} for exactly that attempt (so retries never stack
+       * handlers) and then calls `server.listen(port, WEB_LISTEN_HOST)`.
+       *
+       * @returns Nothing.
+       * @throws Never - Failures surface through the error handler and the surrounding promise.
+       */
       const listen = (): void => {
+        /**
+         * Handles a bind failure: retries while the address is in use and the retry window is open.
+         *
+         * Warns once, waits 250 ms, and calls {@link listen} again; any other error — or a still-busy
+         * port after the window — rejects the surrounding promise.
+         *
+         * @param ex - The listen error, inspected for its `code`.
+         * @returns Nothing.
+         * @throws Never - Failures reject the surrounding promise instead.
+         */
         const onError = (ex: Error & { code?: string }): void => {
           activeListenErrorHandler = undefined;
           if (ex.code === 'EADDRINUSE' && Date.now() - startedAt < listenRetryTimeoutMs) {
@@ -142,6 +198,15 @@ export const plugin: MatbotPluginSpec = {
     if (webServer) { services.tools.register(urlForResourceTool); toolRegistry = services.tools; }
   },
 
+  /**
+   * Unregisters the URL tool and closes the web server.
+   *
+   * Closing ends all SSE streams, resolves pending prompts, and stops the watch loops (see
+   * {@link createWebServer}). A no-op when setup never ran.
+   *
+   * @returns Resolves once the server has closed.
+   * @throws Never - Close errors are logged, not thrown.
+   */
   async teardown() {
     toolRegistry?.remove('url_for_resource');
     toolRegistry = undefined;

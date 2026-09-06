@@ -34,16 +34,44 @@ export interface WebBranding {
 const DEFAULT_WEB_BRANDING: WebBranding = { productName: 'Cortex', title: 'Cortex' };
 const CSS_COLOR = /^(?:#[0-9a-fA-F]{3,8}|(?:rgb|hsl)a?\([^<>]{1,80}\))$/;
 
-/** Parse only presentation-safe branding values. Invalid input falls back per field. */
+/**
+ * Parses install-scoped UI branding values. Invalid input falls back per field.
+ *
+ * Reads the `CORTEX_WEBUI_BRANDING_JSON` environment variable by default. Only presentation-safe
+ * values are accepted: names and titles must be non-empty strings of at most 80 characters, and
+ * colors must match a CSS hex/rgb(a)/hsl(a) pattern (rejecting anything that could carry markup).
+ * Invalid JSON, a non-object value, or an invalid field degrades per field — the title defaults to
+ * the product name when not given.
+ *
+ * @param raw - Raw JSON text; defaults to the environment variable. `undefined`/empty yields the
+ *                defaults.
+ * @returns The branding, with defaults filled in and optional colors omitted when invalid.
+ * @throws Never - All parse failures fall back to defaults.
+ */
 export function parseWebBranding(raw = process.env['CORTEX_WEBUI_BRANDING_JSON']): WebBranding {
   if (!raw) return { ...DEFAULT_WEB_BRANDING };
   try {
     const value = JSON.parse(raw) as unknown;
     if (!isRecord(value)) return { ...DEFAULT_WEB_BRANDING };
+    /**
+     * Validates one branding string field.
+     *
+     * @param key - Field to read.
+     * @param fallback - Value used when the field is missing, empty, or longer than 80 characters.
+     * @returns The trimmed value, or `fallback`.
+     * @throws Never.
+     */
     const text = (key: 'productName' | 'title', fallback: string) => {
       const candidate = value[key];
       return typeof candidate === 'string' && candidate.trim() && candidate.trim().length <= 80 ? candidate.trim() : fallback;
     };
+    /**
+     * Validates one branding color field against the safe CSS color pattern.
+     *
+     * @param key - Field to read.
+     * @returns The trimmed value, or `undefined` when missing or not a safe CSS color.
+     * @throws Never.
+     */
     const color = (key: 'brand' | 'brandStrong' | 'brandSoft') => {
       const candidate = value[key];
       return typeof candidate === 'string' && CSS_COLOR.test(candidate.trim()) ? candidate.trim() : undefined;
@@ -137,6 +165,12 @@ export interface WorkspaceRagManager {
   workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus;
 }
 
+/**
+ * Whether a workspace may be deleted right now, and why not when it may not.
+ *
+ * Mirrors the RAG lock status fields ({@link WorkspaceRagLockStatus}) so the UI can show both the
+ * verdict and the blocker.
+ */
 interface WorkspaceDeleteReadiness {
   canDelete: boolean;
   locked: boolean;
@@ -161,6 +195,13 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/**
+ * Body of `POST /sessions/:id/submit`.
+ *
+ * `content` is either plain text or a form response; `sessionId` overrides the id in the path;
+ * `concatQueue` chooses between joining the running turn's batch (`true`) and a separate queued
+ * turn (`false`, the server-side default when unspecified); attachments reference workspace files.
+ */
 interface SubmitBody {
   content:      string | { type: 'form-response'; values: Record<string, string> };
   provider:     string;       // opaque name passed to deps.resolveProvider
@@ -170,6 +211,7 @@ interface SubmitBody {
   attachments?: WorkspaceAttachment[];
 }
 
+/** Reference to a workspace file attached to a submission. */
 interface WorkspaceAttachment {
   namespace: 'workspace';
   path:      string;
@@ -177,11 +219,24 @@ interface WorkspaceAttachment {
 
 
 
+/**
+ * Optional `$context` envelope fields for direct tool invocation.
+ *
+ * Lets `POST /tools/:name` and `POST /stream/tools/:name` opt into a real session or provider;
+ * without it the tool runs against a stub session. Interactive prompting is unavailable in either
+ * case (see {@link nonInteractivePrompt}).
+ */
 interface DirectToolContextSpec {
   provider?:  string;
   sessionId?: string;
 }
 
+/**
+ * A resolved direct tool call: the parsed input plus optional session/provider context.
+ *
+ * Produced by {@link resolveDirectToolInvocation} from the request body's optional `$context`
+ * envelope.
+ */
 interface DirectToolInvocation {
   input:      unknown;
   session?:   Session;
@@ -205,16 +260,40 @@ const MAX_CAS_ATTEMPTS = 10;
 
 /** Thrown by {@link appendSessionMessages} when the session stays contended past the CAS retry budget. */
 export class SessionConflictError extends Error {
+  /**
+   * Creates the error for a session whose appends kept conflicting past the CAS retry budget.
+   *
+   * @param sessionId - Session the conflicting writes targeted.
+   * @throws Never.
+   */
   constructor(sessionId: string) {
     super(`Session "${sessionId}" was concurrently modified; please retry.`);
     this.name = 'SessionConflictError';
   }
 }
 
+/**
+ * Waits for a fixed delay.
+ *
+ * @param ms - Milliseconds to wait.
+ * @returns Resolves once the delay has elapsed; not abortable.
+ * @throws Never.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Reads a request body into a UTF-8 string, enforcing a size cap.
+ *
+ * When the cap is exceeded the connection is destroyed immediately (rather than drained) so an
+ * oversized body cannot keep consuming memory, and the returned promise rejects.
+ *
+ * @param req - Request whose body to buffer.
+ * @param maxBytes - Cap in bytes; larger bodies reject. Defaults to 1 MiB.
+ * @returns The body, decoded as UTF-8.
+ * @throws Error - When the body exceeds `maxBytes` or the request stream errors.
+ */
 async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -252,9 +331,19 @@ const ANONYMOUS_WEB_USER: Principal = {
  * Default request identity resolver: the ambient boot principal, falling back
  * to a fixed anonymous `web-user` when none is established.
  * @returns The resolved principal for a request.
+ * @throws Never - A missing boot principal resolves to the anonymous identity instead of throwing.
  */
 export const defaultWebPrincipal: WebPrincipalResolver = () => tryCurrentPrincipal() ?? ANONYMOUS_WEB_USER;
 
+/**
+ * Writes a JSON response with `content-type` and `content-length` headers.
+ *
+ * @param res - Response to write to.
+ * @param status - HTTP status code.
+ * @param body - Value serialised as the JSON body.
+ * @returns Nothing.
+ * @throws Never - Socket failures surface as response stream events, not exceptions.
+ */
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -264,6 +353,16 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/**
+ * Builds the CORS headers for a response.
+ *
+ * The `access-control-allow-origin` value is the caller-chosen origin (reflected), or absent when
+ * `undefined` is passed; the allowed headers include the shared-secret header.
+ *
+ * @param origin - Origin to allow, or `undefined` to send no `access-control-allow-origin`.
+ * @returns Header records to apply to the response.
+ * @throws Never.
+ */
 function corsHeaders(origin: string | undefined): Record<string, string> {
   return {
     ...(origin !== undefined ? { 'access-control-allow-origin': origin } : {}),
@@ -274,6 +373,15 @@ function corsHeaders(origin: string | undefined): Record<string, string> {
 
 // DNS-rebinding defense, mirroring http-utils assertLoopbackRequest for file-broker/file-index:
 // only requests whose Host names a loopback origin are served.
+/**
+ * Checks whether a `Host` header names a loopback host (DNS-rebinding defense).
+ *
+ * Strips the port (bracket-aware for IPv6 literals) before comparing.
+ *
+ * @param hostHeader - Raw `Host` header value.
+ * @returns `true` for `localhost`, `127.0.0.1`, or `[::1]` (on any port).
+ * @throws Never.
+ */
 function isLoopbackHost(hostHeader: string): boolean {
   const host = hostHeader.trim().toLowerCase();
   const name = host.startsWith('[')
@@ -283,6 +391,16 @@ function isLoopbackHost(hostHeader: string): boolean {
 }
 
 // CORS allowlist: loopback origins on any port (the UI is served from this same server).
+/**
+ * Checks whether an `Origin` header is a loopback origin (CORS allowlist).
+ *
+ * Only http(s) URLs whose hostname is `localhost`, `127.0.0.1`, or `::1` (on any port) qualify —
+ * the UI is served from this same server.
+ *
+ * @param origin - Raw `Origin` header value.
+ * @returns `true` when the origin is loopback and may be reflected.
+ * @throws Never.
+ */
 function isLoopbackOrigin(origin: string): boolean {
   try {
     const url = new URL(origin);
@@ -294,16 +412,40 @@ function isLoopbackOrigin(origin: string): boolean {
   }
 }
 
+/**
+ * Compares a presented shared secret with the expected one in constant time.
+ *
+ * Length is checked first so {@link timingSafeEqual}'s length-mismatch throw is unreachable.
+ *
+ * @param presented - Token from the request header.
+ * @param expected - Configured token.
+ * @returns `true` when the two are byte-identical.
+ * @throws Never.
+ */
 function tokensEqual(presented: string, expected: string): boolean {
   const a = Buffer.from(presented, 'utf8');
   const b = Buffer.from(expected, 'utf8');
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * Decodes a URI-encoded tool name from a route path, tolerating bad escapes.
+ *
+ * @param raw - Encoded tool name from the URL.
+ * @returns The decoded name, or the raw input when decoding fails.
+ * @throws Never.
+ */
 function decodeToolName(raw: string): string {
   try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
+/**
+ * Narrows a value to a plain object record.
+ *
+ * @param value - Value to test.
+ * @returns `true` when the value is a non-null, non-array object.
+ * @throws Never.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -316,6 +458,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // UI flow that needs to ask the user something must drive the tool through `/submit` instead. This
 // fallback makes that boundary explicit: take the default if one was offered, otherwise fail loudly
 // rather than hang.
+/**
+ * Prompt stand-in for contexts with no answer channel (the direct tool-invocation endpoints).
+ *
+ * Resolves immediately with the offered default (for a string question the `def` argument, for a
+ * field the field default); with no default it rejects rather than hanging, so a tool that needs
+ * the user fails fast instead of blocking. Flows that must ask the user have to drive the tool
+ * through `/sessions/:id/submit`, whose SSE round-trip prompt can actually receive an answer.
+ *
+ * @param p - Question string or form field offered by the tool.
+ * @param def - Default answer for a string question.
+ * @returns Resolves with the default, or rejects when none is offered.
+ * @throws Never - The rejection is delivered via the returned promise.
+ */
 const nonInteractivePrompt: PromptFn = ((p: string | FormField, def?: string) => {
   const fallback = typeof p === 'string' ? def : p.default;
   return fallback !== undefined
@@ -329,10 +484,22 @@ const nonInteractivePrompt: PromptFn = ((p: string | FormField, def?: string) =>
  * @returns A Node `http.Server` serving the static UI, session submit/abort,
  *          prompt round-trips, workspace management, direct tool invocation,
  *          and multiplexed SSE event streams.
+ * @throws Never - Watch-loop and request failures are handled internally (logged or answered
+ *          per-response); nothing here throws synchronously.
  */
 export function createWebServer(deps: WebServerDeps) {
   // CORS: an explicit deps.cors value wins; otherwise only loopback origins are reflected.
   const configuredCors = deps.cors;
+  /**
+   * Picks the `access-control-allow-origin` value for a request.
+   *
+   * An explicit `deps.cors` wins; otherwise a request `Origin` is reflected only when it is a
+   * loopback origin (see {@link isLoopbackOrigin}), and an absent origin gets none.
+   *
+   * @param req - Incoming request.
+   * @returns The origin to reflect, or `undefined` to withhold the header.
+   * @throws Never.
+   */
   const resolveCorsOrigin = (req: IncomingMessage): string | undefined => {
     if (configuredCors !== undefined) return configuredCors;
     const origin = req.headers.origin;
@@ -357,6 +524,15 @@ export function createWebServer(deps: WebServerDeps) {
   // Expert-panel composer submissions persist their own messages outside the model runner. Keep them
   // single-writer per session so they do not interleave with another forced panel run.
   const fallbackExpertSessions = new ExpertSessionService({store:deps.store,run:deps.run,resolve:name=>deps.tools?.resolve(name)??null,invoke:deps.invokeTool??invokeToolEvents,...(deps.sessionTitler?{titleSession:(input:{sessionId:string;provider:string})=>deps.sessionTitler?.()?.titleSession(input)??Promise.resolve()}: {})});
+  /**
+   * Resolves the expert-session service for a call, preferring an injected provider.
+   *
+   * Returns `deps.expertSessions()` when one is supplied, else the server-owned fallback service,
+   * which shares the store, runner, tool resolution, and optional session titler.
+   *
+   * @returns The expert-session service, or `undefined` when an injected provider reports none.
+   * @throws Never.
+   */
   const expertSessions=()=>deps.expertSessions?deps.expertSessions():fallbackExpertSessions;
   // session ID → the parked prompt's settlers. `resolve` delivers an answer (applying the default
   // fallback); `cancel` rejects it with PromptCancelledError — the "give up" path.
@@ -368,6 +544,15 @@ export function createWebServer(deps: WebServerDeps) {
   // that and starve ordinary fetches (the sidebar load, tool calls), so the whole UI shares one socket.
   const globalListeners = new Set<ServerResponse>();
 
+  /**
+   * Writes a pre-formatted SSE message to every connected global-stream client.
+   *
+   * Connections that have gone unwritable are pruned from the listener set as they are encountered.
+   *
+   * @param msg - Fully serialised SSE frame (see {@link sseEvent}).
+   * @returns Nothing.
+   * @throws Never.
+   */
   const broadcast = (msg: string): void => {
     for (const res of globalListeners) { if (res.writable) res.write(msg); else globalListeners.delete(res); }
   };
@@ -377,6 +562,14 @@ export function createWebServer(deps: WebServerDeps) {
   const fileEventListeners = new Map<string, Set<ServerResponse>>();
   const watchAc            = new AbortController();
 
+  /**
+   * Logs a watch loop that stopped unexpectedly, unless shutdown already aborted it.
+   *
+   * @param name - Human-readable watch name for the log line (e.g. `file`, `tool`).
+   * @param error - The failure that ended the loop.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const reportWatchFailure = (name: string, error: unknown): void => {
     if (!watchAc.signal.aborted) {
       console.warn(`[frontend-web] ${name} watch stopped:`, error instanceof Error ? error.message : String(error));
@@ -405,6 +598,17 @@ export function createWebServer(deps: WebServerDeps) {
   // may load after frontend-web; the watch loop starts at most once, the first time a client subscribes.
   let skillWatchStarted = false;
 
+  /**
+   * Starts the skill-CRUD broadcast loop, at most once per server lifetime.
+   *
+   * Broadcasts `skill-changed` events (saves/deletes, including mid-turn LLM edits) to the global
+   * stream. Called lazily on the first `/events` connect, by which point the skills plugin has
+   * finished setup even when it loaded after frontend-web.
+   *
+   * @param skills - Skill manager to watch.
+   * @returns Nothing.
+   * @throws Never - Loop failures are reported via {@link reportWatchFailure}.
+   */
   function startSkillWatch(skills: SkillManager): void {
     if (skillWatchStarted) return;
     skillWatchStarted = true;
@@ -421,6 +625,16 @@ export function createWebServer(deps: WebServerDeps) {
     })().catch(error => reportWatchFailure('plugin', error));
   }
 
+  /**
+   * Writes a pre-formatted SSE message to every per-session stream for one session.
+   *
+   * Unwritable connections are pruned; a session with no connected clients is a no-op.
+   *
+   * @param sessionId - Session whose subscriber connections receive the message.
+   * @param msg - Fully serialised SSE frame (see {@link sseEvent}).
+   * @returns Nothing.
+   * @throws Never.
+   */
   function sendToSession(sessionId: string, msg: string): void {
     const conns = sessionConns.get(sessionId);
     if (conns === undefined) return;
@@ -429,6 +643,16 @@ export function createWebServer(deps: WebServerDeps) {
 
   // Broadcast a session's busy/idle transition to the global status listeners (sidebar), deduped
   // against the last value. Authoritative busy comes from the runner (running || queued > 0).
+  /**
+   * Publishes a session's busy/idle transition to the global stream, deduped.
+   *
+   * Busy state is read authoritatively from the runner (`running || queued > 0`) and broadcast only
+   * on change; when idle, the session's cached state is dropped.
+   *
+   * @param sessionId - Session to re-evaluate.
+   * @returns Nothing.
+   * @throws Never.
+   */
   function updateBusy(sessionId: string): void {
     const busy = deps.run.status(sessionId).busy;
     if ((busyState.get(sessionId) ?? false) === busy) return;
@@ -436,6 +660,16 @@ export function createWebServer(deps: WebServerDeps) {
     broadcast(sseEvent('session-busy', { sessionId, busy }));
   }
 
+  /**
+   * Determines whether a workspace can be deleted, and why not when it cannot.
+   *
+   * Refusal order: no workspace manager, an explicit `deleteCheck` verdict from the manager, an
+   * unknown workspace, the active workspace, then an active or pending RAG indexing lock.
+   *
+   * @param workspaceId - Workspace to evaluate.
+   * @returns The readiness verdict, including lock state and message when applicable.
+   * @throws Error - If the workspace manager's `list()` or `deleteCheck()` fails.
+   */
   async function workspaceDeleteReadiness(workspaceId: string): Promise<WorkspaceDeleteReadiness> {
     const workspaceManager=deps.getWorkspaceManager?deps.getWorkspaceManager():deps.workspaceManager;
     if (!workspaceManager) return { canDelete: false, locked: false, reason: 'Workspace manager unavailable.' };
@@ -506,6 +740,22 @@ export function createWebServer(deps: WebServerDeps) {
     }
   });
 
+  /**
+   * Builds a `ToolContext` for server-driven tool invocations.
+   *
+   * With no explicit invocation context the tool runs against a stub session owned by the request
+   * principal and no provider; a `$context`-resolved invocation (see
+   * {@link resolveDirectToolInvocation}) supplies a real session and/or provider. Prompting uses
+   * {@link nonInteractivePrompt} — there is no answer channel outside `/submit`. Optional
+   * environment fields (workdir, files, configPath) are spread only when present, and the call id
+   * is freshly minted per invocation.
+   *
+   * @param ac - Controller whose signal cancels the tool execution (tied to the request).
+   * @param principal - Request principal attributed to the invocation.
+   * @param invocation - Optional session/provider context resolved from a `$context` envelope.
+   * @returns The tool context object.
+   * @throws Never.
+   */
   function makeToolCtx(ac: AbortController, principal: Principal, invocation?: Pick<DirectToolInvocation, 'session' | 'provider'>) {
     const now = new Date().toISOString();
     const stubSession: Session = {
@@ -529,6 +779,18 @@ export function createWebServer(deps: WebServerDeps) {
     };
   }
 
+  /**
+   * Splits a direct tool-call body into tool input and optional execution context.
+   *
+   * A body containing a `$context` key is treated as `{ $context?, input? }`: the context may name
+   * a provider and/or an existing session (validated and fetched — an unknown session is a 404),
+   * and everything else runs as plain input. A body without `$context` passes through untouched.
+   *
+   * @param rawInput - Parsed request body.
+   * @returns `{ ok: true, invocation }` on success, or `{ ok: false, status, error }` with the HTTP
+   *          status (400/404) to answer with.
+   * @throws Never - Failures are returned as the `ok: false` variant.
+   */
   async function resolveDirectToolInvocation(rawInput: unknown): Promise<
     | { ok: true; invocation: DirectToolInvocation }
     | { ok: false; status: number; error: string }
@@ -567,6 +829,17 @@ export function createWebServer(deps: WebServerDeps) {
     return { ok: true, invocation };
   }
 
+  /**
+   * Builds a handler that serves one bundled static file with a 200 response.
+   *
+   * The file is read from disk (module-relative path) on every request.
+   *
+   * @param res - Response the handler writes to.
+   * @param contentType - `Content-Type` to serve the file as.
+   * @param path - Module-relative path of the static file.
+   * @returns An async handler performing the read and the write.
+   * @throws Error - If the file cannot be read (propagates to the request-level error handler).
+   */
   function static200(res: ServerResponse, contentType: string, path: string) {
     return async () => {
       const body = await readFile(new URL(path, import.meta.url), "utf-8");
@@ -574,6 +847,31 @@ export function createWebServer(deps: WebServerDeps) {
       res.end(body);
     };
   }
+  /**
+   * Routes and serves one request after authentication, CORS, and principal setup.
+   *
+   * Handled in order: branding; plugin-contributed `webui` listings and contributed HTTP routes;
+   * static UI files; providers and health; workspace administration (routed through the
+   * `workspace_admin_action` tool when contributions are present, else direct workspace-manager
+   * routes); the multiplexed global SSE stream (`/events`); session status, create, submit,
+   * expert-panel, abort, and prompt round-trip; the persistent per-session SSE stream; direct
+   * buffered (`/tools/:name`) and streaming (`/stream/tools/:name`) tool invocation, with
+   * execution-class shell tools denied unless `CORTEX_WEBUI_ALLOW_SHELL_TOOLS=1`; the single-file
+   * SSE watch; and read-only file serving (only files marked `allowed`, reported as 404 rather
+   * than 403 when unresolvable so path existence is not revealed). Everything else is a 404.
+   * Submits are fire-and-forget: turn output and interactive prompts reach clients over the
+   * per-session SSE stream, not the submit response.
+   *
+   * @param req - Incoming request.
+   * @param res - Response to write to.
+   * @param method - HTTP method (`GET` when absent).
+   * @param url - Request URL (`/` when absent).
+   * @param principal - Principal resolved for this request and already established ambiently.
+   * @returns Resolves once the response has been fully written or handed off to a persistent
+   *          stream.
+   * @throws Error - Unexpected failures propagate to the request-level handler, which answers 500
+   *          (409 for {@link SessionConflictError}) when headers have not been sent.
+   */
   async function handleRequest(
     req: IncomingMessage, res: ServerResponse, method: string, url: string, principal: Principal,
   ): Promise<void> {
@@ -776,6 +1074,19 @@ export function createWebServer(deps: WebServerDeps) {
       // reach the client over its persistent GET /events/sessions/:id stream, not this request.
       // Answered via POST /sessions/:id/prompt. (Only one prompt is outstanding per session, since
       // turns are serialised.)
+      /**
+       * Interactive prompt for this submission: parks on `pendingPrompts` and emits a `prompt` SSE
+       * event on the session's stream.
+       *
+       * Resolves when `POST /sessions/:id/prompt` answers (an empty answer falls back to the offered
+       * default, else `''`); rejects with {@link PromptCancelledError} on the cancel path. At most
+       * one prompt is outstanding per session, since turns are serialised.
+       *
+       * @param p - Question string or form field offered by the tool.
+       * @param defaultValue - Default answer for a string question.
+       * @returns Resolves with the user's answer; rejects when cancelled or released.
+       * @throws Never - The rejection is delivered via the returned promise.
+       */
       const promptFn = ((p: string | FormField, defaultValue?: string): Promise<string> =>
         new Promise<string>((resolve, reject) => {
           const def = typeof p === 'string' ? defaultValue : p.default;
@@ -1108,6 +1419,18 @@ export function createWebServer(deps: WebServerDeps) {
     json(res, 404, { error: 'Not found' });
   }
 
+  /**
+   * Shuts the server down in dependency order and releases every waiting party.
+   *
+   * Ends all per-session, global, and per-file SSE streams; aborts the watch loops; resolves all
+   * pending prompts with an empty answer; then closes the listener — dropping idle keep-alive
+   * sockets immediately and cutting any connection still mid-request after a one-second grace
+   * ({@link CLOSE_GRACE_MS}), so a workspace switch cannot stall process exit indefinitely. Close
+   * errors are logged, not thrown.
+   *
+   * @returns Resolves once the listener has closed, gracefully or after the grace cut.
+   * @throws Never.
+   */
   async function close(): Promise<void> {
     // Close all persistent per-session event streams.
     for (const conns of sessionConns.values()) for (const res of conns) res.end();

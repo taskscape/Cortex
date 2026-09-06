@@ -24,6 +24,17 @@ export const plugin: MatbotPluginSpec = {
     open: (dotData: string) => BrowserStorageBackend.open(dotData),
   },
 
+  /**
+   * Activate the browser defaults: refuse non-browser realms, become the active StorageBackend
+   * when the boot pre-scan did not already open this plugin's backend, publish the persisted
+   * user-added plugin list (pinned to the concrete local IndexedDB store so it survives later
+   * backend swaps), and replay that list via `services.loadPlugin` — stale specifiers are
+   * warned and skipped so boot never aborts.
+   * @param services - Machine passed to the plugin's setup.
+   * @returns Resolves once registration and replay complete.
+   * @throws Error - Re-thrown from assertBrowserRealm when not running in a browser; replay
+   *          failures are swallowed by design.
+   */
   async setup(services: MatbotMachine): Promise<void> {
     // Browser-only: on node this throws, the loader logs and skips the plugin, and the host keeps its
     // real (filesystem) backend — no dead config.
@@ -49,13 +60,31 @@ export const plugin: MatbotPluginSpec = {
       ? makePluginSettings(backend.createStore<SettingsDoc>('settings'), services.self?.name ?? 'matbot-browser')
       : services.settings();
     const extras: ExtraPlugins = {
+      /**
+       * Read the persisted user-added plugin specifiers.
+       * @returns The stored specifiers in insertion order, or an empty array when none stored.
+       * @throws Error - Propagates settings-store failures.
+       */
       async list() {
         return (await settings.get<string[]>(EXTRA_KEY)) ?? [];
       },
+      /**
+       * Append a specifier to the persisted list; already-present specifiers are ignored
+       * (idempotent).
+       * @param specifier Specifier to persist.
+       * @returns Resolves once the list is written, or found to already contain the specifier.
+       * @throws Error - Propagates settings-store failures.
+       */
       async add(specifier: string) {
         const cur = (await settings.get<string[]>(EXTRA_KEY)) ?? [];
         if (!cur.includes(specifier)) await settings.set(EXTRA_KEY, [...cur, specifier]);
       },
+      /**
+       * Drop a specifier from the persisted list (no-op when absent).
+       * @param specifier Specifier to forget.
+       * @returns Resolves once the updated list is written.
+       * @throws Error - Propagates settings-store failures.
+       */
       async remove(specifier: string) {
         const cur = (await settings.get<string[]>(EXTRA_KEY)) ?? [];
         await settings.set(EXTRA_KEY, cur.filter(s => s !== specifier));

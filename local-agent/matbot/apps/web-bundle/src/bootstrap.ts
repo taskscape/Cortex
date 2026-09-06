@@ -35,6 +35,17 @@ export interface BrowserConfig {
 
 const PROVIDERS_KEY = 'matbot.providers';
 
+/**
+ * Load the provider configs persisted from earlier sessions.
+ *
+ * Reads the {@link PROVIDERS_KEY} entry from `localStorage` and JSON-parses it. Storage and
+ * parse failures are swallowed.
+ *
+ * @returns Name-keyed provider configs (the name is the map key and is omitted from each
+ *          value). Empty when nothing is persisted or storage is unavailable; key order is
+ *          unspecified.
+ * @throws Never.
+ */
 function loadPersistedProviders(): Record<string, Omit<ProviderConfig, 'name'>> {
   try {
     const raw = globalThis.localStorage?.getItem(PROVIDERS_KEY);
@@ -42,6 +53,15 @@ function loadPersistedProviders(): Record<string, Omit<ProviderConfig, 'name'>> 
   } catch { return {}; }
 }
 
+/**
+ * Persist one provider config to `localStorage`, merging it over the previously saved set.
+ *
+ * The config's `name` becomes the map key and is stripped from the stored value.
+ *
+ * @param cfg - Full provider config to persist.
+ * @returns Nothing.
+ * @throws Never — storage unavailability and quota failures are swallowed by design.
+ */
 function savePersistedProvider(cfg: ProviderConfig): void {
   const cur = loadPersistedProviders();
   const { name, ...rest } = cfg;
@@ -49,6 +69,15 @@ function savePersistedProvider(cfg: ProviderConfig): void {
   try { globalThis.localStorage?.setItem(PROVIDERS_KEY, JSON.stringify(cur)); } catch { /* unavailable */ }
 }
 
+/**
+ * Remove a previously persisted provider config from `localStorage`.
+ *
+ * No-op when no config under that name is persisted; storage failures are swallowed.
+ *
+ * @param name - Provider name (persistence key) to delete.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function removePersistedProvider(name: string): void {
   const cur = loadPersistedProviders();
   if (!(name in cur)) return;
@@ -58,8 +87,15 @@ function removePersistedProvider(name: string): void {
 
 /** Host services the in-page loader provides to the bootstrap (see loader.js / __mbLoader). */
 export interface LoaderApi {
-  /** Fetch a remote .ts plugin, type-strip it, and return a specifier importable right now, plus the
-   *  name and declared matbotRuntime read from its sibling package.json. */
+  /**
+   * Fetch a remote .ts plugin, type-strip it, and return a specifier importable right now, plus
+   * the name and declared matbotRuntime read from its sibling package.json.
+   * @param url - Source URL of the remote plugin entry module.
+   * @returns `spec` — an import specifier valid for this session (an ephemeral blob: URL),
+   *          `name` — the canonical plugin name, and `runtimes` — the declared matbotRuntime
+   *          when the plugin declares one.
+   * @throws Error - The fetch or type-strip fails.
+   */
   loadRemote(url: string): Promise<{ spec: string; name: string; runtimes?: readonly Runtime[] }>;
 }
 
@@ -79,7 +115,18 @@ export interface BootEnv {
 const NEVER_ABORT = new AbortController().signal;
 const WEB_USER: Principal = { id: 'web-user', type: 'user' };
 
-/** Resolve `${NAME}` placeholders, prompting (once, persisted) for any the vault is missing. */
+/**
+ * Resolve `${NAME}` placeholders, prompting (once, persisted) for any the vault is missing.
+ *
+ * Loops on {@link MissingSecretError}: prompts via `globalThis.prompt` for each missing key,
+ * writes the entered value into the vault, and retries resolution. Any vault error other than
+ * {@link MissingSecretError} propagates unchanged.
+ *
+ * @param ref - Text containing `${NAME}` placeholders (or a bare key) to resolve.
+ * @param vault - Vault to resolve against and to persist prompted values into.
+ * @returns The fully resolved text.
+ * @throws Error - The user cancelled the prompt or entered an empty value for a missing secret.
+ */
 async function resolveInteractive(ref: string, vault: Vault): Promise<string> {
   for (;;) {
     try {
@@ -95,6 +142,14 @@ async function resolveInteractive(ref: string, vault: Vault): Promise<string> {
   }
 }
 
+/**
+ * Resolve every value in a provider's credentials map through the vault, prompting (and
+ * persisting) for any missing secret.
+ * @param creds - Credential values, each a `${NAME}` placeholder or bare key reference.
+ * @param vault - Vault to resolve against.
+ * @returns A new map with every value resolved to its secret text.
+ * @throws Error - A secret cannot be resolved interactively (see resolveInteractive).
+ */
 async function resolveCredentials(creds: Record<string, string>, vault: Vault): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(creds)) out[k] = await resolveInteractive(v, vault);
@@ -131,6 +186,15 @@ export async function boot(env: BootEnv): Promise<void> {
   // Store a wizard draft: key in the vault under a derived name, persist the config (with a ${ref},
   // never the raw key) to localStorage, and return the runnable config. A self-contained provider
   // (no endpoint/key — e.g. a local demo adapter) persists neither: only model + module.
+  /**
+   * Convert a wizard draft into a runnable {@link ProviderConfig}: store its API key in the
+   * vault under a derived `APIKEY_<NAME>` name (referencing whatever the entered value
+   * canonicalises to, per the vault's dedup policy), persist the resulting config — carrying a
+   * `${...}` reference, never the raw key — to localStorage, and return it.
+   * @param draft - Provider details collected by the setup wizard.
+   * @returns The full provider config for the draft; credentials (when any) are vault references.
+   * @throws Error - The vault rejects the secret write.
+   */
   const persistDraft = async (draft: ProviderDraft): Promise<ProviderConfig> => {
     let credentials: Record<string, string> | undefined;
     if (draft.apiKey) {
@@ -193,6 +257,15 @@ export async function boot(env: BootEnv): Promise<void> {
   type AnyStore = Store<{ id: string; version: string }>;
   // forwardingProxy/makeSwappable are shared with the CLI (capture-safe service swap).
   const storeProxies = new Map<string, [AnyStore, SwapFn<AnyStore>]>();
+  /**
+   * Return the capture-safe {@link Store} proxy for a namespace, creating the underlying store
+   * on the active backend at first use; later calls for the same namespace reuse the proxy,
+   * which {@link makeSwappable} re-targets when the backend is swapped.
+   * @typeParam T - Stored record shape; must carry the `id`/`version` CAS fields.
+   * @param namespace - Backend namespace backing the store (e.g. `"sessions"`).
+   * @returns The shared proxy store for the namespace.
+   * @throws Never.
+   */
   const createStore = <T extends { id: string; version: string }>(namespace: string): Store<T> => {
     let entry = storeProxies.get(namespace);
     if (entry === undefined) {
@@ -228,6 +301,16 @@ export async function boot(env: BootEnv): Promise<void> {
   // returns, so readers see `next` at once and the `mounted` emit can fire immediately. The displaced
   // impl is closed in the *background* — a slow or throwing close() must never gate the swap or suppress
   // the mounted notification. Driven only from the quiescent-edge flush below — never mid-turn.
+  /**
+   * Re-point every store proxy and the file proxy at `next` synchronously, so readers observe
+   * the new backend at once, and close the displaced backend in the background (a slow or
+   * throwing close never gates the swap or suppresses the mounted notification). Driven only
+   * from the quiescent-edge flush — never mid-turn.
+   * @param next - Backend to make active.
+   * @returns True when the active backend changed; false when `next` was already active, letting
+   *          the caller skip a redundant `mounted` emit.
+   * @throws Never — displaced-backend close failures are logged, not propagated.
+   */
   const swapStorage = (next: StorageBackend): boolean => {
     const removed = activeStorageBackend;
     if (removed === next) return false;
@@ -247,6 +330,14 @@ export async function boot(env: BootEnv): Promise<void> {
   // single remount. Notification timing is deliberately unspecified — see the `Mounted` contract.
   const mountTable = createMountTable(() => services);
   let pendingSwap: { next: StorageBackend } | undefined;
+  /**
+   * Stage a deferred StorageBackend swap (last write wins: a slot, not a queue) and request a
+   * flush at the next quiescent edge, so a swap never lands mid-turn and never splits a
+   * compare-and-swap across two backends.
+   * @param next - Backend to activate at the next quiescent edge.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const stageSwap = (next: StorageBackend): void => {
     pendingSwap = { next };
     flushIfQuiescent();
@@ -259,6 +350,15 @@ export async function boot(env: BootEnv): Promise<void> {
     }
     mountTable.flush();
   });
+  /**
+   * Re-point the knowledge index at `next` immediately (unlike StorageBackend, no deferral) and
+   * re-index the previous implementation's entries into `next` fire-and-forget, so a live swap
+   * does not silently drop indexed knowledge.
+   * @param next - Knowledge index to make active.
+   * @returns Nothing.
+   * @throws Never — re-indexing is dispatched without awaiting; async failures surface as
+   *          unhandled rejections.
+   */
   const swapKnowledge = (next: KnowledgeIndex): void => {
     const prev = knowledgeImpl;
     if (prev === next) return;
@@ -267,6 +367,13 @@ export async function boot(env: BootEnv): Promise<void> {
   };
 
   const resolver: PluginResolver = {
+    /**
+     * Map a plugin specifier to its canonical plugin name.
+     * @param specifier - Import specifier: a baked synthetic id or a URL-like path.
+     * @returns The baked name when known; otherwise the path's final segment with any query and
+     *          extension stripped (the input itself when nothing remains to strip).
+     * @throws Never.
+     */
     async identify(specifier: string): Promise<string> {
       if (specNames[specifier] !== undefined) return specNames[specifier]!;
       const last = (specifier.split('?')[0] ?? specifier).replace(/\/+$/, '').split('/').pop() ?? specifier;
@@ -274,6 +381,14 @@ export async function boot(env: BootEnv): Promise<void> {
     },
     // Baked by the assembler from each plugin's package.json; absent means "not declared", so the
     // loader imports and falls back to load/rollback. A remote .ts added at runtime is undeclared.
+    /**
+     * Report the matbotRuntimes a plugin declares, as baked by the assembler from its
+     * package.json.
+     * @param specifier - Plugin specifier to look up.
+     * @returns The declared runtimes, or undefined when not declared — the loader then imports
+     *          the plugin and falls back to load/rollback.
+     * @throws Never.
+     */
     async runtimes(specifier: string): Promise<readonly Runtime[] | undefined> {
       return specRuntimes[specifier];
     },
@@ -282,11 +397,33 @@ export async function boot(env: BootEnv): Promise<void> {
   let sessionRunner: SessionRunner | undefined;
 
   const baseServices: MatbotMachine = {
+    /**
+     * Placeholder on the base machine: plugin settings are scoped per plugin, not global.
+     * @returns Nothing (always throws).
+     * @throws Error - Always; callers must use the services instance passed to `setup()`.
+     */
     settings(): PluginSettings {
       throw new Error('settings() is only available within a plugin scope (use the services passed to setup()).');
     },
     createStore,
+    /**
+     * Read a registered service by its interface-name key.
+     * @param key - Service key (interface name) to read.
+     * @returns The registered implementation, or undefined when the key is absent.
+     * @throws Never.
+     */
     get(key) { return serviceRegistry.get(key as string) as never; },
+    /**
+     * Provide a service under its interface-name key. `StorageBackend` is staged and applied at
+     * the next quiescent edge (it is the system of record, so the swap must not split a CAS);
+     * `KnowledgeIndex` and `Vault` repoint immediately; anything else is a plain registry set.
+     * Every key is marked dirty so the mount table multicasts the remount at the quiescent edge.
+     * @param key - Service key (interface name) being provided.
+     * @param value - Implementation to register, cast per key.
+     * @returns Resolves once the registration is recorded; a StorageBackend swap may still be
+     *          pending until the quiescent edge.
+     * @throws Never.
+     */
     async register(key, value) {
       // StorageBackend is the system of record: stage it and let the quiescent edge apply it (idle →
       // now; mid-turn → at turn end) — its mount notification is marked dirty there, after the swap
@@ -300,6 +437,15 @@ export async function boot(env: BootEnv): Promise<void> {
     // Symmetric with register: a swap-key reverts to the app's captured boot default instead of
     // dangling on the unloaded plugin's impl; everything else is a plain registry delete. Marking dirty
     // lets the edge deliver a committed unload (or, if re-registered before the edge, a single remount).
+    /**
+     * Remove a service: swap-keys revert to the host's captured boot default rather than
+     * dangling on the unloaded plugin's impl; everything else is a plain registry delete. Marks
+     * the key dirty so the edge delivers a committed unload — or a single remount if the key is
+     * re-registered before the edge.
+     * @param key - Service key being removed.
+     * @returns Nothing.
+     * @throws Never.
+     */
     unregister(key: string) {
       if (key === 'StorageBackend')      stageSwap(bootBackend);
       else if (key === 'KnowledgeIndex') knowledgeImpl = bootKnowledge;
@@ -307,8 +453,24 @@ export async function boot(env: BootEnv): Promise<void> {
       else serviceRegistry.delete(key);
       if (key !== 'StorageBackend') { mountTable.markDirty(key as keyof MatbotServices); flushIfQuiescent(); }
     },
+    /**
+     * Base no-op: frontend registration is bound per-plugin within `setupPlugin`'s scope.
+     * @returns Nothing.
+     * @throws Never.
+     */
     registerFrontend() { /* bound per-plugin in setupPlugin's scope; base is a no-op */ },
 
+    /**
+     * Run a one-shot completion against a configured provider. Credential and endpoint `${...}`
+     * placeholders are resolved through the vault first; a synthetic system message is prepended
+     * when the request carries one; the adapter's streamed events are folded into a single text
+     * result with token usage.
+     * @param req - Completion request naming a configured provider; `signal` aborts the stream
+     *              when supplied, and without it the request never aborts.
+     * @returns The concatenated response text plus input/output token usage.
+     * @throws Error - The provider name is unknown, a secret cannot be resolved interactively,
+     *          or the provider adapter fails.
+     */
     async complete(req) {
       const rawCfg = providers.get(req.provider);
       if (rawCfg === undefined) throw new Error(`complete(): unknown provider "${req.provider}". Available: ${[...providers.keys()].join(', ')}`);
@@ -329,10 +491,28 @@ export async function boot(env: BootEnv): Promise<void> {
       return { text, usage: { inputTokens, outputTokens } };
     },
 
+    /**
+     * Convenience wrapper: normalize a single-turn request and run it through complete().
+     * @param req - Single-turn request (provider, system prompt, messages).
+     * @returns The completed text and usage, as complete() returns.
+     * @throws Error - Whatever complete() throws.
+     */
     async singleTurn(req) {
       return this.complete(singleTurnRequest(req));
     },
 
+    /**
+     * Load a plugin by specifier at runtime. Remote `http(s)`/root-absolute specifiers are
+     * fetched and type-stripped by the in-page loader into an ephemeral blob: URL, imported, and
+     * recorded under their source URL so identify()/unload resolve consistently across reloads;
+     * baked specifiers import via the import map. Cache busting is disabled — a query stamp
+     * would corrupt blob:/mbmod: specifiers and remote blobs are already fresh — so a true
+     * reload in the browser is a realm reload.
+     * @param specifier - Import specifier, remote `.ts` URL, or baked package name.
+     * @param prompt - Optional prompt function forwarded to the loader for interactive setup.
+     * @returns The loaded plugin.
+     * @throws Error - Loading fails (configured to throw) or yields no plugin.
+     */
     async loadPlugin(specifier: string, prompt?: PromptFn): Promise<MatbotPlugin> {
       // A runtime add of a remote .ts (URL or root-absolute path) is fetched and type-stripped by the
       // in-page loader into an ephemeral blob: URL; baked baseline specifiers are already importable
@@ -356,6 +536,13 @@ export async function boot(env: BootEnv): Promise<void> {
       if (plugin === undefined) throw new Error(`No plugin loaded for specifier "${specifier}"`);
       return plugin;
     },
+    /**
+     * Unload the plugin loaded for a specifier, resolving the specifier to its canonical name
+     * first (loader registry, then the baked/remote specNames map).
+     * @param specifier - Specifier the plugin was loaded under.
+     * @returns True when a matching plugin was found and unloaded; false when none is loaded.
+     * @throws Error - Plugin teardown fails or exceeds the core's 10-second teardown timeout.
+     */
     async unloadPlugin(specifier: string): Promise<boolean> {
       const name = getPluginNameForSpecifier(specifier) ?? (specNames[specifier] !== undefined ? specNames[specifier] : undefined);
       if (name === undefined) { console.warn(`[matbot] No loaded plugin for specifier "${specifier}"`); return false; }
@@ -365,8 +552,17 @@ export async function boot(env: BootEnv): Promise<void> {
     resolver,
     providers,
     mounted: mountTable.mounted,
+    /**
+     * The active storage backend behind a capture-safe proxy.
+     * @returns The current {@link StorageBackend} proxy; undefined only before a backend has
+     *          been initialised (never once boot has completed).
+     */
     get StorageBackend() { return activeStorageBackend === undefined ? undefined : storageBackendProxy; },
     sessions: store,
+    /**
+     * The active session runner.
+     * @returns The {@link SessionRunner}, or undefined before it is created during boot.
+     */
     get run() { return sessionRunner; },
     files: fileStore,
     Vault: vault,
@@ -374,10 +570,22 @@ export async function boot(env: BootEnv): Promise<void> {
     tools:         toolReg,
     systemContext: systemContextReg,
     isSubAgent: () => false,
+    /**
+     * The active knowledge index behind a capture-safe proxy, following register()-driven swaps.
+     * @returns The current {@link KnowledgeIndex} proxy.
+     */
     get KnowledgeIndex() { return knowledgeProxy; },
   };
   const services: MatbotMachine = unifyServices(baseServices);
 
+  /**
+   * Resolve a provider name to its adapter and fully-resolved config, substituting `${...}`
+   * credential and endpoint placeholders through the vault.
+   * @param name - Configured provider name to look up.
+   * @returns The adapter (factory resolved by the provider's module/plugin name) plus the
+   *          resolved config, or null when the name is not configured.
+   * @throws Error - Secret resolution fails or the module resolves to no provider factory.
+   */
   const resolveProvider = async (name: string): Promise<{ adapter: ProviderAdapter; config: ProviderConfig } | null> => {
     const cfg = providers.get(name);
     if (cfg === undefined) return null;
@@ -413,6 +621,15 @@ export async function boot(env: BootEnv): Promise<void> {
   // Apply a provider draft: persist it (config → localStorage, key → vault), load the adapter plugin
   // if new, canonicalise its module to the plugin name, and register it in the live providers map.
   // Shared by the wizard (UI), the runtime "+ Add provider" bridge, and the `provider` tool (LLM).
+  /**
+   * Apply a provider draft: persist it (config to localStorage, key to the vault), load the
+   * adapter plugin when it is not loaded yet, canonicalise the module to the plugin name, and
+   * register it in the live providers map. Shared by the wizard UI, the runtime "+ Add provider"
+   * bridge, and the `provider` tool.
+   * @param draft - Provider draft to apply.
+   * @returns The provider's config name (the key it is registered under).
+   * @throws Error - Persisting the draft or loading the adapter plugin fails.
+   */
   const applyDraft = async (draft: ProviderDraft): Promise<string> => {
     const cfg = await persistDraft(draft);
     let name = getPluginNameForSpecifier(cfg.module);
@@ -423,6 +640,12 @@ export async function boot(env: BootEnv): Promise<void> {
     providers.set(cfg.name, name !== undefined ? { ...cfg, module: name } : cfg);
     return cfg.name;
   };
+  /**
+   * Remove a provider from the live providers map and its persisted copy from localStorage.
+   * @param name - Provider name to remove.
+   * @returns True when the provider existed and was removed; false otherwise.
+   * @throws Never.
+   */
   const removeProvider = async (name: string): Promise<boolean> => {
     if (!providers.has(name)) return false;
     providers.delete(name);

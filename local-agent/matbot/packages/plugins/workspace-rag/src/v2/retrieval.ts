@@ -41,6 +41,12 @@ export interface RetrievalOptions {
 
 
 
+/**
+ * Collaborators and tuning knobs used to construct a
+ * {@link RagV2RetrievalEngine}. Only the repository, object store, and
+ * embedder are required; the rest enable optional lanes such as reranking,
+ * late interaction, and semantic rewriting.
+ */
 interface RetrievalDependencies {
   repository: RagV2Repository;
   objectStore: RagV2ObjectStore;
@@ -102,18 +108,46 @@ const CONTROLLED_LEGAL_EXPANSIONS: Record<string, Record<string, string[]>> = {
   },
 };
 
+/**
+ * Computes the SHA-256 hex digest of a string or buffer.
+ * @param value - Content to hash.
+ * @returns Lowercase hex digest (64 characters).
+ * @throws Never.
+ */
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * Measures wall-clock milliseconds elapsed since a start timestamp.
+ * @param startedAt - Start time in milliseconds (e.g. from `Date.now()`).
+ * @returns Elapsed milliseconds.
+ * @throws Never.
+ */
 function elapsed(startedAt: number): number {
   return Date.now() - startedAt;
 }
 
+/**
+ * Trims and filters empty strings, then removes duplicates while preserving
+ * first-occurrence order.
+ * @param values - Values to normalize.
+ * @returns Distinct non-empty values in first-occurrence order.
+ * @throws Never.
+ */
 function unique(values: Iterable<string>): string[] {
   return [...new Set([...values].map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Tags every hit with the retriever lane that produced it, assigning 1-based
+ * ranks within the lane and appending a rank reason.
+ * @param hits - Hits in the lane's ranking order.
+ * @param retriever - Lane name recorded on each hit.
+ * @returns Copies of the hits annotated with `retriever`, `retrieverRank`,
+ *   and an added retrieval reason.
+ * @throws Never.
+ */
 function identifyLane(hits: readonly RagV2RankedHit[], retriever: string): RagV2RankedHit[] {
   return hits.map((hit, index) => ({
     ...hit,
@@ -123,6 +157,15 @@ function identifyLane(hits: readonly RagV2RankedHit[], retriever: string): RagV2
   }));
 }
 
+/**
+ * Classifies the question's retrieval intent from multilingual keyword
+ * patterns: as-of lookups, comparisons, diagnostics, exact references, broad
+ * synthesis, or plain fact lookup.
+ * @param query - The question text.
+ * @param exactReferences - Reference strings already extracted from the query.
+ * @returns The detected intent; defaults to `fact_lookup`.
+ * @throws Never.
+ */
 function inferIntent(query: string, exactReferences: readonly string[]): RagV2RetrievalPlan['intent'] {
   if (/\b(?:as of|on \d{4}-\d{2}-\d{2}|na dzień|według stanu na|zum stand)\b/iu.test(query)) return 'as_of';
   if (/\b(?:compare|difference|versus|vs\.?|porównaj|różnic|vergleich)\b/iu.test(query)) return 'comparison';
@@ -134,24 +177,58 @@ function inferIntent(query: string, exactReferences: readonly string[]): RagV2Re
   return 'fact_lookup';
 }
 
+/**
+ * Extracts the first ISO `YYYY-MM-DD` date appearing in the query.
+ * @param query - The question text.
+ * @returns The date string, or undefined when none is present.
+ * @throws Never.
+ */
 function extractAsOfDate(query: string): string | undefined {
   return /\b(\d{4}-\d{2}-\d{2})\b/u.exec(query)?.[1];
 }
 
+/**
+ * Extracts inline facet filter values of the form `name:value` (quoted or
+ * bare) from the query text.
+ * @param query - The question text.
+ * @param name - Filter name to look for (e.g. `type`, `jurisdiction`); must
+ *   be a valid regular-expression fragment.
+ * @returns Distinct filter values in order of appearance; empty when the
+ *   query contains no such filter.
+ * @throws SyntaxError - if `name` is not a valid regular expression.
+ */
 function extractFilterValues(query: string, name: string): string[] {
   const expression = new RegExp(`\\b${name}\\s*:\\s*(?:["']([^"']+)["']|([\\p{L}\\p{N}_.-]+))`, 'giu');
   return unique([...query.matchAll(expression)].map(match => match[1] ?? match[2] ?? ''));
 }
 
+/**
+ * Folds a string to NFKD and strips combining marks, mapping accented
+ * letters to their base form.
+ * @param value - Text to fold.
+ * @returns The diacritic-free text.
+ * @throws Never.
+ */
 function stripDiacritics(value: string): string {
   return value.normalize('NFKD').replace(/\p{M}+/gu, '');
 }
 
 /**
  * Builds the full {@link RagV2RetrievalPlan} for a question: rewrite,
- * language/intent detection, reference extraction, and query variants.
- * @param params - Question, conversation turns, corpus info, and options.
- * @returns The resolved plan.
+ * language/intent detection, reference extraction, and query variants. Adds a
+ * diacritic-folded lexical variant and controlled legal-terminology
+ * expansions when the query contains a known term.
+ * @param query - The (already rewritten) question text.
+ * @param workspaceId - Workspace scoping for the plan's authorization block.
+ * @param contextId - Context scoping for the plan's authorization block.
+ * @param options - Caller options; explicit filters and as-of dates win over
+ *   inline `type:`/`jurisdiction:` query syntax, and defaults fill the rest
+ *   (principal `local-user`, no groups, English when language is undetected).
+ * @param rewrite - Result of conversation rewriting; defaults to an identity
+ *   rewrite of `query` itself.
+ * @returns The resolved plan, with `iterativeQueries` left empty for later
+ *   population by the engine.
+ * @throws Never.
  */
 export function planRagV2Query(
   query: string,
@@ -218,9 +295,18 @@ export function planRagV2Query(
 
 /**
  * Fuses per-retriever ranked lists into a single ranking via weighted RRF.
- * @param lists - Ranked hit lists keyed by retriever, with weights.
- * @param k - RRF smoothing constant.
- * @returns Hits sorted by fused score with fusion metadata attached.
+ * Duplicate hits across lists accumulate contributions; a hit's per-list rank
+ * comes from `retrieverRank` when present, else its list position.
+ * @param resultSets - Independent ranked hit lists; hits carry their
+ *   `retriever` name for weighting.
+ * @param weights - Contribution weight per retriever name; retrievers without
+ *   an entry weigh 1.
+ * @param k - RRF smoothing constant (larger values flatten rank
+ *   differences); defaults to 60.
+ * @returns Fused hits sorted by descending fusion score (ties broken by
+ *   `retrieverScore`), with `fusionScore` and merged retrieval reasons
+ *   attached.
+ * @throws Never.
  */
 export function reciprocalRankFusion(
   resultSets: readonly RagV2RankedHit[][],
@@ -260,12 +346,35 @@ export function reciprocalRankFusion(
 
 
 
+/**
+ * Decides whether a hit's text looks truncated or short enough that
+ * neighbouring passages should be pulled in for context.
+ * @param text - The hit's passage text.
+ * @returns True when the text is under 180 characters or lacks terminal
+ *   punctuation.
+ * @throws Never.
+ */
 function needsNeighbour(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length < 180 || !/[.!?;:)\]]$/u.test(trimmed);
 }
 
+/**
+ * Tests two texts for near-duplication via word-set Jaccard similarity.
+ * @param left - First text to compare.
+ * @param right - Second text to compare.
+ * @returns True when both texts have at least 8 distinct words (up to 1,000
+ *   considered per text) and their Jaccard similarity reaches 0.92.
+ * @throws Never.
+ */
 function nearDuplicate(left: string, right: string): boolean {
+  /**
+   * Lowercases the text, extracts up to 1,000 word tokens, and returns them
+   * as a distinct-word set.
+   * @param value - Text to tokenize.
+   * @returns Set of distinct word tokens.
+   * @throws Never.
+   */
   const words = (value: string) => new Set(
     value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu)?.slice(0, 1_000) ?? [],
   );
@@ -278,6 +387,16 @@ function nearDuplicate(left: string, right: string): boolean {
   return union > 0 && intersection / union >= 0.92;
 }
 
+/**
+ * Greedily selects hits up to `limit`, enforcing content-hash deduplication,
+ * near-duplicate filtering, a cap of 8 passages per document, and a cap of 4
+ * passages per section; every skipped hit is recorded with a reason.
+ * @param hits - Candidate hits in fused ranking order.
+ * @param limit - Maximum number of hits to select.
+ * @returns The selected hits in selection order, plus a map of excluded hit
+ *   ids to their exclusion reasons.
+ * @throws Never.
+ */
 function diversify(hits: readonly RagV2RankedHit[], limit: number): {
   selected: RagV2RankedHit[];
   exclusions: Map<string, string>;
@@ -321,6 +440,16 @@ function diversify(hits: readonly RagV2RankedHit[], limit: number): {
   return { selected, exclusions };
 }
 
+/**
+ * Builds a ranked hit for a neighbouring passage by copying the source hit's
+ * identity and score, applying a 5% fusion-score discount, and marking it as
+ * a `neighbour_expansion` retrieval.
+ * @param source - The hit whose neighbour is being expanded.
+ * @param passage - The neighbouring passage record providing the content.
+ * @returns A new hit referencing the neighbour's passage id, offsets, text,
+ *   and hash.
+ * @throws Never.
+ */
 function hitFromNeighbour(source: RagV2RankedHit, passage: RagV2PassageRecord): RagV2RankedHit {
   return {
     ...source,
@@ -344,6 +473,15 @@ function hitFromNeighbour(source: RagV2RankedHit, passage: RagV2PassageRecord): 
   };
 }
 
+/**
+ * Detects materially conflicting polarity across retrieved sources via
+ * multilingual (English/Polish/German) keyword polarity matching.
+ * @param values - Hit- or evidence-like objects; only `text` and `documentId`
+ *   are read.
+ * @returns True when at least two distinct documents contribute texts whose
+ *   first 30 items contain both an affirming and a negating marker.
+ * @throws Never.
+ */
 function hasEvidenceConflict(values: readonly Pick<RagV2RankedHit, 'text' | 'documentId'>[]): boolean {
   if (new Set(values.map(value => value.documentId)).size < 2) return false;
   let positive = false;
@@ -356,6 +494,16 @@ function hasEvidenceConflict(values: readonly Pick<RagV2RankedHit, 'text' | 'doc
   return positive && negative;
 }
 
+/**
+ * Judges whether the fused first-pass candidates already satisfy the plan's
+ * intent: minimal passage counts, exact-reference recovery, and two-source
+ * coverage for comparisons, plus a polarity-conflict check.
+ * @param plan - The retrieval plan whose intent is being assessed.
+ * @param candidates - Fused first-pass hits in ranking order.
+ * @returns The first-pass assessment: status (`sufficient`, `insufficient`,
+ *   or `conflicting`), candidate count, and human-readable reasons.
+ * @throws Never.
+ */
 function assessFirstPassCandidates(
   plan: RagV2RetrievalPlan,
   candidates: readonly RagV2RankedHit[],
@@ -383,6 +531,19 @@ function assessFirstPassCandidates(
   };
 }
 
+/**
+ * Computes the final answerability verdict from the verified evidence,
+ * combining intent-specific coverage requirements, conflict detection, and
+ * iteration count into a status, score, and reasons.
+ * @param plan - The retrieval plan whose intent is being assessed.
+ * @param evidence - Verified evidence items in delivery order.
+ * @param iterations - Number of retrieval passes performed.
+ * @param conflicting - Whether the evidence contains conflicting polarity.
+ * @param firstPass - The first-pass assessment carried into the result.
+ * @returns The answerability block; `abstained` is true exactly when the
+ *   status is `insufficient`.
+ * @throws Never.
+ */
 function assessAnswerability(
   plan: RagV2RetrievalPlan,
   evidence: readonly RagV2Evidence[],
@@ -431,6 +592,14 @@ export class RagV2RetrievalEngine {
   private readonly colbert: RagV2ColbertAdapter | undefined;
   private readonly semanticServices: RagV2SemanticServices | undefined;
 
+  /**
+   * Assembles the engine from its dependencies; when no reranker instance is
+   * supplied but a `rerankerUrl` is given, an HTTP reranker adapter is
+   * created from it.
+   * @param dependencies - Repository, object store, embedder, and optional
+   *   retrieval lanes/tuning.
+   * @throws Never.
+   */
   constructor(dependencies: RetrievalDependencies) {
     this.repository = dependencies.repository;
     this.objectStore = dependencies.objectStore;
@@ -447,10 +616,22 @@ export class RagV2RetrievalEngine {
   }
 
   /**
-   * Performs one end-to-end retrieval for a plan.
-   * @param plan - The retrieval plan to execute.
-   * @param options - Limits, variant selection, and reranker controls.
-   * @returns The complete {@link RagV2SearchResult}.
+   * Performs one end-to-end retrieval: resolves the active publication,
+   * rewrites the query against the conversation, plans and executes the
+   * routing/candidate lanes, fuses, iterates, reranks, verifies evidence by
+   * re-authorization and range rehash, and records the audit run.
+   * @param workspaceId - Workspace of the context to search.
+   * @param contextId - Context whose active generation is searched.
+   * @param query - The user's raw question text.
+   * @param options - Limits (result cap 25), variant selection, conversation
+   *   turns, filters, and rewrite controls; defaults apply when omitted.
+   * @param signal - Optional abort signal forwarded to embedding, rerank, and
+   *   late-interaction calls.
+   * @returns The complete {@link RagV2SearchResult}; `evidence` is empty when
+   *   the verdict abstains.
+   * @throws Error - when the context has no active publication; embedder,
+   *   repository, and audit-write failures propagate (the failed run is
+   *   closed best-effort), as does an abort signalled mid-flight.
    */
   async search(
     workspaceId: string,
@@ -918,6 +1099,19 @@ export class RagV2RetrievalEngine {
     }
   }
 
+  /**
+   * Expands selected hits with their immediately adjacent passages when the
+   * hit text looks truncated, deduplicating by passage id and stopping once
+   * `limit` results have been collected.
+   * @param selected - Selected hits in ranking order.
+   * @param workspaceId - Workspace of the searched context.
+   * @param contextId - Context being searched.
+   * @param generationId - Generation whose passages are read.
+   * @param limit - Maximum number of hits to return, including originals.
+   * @returns The original hits interleaved with their neighbour hits, in
+   *   encounter order.
+   * @throws Error - if reading a section's passages fails.
+   */
   private async expandNeighbours(
     selected: readonly RagV2RankedHit[],
     workspaceId: string,

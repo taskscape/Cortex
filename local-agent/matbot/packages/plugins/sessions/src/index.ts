@@ -11,6 +11,13 @@ import { makeSessionTools }                 from './tools.js';
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Registers the session tools against the runtime's session store.
+   *
+   * @param services - Runtime machine; a no-op when no sessions store is present.
+   * @returns A promise that resolves once the tools are registered.
+   * @throws Never.
+   */
   async setup(services: MatbotMachine) {
     const store = services.sessions;
     if (!store) return;

@@ -17,6 +17,15 @@ export const plugin: MatbotPluginSpec = {
   storageBackend: {
     open: (dotData: string) => SQLiteStorageBackend.open(dotData),
   },
+  /**
+   * Activates the SQLite backend when the plugin is hot-loaded. No-op when the
+   * pre-scan already opened this backend at boot, or when no config path is
+   * available to derive the data root from.
+   * @param services - Runtime machine used to register the backend.
+   * @returns Resolves once the backend is registered (or the no-op exits).
+   * @throws Propagates errors from {@link SQLiteStorageBackend.open} or
+   *   `services.register`.
+   */
   async setup(services: MatbotMachine) {
     // Pre-scan already opened this backend at startup — nothing to do.
     if (services.StorageBackend instanceof SQLiteStorageBackend) return;

@@ -1,13 +1,29 @@
 import type { Tool, ToolEvent, ToolContext } from '@matatbread/matbot-plugin-api';
 import type { MCPClient, MCPToolDef } from './types.js';
 
-/** The matbot tool name a server's tool is registered under. */
+/**
+ * The matbot tool name a server's tool is registered under.
+ *
+ * @param serverName - The server id used as the name prefix.
+ * @param tool - The tool's name on the server.
+ * @returns `mcp__<serverName>__<tool>`.
+ * @throws Never.
+ */
 export const proxyToolName = (serverName: string, tool: string): string => `mcp__${serverName}__${tool}`;
 
 /**
  * Build the matbot proxy tool for one MCP tool. `resolveClient` is called per invocation so the tool
  * always uses the live connection (and reports cleanly if the server has since disconnected). Shared
  * by both transports — mcp-http for remote servers, the node mcp plugin for local ones.
+ *
+ * @param serverName - Server id used in the proxy tool name and its description prefix.
+ * @param toolDef - The server-advertised tool definition (name, description, input schema).
+ * @param resolveClient - Resolves the live {@link MCPClient} for `serverName` at call time;
+ *          returning `undefined` makes the proxy yield a "no longer connected" error event.
+ * @returns The proxy tool. Text content is streamed as `stdout` chunks and the full content parts
+ *          are the `result` value; an `error` event is yielded on disconnection, call failure, or
+ *          a server-reported tool error.
+ * @throws Never.
  */
 export function makeProxyTool(
   serverName:    string,

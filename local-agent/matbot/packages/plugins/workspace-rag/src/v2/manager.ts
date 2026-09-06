@@ -16,6 +16,7 @@ import {
   ragV2RrfFromEnv,
   ragV2SummaryConcurrencyFromEnv,
   ragV2SummaryQueueLimitFromEnv,
+  ragV2SummaryTimeoutMsFromEnv,
 } from './config.js';
 import {
   evaluateRagV2Results,
@@ -50,6 +51,11 @@ import type {
   RagV2WorkspaceRef,
 } from './types.js';
 
+/**
+ * A queued routing-summary unit of work: one embedding-grade summary for a
+ * collection, document, section, or passage, deduplicated by source content
+ * hash and summarizer signature before generation.
+ */
 interface SummaryTask extends RagV2SummaryInput {
   workspaceId: string;
   contextId: string;
@@ -59,11 +65,41 @@ interface SummaryTask extends RagV2SummaryInput {
   sourceContentSha256: string;
 }
 
+/**
+ * Wraps an operation so the returned promise settles as soon as `signal`
+ * aborts, rejecting with the signal's abort reason. The underlying operation
+ * keeps running and its eventual settlement is ignored once aborted.
+ *
+ * @typeParam T - The operation's resolution value.
+ * @param operation - Promise to gate on the signal.
+ * @param signal - Abort signal; aborting before or during the operation rejects the wrapper.
+ * @returns A promise resolving with the operation's value, rejecting with its error, or rejecting with the signal's abort reason when aborted.
+ * @throws Error - The returned promise rejects with the signal's abort reason when it fires.
+ */
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = (): void => reject(abortError(signal));
+    const cleanup = (): void => signal.removeEventListener('abort', abort);
+    operation.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+/**
+ * Identifiers returned by a source bridge after registering one indexed
+ * document with the external source registry. Either field may be omitted
+ * when the registry declines to version the source.
+ */
 interface SourceRegistration {
   sourceId?: string;
   sourceVersionId?: string;
 }
 
+/**
+ * Audit payload delivered to the manager's garbage-collection observer after
+ * each orphan sweep and retired-generation cleanup for one context.
+ */
 export interface RagV2GcEvent {
   workspace: RagV2WorkspaceRef;
   context: RagV2ContextRef;
@@ -78,6 +114,16 @@ export interface RagV2GcEvent {
  * source-registry-like service.
  */
 export interface RagV2SourceBridge {
+  /**
+   * Registers one newly indexed document with the external source registry.
+   * @param workspace - Owning workspace reference.
+   * @param context - Owning context reference.
+   * @param normalizedPath - Normalized path of the indexed file.
+   * @param contentSha256 - Hex SHA-256 of the stored content.
+   * @param modifiedAt - ISO-8601 modification timestamp of the source file.
+   * @param summary - Generated routing summary for the document.
+   * @returns Registration identifiers; either field may be undefined.
+   */
   register(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -88,7 +134,10 @@ export interface RagV2SourceBridge {
   ): Promise<SourceRegistration>;
   /**
    * Records that indexing one source failed.
-   * @param args - Source id, path, and failure description.
+   * @param workspace - Owning workspace reference.
+   * @param context - Owning context reference.
+   * @param normalizedPath - Normalized path of the file that failed to index.
+   * @param error - The ingestion failure, serialized for the registry.
    */
   recordFailure(
     workspace: RagV2WorkspaceRef,
@@ -98,13 +147,23 @@ export interface RagV2SourceBridge {
   ): Promise<void>;
   /**
    * Records that a previously indexed source disappeared from disk.
-   * @param args - Workspace/context ids and the removed path.
+   * @param workspace - Owning workspace reference.
+   * @param context - Owning context reference.
+   * @param normalizedPaths - Normalized paths removed during reconciliation.
    */
   markRemoved(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
     normalizedPaths: readonly string[],
   ): Promise<void>;
+  /**
+   * Optionally links the registered source into an external context graph.
+   * @param workspace - Owning workspace reference.
+   * @param context - Owning context reference.
+   * @param normalizedPath - Normalized path of the indexed file.
+   * @param registration - Registration returned by {@link RagV2SourceBridge.register}.
+   * @param summary - Generated routing summary for the document.
+   */
   enrichContextGraph?(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -178,18 +237,28 @@ export interface RagV2CensusOptions {
   resumeAfter?: string;
 }
 
+/**
+ * Bookkeeping for one in-flight ingestion: its live job record, abort
+ * controller, and completion promise, keyed by workspace/context.
+ */
 interface ActiveRun {
   job: RagV2Job;
   controller: AbortController;
   promise: Promise<void>;
 }
 
+/** What requested an ingestion run; mirrors the trigger field of {@link RagV2Job}. */
 type IngestionTrigger = RagV2Job['trigger'];
 
 
 
 
 
+/**
+ * Current wall-clock time as an ISO-8601 UTC timestamp.
+ * @returns ISO-8601 string, e.g. `2026-09-06T12:00:00.000Z`.
+ * @throws Never.
+ */
 function now(): string {
   return new Date().toISOString();
 }
@@ -207,27 +276,72 @@ const FILE_CONCURRENCY_TAIL_FILES = 4;
 
 
 
+/**
+ * Computes the lowercase hex SHA-256 digest of a string or buffer.
+ * @param value - Content to hash.
+ * @returns 64-character lowercase hex digest.
+ * @throws Never.
+ */
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * Deterministic input key for embedding reuse: hashes the level and the exact
+ * embedding input text together so cached vectors never cross levels.
+ * @param level - Record level (`document`, `section`, `passage`, or `collection`).
+ * @param text - Exact text sent to the embedder.
+ * @returns 64-character lowercase hex digest.
+ * @throws Never.
+ */
 function embeddingInputSha256(level: string, text: string): string {
   return sha256(`${level}\0${text}`);
 }
 
+/**
+ * Builds a deterministic, UUID-formatted identifier from a namespace and
+ * value using SHA-256 bits laid out like a version-5 UUID; identical inputs
+ * always yield the same id.
+ * @param namespace - Scope separating identical values (e.g. `workspaceId:contextId`).
+ * @param value - Stable value to identify, typically a normalized path or content hash.
+ * @returns Deterministic UUID-formatted identifier.
+ * @throws Never.
+ */
 function stableId(namespace: string, value: string): string {
   const hex = sha256(`${namespace}\0${value}`);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+/**
+ * Builds the NUL-separated map key identifying a workspace/context pair in
+ * the manager's in-memory bookkeeping maps.
+ * @param workspaceId - Workspace id.
+ * @param contextId - Context id.
+ * @returns Composite map key.
+ * @throws Never.
+ */
 function runKey(workspaceId: string, contextId: string): string {
   return `${workspaceId}\0${contextId}`;
 }
 
+/**
+ * Extracts the cancellation error carried by an aborted signal, falling back
+ * to a generic cancellation message when the abort reason is not an Error.
+ * @param signal - Aborted (or aborting) signal whose reason is read.
+ * @returns The signal's reason when it is an Error, otherwise a generic cancellation error.
+ * @throws Never.
+ */
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error('Workspace RAG V2 ingestion cancelled.');
 }
 
+/**
+ * Resolves after the given delay unless the signal aborts first, in which
+ * case the timer is cleared and the returned promise rejects.
+ * @param milliseconds - Delay before resolution.
+ * @param signal - Abort signal; aborting cancels the timer and rejects.
+ * @throws Error - The returned promise rejects with the signal's abort reason when it fires before the timer.
+ */
 async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -266,6 +380,7 @@ export class WorkspaceRagV2Manager {
   private readonly gcObserver: ((event: RagV2GcEvent) => void | Promise<void>) | undefined;
   private readonly objectStores = new Map<string, RagV2ObjectStore>();
   private readonly runs = new Map<string, ActiveRun>();
+  private readonly lastJobs = new Map<string, RagV2Job>();
   private readonly lazySections = new Map<string, {
     workspaceId: string;
     contextId: string;
@@ -305,12 +420,27 @@ export class WorkspaceRagV2Manager {
   private readonly summaryController = new AbortController();
   private readonly summaryConcurrency = ragV2SummaryConcurrencyFromEnv();
   private readonly summaryQueueLimit = ragV2SummaryQueueLimitFromEnv();
+  private readonly summaryTimeoutMs = ragV2SummaryTimeoutMsFromEnv();
+  private closing = false;
+  private closePromise?: Promise<void>;
   private summaryActive = 0;
   private summaryCompleted = 0;
   private summaryFailed = 0;
   private initialized = false;
   private readonly sourceAcquisition:RagSourceAcquisition;
 
+  /**
+   * Creates the manager. Collaborators are captured as-is; policy, retention,
+   * rate limiters, and background workers are initialized from the
+   * environment, but no connections are opened until {@link initialize}.
+   *
+   * @param repository - Persistence backend for documents, jobs, and publications.
+   * @param embedder - Embedding client used for document, section, passage, collection, and summary vectors.
+   * @param sourceBridge - Optional bridge to an external source registry; ingestion degrades gracefully when absent.
+   * @param semanticServices - Optional semantic summarizer for routing summaries; summarization is skipped when absent.
+   * @param gcObserver - Optional observer invoked after each garbage-collection run; observer errors are logged, not fatal.
+   * @param sourceAcquisition - Source discovery, counting, and root-selection strategy over configured Markdown paths; defaults to the filesystem implementation.
+   */
   constructor(
     repository: RagV2Repository,
     embedder: RagV2Embedder,
@@ -328,7 +458,10 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Initialises repositories, vectorizers, and sidecar connections. Idempotent.
+   * Initialises repositories, vectorizers, and sidecar connections. Idempotent:
+   * calls after a successful initialization return immediately.
+   *
+   * @throws Error - When the underlying repository initialization fails.
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -337,15 +470,34 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Stops background work and closes repository connections.
+   * Stops background work and closes repository connections. Idempotent:
+   * concurrent and repeated calls share one shutdown sequence, which aborts
+   * ingestion, summary, lazy-embedding, and GC workers, then closes the
+   * repository.
+   *
+   * @throws Error - When the repository fails to close.
    */
   async close(): Promise<void> {
+    return this.closePromise ??= this.closeAll();
+  }
+
+  /**
+   * Shutdown sequence behind {@link WorkspaceRagV2Manager.close}: sets the
+   * closing flag, aborts all runs and background workers, drains their
+   * promises, clears the GC queue, and closes the repository. Clearing the
+   * summary queue wakes space waiters so pending enqueue calls reject.
+   *
+   * @throws Error - When the repository fails to close.
+   */
+  private async closeAll(): Promise<void> {
+    this.closing = true;
     for (const run of this.runs.values()) run.controller.abort(new Error('Workspace RAG V2 manager is closing.'));
-    await Promise.allSettled([...this.runs.values()].map(run => run.promise));
     this.summaryController.abort(new Error('Workspace RAG V2 manager is closing.'));
     this.summaryQueue.splice(0);
-    await this.waitForSummaries();
+    for (const wake of this.summarySpaceWaiters.splice(0)) wake();
     this.lazyWorkerController.abort(new Error('Workspace RAG V2 manager is closing.'));
+    await Promise.allSettled([...this.runs.values()].map(run => run.promise));
+    await this.waitForSummaries();
     await this.lazyWorker?.catch(() => undefined);
     if (this.gcWorkerTimer) clearTimeout(this.gcWorkerTimer);
     this.gcQueue.clear();
@@ -353,22 +505,43 @@ export class WorkspaceRagV2Manager {
     await this.repository.close();
   }
 
+  /**
+   * Builds a status snapshot for one context: the active publication, the
+   * live or last known job (the in-memory job wins when it is newer than or
+   * identical to the stored one), the indexed document count, summary
+   * pipeline counters, and a composed human-readable message. Repository
+   * lookups run through `Promise.allSettled`, so storage failures degrade
+   * `available` and feed the message instead of rejecting.
+   *
+   * @param mode - Operating mode echoed back in the status.
+   * @param workspace - Workspace to report on.
+   * @param context - Context to report on.
+   * @returns Status snapshot; the included `job` is a deep clone.
+   * @throws Never.
+   */
   async status(
     mode: RagV2Status['mode'],
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
   ): Promise<RagV2Status> {
-    const publication = await this.repository.activePublication(workspace.id, context.id);
-    const run = this.runs.get(runKey(workspace.id, context.id));
-    const job = run?.job ?? await this.repository.currentJob(workspace.id, context.id);
-    const indexedDocuments = await this.repository.countGenerationDocuments(
-      workspace.id,
-      context.id,
-      run?.job.generationId,
-    );
+    const key = runKey(workspace.id, context.id);
+    const run = this.runs.get(key);
+    const results = await Promise.allSettled([
+      this.repository.activePublication(workspace.id, context.id),
+      this.repository.currentJob(workspace.id, context.id),
+      this.repository.countGenerationDocuments(workspace.id, context.id, run?.job.generationId),
+    ]);
+    const publication = results[0].status === 'fulfilled' ? results[0].value : undefined;
+    const storedJob = results[1].status === 'fulfilled' ? results[1].value : undefined;
+    const remembered = this.lastJobs.get(key);
+    const job = run?.job ?? (remembered && (!storedJob || remembered.id === storedJob.id
+      || remembered.createdAt >= storedJob.createdAt) ? remembered : storedJob);
+    const indexedDocuments = results[2].status === 'fulfilled' ? results[2].value : 0;
+    const storageErrors = results.flatMap(result => result.status === 'rejected'
+      ? [result.reason instanceof Error ? result.reason.message : String(result.reason)] : []);
     return {
       mode,
-      available: this.initialized,
+      available: this.initialized && storageErrors.length === 0,
       backend: this.repository.backend,
       indexedDocuments,
       ...(publication ? {
@@ -376,7 +549,7 @@ export class WorkspaceRagV2Manager {
         activeState: publication.state,
         embeddingSignature: publication.embeddingSignature,
       } : {}),
-      ...(job ? { job } : {}),
+      ...(job ? { job: structuredClone(job) } : {}),
       ...(this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))
         ? { lastSuccessfulReconcileAt: this.lastSuccessfulReconcile.get(runKey(workspace.id, context.id))! }
         : {}),
@@ -394,6 +567,8 @@ export class WorkspaceRagV2Manager {
           : {}),
       },
       message: [
+        ...(storageErrors.length ? [`Workspace RAG storage is unavailable: ${[...new Set(storageErrors)].join('; ')}.`] : []),
+        ...(job?.message ? [job.message] : []),
         publication
           ? `Workspace RAG V2 publication ${publication.generationId} is ${publication.state}.`
           : 'Workspace RAG V2 has no active publication.',
@@ -404,6 +579,20 @@ export class WorkspaceRagV2Manager {
     };
   }
 
+  /**
+   * Starts an ingestion run for the context, or returns the active run's job
+   * unchanged when one already exists (single-flight per context). The job
+   * record is created synchronously and mutated in place as the background
+   * run progresses; run failures are logged, never surfaced to the caller.
+   *
+   * @param workspace - Workspace to index.
+   * @param context - Context whose configured paths are indexed.
+   * @param trigger - What requested the run; defaults to `'manual'`.
+   * @param forcePaths - Paths to re-ingest even when fingerprints match; normalized before use, defaults to none.
+   * @param forceAll - Re-ingest every file regardless of fingerprint match; defaults to false.
+   * @returns The new (or already active) job record.
+   * @throws Error - When the manager is closing.
+   */
   startIngestion(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -411,6 +600,7 @@ export class WorkspaceRagV2Manager {
     forcePaths: readonly string[] = [],
     forceAll = false,
   ): RagV2Job {
+    if (this.closing) throw new Error('Workspace RAG V2 manager is closing.');
     const key = runKey(workspace.id, context.id);
     const existing = this.runs.get(key);
     if (existing) return existing.job;
@@ -460,6 +650,7 @@ export class WorkspaceRagV2Manager {
         console.warn(`[workspace-rag-v2] ingestion ${job.id} stopped: ${error instanceof Error ? error.message : String(error)}`);
       })
       .finally(() => {
+        this.lastJobs.set(key, structuredClone(job));
         if (this.runs.get(key)?.job.id === job.id) this.runs.delete(key);
         const gc = this.gcAfterIngestion.get(key);
         if (gc) {
@@ -475,12 +666,27 @@ export class WorkspaceRagV2Manager {
    * Resolves when the context's current job reaches a terminal state.
    * @param workspaceId - Workspace id.
    * @param contextId - Context id.
+   * @returns The terminal job, including failure details when ingestion failed.
+   * @throws Error - When the stored job lookup fails.
    */
-  async waitForIngestion(workspaceId: string, contextId: string): Promise<void> {
-    await this.runs.get(runKey(workspaceId, contextId))?.promise;
+  async waitForIngestion(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
+    const key = runKey(workspaceId, contextId);
+    const run = this.runs.get(key);
+    await run?.promise;
+    const job = run?.job ?? this.lastJobs.get(key) ?? await this.repository.currentJob(workspaceId, contextId);
+    return job ? structuredClone(job) : undefined;
   }
 
-  /** Runs one orphan sweep and retired-generation cleanup for a context. */
+  /**
+   * Runs one orphan sweep and retired-generation cleanup for a context.
+   * Concurrent calls for the same context share a single in-flight operation
+   * instead of starting a second sweep; the repository is initialized first.
+   *
+   * @param workspace - Workspace to clean.
+   * @param context - Context to clean.
+   * @returns Deletion counts from the sweep; `deletionsSkipped` is set when ingestion is active.
+   * @throws Error - When initialization or the sweep fails.
+   */
   async garbageCollect(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -495,7 +701,17 @@ export class WorkspaceRagV2Manager {
     return operation;
   }
 
-  /** Cancels local ingestion if needed, then idempotently purges non-audit context state. */
+  /**
+   * Cancels local ingestion if needed, then idempotently purges non-audit
+   * context state: queued and in-flight summaries, pending GC work, lazy
+   * embedding scopes, repository records, and — in managed retention mode —
+   * unreferenced content blobs older than the grace period. In-memory
+   * bookkeeping for the context is cleared on success.
+   *
+   * @param workspace - Workspace owning the context.
+   * @param context - Context to purge.
+   * @throws Error - When cancellation, the purge, or blob pruning fails.
+   */
   async purgeContext(workspace: RagV2WorkspaceRef, context: RagV2ContextRef): Promise<void> {
     const key = runKey(workspace.id, context.id);
     if (this.runs.has(key)) await this.cancel(workspace.id, context.id);
@@ -513,11 +729,17 @@ export class WorkspaceRagV2Manager {
     }
     this.lastGc.delete(key);
     this.lastSuccessfulReconcile.delete(key);
+    this.lastJobs.delete(key);
   }
 
   /**
-   * Requests a pause of the context's running job.
-   * @returns The updated job, or undefined when none is active.
+   * Requests a pause of the context's running job at the next safe boundary.
+   * With no active run, the stored job is returned unchanged.
+   *
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   * @returns The updated live job, or the stored job, or undefined when none is active.
+   * @throws Error - When persisting the updated job fails.
    */
   async pause(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
@@ -531,8 +753,14 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Resumes a paused job.
-   * @returns The updated job, or undefined when there is nothing to resume.
+   * Resumes a paused job by clearing the pause request and returning the run
+   * to its discovery state. With no active run, the stored job is returned
+   * unchanged.
+   *
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   * @returns The updated live job, or the stored job, or undefined when there is nothing to resume.
+   * @throws Error - When persisting the updated job fails.
    */
   async resume(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
@@ -546,8 +774,14 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Requests cancellation of the context's current job.
-   * @returns The updated job, or undefined when none is active.
+   * Requests cancellation of the context's current job: flags the job, aborts
+   * the run's controller, and waits for the run to settle before returning.
+   * With no active run, the stored job is returned unchanged.
+   *
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   * @returns The updated live job, or the stored job, or undefined when none is active.
+   * @throws Error - When persisting the updated job fails.
    */
   async cancel(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const run = this.runs.get(runKey(workspaceId, contextId));
@@ -561,6 +795,18 @@ export class WorkspaceRagV2Manager {
     return run.job;
   }
 
+  /**
+   * Runs a retrieval query against the context's active publication via the
+   * per-workspace retrieval engine, which is created lazily on first use.
+   *
+   * @param workspace - Workspace to search.
+   * @param context - Context to search.
+   * @param query - Natural-language query text.
+   * @param options - Optional authorization scopes, match limit, filters, retrieval variant, conversation context, and rewrite/iterative settings; defaults to all-empty.
+   * @param signal - Optional abort signal forwarded to the retrieval engine.
+   * @returns Search results with evidence passages, diagnostics, and answer material.
+   * @throws Error - When the workspace id is invalid, there is no active publication, or the retrieval engine fails.
+   */
   async search(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -585,23 +831,59 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Resolves when all queued routing-summary tasks have drained.
+   * Resolves when all queued routing-summary tasks have drained, returning
+   * immediately when the pipeline is already idle. Used by shutdown, purge,
+   * and garbage collection so summaries cannot recreate swept state.
+   *
+   * @throws Never.
    */
   async waitForSummaries(): Promise<void> {
     if (this.summaryQueue.length === 0 && this.summaryActive === 0) return;
     await new Promise<void>(resolve => this.summaryIdleWaiters.push(resolve));
   }
 
-  private async enqueueSummary(task: SummaryTask): Promise<void> {
+  /**
+   * Queues one routing-summary task and starts the summary pump. No-op when
+   * summarization is disabled (no semantic services or signature). While the
+   * queue is at its limit, waits for space until either the caller's signal
+   * or the manager's closing signal aborts.
+   *
+   * @param task - Summary unit of work with workspace/context/generation scope and source content hash.
+   * @param signal - Caller's abort signal; combined with the manager's closing signal while waiting for space.
+   * @throws Error - The returned promise rejects with the abort reason when the combined signal fires while waiting for queue space.
+   */
+  private async enqueueSummary(task: SummaryTask, signal: AbortSignal): Promise<void> {
     if (!this.semanticServices?.summarize || !this.semanticServices.summarizerSignature) return;
+    const combined = AbortSignal.any([signal, this.summaryController.signal]);
     while (this.summaryQueue.length >= this.summaryQueueLimit && !this.summaryController.signal.aborted) {
-      await new Promise<void>(resolve => this.summarySpaceWaiters.push(resolve));
+      combined.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+          combined.removeEventListener('abort', abort);
+          const index = this.summarySpaceWaiters.indexOf(wake);
+          if (index >= 0) this.summarySpaceWaiters.splice(index, 1);
+        };
+        const wake = (): void => { cleanup(); resolve(); };
+        const abort = (): void => { cleanup(); reject(abortError(combined)); };
+        this.summarySpaceWaiters.push(wake);
+        combined.addEventListener('abort', abort, { once: true });
+        if (combined.aborted) abort();
+      });
     }
-    if (this.summaryController.signal.aborted) return;
+    combined.throwIfAborted();
     this.summaryQueue.push(task);
     this.pumpSummaryQueue();
   }
 
+  /**
+   * Drains the summary queue while concurrency slots are free and the
+   * pipeline is not closed, running each task under a per-task timeout
+   * signal. Tracks completion and failure counters, wakes idle waiters when
+   * the pipeline empties, and releases both idle and space waiters once a
+   * close has fully drained.
+   *
+   * @throws Never.
+   */
   private pumpSummaryQueue(): void {
     while (
       this.summaryActive < this.summaryConcurrency
@@ -611,7 +893,10 @@ export class WorkspaceRagV2Manager {
       const task = this.summaryQueue.shift()!;
       this.summarySpaceWaiters.shift()?.();
       this.summaryActive++;
-      void this.runSummaryTask(task, this.summaryController.signal)
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(new Error(`Semantic summary timed out after ${this.summaryTimeoutMs}ms.`)), this.summaryTimeoutMs);
+      const signal = AbortSignal.any([this.summaryController.signal, deadline.signal]);
+      void this.runSummaryTask(task, signal)
         .then(() => { this.summaryCompleted++; })
         .catch(error => {
           if (!this.summaryController.signal.aborted) {
@@ -620,6 +905,7 @@ export class WorkspaceRagV2Manager {
           }
         })
         .finally(() => {
+          clearTimeout(timer);
           this.summaryActive--;
           if (this.summaryQueue.length === 0 && this.summaryActive === 0) {
             for (const resolve of this.summaryIdleWaiters.splice(0)) resolve();
@@ -634,6 +920,18 @@ export class WorkspaceRagV2Manager {
     }
   }
 
+  /**
+   * Executes one summary task: reuses a stored summary for the same level,
+   * content hash, and summarizer signature when available; otherwise calls
+   * the semantic summarizer, collapses whitespace, truncates to 2000
+   * characters, and persists the routing summary. Then embeds
+   * `title + summary` and stores the vector when its dimensionality matches
+   * the embedder; dimension mismatches are silently dropped.
+   *
+   * @param task - Summary unit of work.
+   * @param signal - Abort signal checked between stages and applied to summarizer and embedding calls.
+   * @throws Error - When the summarizer returns no usable text; also propagates abort reasons and repository failures.
+   */
   private async runSummaryTask(task: SummaryTask, signal: AbortSignal): Promise<void> {
     const signature = this.semanticServices?.summarizerSignature;
     const summarize = this.semanticServices?.summarize;
@@ -645,12 +943,14 @@ export class WorkspaceRagV2Manager {
       task.sourceContentSha256,
       signature,
     );
-    const generated = reusable?.summary ?? await summarize({
+    signal.throwIfAborted();
+    const generated = reusable?.summary ?? await abortable(summarize({
       level: task.level,
       title: task.title,
       breadcrumb: task.breadcrumb,
       text: task.text,
-    }, signal);
+    }, signal), signal);
+    signal.throwIfAborted();
     const summaryText = generated?.replace(/\s+/gu, ' ').trim().slice(0, 2_000);
     if (!summaryText) throw new Error('semantic summarizer returned no usable text');
     const record: RagV2RoutingSummaryRecord = {
@@ -668,7 +968,9 @@ export class WorkspaceRagV2Manager {
     };
     await this.repository.putRoutingSummary(record);
     const summaryEmbeddingText = `${task.title}\n${summaryText}`;
-    const vector = (await this.embedder.embed([summaryEmbeddingText], 'document', signal))[0];
+    signal.throwIfAborted();
+    const vector = (await abortable(this.embedder.embed([summaryEmbeddingText], 'document', signal), signal))[0];
+    signal.throwIfAborted();
     if (vector?.length !== this.embedder.info.dimensions) return;
     await this.repository.putEmbeddings([{
       level: task.level,
@@ -683,9 +985,18 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Reads a byte range from an indexed document's stored object.
-   * @param params - Document/version ids and byte range.
-   * @returns The requested text.
+   * Reads a byte range from an indexed document's stored object after
+   * checking the caller's authorization tokens against the document.
+   *
+   * @param workspace - Workspace owning the document.
+   * @param context - Context owning the document.
+   * @param documentVersionId - Document version to read from.
+   * @param startByte - Inclusive start offset in bytes.
+   * @param endByte - End offset in bytes.
+   * @param principalId - Caller identity for authorization; defaults to `'local-user'`.
+   * @param groupIds - Caller group ids for authorization; defaults to none.
+   * @returns Document metadata, the echoed byte range, the range's content SHA-256, and the decoded UTF-8 text.
+   * @throws Error - When the workspace id is invalid, the document version is unavailable or unauthorized, or the byte range is invalid or too large.
    */
   async fetchSourceRange(
     workspace: RagV2WorkspaceRef,
@@ -715,9 +1026,18 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Reads a line range from an indexed document via its line index.
-   * @param params - Document/version ids and 1-based line range.
-   * @returns The requested lines joined with newlines.
+   * Reads a line range from an indexed document via its line index after
+   * checking the caller's authorization tokens against the document.
+   *
+   * @param workspace - Workspace owning the document.
+   * @param context - Context owning the document.
+   * @param documentVersionId - Document version to read from.
+   * @param startLine - Inclusive 1-based start line.
+   * @param endLine - Inclusive 1-based end line.
+   * @param principalId - Caller identity for authorization; defaults to `'local-user'`.
+   * @param groupIds - Caller group ids for authorization; defaults to none.
+   * @returns Document metadata, the echoed line range, the covered byte range, and the requested lines joined with newlines.
+   * @throws Error - When the workspace id is invalid, the document version is unavailable or unauthorized, or the line range is invalid.
    */
   async fetchLines(
     workspace: RagV2WorkspaceRef,
@@ -750,9 +1070,20 @@ export class WorkspaceRagV2Manager {
 
   /**
    * Regex/substring search over indexed documents with authorization scoping
-   * and persisted audit runs.
-   * @param params - Pattern, scope, and match options.
-   * @returns Matched passages with highlighted ranges.
+   * and persisted audit runs. Requires an active publication; the match limit
+   * is clamped to 1-100 and results are additionally capped at 2 MiB of text.
+   * The pattern is validated for safety before execution, and an audit record
+   * (pattern hash, counts, result bytes, duration) is always persisted.
+   *
+   * @param workspace - Workspace owning the documents.
+   * @param context - Context whose active publication scopes the search.
+   * @param documentVersionIds - Document versions to search; must contain 1-50 entries.
+   * @param pattern - Regular expression evaluated by the repository.
+   * @param limit - Requested match limit before clamping; defaults to 50.
+   * @param principalId - Caller identity for authorization; defaults to `'local-user'`.
+   * @param groupIds - Caller group ids for authorization; defaults to none.
+   * @returns The publication generation id, the pattern, and matches with line/byte ranges and text.
+   * @throws Error - When the version count is outside 1-50, the pattern fails safety validation or is invalid, or there is no active publication.
    */
   async grepDocuments(
     workspace: RagV2WorkspaceRef,
@@ -819,9 +1150,17 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Removes embeddings not touched within the retention window to reclaim space.
-   * @param params - Retention window and batch size.
-   * @returns Number of embeddings evicted.
+   * Removes embeddings not touched within the retention window to reclaim
+   * space. Requires an active publication; the batch limit is clamped to
+   * 1-100000. After eviction the generation is revalidated and republished as
+   * `active_lexical`, `active_hybrid_complete`, or `active_hybrid_partial` to
+   * reflect the new embedding coverage.
+   *
+   * @param workspace - Workspace owning the publication.
+   * @param context - Context owning the publication.
+   * @param limit - Requested eviction batch size before clamping; defaults to 1000.
+   * @returns The generation id, the number of embeddings evicted, and the republished state.
+   * @throws Error - When there is no active publication or repository access fails.
    */
   async evictColdPassageEmbeddings(
     workspace: RagV2WorkspaceRef,
@@ -857,8 +1196,20 @@ export class WorkspaceRagV2Manager {
 
   /**
    * Runs retrieval against evaluation cases and scores recall/precision.
-   * @param input - Cases, scope, and options.
-   * @returns Aggregate and per-case evaluation metrics.
+   * Requires an active publication; cases must number 1-1000, and search
+   * depth is capped at 25 with metrics reporting the searched k rather than a
+   * requested k the corpus never produced. Cases run sequentially so aborts
+   * are honored between searches; the run configuration and metrics are
+   * persisted.
+   *
+   * @param workspace - Workspace to evaluate.
+   * @param context - Context to evaluate.
+   * @param cases - Evaluation cases with queries and expected evidence.
+   * @param k - Requested search depth before the 25 cap; defaults to 10.
+   * @param variant - Retrieval variant to evaluate; defaults to `'hierarchical_lazy'`.
+   * @param signal - Optional abort signal checked between cases and forwarded to each search.
+   * @returns The run id, the publication generation id, and aggregate plus per-case metrics.
+   * @throws Error - When the case count is outside 1-1000, there is no active publication, or a search fails; also propagates the abort reason.
    */
   async evaluate(
     workspace: RagV2WorkspaceRef,
@@ -939,11 +1290,17 @@ export class WorkspaceRagV2Manager {
 
   /**
    * Scans a context's source roots without ingesting, producing file counts,
-   * byte totals, and cardinality estimates.
-   * @param workspaceId - Workspace id.
-   * @param contextId - Context id.
-   * @param options - Census options.
-   * @returns The census report.
+   * byte totals, size percentiles, language and structure statistics,
+   * duplicate rate estimates (deep mode only), and storage/vector
+   * projections. Aborts end the scan early with `complete: false` instead of
+   * throwing; when `deep` is enabled each file is additionally analyzed for
+   * structure and language.
+   *
+   * @param paths - Configured source paths to scan.
+   * @param signal - Abort signal; defaults to a never-aborted signal.
+   * @param options - `deep` (default true) enables per-file analysis; `resumeAfter` is a normalized checkpoint path — files at or before it lexicographically are skipped.
+   * @returns The census report, carrying a `checkpoint` path for resumable scans.
+   * @throws Error - When discovery or per-file analysis fails for a non-abort reason.
    */
   async census(
     paths: readonly string[],
@@ -1079,6 +1436,11 @@ export class WorkspaceRagV2Manager {
         throw error;
       }
     }
+    /**
+     * Estimates a file-size percentile from the log2-banded histogram,
+     * falling back to the largest observed file when the histogram is
+     * exhausted. Returns 0 when no files were seen.
+     */
     const percentile = (fraction: number): number => {
       if (result.files === 0) return 0;
       const target = Math.max(1, Math.ceil(result.files * fraction));
@@ -1123,6 +1485,14 @@ export class WorkspaceRagV2Manager {
    * A run that dies mid-scan leaves its generation unpublished, so the next run would rediscover
    * the whole corpus as new. Adopt that generation instead: a document joins a generation only
    * once it is fully ingested, so everything the interrupted run left there is safe to inherit.
+   * Adoption requires the previous job to have incomplete discovery, its generation to exist in
+   * staging with the current embedding signature, and at least one indexed document.
+   *
+   * @param workspace - Workspace owning the generation.
+   * @param context - Context owning the generation.
+   * @param previous - Stored job from the interrupted run, when present.
+   * @returns The resumable generation id, or undefined when the run cannot be resumed.
+   * @throws Error - When repository access fails.
    */
   private async resumableGeneration(
     workspace: RagV2WorkspaceRef,
@@ -1133,7 +1503,7 @@ export class WorkspaceRagV2Manager {
     const generation = await this.repository.generation(
       workspace.id, context.id, previous.generationId,
     );
-    if (!generation || generation.embeddingSignature !== this.embedder.info.signature) return undefined;
+    if (!generation || generation.state !== 'staging' || generation.embeddingSignature !== this.embedder.info.signature) return undefined;
     const documents = await this.repository.countGenerationDocuments(
       workspace.id, context.id, previous.generationId,
     );
@@ -1141,9 +1511,15 @@ export class WorkspaceRagV2Manager {
   }
 
   /**
-   * Publishes the work done so far so a restart inherits it. The generation carries the previous
-   * publication's documents forward, so promoting it mid-scan only ever adds to what search sees;
-   * removals still wait for discovery to complete.
+   * Publishes an independent membership snapshot. Writers continue using the job's staging
+   * generation, so subsequent reconciliation cannot mutate a snapshot already used by search.
+   * The snapshot is validated first and only published when valid and non-empty; any failure
+   * is logged and skipped so checkpointing never fails ingestion.
+   *
+   * @param workspace - Workspace to publish the checkpoint for.
+   * @param context - Context to publish the checkpoint for.
+   * @param job - Active job whose `publishedCheckpoints` counter and timestamp are updated on success.
+   * @throws Never.
    */
   private async publishCheckpoint(
     workspace: RagV2WorkspaceRef,
@@ -1151,14 +1527,17 @@ export class WorkspaceRagV2Manager {
     job: RagV2Job,
   ): Promise<void> {
     try {
+      const checkpointId = randomUUID();
+      await this.repository.beginGeneration(workspace.id, context.id, checkpointId, job.generationId);
+      await this.repository.rebuildCollections(workspace.id, context.id, checkpointId);
       const validation = await this.repository.validateGeneration(
-        workspace.id, context.id, job.generationId,
+        workspace.id, context.id, checkpointId,
       );
       if (!validation.valid || validation.documents === 0) return;
       await this.repository.publishGeneration(
         workspace.id,
         context.id,
-        job.generationId,
+        checkpointId,
         validation.passageEmbeddings === 0
           ? 'active_lexical'
           : validation.passageEmbeddings === validation.passages
@@ -1173,6 +1552,26 @@ export class WorkspaceRagV2Manager {
     }
   }
 
+  /**
+   * Executes a full ingestion run: marks any stale interrupted job as failed,
+   * adopts a resumable staging generation when present, selects available
+   * source roots (stopping early with a retryable failure when a skipped root
+   * still backs indexed documents), then discovers and processes files tier
+   * by tier (`authority` -> `current` -> `archive`) through a bounded worker
+   * pool with periodic checkpoint publications. After discovery it reconciles
+   * removals (deferring them when files failed), rebuilds and embeds
+   * collections, validates the generation, and publishes it; failures mark
+   * the job `retryable_failure` (or `cancelled` on abort) with a best-effort
+   * terminal update before rethrowing.
+   *
+   * @param workspace - Workspace being indexed.
+   * @param context - Context being indexed; its effective paths may be narrowed to available roots.
+   * @param job - Pre-initialized job record, mutated in place throughout the run and persisted at each stage.
+   * @param signal - Abort signal for the run, checked between stages and honored by discovery and embedding calls.
+   * @param forcePaths - Normalized paths to re-ingest even when fingerprints match.
+   * @param forceAll - Re-ingest every file regardless of fingerprint match.
+   * @throws Error - When generation validation fails or a file task fails; abort reasons propagate after the job is marked cancelled.
+   */
   private async runIngestion(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -1181,62 +1580,79 @@ export class WorkspaceRagV2Manager {
     forcePaths: ReadonlySet<string>,
     forceAll: boolean,
   ): Promise<void> {
-    await this.initialize();
-    await this.gcLocks.get(runKey(workspace.id, context.id));
-    const previousJob = await this.repository.currentJob(workspace.id, context.id);
-    const resumed = await this.resumableGeneration(workspace, context, previousJob);
-    if (resumed) job.generationId = resumed.generationId;
-    await this.repository.createJob(job);
-    const fingerprints = new Map(
-      (await this.repository.listFingerprints(workspace.id, context.id)).map(value => [normalizedPath(value.path), value]),
-    );
-    if (resumed) {
-      const inherited = await this.repository.listFingerprints(
-        workspace.id, context.id, resumed.generationId,
+    let jobCreated = false;
+    try {
+      await this.initialize();
+      await this.gcLocks.get(runKey(workspace.id, context.id));
+      signal.throwIfAborted();
+      const previousJob = await this.repository.currentJob(workspace.id, context.id);
+      if (previousJob && !['active_lexical', 'active_hybrid_partial', 'active_hybrid_complete',
+        'cancelled', 'retryable_failure', 'permanent_failure', 'quarantined'].includes(previousJob.state)) {
+        previousJob.state = 'retryable_failure';
+        previousJob.message = 'Previous ingestion was interrupted before reaching a terminal state.';
+        previousJob.updatedAt = now();
+        delete previousJob.currentPath;
+        await this.repository.updateJob(previousJob);
+      }
+      const resumed = await this.resumableGeneration(workspace, context, previousJob);
+      if (resumed) job.generationId = resumed.generationId;
+      signal.throwIfAborted();
+      // Treat an unacknowledged create as potentially committed, so its failure
+      // also gets a best-effort terminal update.
+      jobCreated = true;
+      await this.repository.createJob(job);
+      const fingerprints = new Map(
+        (await this.repository.listFingerprints(workspace.id, context.id)).map(value => [normalizedPath(value.path), value]),
       );
-      for (const value of inherited) fingerprints.set(normalizedPath(value.path), value);
-      job.resumedFiles = inherited.length;
-      job.message = `Resuming the generation left by an interrupted run with ${job.resumedFiles} file${job.resumedFiles === 1 ? '' : 's'} already indexed.`;
-      job.updatedAt = now();
-      await this.repository.updateJob(job);
-    }
-    const rootSelection = await this.sourceAcquisition.availableMarkdownRoots(context.paths);
-    if (rootSelection.skippedPaths.length > 0) {
-      job.skippedPaths = rootSelection.skippedPaths;
-      job.message = `Skipping ${rootSelection.skippedPaths.length} unavailable configured path${rootSelection.skippedPaths.length === 1 ? '' : 's'} while indexing the remaining paths.`;
-      job.updatedAt = now();
-      await this.repository.updateJob(job);
-      const unavailableRootWithIndexedDocuments = rootSelection.skippedPaths.find(root =>
-        [...fingerprints.keys()].some(filePath => isWithinRoot(filePath, root)),
-      );
-      if (unavailableRootWithIndexedDocuments) {
-        job.state = 'retryable_failure';
-        job.deletionsDeferred = true;
-        job.message = (
-          `Workspace RAG V2 could not completely discover ${unavailableRootWithIndexedDocuments}: `
-          + 'the root has indexed documents, so its previous publication remains active.'
+      if (resumed) {
+        const inherited = await this.repository.listFingerprints(
+          workspace.id, context.id, resumed.generationId,
         );
+        for (const value of inherited) fingerprints.set(normalizedPath(value.path), value);
+        job.resumedFiles = inherited.length;
+        job.message = `Resuming the generation left by an interrupted run with ${job.resumedFiles} file${job.resumedFiles === 1 ? '' : 's'} already indexed.`;
         job.updatedAt = now();
         await this.repository.updateJob(job);
-        return;
       }
-    }
-    const indexContext: RagV2ContextRef = { ...context, paths: rootSelection.paths };
-    job.totalFiles = await this.sourceAcquisition.countMarkdown(indexContext.paths, signal);
-    job.message = `Discovering ${job.totalFiles} Markdown file${job.totalFiles === 1 ? '' : 's'}.`;
-    job.updatedAt = now();
-    await this.repository.updateJob(job);
-    await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
-    const pruned = await this.repository.pruneStagingGenerations(
-      workspace.id, context.id, job.generationId,
-    );
-    if (pruned > 0) {
-      console.warn(`[workspace-rag-v2] pruned ${pruned} abandoned staging generation${pruned === 1 ? '' : 's'}.`);
-    }
-    const seenPaths = new Set<string>();
-    const checkpointState = { sinceFiles: 0 };
-    let removedPaths: string[] = [];
-    try {
+      const rootSelection = await this.sourceAcquisition.availableMarkdownRoots(context.paths);
+      signal.throwIfAborted();
+      if (rootSelection.skippedPaths.length > 0) {
+        job.skippedPaths = rootSelection.skippedPaths;
+        job.message = `Skipping ${rootSelection.skippedPaths.length} unavailable configured path${rootSelection.skippedPaths.length === 1 ? '' : 's'} while indexing the remaining paths.`;
+        job.updatedAt = now();
+        await this.repository.updateJob(job);
+        const unavailableRootWithIndexedDocuments = rootSelection.skippedPaths.find(root =>
+          [...fingerprints.keys()].some(filePath => isWithinRoot(filePath, root)),
+        );
+        if (unavailableRootWithIndexedDocuments) {
+          job.state = 'retryable_failure';
+          job.deletionsDeferred = true;
+          job.message = (
+            `Workspace RAG V2 could not completely discover ${unavailableRootWithIndexedDocuments}: `
+            + 'the root has indexed documents, so its previous publication remains active.'
+          );
+          job.updatedAt = now();
+          await this.repository.updateJob(job);
+          return;
+        }
+      }
+      const indexContext: RagV2ContextRef = { ...context, paths: rootSelection.paths };
+      job.totalFiles = await this.sourceAcquisition.countMarkdown(indexContext.paths, signal);
+      signal.throwIfAborted();
+      job.message = `Discovering ${job.totalFiles} Markdown file${job.totalFiles === 1 ? '' : 's'}.`;
+      job.updatedAt = now();
+      await this.repository.updateJob(job);
+      await this.repository.beginGeneration(workspace.id, context.id, job.generationId);
+      signal.throwIfAborted();
+      const pruned = await this.repository.pruneStagingGenerations(
+        workspace.id, context.id, job.generationId,
+      );
+      if (pruned > 0) {
+        console.warn(`[workspace-rag-v2] pruned ${pruned} abandoned staging generation${pruned === 1 ? '' : 's'}.`);
+      }
+      const seenPaths = new Set<string>();
+      const checkpointState = { sinceFiles: 0, pending: Promise.resolve() };
+      let removedPaths: string[] = [];
       for (const priority of ['authority', 'current', 'archive'] as const) {
         // Files within a tier run through a bounded worker pool so Postgres
         // writes, parsing, and GPU embedding overlap across files. Tiers stay
@@ -1351,7 +1767,7 @@ export class WorkspaceRagV2Manager {
             title: collection.title,
             breadcrumb: [collection.title],
             text: collection.routingSummary,
-          });
+          }, signal);
         }
       }
       const validation = await this.repository.validateGeneration(workspace.id, context.id, job.generationId);
@@ -1392,14 +1808,20 @@ export class WorkspaceRagV2Manager {
     } catch (error) {
       if (signal.aborted || job.cancelRequested) {
         job.state = 'cancelled';
-        job.message = 'Workspace RAG V2 ingestion cancelled; the previous publication remains active.';
+        job.message = 'Workspace RAG V2 ingestion cancelled; the last successfully published snapshot remains active.';
       } else {
         job.state = 'retryable_failure';
         job.message = error instanceof Error ? error.message : String(error);
       }
       job.updatedAt = now();
       delete job.currentPath;
-      await this.repository.updateJob(job);
+      if (jobCreated) {
+        try {
+          await this.repository.updateJob(job);
+        } catch (persistenceError) {
+          job.message += ` Terminal state could not be saved: ${persistenceError instanceof Error ? persistenceError.message : String(persistenceError)}`;
+        }
+      }
       if (!signal.aborted) throw error;
     }
   }
@@ -1409,6 +1831,10 @@ export class WorkspaceRagV2Manager {
    * always wins; otherwise bulk backlogs run 3-wide and taper to sequential once
    * only a handful of files remain, so small incremental scans stay strictly
    * ordered and keep cross-file derivative reuse.
+   *
+   * @param job - Active job whose discovered/processed totals express the remaining backlog.
+   * @returns Concurrency between 1 and 8.
+   * @throws Never.
    */
   private fileConcurrencyFor(job: RagV2Job): number {
     const configured = this.policy.fileConcurrency;
@@ -1425,6 +1851,21 @@ export class WorkspaceRagV2Manager {
    * fails the scan exactly as the sequential loop did. Checkpoint accounting
    * is shared for the whole run; the synchronous read-modify-write on the
    * single-threaded event loop keeps publications serial without locks.
+   * Files whose fingerprint (size, modified time, embedding and summary
+   * signatures) matches are counted unchanged unless forced; throughput and
+   * ETA are recomputed after every file, and a checkpoint snapshot is
+   * published every `checkpointFiles` processed files.
+   *
+   * @param workspace - Workspace being indexed.
+   * @param context - Effective context whose narrowed paths are being indexed.
+   * @param job - Active job record, mutated in place with state, counters, and progress.
+   * @param file - Discovered file descriptor (normalized path, size in bytes, ISO modification time).
+   * @param fingerprints - Shared known-path fingerprint map, read to skip unchanged files.
+   * @param forceAll - Re-ingest regardless of fingerprint match.
+   * @param forcePaths - Normalized paths to re-ingest regardless of fingerprint match.
+   * @param checkpointState - Run-scoped checkpoint accumulator (`sinceFiles` counter and the serialized `pending` publication promise).
+   * @param signal - Abort signal; aborts propagate instead of being recorded as file failures.
+   * @throws Error - Propagates abort reasons and non-abort repository failures; per-file ingestion errors are recorded on the job instead.
    */
   private async processDiscoveredFile(
     workspace: RagV2WorkspaceRef,
@@ -1434,7 +1875,7 @@ export class WorkspaceRagV2Manager {
     fingerprints: Map<string, RagV2DocumentFingerprint>,
     forceAll: boolean,
     forcePaths: ReadonlySet<string>,
-    checkpointState: { sinceFiles: number },
+    checkpointState: { sinceFiles: number; pending: Promise<void> },
     signal: AbortSignal,
   ): Promise<void> {
     const existing = fingerprints.get(file.path);
@@ -1503,10 +1944,31 @@ export class WorkspaceRagV2Manager {
     await this.repository.updateJob(job);
     if (this.checkpointFiles > 0 && checkpointState.sinceFiles >= this.checkpointFiles) {
       checkpointState.sinceFiles = 0;
-      await this.publishCheckpoint(workspace, context, job);
+      // Serialize snapshot promotion across concurrent file workers.
+      checkpointState.pending = checkpointState.pending.then(() => this.publishCheckpoint(workspace, context, job));
+      await checkpointState.pending;
     }
   }
 
+  /**
+   * Ingests one file end to end: hashes and stores the object under the
+   * storage rate limiter, stages the document record, parses the markdown
+   * stream into batched section and passage flushes that run through a
+   * bounded embedding pipeline (with cross-generation embedding reuse),
+   * builds the line index, registers the source with the bridge
+   * (rate-limited) and optionally enriches the context graph, merges parsed
+   * metadata, embeds the document-level summary, finishes the document,
+   * queues its routing summary, and records the final job item state. Job
+   * state transitions (`hashing` -> `parsing`) and embedding counters are
+   * persisted as the work proceeds.
+   *
+   * @param workspace - Workspace being indexed.
+   * @param context - Context being indexed.
+   * @param job - Active job record, mutated in place with state and embedding counters.
+   * @param file - Discovered file descriptor (normalized path, size in bytes, ISO modification time).
+   * @param signal - Abort signal applied to hashing, parsing, embedding, and bridge calls.
+   * @throws Error - Propagates abort reasons, parsing failures, and repository failures; per-part embedding failures are recorded on records instead of thrown.
+   */
   private async ingestFile(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -1560,6 +2022,11 @@ export class WorkspaceRagV2Manager {
     // Embedding batches drain through this bounded pipeline so the GPU keeps
     // working while Postgres writes and markdown parsing continue on the host.
     const pipeline: Array<Promise<void>> = [];
+    /**
+     * Schedules embedding work on a bounded pipeline: waits while
+     * `embedPipelineDepth` tasks are in flight, then starts the task, which
+     * removes itself from the pipeline when it settles.
+     */
     const scheduleEmbeddingWork = async (task: () => Promise<void>): Promise<void> => {
       while (pipeline.length >= this.policy.embedPipelineDepth) {
         await Promise.race(pipeline);
@@ -1571,10 +2038,17 @@ export class WorkspaceRagV2Manager {
       void run.catch(() => undefined);
       pipeline.push(run);
     };
+    /** Waits for every in-flight pipeline task to settle. */
     const drainPipeline = async (): Promise<void> => {
       const pending = pipeline.splice(0);
       await Promise.all(pending);
     };
+    /**
+     * Persists the accumulated section batch, then schedules embedding work
+     * that reuses cached vectors where possible, embeds the remainder under
+     * the embedding rate limiter, marks sections failed on non-abort errors,
+     * and queues a routing summary per section.
+     */
     const flushSections = async (): Promise<void> => {
       if (sectionBatch.length === 0) return;
       const batch = sectionBatch.splice(0);
@@ -1582,6 +2056,10 @@ export class WorkspaceRagV2Manager {
         for (const section of batch) section.embeddingState = 'queued';
         await this.repository.appendSections(batch);
         try {
+          /**
+           * Builds the section embedding input: the heading path joined by
+           * `>` over the routing summary.
+           */
           const embeddingText = (section: RagV2SectionRecord) =>
             `${section.headingPath.join(' > ')}\n${section.routingSummary}`;
           const reusable = batch.map(section => ({
@@ -1633,10 +2111,16 @@ export class WorkspaceRagV2Manager {
             title: section.headingText,
             breadcrumb: section.headingPath,
             text: section.routingSummary,
-          });
+          }, signal);
         }
       });
     };
+    /**
+     * Persists the accumulated passage batch and plans embeddings by file
+     * size tier: eager passages (small files) are embedded immediately within
+     * the per-file vector cap, async passages (medium files) are queued for
+     * the lazy worker, and the rest are marked `not_planned`.
+     */
     const flushPassages = async (): Promise<void> => {
       if (passageBatch.length === 0) return;
       const batch = passageBatch.splice(0);
@@ -1836,7 +2320,7 @@ export class WorkspaceRagV2Manager {
         title: document.title,
         breadcrumb: document.tableOfContents.slice(0, 100).map(item => item.text),
         text: `${document.routingSummary}\nTable of contents:\n${document.tableOfContents.slice(0, 100).map(item => item.text).join('\n')}`,
-      });
+      }, signal);
       await this.repository.upsertJobItem({
         jobId: job.id,
         workspaceId: workspace.id,
@@ -1856,10 +2340,28 @@ export class WorkspaceRagV2Manager {
     }
   }
 
+  /**
+   * Polls every 100 ms while the job's pause request is set, so aborts still
+   * interrupt the wait promptly.
+   *
+   * @param job - Active job whose `pauseRequested` flag is observed.
+   * @param signal - Abort signal that ends the wait with a rejection.
+   * @throws Error - The returned promise rejects with the abort reason when the signal fires while paused.
+   */
   private async waitWhilePaused(job: RagV2Job, signal: AbortSignal): Promise<void> {
     while (job.pauseRequested && !signal.aborted) await delay(100, signal);
   }
 
+  /**
+   * Returns the per-workspace object store, creating and caching it on first
+   * use. The store root is the configured object root joined with the
+   * workspace id, or `<workspace configDir>/.data/workspace-rag-v2` when
+   * unconfigured; the retention mode comes from the environment.
+   *
+   * @param workspace - Workspace whose content objects are addressed.
+   * @returns The workspace's cached object store.
+   * @throws Error - When the workspace id contains characters outside `[A-Za-z0-9_-]`.
+   */
   private objectStore(workspace: RagV2WorkspaceRef): RagV2ObjectStore {
     if (!/^[A-Za-z0-9_-]{1,128}$/u.test(workspace.id)) {
       throw new Error(
@@ -1883,6 +2385,16 @@ export class WorkspaceRagV2Manager {
     return store;
   }
 
+  /**
+   * Builds the ACL token list scoping repository reads to a caller: the
+   * workspace token, the user token, then one token per group.
+   *
+   * @param workspaceId - Workspace id.
+   * @param principalId - Caller identity.
+   * @param groupIds - Caller group ids.
+   * @returns ACL tokens in `workspace:`, `user:`, then `group:` order.
+   * @throws Never.
+   */
   private authorizationTokens(
     workspaceId: string,
     principalId: string,
@@ -1895,6 +2407,16 @@ export class WorkspaceRagV2Manager {
     ];
   }
 
+  /**
+   * Returns the per-workspace retrieval engine, creating and caching it on
+   * first use with the shared repository, object store, embedder,
+   * reranker/ColBERT endpoints, RRF settings, semantic services, and a
+   * callback routing lazily selected sections into the lazy embedding worker.
+   *
+   * @param workspace - Workspace whose engine is addressed.
+   * @returns The workspace's cached retrieval engine.
+   * @throws Error - When the workspace id is invalid while creating the object store.
+   */
   private retrievalEngine(workspace: RagV2WorkspaceRef): RagV2RetrievalEngine {
     let engine = this.retrieval.get(workspace.id);
     if (!engine) {
@@ -1918,6 +2440,19 @@ export class WorkspaceRagV2Manager {
     return engine;
   }
 
+  /**
+   * Records a lazily selected section for background passage embedding,
+   * capping the window at `min(512, eagerPassageVectorCap)` passages and
+   * centering it on the priority passage when provided, then starts the lazy
+   * worker. Replaces any pending scope for the same section.
+   *
+   * @param workspaceId - Workspace id.
+   * @param contextId - Context id.
+   * @param generationId - Generation whose passages are embedded.
+   * @param sectionId - Section selected by retrieval.
+   * @param priorityPassageId - Passage to center the embedding window on, when any.
+   * @throws Never.
+   */
   private enqueueSelectedLazySection(
     workspaceId: string,
     contextId: string,
@@ -1935,6 +2470,19 @@ export class WorkspaceRagV2Manager {
     this.startLazyWorker();
   }
 
+  /**
+   * Sweeps one context: skips deletions while an ingestion run is active,
+   * otherwise drains the summary and lazy workers (re-checking for runs) and
+   * prunes orphaned rows older than the grace period, retired generations
+   * past their TTL, and — in managed retention mode — unreferenced blobs.
+   * Records the outcome in `lastGc`, logs it, and notifies the observer
+   * (observer failures are logged, not fatal).
+   *
+   * @param workspace - Workspace to sweep.
+   * @param context - Context to sweep.
+   * @returns Deletion counts, with `deletionsSkipped` set when a run prevented deletion.
+   * @throws Error - When the repository sweep fails.
+   */
   private async performGarbageCollection(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -2022,6 +2570,17 @@ export class WorkspaceRagV2Manager {
     return result;
   }
 
+  /**
+   * Enqueues a garbage-collection task for the context, due `delayMs` from
+   * now, keeping the earliest requested due time per context, and starts the
+   * GC worker. No-op when GC is disabled or the manager is shutting down.
+   *
+   * @param workspace - Workspace to schedule GC for.
+   * @param context - Context to schedule GC for.
+   * @param attempt - Retry attempt number used for backoff when rescheduled; defaults to 0.
+   * @param delayMs - Delay before the task is due, in milliseconds; defaults to 0.
+   * @throws Never.
+   */
   private scheduleGarbageCollection(
     workspace: RagV2WorkspaceRef,
     context: RagV2ContextRef,
@@ -2038,6 +2597,13 @@ export class WorkspaceRagV2Manager {
     this.startGcWorker();
   }
 
+  /**
+   * Schedules a timer for the earliest queued GC task and runs the worker
+   * when it fires, logging failures and rescheduling itself while the queue
+   * is non-empty. No-op when a worker or timer already exists.
+   *
+   * @throws Never.
+   */
   private startGcWorker(): void {
     if (this.gcWorker || this.gcWorkerTimer || this.gcQueue.size === 0) return;
     const next = [...this.gcQueue.values()].sort((left, right) => left.dueAt - right.dueAt)[0]!;
@@ -2055,6 +2621,14 @@ export class WorkspaceRagV2Manager {
     this.gcWorkerTimer.unref?.();
   }
 
+  /**
+   * Takes the earliest due GC task off the queue and runs one garbage
+   * collection for it. When deletions were skipped because ingestion was
+   * active, the task is rescheduled with exponential backoff (1 s doubled per
+   * attempt, capped at one hour). Errors propagate to the worker's caller.
+   *
+   * @throws Error - When {@link WorkspaceRagV2Manager.garbageCollect} fails.
+   */
   private async runGcWorker(): Promise<void> {
     const entry = [...this.gcQueue.entries()].sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
     if (!entry) return;
@@ -2068,10 +2642,23 @@ export class WorkspaceRagV2Manager {
     }
   }
 
+  /**
+   * Waits until the lazy embedding worker has fully drained, so garbage
+   * collection cannot race vector writes.
+   *
+   * @throws Never.
+   */
   private async waitForLazyWorker(): Promise<void> {
     while (this.lazyWorker) await this.lazyWorker.catch(() => undefined);
   }
 
+  /**
+   * Starts the lazy embedding worker when work is pending and none is
+   * running; failures are logged (unless shutting down) and the worker
+   * restarts itself while sections remain.
+   *
+   * @throws Never.
+   */
   private startLazyWorker(): void {
     if (this.lazyWorker || this.lazySections.size === 0) return;
     this.lazyWorker = this.runLazyWorker()
@@ -2086,6 +2673,17 @@ export class WorkspaceRagV2Manager {
       });
   }
 
+  /**
+   * Processes queued lazy-section scopes in insertion order: fetches the
+   * section's passages, centers a window of up to `maxPassages` around the
+   * priority passage when present, and embeds them in batches of 256 with
+   * cross-generation reuse under the embedding rate limiter. A non-abort
+   * batch failure marks that batch failed and abandons the section; aborts
+   * propagate. Once drained, revalidates every touched scope and republishes
+   * its generation as hybrid-complete or hybrid-partial.
+   *
+   * @throws Error - Propagates the abort reason when shutting down, plus repository failures from passage, embedding, or validation calls.
+   */
   private async runLazyWorker(): Promise<void> {
     const signal = this.lazyWorkerController.signal;
     const completedScopes = new Map<string, { workspaceId: string; contextId: string; generationId: string }>();

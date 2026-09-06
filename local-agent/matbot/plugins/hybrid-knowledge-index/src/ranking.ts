@@ -33,6 +33,13 @@ export function mergeRankAndDeduplicate(entries: KnowledgeEntry[], limit = 12): 
   return result;
 }
 
+/**
+ * Compute a ranking score: the entry's numeric confidence (default 0) plus a source
+ * boost of 2 for mem0, 1 for file-index, 0 otherwise.
+ * @param entry Entry to score.
+ * @returns The combined score; higher is better.
+ * @throws Never.
+ */
 function score(entry: KnowledgeEntry): number {
   const explicit = Number(entry.confidence ?? 0);
   const sourceBoost = entry.source.type === "mem0" ? 2 : entry.source.type === "file-index" ? 1 : 0;

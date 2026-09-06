@@ -51,12 +51,29 @@ type ProviderInput = {
     name: string;
 };
 /**
+ * Discriminated union of `provider` tool inputs, keyed on `action`.
+ * `add` requires `name` and `adapter`; `endpoint`/`model` are optional only for
+ * self-contained adapters; `parameters` carries optional generation settings.
+ */
+/**
  * Browser `provider` tool. The portable analogue of the node provider tool: it manages the same
  * named-LLM-profile concept, but reads/writes the live providers map + localStorage + vault rather
  * than a YAML file. The API key is collected out-of-band via `ctx.prompt` (never in the transcript),
  * exactly like `plugin store-key`.
+ *
+ * @param admin - The provider-admin surface backed by the portable store/vault path; used for all
+ *   listing, persistence, and live-map mutations. Must already be initialized.
+ * @returns A `Tool` named `provider` whose executor yields `result`/`error` events per action;
+ *   operational failures (unknown adapter, missing fields, persist errors) are reported as
+ *   `error` events rather than thrown.
+ * @throws Never.
  */
 export function createBrowserProviderTool(admin: ProviderAdmin): Tool {
+    /**
+     * Formats the available adapters as a numbered, multi-line list for error messages.
+     * @returns Newline-joined rows in `admin.available` order, each `  <n>. <label>  (<module>)`.
+     * @throws Never.
+     */
     const adapterList = () => admin.available.map((a, i) => `  ${i}. ${a.label}  (${a.module})`).join('\n');
     const executor = {
         async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {

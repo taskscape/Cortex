@@ -10,6 +10,12 @@ import path from 'node:path';
 import process from 'node:process';
 import { classifySpecifier, fetchRemoteManifest } from '@matatbread/matbot-plugin-materialization-node';
 // ── Helpers ───────────────────────────────────────────────────────────────────
+/**
+ * Reads the `plugins:` list entries from the configuration file.
+ * @param configPath - Path of the configuration file to read.
+ * @returns The configured plugin specifiers in file order; empty if no `plugins:` block exists.
+ * @throws Error - If the file cannot be read.
+ */
 async function readPluginsList(configPath: string): Promise<string[]> {
     const text = await readFile(configPath, 'utf8');
     const match = text.match(/^plugins:\s*\n((?:[ \t]+-[^\n]*\n)*)/m);
@@ -19,6 +25,17 @@ async function readPluginsList(configPath: string): Promise<string[]> {
         .map(l => l.replace(/^[ \t]+-\s*/, '').trim())
         .filter(Boolean);
 }
+/**
+ * Adds a plugin specifier to the `plugins:` list in the configuration file. The entry is inserted
+ * after the existing list items; if the file has no `plugins:` block, one is created before the
+ * `providers:` key (or prepended when that key is absent too). Already-present specifiers are a
+ * no-op. The write is atomic and compare-and-swap guarded via {@link replaceConfigurationFile}.
+ *
+ * @param configPath - Path of the configuration file to edit.
+ * @param specifier - Exact specifier to record as a list item.
+ * @returns Resolves once the file is written; a no-op resolve if the specifier was present.
+ * @throws Error - If the file cannot be read or written, or changed on disk since it was read.
+ */
 async function addPlugin(configPath: string, specifier: string): Promise<void> {
     const text = await readFile(configPath, 'utf8');
     if (text.includes(`- ${specifier}`))
@@ -37,6 +54,16 @@ async function addPlugin(configPath: string, specifier: string): Promise<void> {
     }
     await replaceConfigurationFile(configPath, text, updated);
 }
+/**
+ * Removes the list entry matching the specifier from the `plugins:` block of the configuration
+ * file. The match is a whole-line, regex-escaped exact match; only the first occurrence is removed.
+ * The write is atomic and compare-and-swap guarded via {@link replaceConfigurationFile}.
+ *
+ * @param configPath - Path of the configuration file to edit.
+ * @param specifier - Exact specifier to match against a list item.
+ * @returns True if an entry was found and the file rewritten; false if nothing matched.
+ * @throws Error - If the file cannot be read or written, or changed on disk since it was read.
+ */
 async function removePlugin(configPath: string, specifier: string): Promise<boolean> {
     const text = await readFile(configPath, 'utf8');
     const updated = text.replace(new RegExp(`^[ \\t]+-[ \\t]+${escapeRegex(specifier)}\\n`, 'm'), '');
@@ -45,17 +72,40 @@ async function removePlugin(configPath: string, specifier: string): Promise<bool
     await replaceConfigurationFile(configPath, text, updated);
     return true;
 }
+/**
+ * Escapes regular-expression metacharacters in a string.
+ * @param s - Text to escape.
+ * @returns A copy safe to embed literally in a `RegExp` pattern.
+ * @throws Never.
+ */
 function escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-// Privileged actions (install/remove/first-time load) gate on an out-of-band yes/no. Use a
-// structured `confirm` field so rich frontends render real buttons and the affirmative is the
-// canonical CONFIRM_YES token — never a parse of the rendered (and potentially localised) label.
+/**
+ * Prompts the user out-of-band for a yes/no confirmation of a privileged action
+ * (install/remove/first-time load). Uses a structured `confirm` field so rich frontends render
+ * real buttons and the affirmative is the canonical CONFIRM_YES token — never a parse of the
+ * rendered (and potentially localised) label.
+ *
+ * @param ctx - Tool execution context whose `prompt` collects the answer outside the transcript.
+ * @param label - Confirmation text shown to the user; may contain markdown.
+ * @returns True only when the trimmed, lower-cased answer equals CONFIRM_YES; any other answer
+ *   (including the CONFIRM_NO default) counts as a decline.
+ * @throws Error - If the underlying prompt mechanism fails.
+ */
 async function confirmAction(ctx: ToolContext, label: string): Promise<boolean> {
     const field: FormField = { name: 'confirm', label, type: 'confirm', default: CONFIRM_NO };
     const answer = await ctx.prompt(field);
     return answer.trim().toLowerCase() === CONFIRM_YES;
 }
+/**
+ * Resolves the main entry path from a package.json `exports` field.
+ * @param exports - The raw `exports` value: either a string shorthand or a map keyed by export
+ *   target.
+ * @returns The string export for `"."` (or the shorthand itself), or undefined if the field has no
+ *   usable main entry.
+ * @throws Never.
+ */
 function resolveExportsMain(exports: unknown): string | undefined {
     if (typeof exports === 'string')
         return exports;
@@ -66,6 +116,9 @@ function resolveExportsMain(exports: unknown): string | undefined {
     }
     return undefined;
 }
+/**
+ * One plugin found by local or cache discovery and offered for installation.
+ */
 interface DiscoveredPlugin {
     specifier: string;
     name: string;
@@ -78,12 +131,25 @@ interface DiscoveredPlugin {
     };
     matbotRuntime?: Runtime[];
 }
-// Inspect one candidate directory: it is a plugin only if its entry module actually exports a
-// `plugin` object — the same contract the loader enforces. The package.json plugin-api dependency is
-// only a cheap pre-filter (a library may import the API for its *types*, e.g. `Store<T>`, yet export
-// no plugin); making the import load-bearing is what stops such a library from being offered here and
-// then failing at install. Returns the discovery entry (with the caller-supplied specifier + source),
-// or null.
+/**
+ * Inspects one candidate directory to decide whether it is a matbot plugin.
+ *
+ * It is a plugin only if its entry module actually exports a `plugin` object — the same contract
+ * the loader enforces. The package.json plugin-api dependency is only a cheap pre-filter (a
+ * library may import the API for its *types*, e.g. `Store<T>`, yet export no plugin); making the
+ * import load-bearing is what stops such a library from being offered here and then failing at
+ * install.
+ *
+ * @param sub - Absolute path of the candidate directory.
+ * @param specifier - Loadable specifier the caller wants recorded for the plugin.
+ * @param source - Origin metadata to attach: `type` categorises the origin; `uri` is the concrete
+ *   source location as a scheme-qualified URI — `file://…` on disk for a local plugin, the
+ *   `https://…` it was fetched from for a cached one.
+ * @returns The discovery entry carrying the caller-supplied specifier and source, or null if the
+ *   directory has no readable package.json, lacks the plugin-api dependency, exposes no resolvable
+ *   entry, fails to import, or exports no `plugin`.
+ * @throws Never (every failure mode is reported as a null return).
+ */
 async function inspectPluginDir(sub: string, specifier: string, source: {
     type: PluginSource;
     uri: string;
@@ -129,15 +195,33 @@ async function inspectPluginDir(sub: string, specifier: string, source: {
         ...(runtimes !== undefined ? { matbotRuntime: runtimes } : {}),
     };
 }
-// TODO: This is a convenience shim for end users in monorepo setups and is
-// intentionally narrow. It should eventually be replaced with a proper
-// discovery interface — registry lookup, repo scanning, or a plugin marketplace.
-//
-// Two roots are scanned: the monorepo's `packages/plugins` (source: local) and, if present, the
-// `.plugins/` remote-plugin cache (source: github for raw.githubusercontent.com, else cdn) — so a
-// previously-fetched remote plugin is rediscoverable and re-installable by its original URL.
+/**
+ * TODO: This is a convenience shim for end users in monorepo setups and is
+ * intentionally narrow. It should eventually be replaced with a proper
+ * discovery interface — registry lookup, repo scanning, or a plugin marketplace.
+ *
+ * Scans two roots for installable plugins: the monorepo's `packages/plugins` (source: local) and,
+ * if present, the `.plugins/` remote-plugin cache (source: github for raw.githubusercontent.com,
+ * else cdn) — so a previously-fetched remote plugin is rediscoverable and re-installable by its
+ * original URL.
+ *
+ * @param projectDir - Project root; `packages/plugins` and `.plugins` are resolved beneath it.
+ * @returns The discovered plugins — local ones first in directory-walk order (up to two levels
+ *   below the scan root), then cached remote ones in cache-walk order; empty if neither root
+ *   exists.
+ * @throws Never (unreadable directories are skipped).
+ */
 async function discoverLocalPlugins(projectDir: string): Promise<DiscoveredPlugin[]> {
     const results: DiscoveredPlugin[] = [];
+    /**
+     * Recursively inspects a directory's subdirectories for plugin packages, appending matches to
+     * the enclosing `results`.
+     * @param dir - Directory to scan.
+     * @param depth - Current recursion depth (the scan root is 1); recursion stops once depth 2 is
+     *   reached, so nested directories one level below the scan root are the deepest inspected.
+     * @returns Nothing.
+     * @throws Never (unreadable directories are skipped).
+     */
     const scanLocal = async (dir: string, depth: number): Promise<void> => {
         let entries;
         try {
@@ -167,10 +251,17 @@ async function discoverLocalPlugins(projectDir: string): Promise<DiscoveredPlugi
     await scanCacheDir(path.join(projectDir, '.plugins'), results);
     return results;
 }
-// Walk the `.plugins/<host>/<path…>` cache, reconstructing each cached package's original URL
-// specifier. Descent stops at the first package.json found on a branch (that is the package — its
-// sources live below and are not separately installable); the symlink farm at `.plugins/node_modules`
-// is skipped (those are host packages, not cached plugins).
+/**
+ * Walks the `.plugins/<host>/<path…>` cache, reconstructing each cached package's original URL
+ * specifier. Descent stops at the first package.json found on a branch (that is the package — its
+ * sources live below and are not separately installable); the symlink farm at
+ * `.plugins/node_modules` is skipped (those are host packages, not cached plugins).
+ *
+ * @param dotPlugins - Path of the `.plugins` cache root.
+ * @param results - Accumulator the discovered plugins are appended to, in walk order.
+ * @returns Nothing.
+ * @throws Never (unreadable directories are skipped).
+ */
 async function scanCacheDir(dotPlugins: string, results: DiscoveredPlugin[]): Promise<void> {
     try {
         await access(dotPlugins);
@@ -178,6 +269,13 @@ async function scanCacheDir(dotPlugins: string, results: DiscoveredPlugin[]): Pr
     catch {
         return;
     }
+    /**
+     * Depth-first walk of one cache directory, appending any plugin package found to the enclosing
+     * `results`.
+     * @param dir - Directory to walk; treated as a package root when it contains a package.json.
+     * @returns Nothing.
+     * @throws Never (unreadable directories are skipped).
+     */
     const walk = async (dir: string): Promise<void> => {
         let entries;
         try {
@@ -211,10 +309,19 @@ async function scanCacheDir(dotPlugins: string, results: DiscoveredPlugin[]): Pr
     };
     await walk(dotPlugins);
 }
-// Read the plugin's package.json description without importing the module — the
-// confirmation prompt runs before the user has consented to install, so we must not
-// execute untrusted plugin code to read manifest.description here. Bare npm names are
-// not yet on disk, so they have no resolvable description until after install.
+/**
+ * Reads a plugin's package.json `description` without importing the module — the
+ * confirmation prompt runs before the user has consented to install, so we must not
+ * execute untrusted plugin code to read manifest.description here. Bare npm names are
+ * not yet on disk, so they have no resolvable description until after install.
+ *
+ * @param specifier - Plugin specifier; `file://` URLs and relative/absolute paths resolve to a
+ *   directory, any other form (bare npm name, remote URL) yields undefined.
+ * @param projectDir - Root that relative path specifiers resolve against.
+ * @returns The `description` of the nearest package.json walking up from the specifier's
+ *   directory, or undefined if none declares one or the specifier cannot be resolved.
+ * @throws Never (unreadable or missing package.json files are skipped).
+ */
 async function pkgDescriptionFromSpecifier(specifier: string, projectDir: string): Promise<string | undefined> {
     let dir: string;
     if (specifier.startsWith('file://')) {
@@ -241,23 +348,46 @@ async function pkgDescriptionFromSpecifier(specifier: string, projectDir: string
         dir = parent;
     }
 }
-// Resolve a user-supplied handle to the loadable specifier recorded in matbot.yaml. A loaded plugin
-// records its config entry as `plugin.specifier`, so the canonical package `name` maps straight to it
-// via getSpecifierForPlugin — that's the stable, preferred handle. The literal config entry also works
-// (it is its own specifier); anything else falls through unchanged so a direct specifier still loads.
+/**
+ * Resolves a user-supplied handle to the loadable specifier recorded in matbot.yaml. A loaded plugin
+ * records its config entry as `plugin.specifier`, so the canonical package `name` maps straight to it
+ * via getSpecifierForPlugin — that's the stable, preferred handle. The literal config entry also works
+ * (it is its own specifier); anything else falls through unchanged so a direct specifier still loads.
+ *
+ * @param handle - Canonical plugin package name, a matbot.yaml entry, or a direct specifier.
+ * @returns The config specifier of the registered plugin the handle names, or the handle unchanged
+ *   if no registered plugin matches.
+ * @throws Never.
+ */
 function toConfigSpecifier(handle: string): string {
     const byName = getSpecifierForPlugin(handle);
     return byName ?? handle;
 }
+/**
+ * Filters a raw `matbotRuntime` value down to the known host names.
+ * @param raw - The untyped package.json field value.
+ * @returns The entries equal to `'node'` or `'browser'` in original order, or undefined if the
+ *   value is not an array.
+ * @throws Never.
+ */
 function normalizeRuntimes(raw: unknown): Runtime[] | undefined {
     if (!Array.isArray(raw))
         return undefined;
     return raw.filter((r): r is Runtime => r === 'node' || r === 'browser');
 }
-// Read a plugin's canonical package.json `name` by walking up from the specifier — the same boundary
-// the node PluginResolver uses, so a declaration on the plugin (not an enclosing monorepo root) wins.
-// file://, paths, and (once installed) bare npm names resolve; a remote github:/https URL does not
-// (→ undefined; callers holding a fetched manifest read its name directly).
+/**
+ * Reads a plugin's canonical package.json `name` by walking up from the specifier — the same boundary
+ * the node PluginResolver uses, so a declaration on the plugin (not an enclosing monorepo root) wins.
+ * file://, paths, and (once installed) bare npm names resolve; a remote github:/https URL does not
+ * (→ undefined; callers holding a fetched manifest read its name directly).
+ *
+ * @param specifier - Plugin specifier: a `file://` URL, a relative/absolute path, or an installed
+ *   npm package name.
+ * @param projectDir - Root relative paths resolve against and npm resolution starts from.
+ * @returns The `name` of the nearest package.json walking up from the resolved directory, or
+ *   undefined if the specifier cannot be resolved or no package.json on the walk declares a name.
+ * @throws Never (resolution and read failures yield undefined).
+ */
 async function nameFromSpecifier(specifier: string, projectDir: string): Promise<string | undefined> {
     let dir: string;
     if (specifier.startsWith('file://')) {
@@ -289,10 +419,23 @@ async function nameFromSpecifier(specifier: string, projectDir: string): Promise
         dir = parent;
     }
 }
+/**
+ * Extracts the adapter `module:` values of the configured providers from the configuration file.
+ * @param configPath - Path of the configuration file to read.
+ * @returns Every `module:` value in file order (duplicates preserved); empty if none appear.
+ * @throws Error - If the file cannot be read.
+ */
 async function readProviderModules(configPath: string): Promise<string[]> {
     const text = await readFile(configPath, 'utf8');
     return [...text.matchAll(/^\s+module:\s+(\S+)/gm)].map(m => m[1] ?? '').filter(Boolean);
 }
+/**
+ * Detects which package manager manages a project directory by probing for its lockfile.
+ * @param dir - Project directory to probe.
+ * @returns `'pnpm'`, `'yarn'`, or `'bun'` when their lockfile exists (checked in that order), else
+ *   `'npm'`.
+ * @throws Never.
+ */
 async function detectPackageManager(dir: string): Promise<string> {
     for (const [pm, lockfile] of [['pnpm', 'pnpm-lock.yaml'], ['yarn', 'yarn.lock'], ['bun', 'bun.lockb']] as const) {
         try {
@@ -303,6 +446,18 @@ async function detectPackageManager(dir: string): Promise<string> {
     }
     return 'npm';
 }
+/**
+ * Spawns a command and captures its combined output. The child runs through the shell on Windows
+ * (so `.cmd` shims such as npm/pnpm resolve) and is executed directly elsewhere; there is no
+ * timeout — a hung child blocks the promise.
+ *
+ * @param cmd - Executable name, resolved via PATH.
+ * @param args - Argument vector passed verbatim.
+ * @param cwd - Working directory for the child process.
+ * @returns The interleaved stdout+stderr text when the child exits with code 0.
+ * @throws Error - If the child exits with a non-zero code; the message carries the exit code and
+ *   the captured output.
+ */
 function runCommand(cmd: string, args: string[], cwd: string): Promise<string> {
     return new Promise((resolve, reject) => {
         const chunks: string[] = [];
@@ -317,9 +472,17 @@ function runCommand(cmd: string, args: string[], cwd: string): Promise<string> {
         });
     });
 }
-// The dependency names recorded in the project package.json — used to discover what a pnpm/npm
-// install of a tarball/git URL actually added (a URL is not a loadable specifier on restart, but
-// the installed package name is). dependencies + optionalDependencies cover what `add` writes.
+/**
+ * Reads the dependency names recorded in the project package.json — used to discover what a
+ * pnpm/npm install of a tarball/git URL actually added (a URL is not a loadable specifier on
+ * restart, but the installed package name is). dependencies + optionalDependencies cover what
+ * `add` writes.
+ *
+ * @param projectDir - Directory whose package.json is read.
+ * @returns The union of `dependencies` and `optionalDependencies` keys, or an empty set if the
+ *   file is missing or unparseable.
+ * @throws Never.
+ */
 async function readDependencyNames(projectDir: string): Promise<Set<string>> {
     try {
         const pkg = JSON.parse(await readFile(path.join(projectDir, 'package.json'), 'utf8')) as {
@@ -332,13 +495,30 @@ async function readDependencyNames(projectDir: string): Promise<Set<string>> {
         return new Set();
     }
 }
+/**
+ * Determines the single dependency a just-completed package-manager install added.
+ * @param projectDir - Directory whose package.json is diffed against `before`.
+ * @param before - Dependency names captured before the install (see {@link readDependencyNames}).
+ * @returns The one name present after but not before, or undefined if zero or several names were
+ *   added (ambiguous).
+ * @throws Never.
+ */
 async function addedDependencyName(projectDir: string, before: Set<string>): Promise<string | undefined> {
     const after = [...await readDependencyNames(projectDir)].filter(n => !before.has(n));
     return after.length === 1 ? after[0] : undefined;
 }
-// Turn a raw package-manager failure into an actionable message: name the intent and translate the
-// two signatures users actually hit (workspace-only source packages; registry 404s) instead of
-// dumping the exit code and stderr alone.
+/**
+ * Turns a raw package-manager failure into an actionable message: name the intent and translate the
+ * two signatures users actually hit (workspace-only source packages; registry 404s) instead of
+ * dumping the exit code and stderr alone.
+ *
+ * @param specifier - The specifier whose install failed.
+ * @param pm - Package manager that was invoked.
+ * @param e - The thrown failure; an Error's message is used verbatim, other values are stringified.
+ * @returns Multi-line message combining the intent, an optional hint for the recognised failure
+ *   signatures, and the raw failure text.
+ * @throws Never.
+ */
 function describeInstallFailure(specifier: string, pm: string, e: unknown): string {
     const raw = e instanceof Error ? e.message : String(e);
     let hint = '';
@@ -352,11 +532,21 @@ function describeInstallFailure(specifier: string, pm: string, e: unknown): stri
     return `Could not install "${specifier}" with ${pm}:${hint}\n${raw}`;
 }
 // ── Helpers ───────────────────────────────────────────────────────────────────
-// A plugin contributes through several channels: static fields on the plugin object
-// (provider, tools, storage, storageBackend, frontend) and runtime registrations made
-// during setup() (tools, hooks, system-context contributors, and MatbotMachine keys such
-// as 'KnowledgeIndex'). Reflect every channel so the reported type list is complete, not just
-// the static ones.
+/**
+ * Classifies everything a plugin contributes. A plugin contributes through several channels:
+ * static fields on the plugin object (provider, tools, storage, storageBackend, frontend) and
+ * runtime registrations made during setup() (tools, hooks, system-context contributors, and
+ * MatbotMachine keys such as 'KnowledgeIndex'). Reflects every channel so the reported type list
+ * is complete, not just the static ones.
+ *
+ * @param p - The loaded plugin to classify.
+ * @param registeredToolPlugins - Names of plugins that registered tools at runtime (a plugin's
+ *   tools are not limited to its static `tools` field).
+ * @returns Deduplicated contribution-type labels in check order (provider, tools, storage,
+ *   frontend, hooks, system-context, then any registered service keys); `['extension']` when
+ *   nothing else applies.
+ * @throws Never.
+ */
 function pluginTypes(p: MatbotPlugin, registeredToolPlugins: Set<string>): string[] {
     const t: string[] = [];
     const serviceKeys = getRegisteredServiceKeys(p.name);
@@ -381,6 +571,11 @@ function pluginTypes(p: MatbotPlugin, registeredToolPlugins: Set<string>): strin
     return [...new Set(t)];
 }
 // ── Input types ───────────────────────────────────────────────────────────────
+/**
+ * Discriminated union of `plugin` tool inputs, keyed on `action`. `add`, `remove`, and `reload`
+ * carry a `specifier`; `store-key` carries the secret `key` name (its value is prompted for
+ * out-of-band); `list` and `discover_local` take no further input.
+ */
 type PluginInput = {
     action: 'list';
 } | {

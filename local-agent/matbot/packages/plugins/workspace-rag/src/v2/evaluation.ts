@@ -87,10 +87,23 @@ export interface RagV2EvaluatedEvidence {
   sectionId?: string;
 }
 
+/**
+ * Computes the arithmetic mean of the values.
+ * @param values - Sample values; may be empty.
+ * @returns The mean, or 0 when the list is empty.
+ * @throws Never.
+ */
 function average(values: readonly number[]): number {
   return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 }
 
+/**
+ * Computes the discounted cumulative gain of an ordered relevance list using
+ * the exponential gain 2^rel - 1 and a log2 position discount.
+ * @param relevances - Relevances in display order (most relevant first).
+ * @returns The DCG value; 0 for an empty list.
+ * @throws Never.
+ */
 function dcg(relevances: readonly number[]): number {
   return relevances.reduce(
     (sum, relevance, index) => sum + (2 ** relevance - 1) / Math.log2(index + 2),
@@ -98,6 +111,14 @@ function dcg(relevances: readonly number[]): number {
   );
 }
 
+/**
+ * Averages each per-case metric across cases and packs the results into the
+ * aggregate (pre-`byCategory`) metric shape.
+ * @param cases - Per-case metrics to average.
+ * @param k - Cutoff recorded verbatim in the result; not applied here.
+ * @returns Aggregate metrics with `caseMetrics` echoing the input order.
+ * @throws Never.
+ */
 function aggregate(cases: readonly RagV2CaseMetrics[], k: number): Omit<RagV2EvaluationMetrics, 'byCategory'> {
   return {
     cases: cases.length,
@@ -117,9 +138,18 @@ function aggregate(cases: readonly RagV2CaseMetrics[], k: number): Omit<RagV2Eva
 }
 
 /**
- * Scores retrieval results against a case's relevance judgments.
- * @param params - The case, its judgments, and the returned hits.
- * @returns Per-case and aggregate metrics.
+ * Scores retrieval results against each case's relevance judgments, computing
+ * per-case recall/precision/NDCG/reciprocal rank, citation correctness,
+ * routing recall, and leakage measures, then aggregates overall and per
+ * category.
+ * @param results - One entry per case: the case with its judgments, the
+ *   returned evidence in rank order, and optionally the section ids routing
+ *   selected.
+ * @param k - Cutoff applied to the returned evidence before scoring; floors
+ *   to at least 1. Defaults to 10.
+ * @returns Aggregate metrics plus `byCategory` breakdowns and the per-case
+ *   metrics they were averaged from.
+ * @throws Never.
  */
 export function evaluateRagV2Results(
   results: ReadonlyArray<{

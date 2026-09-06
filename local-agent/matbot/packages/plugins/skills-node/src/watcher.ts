@@ -2,12 +2,31 @@ import { watch, readdir, readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { SkillManager } from '@matatbread/matbot-skills';
 
+/**
+ * Derives a skill name from a Markdown filename: strips the `.md` extension, turns `-`/`_` runs
+ * into spaces, and title-cases each word.
+ *
+ * @param filename - File name to convert.
+ * @returns Title-cased skill name.
+ * @throws Never.
+ */
 function mdNameToSkillName(filename: string): string {
   return path.basename(filename, '.md')
     .replace(/[-_]+/g, ' ')
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
+/**
+ * Imports one `.md` file into the manager, unless a skill of the derived name already exists —
+ * `.md` files are import-only and never clobber an existing skill (the file isn't even read).
+ * Unreadable files are silently ignored.
+ *
+ * @param manager - Skill manager receiving the import.
+ * @param dir - Directory holding the file.
+ * @param filename - Name of the file to import.
+ * @returns A promise that resolves when the import attempt is done (imported, skipped or ignored).
+ * @throws Error - Propagates a rejected {@link SkillManager.importIfAbsent} store write.
+ */
 async function importFile(
   manager:  SkillManager,
   dir:      string,
@@ -23,8 +42,15 @@ async function importFile(
   await manager.importIfAbsent(name, content);
 }
 
-// Resolves after `pollMs` or on abort — whichever comes first. The abort
-// listener is always removed so repeated polls cannot accumulate listeners.
+/**
+ * Resolves after `pollMs` or on abort — whichever comes first. The abort
+ * listener is always removed so repeated polls cannot accumulate listeners.
+ *
+ * @param ms - Maximum time to wait, in milliseconds.
+ * @param signal - Abort signal ending the wait early.
+ * @returns A promise that resolves (never rejects) when the timer fires or the signal aborts.
+ * @throws Never.
+ */
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise<void>(resolve => {
     const onAbort = (): void => done();
@@ -54,8 +80,12 @@ export interface WatcherDeps {
  * @param dir - Directory to import and watch.
  * @param manager - Skill manager receiving imported skills.
  * @param signal - Abort signal terminating the watcher.
- * @param pollMs - Poll interval used when fs.watch is unavailable.
+ * @param pollMs - Poll interval used when fs.watch is unavailable. Default 5000 ms.
  * @param deps - Optional fs overrides (test seam).
+ * @returns A promise that resolves when `signal` aborts.
+ * @throws Error - If the initial directory creation or the initial import pass fails (e.g. the
+ *   store rejects a write); after the watch starts, per-event import failures switch to the
+ *   polling fallback instead of rejecting.
  */
 export async function watchAndImportSkillDir(
   dir:     string,

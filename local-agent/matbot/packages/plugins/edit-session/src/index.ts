@@ -22,15 +22,28 @@ declare module '@matatbread/matbot-plugin-api' {
   }
 }
 
+/** Typed payload of this plugin's marker messages, via the `MarkerData` augmentation above. */
 type EditSessionMarkerData = Marker<typeof MARKER_CREATOR>['data'];
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/**
+ * Current wall-clock time as an ISO-8601 UTC timestamp.
+ *
+ * @returns ISO timestamp string, e.g. `2026-01-01T12:34:56.789Z`.
+ * @throws Never.
+ */
 function now(): string { return new Date().toISOString(); }
 
-// A standalone marker message: opaque to the LLM (the 'marker' role is skipped by every provider
-// converter), preserved by compaction, carried with the session for the UI to render as a
-// cross-thread link.
+/**
+ * A standalone marker message: opaque to the LLM (the 'marker' role is skipped by every provider
+ * converter), preserved by compaction, carried with the session for the UI to render as a
+ * cross-thread link.
+ *
+ * @param data - Typed marker payload naming the peer session and the message to scroll to.
+ * @returns A marker-role {@link Message} with fresh id and trace id.
+ * @throws Never.
+ */
 function markerMessage(data: EditSessionMarkerData): Message {
   const marker: Marker<typeof MARKER_CREATOR> = { type: 'marker', creator: MARKER_CREATOR, data };
   return {
@@ -42,17 +55,41 @@ function markerMessage(data: EditSessionMarkerData): Message {
   };
 }
 
+/**
+ * Copies a store document with a fresh random version token, so a subsequent compare-and-swap
+ * write against the new version succeeds and stale concurrent writers fail.
+ *
+ * @typeParam T - Document shape carrying the required `version` token.
+ * @param doc - Document to re-version; not mutated.
+ * @returns A shallow copy of `doc` with `version` set to a fresh UUID.
+ * @throws Never.
+ */
 function bumpVersion<T extends { version: string }>(doc: T): T {
   return { ...doc, version: crypto.randomUUID() };
 }
 
-// Resolve msgIndex (raw index into session.messages) to the actual index.
-// The frontend passes the original message index from the full messages array.
+/**
+ * Resolve msgIndex (raw index into session.messages) to the actual index.
+ * The frontend passes the original message index from the full messages array.
+ *
+ * @param session - Session whose message array bounds the index.
+ * @param msgIndex - Zero-based index into `session.messages` as passed by the frontend.
+ * @returns `msgIndex` unchanged when in bounds; `null` when negative or past the end.
+ * @throws Never.
+ */
 function resolveIndex(session: Session, msgIndex: number): number | null {
   if (msgIndex < 0 || msgIndex >= session.messages.length) return null;
   return msgIndex;
 }
 
+/**
+ * Derives the title for the current session after a split by bumping a trailing split counter: a
+ * title ending in " pt N" becomes " pt N+1"; any other title gets " pt 2" appended.
+ *
+ * @param title - Current session title; may be empty.
+ * @returns The bumped title — an empty title yields "Untitled pt 2".
+ * @throws Never.
+ */
 function generateSplitTitle(title: string): string {
   // If title ends with " pt N", bump the number
   const match = title.match(/^(.*?)\s*pt\s+(\d+)$/);
@@ -67,11 +104,25 @@ const KEEP_TYPES = new Set(['text', 'refusal', 'marker']);
 
 // ── tool ──────────────────────────────────────────────────────────────────────
 
-// All four actions share the same parameter shape ({ sessionId, msgIndex }); only the behaviour
-// differs. The schema stays loose (action enum + the shared fields) and the description carries
-// this TypeScript signature, which the executor enforces.
+/**
+ * Executor-level input contract for `session_edit`: the four actions share this shape ({ sessionId,
+ * msgIndex }) and differ only in behaviour. Loose by design — the executor validates per action.
+ */
 interface SessionEditInput { action: string; sessionId: string; msgIndex: number }
 
+/**
+ * All four actions share the same parameter shape ({ sessionId, msgIndex }); only the behaviour
+ * differs. The schema stays loose (action enum + the shared fields) and the description carries
+ * this TypeScript signature, which the executor enforces.
+ *
+ * Every write goes through compare-and-swap against the store; on CAS failure (or any other
+ * rejection) the tool yields an `error` tool event — and for `split` deletes the peer session it
+ * just created — rather than throwing.
+ *
+ * @param store - Session store backing all reads, CAS writes and deletes.
+ * @returns The `session_edit` tool definition.
+ * @throws Never.
+ */
 function makeSessionEditTool(store: Store<Session>): Tool {
   return {
     name: 'session_edit',
@@ -226,6 +277,13 @@ function makeSessionEditTool(store: Store<Session>): Tool {
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Registers the `session_edit` tool against the runtime's session store.
+   *
+   * @param services - Runtime machine; a no-op when no sessions store is present.
+   * @returns A promise that resolves once registration is done.
+   * @throws Never.
+   */
   async setup(services: MatbotMachine) {
     const store = services.sessions;
     if (!store) return;

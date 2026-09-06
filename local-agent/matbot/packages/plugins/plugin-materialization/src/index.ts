@@ -38,6 +38,14 @@ export type Classified = {
     kind: 'missing-path';
     resolved: string;
 }; // looked like a path but no package.json exists there
+/**
+ * Checks whether a URL specifier names a tarball or git repository (as opposed
+ * to a plain remote module tree), which decides `pnpm-url` vs `remote` routing.
+ * @param url - The specifier to inspect; query strings are ignored for the
+ *   extension check, and a `git+` prefix always counts as git.
+ * @returns True for `.tgz`/`.tar.gz`/`.git` endings or a `git+` prefix.
+ * @throws Never.
+ */
 function isTarballOrGit(url: string): boolean {
     const noQuery = (url.split('?')[0]) ?? url;
     return noQuery.endsWith('.tgz') || noQuery.endsWith('.tar.gz') || noQuery.endsWith('.git') || url.startsWith('git+');
@@ -47,6 +55,11 @@ function isTarballOrGit(url: string): boolean {
  * package the path belongs to); otherwise undefined. Existence is checked FIRST so a non-existent
  * path is never mis-classified as local just because some ancestor (e.g. the project root) happens
  * to carry a package.json. A file resolves from its containing directory.
+ *
+ * @param resolved - Absolute filesystem path to check.
+ * @returns The nearest ancestor directory (including `resolved` itself) holding a
+ *   package.json, or `undefined` when the path does not exist or no ancestor does.
+ * @throws Never - filesystem errors are treated as "not found".
  */
 async function resolveLocalDir(resolved: string): Promise<string | undefined> {
     let info;
@@ -75,6 +88,12 @@ async function resolveLocalDir(resolved: string): Promise<string | undefined> {
  * exists (with a package.json); otherwise it falls through to npm. An explicit path shape (`./`,
  * `../`, `file://`, or a leading `/`) that has no package.json is reported as `missing-path` rather
  * than silently mis-routed to a registry install.
+ *
+ * @param spec - The load specifier to classify.
+ * @param projectDir - Project root used to resolve relative/path-like specifiers.
+ * @returns The classification: `local` (with its package directory), `npm`, `remote`,
+ *   `pnpm-url` (tarball/git), or `missing-path` (with the resolved path).
+ * @throws Never.
  */
 export async function classifySpecifier(spec: string, projectDir: string): Promise<Classified> {
     if (/^https?:\/\//.test(spec) || spec.startsWith('git+')) {
@@ -110,7 +129,12 @@ export interface RemoteManifest {
     runtimes: readonly string[] | undefined; // package.json `matbotRuntime`, if declared
 }
 const CODE_EXT = /\.(?:ts|mts|cts|js|mjs|cjs)$/;
-/** Expand a `github:owner/repo[/sub][#ref]` shorthand into a raw.githubusercontent.com base URL. */
+/**
+ * Expand a `github:owner/repo[/sub][#ref]` shorthand into a raw.githubusercontent.com base URL.
+ * @param spec - The `github:` shorthand; `#ref` selects the git ref (default `HEAD`).
+ * @returns The base URL for fetching files from the repo (and subdirectory), with a trailing slash.
+ * @throws TypeError - If the expanded URL cannot be constructed (malformed specifier).
+ */
 function expandGithub(spec: string): string {
     const body = spec.slice('github:'.length);
     const [pathPart, ref = 'HEAD'] = body.split('#');
@@ -121,6 +145,16 @@ function expandGithub(spec: string): string {
     const base = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/`;
     return sub ? new URL(sub + '/', base).href : base;
 }
+/**
+ * Resolves a package.json `exports` field down to a single entry path:
+ * accepts a plain string, the `"."` key of a conditions map, or the first
+ * string found among the `import`/`module`/`default` conditions (then any
+ * remaining condition).
+ *
+ * @param exports - The raw `exports` value of unknown shape.
+ * @returns The entry path string, or `undefined` when no resolvable entry exists.
+ * @throws Never.
+ */
 function resolveExportsEntry(exports: unknown): string | undefined {
     if (typeof exports === 'string')
         return exports;
@@ -145,6 +179,12 @@ function resolveExportsEntry(exports: unknown): string | undefined {
 const manifestCache = new Map<string, RemoteManifest>();
 // A stalled connection must not block a plugin install/refresh forever.
 const FETCH_TIMEOUT_MS = 30000;
+/**
+ * Fetches a URL as text under the module-wide 30s timeout.
+ * @param url - Absolute URL to fetch.
+ * @returns `{ ok, status, text }`; `text` is empty for non-OK responses.
+ * @throws Error - On network failure or timeout ({@link DOMException} `TimeoutError`).
+ */
 async function fetchText(url: string): Promise<{
     ok: boolean;
     status: number;
@@ -203,6 +243,13 @@ export async function fetchRemoteManifest(spec: string): Promise<RemoteManifest>
     manifestCache.set(spec, manifest);
     return manifest;
 }
+/**
+ * Parses JSON text, converting parse failures into a uniform error naming the source URL.
+ * @param text - Raw JSON text (a fetched package.json body).
+ * @param url - URL the text came from; included in the error message.
+ * @returns The parsed object.
+ * @throws Error - If `text` is not valid JSON.
+ */
 function safeJson(text: string, url: string): Record<string, unknown> {
     try {
         return JSON.parse(text) as Record<string, unknown>;
@@ -211,6 +258,13 @@ function safeJson(text: string, url: string): Record<string, unknown> {
         throw new Error(`package.json at ${url} is not valid JSON`);
     }
 }
+/**
+ * Reads a package's `matbotRuntime` runtime-gate declaration.
+ * @param pkg - Parsed package.json fields.
+ * @returns The declared runtime names (strings only), or `undefined` when the
+ *   field is absent or not an array.
+ * @throws Never.
+ */
 function runtimesOf(pkg: Record<string, unknown>): readonly string[] | undefined {
     const raw = pkg['matbotRuntime'];
     return Array.isArray(raw) ? raw.filter((r): r is string => typeof r === 'string') : undefined;
@@ -219,6 +273,14 @@ function runtimesOf(pkg: Record<string, unknown>): readonly string[] | undefined
 // sit beside its package.json — we check the sibling only, never fish up ancestors or down subdirs
 // (a URL pointing into a tree could otherwise pick up an unrelated/monorepo manifest). Its absence,
 // or a missing "name", is a hard error: point at the package dir or its package.json instead.
+/**
+ * Locates the package.json that must sit beside a direct entry URL, per the
+ * remote-plugin contract (a plugin is a named package, not a loose file).
+ * @param entryUrl - Absolute URL of the plugin entry module.
+ * @returns The sibling package.json URL and its parsed contents.
+ * @throws Error - If the sibling package.json is missing, unreadable, invalid
+ *   JSON, or declares no "name".
+ */
 async function findEntryManifest(entryUrl: string): Promise<{
     url: string;
     pkg: Record<string, unknown>;
@@ -233,6 +295,14 @@ async function findEntryManifest(entryUrl: string): Promise<{
     throw new Error(`a remote plugin must be a named package: no sibling package.json with a "name" at ${url} (point at the package directory or its package.json instead)`);
 }
 // ── Materialisation (fetch the module graph onto disk) ───────────────────────────
+/**
+ * Maps a fetched URL to its location inside the `.plugins/` cache, preserving
+ * host and path structure.
+ * @param url - Absolute URL of a fetched remote file.
+ * @param dotPlugins - The `.plugins/` cache root.
+ * @returns The local filesystem path `<dotPlugins>/<host>/<decoded path>`.
+ * @throws TypeError - If `url` is not a valid absolute URL.
+ */
 function urlToCachePath(url: string, dotPlugins: string): string {
     const u = new URL(url);
     return path.join(dotPlugins, u.host, decodeURIComponent(u.pathname));
@@ -240,6 +310,16 @@ function urlToCachePath(url: string, dotPlugins: string): string {
 // matbot source imports siblings with explicit `.js` extensions (verbatimModuleSyntax); the raw
 // file on disk is `.ts`. Mirror the web bundle: fetch the `.js`, fall back to `.ts`, and write the
 // content at the `.ts` path so the ts-hooks `.js`→`.ts` resolve remap finds it at load time.
+/**
+ * Fetches a remote module's source, trying extension/index fallbacks: a
+ * requested `.js` falls back to `.ts` (and `.mjs` to `.mts`); a URL without a
+ * code extension falls back to appending `.ts` and then `/index.ts`.
+ *
+ * @param url - Absolute URL of the module to fetch.
+ * @returns The URL actually fetched (for cache-keying and sibling resolution)
+ *   and its text content.
+ * @throws Error - If every candidate path fails to fetch (or a fetch times out).
+ */
 async function fetchModule(url: string): Promise<{
     finalUrl: string;
     content: string;
@@ -267,6 +347,16 @@ const IMP_DYNAMIC = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
 // URLs are neither. A regex lexer over raw .ts is intentional: these are first-party controlled
 // modules, and the only failure mode — over-collecting a string that looks like an import — is
 // harmless (we fetch a real sibling file, or try to link a package that doesn't resolve and skip it).
+/**
+ * Extracts a module's import specifiers from raw TypeScript source: `from`
+ * imports, side-effect imports, and dynamic `import()` calls. Specifiers
+ * starting with `.` are relative siblings; bare specifiers (excluding
+ * `node:` builtins and absolute URLs) are host packages to symlink.
+ *
+ * @param code - Raw TypeScript/JavaScript module source.
+ * @returns `{ relative, bare }` — deduplicated specifiers in first-seen order.
+ * @throws Never.
+ */
 function scanImports(code: string): {
     relative: string[];
     bare: string[];
@@ -311,6 +401,19 @@ export async function materializeRemote(spec: string, dotPlugins: string, resolv
     await linkHostPackages(bare, dotPlugins, resolveBase);
     return entryLocal;
 }
+/**
+ * Breadth-first crawl of the remote module graph: fetches every reachable
+ * module (deduplicated by final URL), writes each into the `.plugins/` cache,
+ * collects bare specifiers for the symlink step, and resolves relative
+ * imports against each module's final URL.
+ *
+ * @param entryUrl - Absolute URL of the plugin entry module.
+ * @param dotPlugins - The `.plugins/` cache root.
+ * @returns The local cache path of the entry module and the set of bare
+ *   specifiers the graph imports.
+ * @throws Error - If any module of the graph cannot be fetched, or (internal
+ *   error) if the entry itself was never materialised.
+ */
 async function crawl(entryUrl: string, dotPlugins: string): Promise<{
     entryLocal: string;
     bare: Set<string>;
@@ -339,7 +442,12 @@ async function crawl(entryUrl: string, dotPlugins: string): Promise<{
         throw new Error(`internal error: entry ${entryUrl} was not materialised`);
     return { entryLocal, bare };
 }
-/** The installable package name of a bare specifier (drops any subpath): `@scope/name` or `name`. */
+/**
+ * The installable package name of a bare specifier (drops any subpath): `@scope/name` or `name`.
+ * @param spec - A bare import specifier.
+ * @returns The package name portion only.
+ * @throws Never.
+ */
 function packageNameOf(spec: string): string {
     const segs = spec.split('/');
     return spec.startsWith('@') ? segs.slice(0, 2).join('/') : (segs[0] ?? spec);
@@ -349,6 +457,20 @@ function packageNameOf(spec: string): string {
 // resolves to the exact module the host loaded — the disk equivalent of the web bundle's import map.
 // A specifier that doesn't resolve from the host is skipped (it's a genuine missing dependency; the
 // import then fails with a clear ERR_MODULE_NOT_FOUND rather than being silently masked).
+/**
+ * Creates the `.plugins/node_modules/` symlink farm bridging the cached
+ * plugin's bare imports to the host's physical packages, so shared singletons
+ * resolve to the exact modules the host loaded. Bare specifiers that do not
+ * resolve from the host are skipped (their import then fails loudly at load
+ * time). Existing links and races producing `EEXIST` are tolerated.
+ *
+ * @param bare - Bare import specifiers collected by {@link crawl}.
+ * @param dotPlugins - The `.plugins/` cache root (receives `node_modules/`).
+ * @param resolveBase - Install root whose module graph defines the host
+ *   singletons; this module's own location is used as a fallback base.
+ * @throws Error - If resolving or creating directories fails, or a symlink
+ *   fails for a reason other than `EEXIST`.
+ */
 async function linkHostPackages(bare: Set<string>, dotPlugins: string, resolveBase: string): Promise<void> {
     // Resolve bare specifiers the way the host would, from a chain of bases: the install root
     // (`resolveBase`, where the user's own deps live) first, then this module's own location — which
@@ -383,6 +505,18 @@ async function linkHostPackages(bare: Set<string>, dotPlugins: string, resolveBa
         }
     }
 }
+/**
+ * Locates the host's installation directory of a package, preferring the
+ * manifest subpath (`<name>/package.json`, independent of an `exports` map)
+ * and falling back to the entry path plus a walk up to the directory whose
+ * package.json carries the name.
+ *
+ * @param req - Require function resolving from the host's module graph.
+ * @param name - Package name to locate.
+ * @returns The package's root directory, or `undefined` when it does not
+ *   resolve from the host.
+ * @throws Never - resolution failures return `undefined`.
+ */
 function hostPackageDir(req: NodeRequire, name: string): string | undefined {
     // Prefer the manifest (works regardless of an `exports` map); fall back to the entry, then walk up
     // to the directory whose package.json carries this name (matbot packages export only ".", so the
@@ -413,6 +547,16 @@ function hostPackageDir(req: NodeRequire, name: string): string | undefined {
         dir = parent;
     }
 }
+/**
+ * Writes a file into the cache unless it is already present (the cache is
+ * content-agnostic and idempotent: existing files are never re-fetched or
+ * overwritten, so restarts load from disk).
+ *
+ * @param localPath - Absolute destination path inside `.plugins/`.
+ * @param content - UTF-8 text to write.
+ * @throws Error - If the directory cannot be created or the file cannot be
+ *   written.
+ */
 async function writeCached(localPath: string, content: string): Promise<void> {
     try {
         await access(localPath);

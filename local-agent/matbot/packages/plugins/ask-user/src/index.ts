@@ -5,6 +5,24 @@ const MAX_OPTIONS = 10;
 const VALID_TYPES: FormField['type'][] = ['text', 'password', 'select', 'confirm'];
 
 const executor = {
+  /**
+   * Validates the requested form field and prompts the user for an answer.
+   *
+   * Expects `input` to be a {@link FormField}-shaped object. Validation failures
+   * are reported as yielded `error` events, not thrown. For `select` fields the
+   * `options` array must be non-empty and contain at most {@link MAX_OPTIONS}
+   * entries. A user cancellation or prompt failure is also surfaced as an
+   * `error` event.
+   *
+   * @param input - Tool input expected to be a {@link FormField}: `name`, `label`,
+   *   and a valid `type` are required; `options` is additionally required when
+   *   `type` is `select`.
+   * @param ctx - Tool context providing the interactive `prompt` capability.
+   * @returns Async iterable of {@link ToolEvent}s: exactly one `result` event
+   *   carrying `{ name, answer }` on success, or one `error` event describing
+   *   the validation or prompt failure.
+   * @throws Never - all failures are reported as yielded `error` events.
+   */
   async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
     const field = input as FormField;
 

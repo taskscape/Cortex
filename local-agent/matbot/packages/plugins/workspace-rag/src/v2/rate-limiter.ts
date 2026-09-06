@@ -5,12 +5,21 @@
 /** Maximum wall-clock wait scheduled for a single consume slice. */
 const MAX_SINGLE_WAIT_MS = 30_000;
 
+/**
+ * Rate limiter that spaces consumption out at a fixed units-per-second rate.
+ *
+ * Consumers are serialized: each reservation extends the earliest time the
+ * next grant may start, so queued callers wait behind all prior
+ * reservations.
+ */
 export class RagV2RateLimiter {
   private nextAvailableAt = 0;
   private readonly unitsPerSecond: number;
 
   /**
-   * @param unitsPerSecond - Sustained units permitted per second.
+   * Creates a limiter with a fixed per-second allowance.
+   * @param unitsPerSecond - Sustained units permitted per second; zero or negative disables limiting entirely.
+   * @throws Never.
    */
   constructor(unitsPerSecond: number) {
     this.unitsPerSecond = unitsPerSecond;
@@ -23,6 +32,8 @@ export class RagV2RateLimiter {
    * releases its unused reservation so later consumers are not starved.
    * @param units - Units to consume.
    * @param signal - Abort signal cancelling the wait.
+   * @returns Resolves once all units have been granted.
+   * @throws Error - When the signal is already aborted or aborts while waiting; the abort reason is rethrown.
    */
   async consume(units: number, signal?: AbortSignal): Promise<void> {
     if (this.unitsPerSecond <= 0 || units <= 0) return;
@@ -41,6 +52,17 @@ export class RagV2RateLimiter {
     if (signal?.aborted) throw abortReason(signal);
   }
 
+  /**
+   * Reserves and waits out one slice of the budget.
+   *
+   * The reservation extends the limiter's next-available time before
+   * waiting, so concurrent consumers queue behind it; an aborted wait
+   * rewinds the unused reservation.
+   * @param units - Units in this slice, at most one wait window's worth.
+   * @param signal - Abort signal cancelling the wait.
+   * @returns Resolves once the slice's reservation has elapsed.
+   * @throws Error - When the signal aborts during the wait; the abort reason is rethrown.
+   */
   private async consumeSlice(units: number, signal?: AbortSignal): Promise<void> {
     const now = Date.now();
     const scheduledAt = Math.max(now, this.nextAvailableAt);
@@ -70,6 +92,12 @@ export class RagV2RateLimiter {
   }
 }
 
+/**
+ * Normalizes an abort into an Error for rejection.
+ * @param signal - The aborted signal.
+ * @returns The signal's `reason` when it is an Error; otherwise a generic cancellation Error.
+ * @throws Never.
+ */
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason

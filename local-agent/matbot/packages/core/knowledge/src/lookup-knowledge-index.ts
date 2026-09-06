@@ -4,6 +4,11 @@ import type { KnowledgeIndex, KnowledgeEntry } from '@matatbread/matbot-plugin-a
 // Entries are held in a Map keyed by id; search scores each doc by raw term-occurrence
 // count, sorts descending, then returns the top docs whose cumulative score covers 50% of
 // the total — surfacing clear winners quickly without drowning results in long-tail noise.
+/**
+ * Default in-memory {@link KnowledgeIndex} implementation for development and environments
+ * without a BGE reranker: entries are held in a map keyed by id, and search scores documents
+ * by raw term-occurrence count.
+ */
 export class LookupKnowledgeIndex implements KnowledgeIndex {
   private readonly byId = new Map<string, KnowledgeEntry>();
 

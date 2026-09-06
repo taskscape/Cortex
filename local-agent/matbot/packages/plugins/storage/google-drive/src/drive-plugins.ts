@@ -4,6 +4,10 @@ import { createBrowserPluginTool } from '@matatbread/matbot-browser';
 
 const DOC_ID = 'manifest';
 
+/**
+ * The persisted manifest document: one record in the `plugin-manifest`
+ * namespace holding the synced plugin specifiers.
+ */
 interface ManifestDoc {
   id:         string;
   version:    string;
@@ -20,24 +24,36 @@ interface ManifestDoc {
  * Its shape satisfies the browser plugin tool's `ExtraPlugins` persistence interface, so the very
  * same `plugin` tool can be backed by Drive instead of IndexedDB (see {@link createSyncedPluginTool}).
  */
-/**
- * The persisted list of remote plugin specifiers, stored as a manifest
- * document in Drive so the set survives reloads.
- */
 export class DrivePluginSet {
   private readonly store: Store<ManifestDoc>;
 
+  /**
+   * Creates the set over a manifest store.
+   * @param store - Store holding the manifest document (the `plugin-manifest`
+   *   namespace of the active backend).
+   * @throws Never.
+   */
   constructor(store: Store<ManifestDoc>) {
     this.store = store;
   }
 
+  /**
+   * Reads the synced specifiers from the manifest.
+   * @returns The specifiers, or an empty array when the manifest is absent.
+   * @throws Propagates store read errors.
+   */
   async list(): Promise<string[]> {
     return (await this.store.get(DOC_ID))?.specifiers ?? [];
   }
 
   /**
-   * Adds a plugin specifier to the manifest.
+   * Adds a plugin specifier to the manifest. No-op when already present;
+   * otherwise the whole manifest document is rewritten with a fresh random
+   * version — a plain `set`, not a CAS.
    * @param specifier - Plugin specifier to record.
+   * @returns Resolves once the manifest is written (immediately when the
+   *   specifier is already present).
+   * @throws Propagates store read/write errors.
    */
   async add(specifier: string): Promise<void> {
     const cur = await this.list();
@@ -46,8 +62,11 @@ export class DrivePluginSet {
   }
 
   /**
-   * Removes a plugin specifier from the manifest.
+   * Removes a plugin specifier from the manifest. The document is rewritten
+   * even when the specifier was absent (the filter is then a no-op).
    * @param specifier - Plugin specifier to drop.
+   * @returns Resolves once the manifest is written.
+   * @throws Propagates store read/write errors.
    */
   async remove(specifier: string): Promise<void> {
     const cur = await this.list();
@@ -69,13 +88,12 @@ export class DrivePluginSet {
  *    this Google Drive plugin itself (it lives in the local extras, not the Drive set — a Drive
  *    remove couldn't uninstall it, it'd just reload next boot). Delegation, not a silent no-op.
  *  - `list` → annotates each loaded plugin with whether it's Drive-synced or local-only.
- */
-/**
- * Wraps the host plugin tool so install/remove actions also update the
- * Drive-synced manifest (falling back to the original tool when absent).
+ *
  * @param driveSet - The synced manifest store.
- * @param original - The underlying plugin tool, if any.
+ * @param original - The underlying (local) plugin tool, if any; `remove`/
+ *   `reload` of non-synced plugins delegate to it.
  * @returns The wrapped tool.
+ * @throws Never.
  */
 export function createSyncedPluginTool(driveSet: DrivePluginSet, original: Tool | null): Tool {
   const driveTool = createBrowserPluginTool(driveSet);
@@ -88,6 +106,16 @@ export function createSyncedPluginTool(driveSet: DrivePluginSet, original: Tool 
       '(including the Google Drive plugin itself) is handled locally, on this browser only. `list` ' +
       'marks each plugin as Drive-synced or local-only.',
     executor: {
+      /**
+       * Routes a plugin tool invocation: `remove`/`reload` of a plugin not in
+       * the Drive set delegates to the original tool; `list` annotates each
+       * entry with `managedBy`; everything else goes to the Drive-backed tool.
+       * @param input - Tool input (`action`, `specifier`).
+       * @param ctx - Tool execution context.
+       * @yields The delegated or wrapped tool's events.
+       * @throws Propagates errors from `driveSet.list()` and the delegated
+       *   tools.
+       */
       async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
         const { action, specifier } = input as { action?: string; specifier?: string };
 
@@ -100,6 +128,14 @@ export function createSyncedPluginTool(driveSet: DrivePluginSet, original: Tool 
 
         if (action === 'list') {
           const drive = await driveSet.list();
+          /**
+           * Whether a plugin belongs to the Drive set, checked by name or
+           * specifier.
+           * @param name - Plugin display name.
+           * @param spec - Plugin specifier.
+           * @returns True when the Drive manifest lists it.
+           * @throws Never.
+           */
           const synced = (name: string, spec: string) => drive.includes(spec) || drive.includes(name);
           for await (const ev of driveTool.executor.execute(input, ctx)) {
             if (ev.type === 'result' && ev.value !== null && typeof ev.value === 'object' && 'loaded' in ev.value) {

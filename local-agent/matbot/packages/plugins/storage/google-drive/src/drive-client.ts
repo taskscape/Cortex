@@ -12,10 +12,22 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_ATTEMPTS       = 4;
 const MAX_LIST_PAGES     = 100;
 
+/**
+ * Whether an HTTP status warrants a retry.
+ * @param status - HTTP status code of the response.
+ * @returns True for 429 (rate limit) or any 5xx server error.
+ * @throws Never.
+ */
 function isTransient(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * Resolves after `ms` milliseconds.
+ * @param ms - Delay in milliseconds.
+ * @returns Resolves once the delay elapses.
+ * @throws Never.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -29,6 +41,12 @@ export interface DriveFile {
   mimeType?: string;
 }
 
+/**
+ * Escapes a value for embedding in a single-quoted Drive `q` string literal.
+ * @param value - Raw value (folder id or name).
+ * @returns The escaped value.
+ * @throws Never.
+ */
 function qEscape(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
@@ -40,10 +58,31 @@ function qEscape(value: string): string {
 export class DriveClient {
   private readonly auth: DriveAuth;
 
+  /**
+   * Creates the client; requests carry no token until the first call fetches
+   * one via {@link DriveAuth.token}.
+   * @param auth - Token source; every request bears its bearer token, and a
+   *   401 invalidates it via {@link DriveAuth.invalidate}.
+   * @throws Never.
+   */
   constructor(auth: DriveAuth) {
     this.auth = auth;
   }
 
+  /**
+   * Core request path: attaches the bearer token, retries transient failures
+   * (429/5xx) up to four attempts honouring `Retry-After` (else exponential
+   * backoff), and on a 401 invalidates the token and retries exactly once —
+   * covering silent renewal of an expired token.
+   * @param url - Absolute endpoint URL.
+   * @param init - Fetch init (method, headers, body); headers are copied and
+   *   the Authorization header is set.
+   * @param retryOn401 - Internal guard set to false on the single 401 retry so
+   *   an authoritative auth failure cannot loop.
+   * @returns The final {@link Response} (which may still be non-OK).
+   * @throws Propagates authorisation failures from {@link DriveAuth.token} and
+   *   network/timeout errors from `fetch`.
+   */
   private async fetch(url: string, init: RequestInit, retryOn401 = true): Promise<Response> {
     const token = await this.auth.token();
     const headers = new Headers(init.headers);
@@ -68,6 +107,14 @@ export class DriveClient {
     }
   }
 
+  /**
+   * Parses a response body as JSON, converting non-OK responses into
+   * descriptive errors (status, status text, first 500 bytes of the body).
+   * @typeParam T - Expected shape of the parsed body.
+   * @param res - Response to parse.
+   * @returns The parsed body.
+   * @throws Error when the response is not OK; JSON parse errors propagate.
+   */
   private async json<T>(res: Response): Promise<T> {
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -76,13 +123,16 @@ export class DriveClient {
     return res.json() as Promise<T>;
   }
 
-  /** List children of a folder, optionally filtered to one exact name. Folders themselves excluded
-   *  unless `foldersOnly`. Walks pagination so callers get the full set. */
   /**
-   * Lists children of a folder, optionally filtered by name or type.
+   * Lists children of a folder, optionally filtered to one exact name. Folders
+   * themselves are excluded unless `foldersOnly`. Walks pagination so callers
+   * get the full set.
    * @param parentId - Folder id to list.
    * @param opts - Optional name filter and folders-only flag.
-   * @returns Matching entries (empty when the parent is missing).
+   * @returns Matching entries in Drive order, complete across pages (empty
+   *   when the parent is missing).
+   * @throws Error when listing exceeds 100 pages; propagates Drive API errors
+   *   from non-OK responses.
    */
   async list(parentId: string, opts?: { name?: string; foldersOnly?: boolean }): Promise<DriveFile[]> {
     const clauses = [`'${qEscape(parentId)}' in parents`, 'trashed=false'];
@@ -112,12 +162,14 @@ export class DriveClient {
     return out;
   }
 
-  /** Find a child folder by name, creating it if absent. `parentId` of 'root' targets Drive root. */
   /**
-   * Finds a child folder by name, creating it when absent.
+   * Finds a child folder by name, creating it when absent. `parentId` of
+   * 'root' targets Drive root. The lookup-then-create window means concurrent
+   * creators can race Drive itself, but the id returned is valid either way.
    * @param name - Folder name.
    * @param parentId - Parent folder id.
-   * @returns The folder id.
+   * @returns The folder id (existing or newly created).
+   * @throws Propagates Drive API errors from the listing or creation.
    */
   async ensureFolder(name: string, parentId: string): Promise<string> {
     const existing = await this.list(parentId, { name, foldersOnly: true });
@@ -130,7 +182,16 @@ export class DriveClient {
     return (await this.json<DriveFile>(res)).id;
   }
 
-  /** Resolve (creating as needed) a nested folder path under `rootParent` (default Drive root). */
+  /**
+   * Resolves (creating as needed) a nested folder path under `rootParent`.
+   * Each segment is resolved sequentially via {@link DriveClient.ensureFolder},
+   * so the call costs one round-trip per segment.
+   * @param parts - Folder path segments, in order.
+   * @param rootParent - Id of the folder to resolve under; 'root' means Drive
+   *   root (the default).
+   * @returns The id of the final folder in the path.
+   * @throws Propagates Drive API errors from any segment.
+   */
   async ensureFolderPath(parts: string[], rootParent = 'root'): Promise<string> {
     let parent = rootParent;
     for (const part of parts) parent = await this.ensureFolder(part, parent);
@@ -138,8 +199,10 @@ export class DriveClient {
   }
 
   /**
-   * Downloads a file as UTF-8 text.
-   * @throws When the download fails after retries.
+   * Downloads a file's content as UTF-8 text.
+   * @param fileId - Drive file id.
+   * @returns The file content.
+   * @throws Error on any non-OK response (after transient-error retries).
    */
   async readText(fileId: string): Promise<string> {
     const res = await this.fetch(`${API}/files/${encodeURIComponent(fileId)}?alt=media`, { method: 'GET' });
@@ -147,17 +210,26 @@ export class DriveClient {
     return res.text();
   }
 
+  /**
+   * Downloads a file's content as raw bytes.
+   * @param fileId - Drive file id.
+   * @returns The file content.
+   * @throws Error on any non-OK response (after transient-error retries).
+   */
   async readBytes(fileId: string): Promise<Uint8Array> {
     const res = await this.fetch(`${API}/files/${encodeURIComponent(fileId)}?alt=media`, { method: 'GET' });
     if (!res.ok) throw new Error(`Google Drive read ${res.status} for ${fileId}`);
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  /** Create a file with body, returning its id. */
   /**
-   * Uploads a new file into a folder.
+   * Creates a file with the given body via a multipart upload.
+   * @param name - File name within the folder.
+   * @param parentId - Folder id to create the file in.
+   * @param body - Content as a Blob or string.
+   * @param mimeType - MIME type of the content.
    * @returns The new file id.
-   * @throws When the upload fails after retries.
+   * @throws Propagates Drive API errors from the upload.
    */
   async createFile(name: string, parentId: string, body: Blob | string, mimeType: string): Promise<string> {
     const metadata = { name, parents: [parentId] };
@@ -170,10 +242,14 @@ export class DriveClient {
     return (await this.json<DriveFile>(res)).id;
   }
 
-  /** Overwrite an existing file's content in place (metadata unchanged). */
   /**
-   * Replaces the content of an existing file.
-   * @throws When the upload fails after retries.
+   * Overwrites an existing file's content in place (metadata unchanged) via a
+   * media PATCH upload.
+   * @param fileId - Drive file id to overwrite.
+   * @param body - New content as a Blob or string.
+   * @param mimeType - MIME type of the content.
+   * @returns Resolves once the content is replaced.
+   * @throws Propagates Drive API errors from the upload.
    */
   async updateFile(fileId: string, body: Blob | string, mimeType: string): Promise<void> {
     const res = await this.fetch(`${UPLOAD}/${encodeURIComponent(fileId)}?uploadType=media`, {
@@ -185,8 +261,11 @@ export class DriveClient {
   }
 
   /**
-   * Deletes (trash) a file.
-   * @throws When the delete fails after retries.
+   * Deletes (trashes) a file. A 404 counts as success — already gone is the
+   * caller's desired end state.
+   * @param fileId - Drive file id.
+   * @returns Resolves once the delete is accepted.
+   * @throws Error on any non-OK response other than 404.
    */
   async deleteFile(fileId: string): Promise<void> {
     const res = await this.fetch(`${API}/files/${encodeURIComponent(fileId)}`, { method: 'DELETE' });
@@ -197,7 +276,15 @@ export class DriveClient {
   }
 }
 
-/** Build a `multipart/related` body (JSON metadata + media part) for Drive's multipart upload. */
+/**
+ * Builds a `multipart/related` body (JSON metadata part + media part) for
+ * Drive's multipart upload, using a random UUID-derived boundary.
+ * @param metadata - JSON-serialisable file metadata (first part).
+ * @param media - The media payload (second part).
+ * @param mediaType - MIME type of the media part.
+ * @returns The `content-type` header value and the assembled body.
+ * @throws Never.
+ */
 function multipart(metadata: unknown, media: Blob | string, mediaType: string): { contentType: string; payload: Blob } {
   const boundary = `mb${crypto.randomUUID().replace(/-/g, '')}`;
   const head =

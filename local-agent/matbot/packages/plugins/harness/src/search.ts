@@ -8,6 +8,10 @@ import { globToRegExp, isBinary, walkFiles, IGNORED_DIRS } from './fsutil.js';
 const RESULT_CAP = 100;
 const LINE_CAP = 2000;
 
+/**
+ * Input of the `glob` tool: a glob pattern, an optional search root inside the
+ * workspace, and a result limit.
+ */
 interface GlobInput { pattern: string; path?: string; limit?: number }
 
 export const globTool: Tool = defineTool({
@@ -52,6 +56,10 @@ export const globTool: Tool = defineTool({
   },
 });
 
+/**
+ * Input of the `grep` tool: a regular expression, an optional search root and
+ * file-glob filter, and a match cap.
+ */
 interface GrepInput { pattern: string; path?: string; include?: string; maxResults?: number }
 
 export const grepTool: Tool = defineTool({
@@ -113,6 +121,10 @@ export const grepTool: Tool = defineTool({
   },
 });
 
+/**
+ * Input of the `list` tool: an optional directory, recursion depth, and a cap
+ * on rendered entries.
+ */
 interface ListInput { path?: string; depth?: number; maxEntries?: number }
 
 export const listTool: Tool = defineTool({

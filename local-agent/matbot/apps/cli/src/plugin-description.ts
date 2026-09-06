@@ -25,6 +25,7 @@ export interface PluginLoadRequest {
  * @param specifier Plugin specifier (file: URL, path, or bare package name).
  * @param baseDir Project directory used to resolve relative paths and module lookups.
  * @returns The start directory, or undefined if a bare name cannot be resolved.
+ * @throws TypeError - Only for a malformed `file:` specifier; every other resolution failure returns undefined.
  */
 export function startDir(specifier: string, baseDir: string): string | undefined {
   const bare = (specifier.split('?')[0]) ?? specifier;
@@ -40,6 +41,14 @@ export function startDir(specifier: string, baseDir: string): string | undefined
   }
 }
 
+/**
+ * Walk up from a plugin's start directory reading each `package.json`, returning the first
+ * non-empty `description` found.
+ * @param specifier - Plugin specifier (file: URL, path, or bare package name).
+ * @param baseDir - Project directory that path/module resolution anchors against.
+ * @returns The nearest package.json description, or `undefined` when none is found.
+ * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
+ */
 async function descriptionFromPackageJson(specifier: string, baseDir: string): Promise<string | undefined> {
   let dir = startDir(specifier, baseDir);
   if (dir === undefined) return undefined;
@@ -59,6 +68,10 @@ async function descriptionFromPackageJson(specifier: string, baseDir: string): P
  * import URL — the node analogue of the web assembler's specNames. Walks up to the first package.json
  * carrying a `name` (a nameless intermediate is not the plugin's manifest), so the CLI can hand the
  * loader a precomputed identity and `plugin.specifier` can stay the human/config specifier.
+ * @param specifier - Resolved import specifier or original plugin specifier.
+ * @param baseDir - Project directory that path/module resolution anchors against.
+ * @returns The package `name` plus the parsed `matbotRuntime` list when declared; `{}` when no named package.json is found.
+ * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
  */
 export async function readPluginMeta(specifier: string, baseDir: string): Promise<{ name?: string; runtimes?: Runtime[] }> {
   let dir = startDir(specifier, baseDir);
@@ -86,6 +99,7 @@ export async function readPluginMeta(specifier: string, baseDir: string): Promis
  * @param specifier Specifier the plugin was loaded with; used to locate its package.json.
  * @param baseDir Project directory that path/module resolution anchors against.
  * @returns Resolves when the manifest has been updated (or no description was found).
+ * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
  */
 export async function backfillPluginDescription(
   plugin:    MatbotPlugin,
@@ -113,6 +127,8 @@ export async function backfillPluginDescription(
  * @param prompt Optional user-prompt function handed to plugins during setup.
  * @param onLoadError Whether a failing load is skipped ('skip') or thrown ('throw').
  * @returns The loaded plugins, with descriptions backfilled.
+ * @throws Error - When `onLoadError` is 'throw' and a plugin fails to load (propagated from the loader).
+ * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
  */
 export async function loadPluginsWithDescriptions(
   requests:   readonly PluginLoadRequest[],

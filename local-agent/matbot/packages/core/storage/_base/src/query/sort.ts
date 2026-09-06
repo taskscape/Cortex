@@ -6,6 +6,18 @@ import { getField, pathSegments } from './access.js';
 // by codepoint order — mirroring the strict filter semantics in compile.ts where ordering
 // only exists within a type. Cross-type pairs still need a deterministic total order for
 // sorting, so they fall back to string codepoint order of the String() forms.
+/**
+ * Compare two resolved field values for sorting: missing (`undefined`/`null`) sorts last,
+ * same-type pairs compare within type (numbers and booleans numerically — false < true —,
+ * strings by codepoint order), and cross-type pairs fall back to their `String()` forms so
+ * the resulting order is always total.
+ *
+ * @param a - The left value.
+ * @param b - The right value.
+ * @returns A negative number, zero, or a positive number as `a` sorts before, equal to, or
+ *          after `b`.
+ * @throws Never.
+ */
 function compareValues(a: unknown, b: unknown): number {
   if (a === b) return 0;
   const am = a === undefined || a === null;

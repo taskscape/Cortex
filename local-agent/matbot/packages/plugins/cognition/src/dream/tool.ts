@@ -39,6 +39,16 @@ import { runDreamTimePass } from './service.js';
  */
 export function createDreamTimeTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
+    /**
+     * Runs one serialised consolidation pass and yields exactly one event: a `result` carrying
+     * the fully-assembled (and persisted) {@link DreamRun}, or an `error` describing why no run
+     * record was produced — no provider in context, an unknown provider, or a setup-shaped
+     * failure before the pass could run.
+     * @param _input Unused; the tool takes no parameters (its schema is empty).
+     * @param ctx Tool context supplying the active provider and the abort signal.
+     * @returns A single-event async iterable; `result` with the {@link DreamRun} on success.
+     * @throws Never - Every failure mode is yielded as an `error` event instead.
+     */
     async *execute(_input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       if (ctx.provider === undefined) {
         yield {

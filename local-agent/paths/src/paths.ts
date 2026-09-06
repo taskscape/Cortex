@@ -69,6 +69,19 @@ export function normalizeWindowsPath(inputPath: string, projectRoot?: string): N
 // Resolves symlinks and junctions before canonicalising, so containment cannot be defeated by a link
 // that points out of its parent. `realpath.native` also expands 8.3 short names (C:\PROGRA~1), which
 // would otherwise canonicalise to a different string than their long form.
+/**
+ * Resolves symlinks, junctions, and Windows 8.3 short names, then canonicalises
+ * the result, so containment checks cannot be defeated by a link that points
+ * outside its parent. When the target does not exist (a pending create), the
+ * nearest existing ancestor is resolved and the remaining tail re-appended, so
+ * a path whose *parent* is a link is still resolved rather than trusted
+ * lexically.
+ *
+ * @param inputPath - Path to resolve (absolute or relative to cwd).
+ * @returns The canonical (lowercased, backslash) form of the real path.
+ * @throws Any filesystem error other than ENOENT from `realpath.native`
+ * (e.g. EACCES on an ancestor); ENOENT is tolerated via the ancestor fallback.
+ */
 export async function realCanonicalPath(inputPath: string): Promise<string> {
   const resolved = path.resolve(inputPath);
   try {

@@ -58,6 +58,28 @@ export async function writeTextFile(targetPath: string, content: string, backupR
   }
 }
 
+/**
+ * Core write implementation invoked while holding the per-path write lock (see
+ * {@link writeTextFile}). Reads the previous content (through a verified
+ * handle when workspace roots are supplied), snapshots it via
+ * {@link createBackup}, then writes atomically: content goes to a unique
+ * temporary file in the target directory, is flushed to disk, and is renamed
+ * over the target, so a crash can never leave truncated or partially written
+ * content in place.
+ *
+ * @param targetPath - Resolved absolute path to write; parent directories are
+ * created as needed.
+ * @param content - Full new text content for the file.
+ * @param backupRoot - Directory under which the pre-write backup is stored.
+ * @param workspaces - Optional workspace roots; when supplied, the previous
+ * content is read through {@link openVerified} (H4 TOCTOU mitigation).
+ * @returns The write result including backup path (when a prior file existed)
+ * and the unified diff of before versus after.
+ * @throws Any filesystem error other than ENOENT when reading the previous
+ * content, from creating the backup, or from writing/renaming the file; the
+ * temporary file is removed on write failure.
+ * @throws {@link HttpError} 403 when verification rejects the target.
+ */
 async function writeTextFileUnlocked(targetPath: string, content: string, backupRoot: string, workspaces?: WorkspaceConfig): Promise<WriteResult> {
   let before = "";
   try {
@@ -180,6 +202,16 @@ export async function openVerified(targetPath: string, workspaces?: WorkspaceCon
   }
 }
 
+/**
+ * Tests whether an already-resolved real path lies inside one of the
+ * workspace's roots, canonicalising each root through the filesystem as well,
+ * so a root registered via a link or short name still matches.
+ *
+ * @param realTarget - Real canonical path of the candidate file.
+ * @param workspaces - Workspace roots to test against.
+ * @returns True if the target equals or is beneath any root.
+ * @throws Any filesystem error from resolving a root path other than ENOENT.
+ */
 async function rootsContain(realTarget: string, workspaces: WorkspaceConfig): Promise<boolean> {
   for (const root of workspaces.roots) {
     if (isPathInside(realTarget, await realCanonicalPath(root.path))) return true;

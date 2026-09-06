@@ -6,11 +6,23 @@ const PROTOCOL_VERSION = '2024-11-05';
 const CLIENT_INFO = { name: 'matbot', version: '0.1.0' };
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/** JSON-RPC 2.0 request carrying a numeric id; responses are matched back by that id. */
 interface JsonRpcRequest      { jsonrpc: '2.0'; id: number; method: string; params: unknown }
+/** JSON-RPC 2.0 notification: no id is sent and no response is expected. */
 interface JsonRpcNotification { jsonrpc: '2.0'; method: string; params?: unknown }
+/** JSON-RPC 2.0 response; `error` carries the server-reported failure when present. */
 interface JsonRpcResponse     { jsonrpc: string; id?: unknown; result?: unknown; error?: { code: number; message: string } }
 
 // Simple shell-like tokenizer: respects single and double quotes.
+/**
+ * Split a command string into tokens using shell-like quoting: single or double quotes group
+ * characters (the quote characters themselves are stripped), unquoted whitespace separates
+ * tokens. Unterminated quotes still emit the trailing token.
+ *
+ * @param cmd - The command string to tokenize.
+ * @returns The tokens in order of appearance; empty when `cmd` is blank.
+ * @throws Never.
+ */
 function tokenize(cmd: string): string[] {
   const tokens: string[] = [];
   let cur = '', quote = '';
@@ -36,9 +48,14 @@ export class StdioMCPClient implements MCPClient {
 
   /**
    * Spawn the server process and start reading its stdout.
+   *
+   * A failed spawn (missing executable, denied access) is not reported here — it arrives
+   * asynchronously via the child's `error` event and rejects pending requests.
+   *
    * @param command Command to run; shell-like quoting (single/double) is respected.
    * @param extraArgs Extra arguments appended after the command's own.
    * @param env Additional environment variables merged over `process.env`.
+   * @throws Never.
    */
   constructor(command: string, extraArgs: string[], env?: Record<string, string>) {
     const parts = tokenize(command);
@@ -66,6 +83,14 @@ export class StdioMCPClient implements MCPClient {
     this.child.on('close', () => this.fail(new Error('MCP server process exited unexpectedly')));
   }
 
+  /**
+   * Mark the client dead and reject every pending request with `error`, clearing their timeout
+   * timers. Safe to call more than once; later calls find nothing pending.
+   *
+   * @param error - The reason delivered to each pending request's rejection.
+   * @returns Nothing.
+   * @throws Never.
+   */
   private fail(error: Error): void {
     this.dead = true;
     for (const { reject, timer } of this.pending.values()) {
@@ -75,6 +100,15 @@ export class StdioMCPClient implements MCPClient {
     this.pending.clear();
   }
 
+  /**
+   * Handle one stdout line as a JSON-RPC response: parse it, match it to a pending request by
+   * numeric `id`, and settle that request. Unparseable lines, non-numeric ids, and unknown ids
+   * are silently ignored; an `error` response rejects the request with the server's message.
+   *
+   * @param line - One raw stdout line (newline already removed).
+   * @returns Nothing.
+   * @throws Never.
+   */
   private onLine(line: string): void {
     let msg: JsonRpcResponse;
     try { msg = JSON.parse(line) as JsonRpcResponse; } catch { return; }
@@ -87,10 +121,27 @@ export class StdioMCPClient implements MCPClient {
     else entry.resolve(msg.result);
   }
 
+  /**
+   * Serialize a JSON-RPC message to the server's stdin followed by a newline (newline-delimited
+   * JSON-RPC framing).
+   *
+   * @param msg - The request or notification to send.
+   * @returns Nothing.
+   * @throws Never - Stdin write failures surface asynchronously through the stdin error handler.
+   */
   private write(msg: JsonRpcRequest | JsonRpcNotification): void {
     this.child.stdin?.write(JSON.stringify(msg) + '\n');
   }
 
+  /**
+   * Send a JSON-RPC request and resolve with the response's `result` field.
+   *
+   * @param method - The JSON-RPC method name.
+   * @param params - The `params` payload; defaults to an empty object.
+   * @returns The `result` value of the matching response.
+   * @throws Error - Rejects if the client is closed, after the 30 s timeout, on process failure,
+   *           or with the server's JSON-RPC error message.
+   */
   private request(method: string, params: unknown = {}): Promise<unknown> {
     if (this.dead) return Promise.reject(new Error('MCP client is closed'));
     const id = this.nextId++;
@@ -103,6 +154,7 @@ export class StdioMCPClient implements MCPClient {
 
   /**
    * Perform the MCP initialize handshake and send the initialized notification.
+   * @returns Nothing; resolves once the handshake result is captured and the notification written.
    * @throws On spawn failure, process exit, timeout, or JSON-RPC error response.
    */
   async initialize(): Promise<void> {
@@ -134,7 +186,12 @@ export class StdioMCPClient implements MCPClient {
     return await this.request('tools/call', { name, arguments: args }) as MCPToolResult;
   }
 
-  /** Reject all pending requests and terminate the server process with SIGTERM. Idempotent. */
+  /**
+   * Reject all pending requests and terminate the server process with SIGTERM. Idempotent.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   close(): void {
     if (this.dead) return;
     this.fail(new Error('MCP client is closed'));

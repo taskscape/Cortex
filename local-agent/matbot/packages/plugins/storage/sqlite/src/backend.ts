@@ -15,6 +15,11 @@ export class SQLiteStorageBackend implements StorageBackend {
   /** FileStore backed by the same database. */
   readonly fileStore:  FileStore;
 
+  /**
+   * Creates the backend over an already-opened database.
+   * @param db - SQLite connection shared by all stores.
+   * @throws Never.
+   */
   private constructor(db: DatabaseSync) {
     this.db        = db;
     this.fileStore = new SQLiteFileStore(db);
@@ -25,6 +30,8 @@ export class SQLiteStorageBackend implements StorageBackend {
    * and NORMAL synchronous pragmas.
    * @param dotData - Root data directory.
    * @returns The initialised backend.
+   * @throws Propagates filesystem errors from creating the data directory and
+   *   SQLite errors from opening the database or applying pragmas.
    */
   static open(dotData: string): Promise<SQLiteStorageBackend> {
     mkdirSync(dotData, { recursive: true });
@@ -36,10 +43,13 @@ export class SQLiteStorageBackend implements StorageBackend {
   }
 
   /**
-   * Creates (or reuses, per call) a store for the given namespace.
+   * Creates a store for the given namespace. A fresh instance is returned per
+   * call (nothing is cached); the instances share this backend's database, and
+   * the namespace's table is created on construction if absent.
    * @param namespace - Store namespace mapped to its own table.
    * @returns A store persisting documents of type `T`.
    * @template T - Stored document shape ({ id, version } at minimum).
+   * @throws Propagates SQLite errors from creating the namespace table.
    */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     return new SQLiteStore<T>(this.db, namespace);
@@ -47,6 +57,8 @@ export class SQLiteStorageBackend implements StorageBackend {
 
   /**
    * Closes the underlying SQLite database.
+   * @returns Resolves once the database is closed.
+   * @throws If SQLite reports an error while closing.
    */
   async close(): Promise<void> {
     this.db.close();

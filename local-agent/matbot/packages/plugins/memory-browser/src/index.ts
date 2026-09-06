@@ -3,6 +3,11 @@ import { readFile } from 'node:fs/promises';
 import type { Filter, MatbotPluginSpec, MatbotMachine, Principal, Store, StoreQuery, Tool, ToolEvent } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION, runAs, tryCurrentPrincipal } from '@matatbread/matbot-plugin-api';
 
+/**
+ * One remembered fact document, stored in the `remembered_facts` store.
+ * `dreamSkill` marks a fact as processed by a dream/skill run; `ignoreUntil`
+ * suppresses re-processing until the given ISO timestamp.
+ */
 interface RememberedFact {
   id: string;
   version: string;
@@ -23,10 +28,21 @@ let activeServer: ReturnType<typeof createServer> | undefined;
 let activeUrl: string | undefined;
 let startupError: string | undefined;
 
+/**
+ * Checks whether a value is a plain, non-array object.
+ * @param value - Value to test.
+ * @returns True when `value` is a non-null, non-array object.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Writes a JSON response with no-cache headers.
+ * @param res - Response to write to; headers must not have been sent yet.
+ * @param status - HTTP status code to send.
+ * @param body - Value serialized as the JSON response body.
+ */
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -37,6 +53,13 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/**
+ * Reads a request body as UTF-8 text with a size cap.
+ * @param req - Incoming request whose body is streamed and collected.
+ * @param maxBytes - Maximum accepted body size in bytes; defaults to 1 MiB.
+ * @returns The full body as a UTF-8 string.
+ * @throws Error - If the body exceeds `maxBytes` or the request stream errors.
+ */
 async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -54,12 +77,25 @@ async function readBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<str
   });
 }
 
+/**
+ * Reads a request body and parses it as JSON.
+ * @param req - Incoming request to read.
+ * @returns The parsed body, or an empty object for an empty body.
+ * @throws Error - If the body exceeds the size cap or is not valid JSON
+ *   (JSON.parse {@link SyntaxError}).
+ */
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const raw = await readBody(req);
   if (!raw.trim()) return {};
   return JSON.parse(raw);
 }
 
+/**
+ * Parses and clamps a `limit` query parameter.
+ * @param raw - Raw parameter value; `null` (absent) means the default.
+ * @returns The parsed limit clamped to the 1–200 range; 50 for absent or
+ *   non-numeric values.
+ */
 function parseLimit(raw: string | null): number {
   if (raw === null) return 50;
   const n = Number(raw);
@@ -67,6 +103,16 @@ function parseLimit(raw: string | null): number {
   return Math.max(1, Math.min(200, Math.trunc(n)));
 }
 
+/**
+ * Builds a store filter from list-query parameters. `q` filters the `fact`
+ * field by substring; `state` selects `unprocessed` (no `dreamSkill`),
+ * `processed` (has `dreamSkill`), or `ignored` (has `ignoreUntil`); `all`
+ * (default) adds no clause.
+ *
+ * @param params - Query parameters of the list request.
+ * @returns A single filter clause, an `and` of clauses, or `undefined` when no
+ *   filtering was requested.
+ */
 function memoryFilter(params: URLSearchParams): Filter | undefined {
   const clauses: Filter[] = [];
   const q = params.get('q')?.trim();
@@ -82,6 +128,18 @@ function memoryFilter(params: URLSearchParams): Filter | undefined {
   return { op: 'and', clauses };
 }
 
+/**
+ * Applies a partial update to a fact document without touching the store.
+ * Only `fact`, `dreamSkill`, and `ignoreUntil` are mutable; setting a nullable
+ * field to `null` or `''` removes it. The result carries a fresh version token
+ * and must be written back via `store.cas` with the caller's expected version.
+ *
+ * @param current - The current stored document.
+ * @param input - Patch payload; absent keys are left unchanged.
+ * @returns The next document, or `{ error }` when a present field has an
+ *   invalid type (`fact` must be a non-empty string; the other two a string,
+ *   `null`, or `''`).
+ */
 function safePatch(current: RememberedFact, input: Record<string, unknown>): RememberedFact | { error: string } {
   const next: RememberedFact = { ...current, version: crypto.randomUUID() };
 
@@ -103,6 +161,14 @@ function safePatch(current: RememberedFact, input: Record<string, unknown>): Rem
   return next;
 }
 
+/**
+ * Serves a bundled static asset from disk with no-cache headers.
+ * @param res - Response to write the asset to.
+ * @param path - Asset path relative to this module's URL.
+ * @param contentType - Content-Type header value for the asset.
+ * @throws Error - If the asset file cannot be read (the HTTP handler converts
+ *   this into a 500 response).
+ */
 async function serveStatic(res: ServerResponse, path: string, contentType: string): Promise<void> {
   const body = await readFile(new URL(path, import.meta.url), 'utf8');
   res.writeHead(200, {
@@ -121,6 +187,7 @@ async function serveStatic(res: ServerResponse, path: string, contentType: strin
  * @param store The `remembered_facts` store to browse.
  * @param principal Principal under which all store operations execute.
  * @returns A Node HTTP server; call `.listen()` to start it.
+ * @throws Never - request handler failures are answered as 500 responses.
  */
 export function createMemoryBrowserServer(store: Store<RememberedFact>, principal: Principal) {
   return createServer(async (req, res) => {
@@ -239,6 +306,7 @@ export function createMemoryBrowserServer(store: Store<RememberedFact>, principa
  * never hang on an in-flight request.
  * @param server The server to close.
  * @param graceMs How long to wait before force-closing active connections.
+ * @throws Never - close errors are logged as warnings, not rethrown.
  */
 export async function closeMemoryBrowserServer(
   server: ReturnType<typeof createServer>,
@@ -263,6 +331,12 @@ export async function closeMemoryBrowserServer(
   }
 }
 
+/**
+ * Factory for the `open_memory_browser` tool, which reports the local URL of
+ * the running memory browser server (or an error event when it never started).
+ *
+ * @returns The tool specification with an empty input schema.
+ */
 function openMemoryBrowserTool(): Tool {
   return {
     name: 'open_memory_browser',
@@ -291,12 +365,28 @@ export const plugin: MatbotPluginSpec = {
     description: 'Standalone local browser for remembered_facts memory records.',
   },
 
+  /**
+   * Reports whether the browser server started and where to reach it.
+   * @returns A human-readable availability message for the installing user.
+   */
   async installationMessage() {
     return activeUrl
       ? `Memory browser is available at ${activeUrl}/.`
       : `Memory browser did not start: ${startupError ?? 'unknown startup error'}.`;
   },
 
+  /**
+   * Registers the `open_memory_browser` tool and, outside sub-agents, starts
+   * the local HTTP server bound to the configured host/port. Store operations
+   * run under the ambient principal (or a `memory-browser` fallback). A port
+   * already in use is tolerated: startup resolves with `startupError` set
+   * instead of rejecting.
+   *
+   * @param services - Machine services; used to register the tool and create
+   *   the `remembered_facts` store.
+   * @throws Error - If the server fails to listen for a reason other than
+   *   `EADDRINUSE`.
+   */
   async setup(services: MatbotMachine) {
     services.tools.register(openMemoryBrowserTool());
     if (services.isSubAgent()) return;
@@ -326,6 +416,10 @@ export const plugin: MatbotPluginSpec = {
     });
   },
 
+  /**
+   * Stops the memory browser server and clears its module-level state. A
+   * no-op when the server never started.
+   */
   async teardown() {
     const server = activeServer;
     activeServer = undefined;

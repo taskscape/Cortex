@@ -19,6 +19,15 @@ export const plugin: MatbotPluginSpec = {
   storageBackend: {
     open: (dotData: string) => HighCardinalityStorageBackend.open(dotData),
   },
+  /**
+   * Activates the backend when the plugin is hot-loaded: derives the data root
+   * from the config path and registers the backend (opening the SQLite
+   * database and running migrations). No-op when the pre-scan already opened
+   * this backend at boot, or when no config path is available.
+   * @param services - Runtime machine used to register the backend.
+   * @returns Resolves once the backend is registered (or the no-op exits).
+   * @throws Propagates backend open/migration errors or registration errors.
+   */
   async setup(services: MatbotMachine) {
     if (services.StorageBackend instanceof HighCardinalityStorageBackend) return;
     if (!services.configPath) return;

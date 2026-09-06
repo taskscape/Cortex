@@ -1,5 +1,6 @@
 import type { KnowledgeEntry } from "@matatbread/matbot-plugin-api";
 import { makeKnowledgeEntry } from "./entry.js";
+/** Options for constructing a {@link Mem0Client}. */
 export interface Mem0ClientOptions {
     baseUrl: string;
     apiKey?: string;
@@ -19,11 +20,11 @@ export interface Mem0ClientOptions {
  * against both legacy and versioned API routes.
  */
 export class Mem0Client {
+    private readonly options: Mem0ClientOptions;
     /**
      * @param options Base URL plus optional API key, user id (defaults to "local-agent"),
      *                and workspace id (defaults to "default").
      */
-    private readonly options: Mem0ClientOptions;
     constructor(options: Mem0ClientOptions) { this.options = options; }
     /**
      * Add an entry to the memory store as a user message with full entry metadata.
@@ -95,6 +96,21 @@ export class Mem0Client {
             });
         }).filter(entry => entry.content.length > 0);
     }
+    /**
+     * Performs an HTTP request against the Mem0 backend, trying each candidate
+     * path in order. A 404 advances to the next candidate; any other non-OK
+     * status throws immediately. A 204 resolves to an empty object; other
+     * success statuses resolve to the parsed JSON body. The caller's abort
+     * signal short-circuits remaining candidates.
+     *
+     * @param paths - Candidate endpoint paths resolved against the base URL,
+     *   tried in order.
+     * @param init - Fetch init (method, body, optional abort signal); an
+     *   `authorization` header is added when an API key is configured.
+     * @returns The parsed JSON response body (object or array), or `{}` for 204.
+     * @throws Error - The last candidate's failure: 404 "endpoint not found"
+     *   errors, non-OK status errors, network failures, or JSON parse errors.
+     */
     private async request(paths: string[], init: RequestInit): Promise<Record<string, unknown> | unknown[]> {
         let lastError: unknown;
         for (const requestPath of paths) {
@@ -126,17 +142,42 @@ export class Mem0Client {
         throw lastError instanceof Error ? lastError : new Error(String(lastError));
     }
 }
+/**
+ * Coerces an unknown value to a plain record, treating anything else as empty.
+ * @param value - Value to coerce.
+ * @returns `value` when it is a non-array object, otherwise `{}`.
+ * @throws Never.
+ */
 function asRecord(value: unknown): Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value)
         ? value as Record<string, unknown>
         : {};
 }
+/**
+ * Extracts a non-empty string from an unknown value.
+ * @param value - Value to extract from.
+ * @returns The string, or `undefined` when it is not a non-empty string.
+ * @throws Never.
+ */
 function stringValue(value: unknown): string | undefined {
     return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+/**
+ * Extracts a finite number from an unknown value.
+ * @param value - Value to extract from.
+ * @returns The number, or `undefined` when it is not a finite number.
+ * @throws Never.
+ */
 function numberValue(value: unknown): number | undefined {
     return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
+/**
+ * Extracts a non-empty string array from an unknown value.
+ * @param value - Value to extract from.
+ * @returns The filtered strings, or `undefined` when the value is not an array
+ *   or contains no non-empty strings.
+ * @throws Never.
+ */
 function stringArray(value: unknown): string[] | undefined {
     if (!Array.isArray(value)) {
         return undefined;

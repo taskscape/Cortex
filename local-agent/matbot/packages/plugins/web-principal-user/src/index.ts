@@ -16,7 +16,15 @@ import process from 'node:process';
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Registers the `WebPrincipalResolver` service: resolves every request to
+   * the `USER` environment variable (falling back to `"unknown"`), typed as
+   * the web frontend's `user` principal type.
+   *
+   * @param services - Machine services receiving the resolver registration.
+   */
   async setup(services: MatbotMachine) {
+    /** Derives the request principal from the `USER` env var, defaulting to `"unknown"`. */
     const resolver: WebPrincipalResolver = () => ({
       id:   process.env['USER'] ?? 'unknown',
       type: 'user',

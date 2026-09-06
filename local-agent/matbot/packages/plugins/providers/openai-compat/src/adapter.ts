@@ -1,10 +1,14 @@
 import type { ProviderAdapter, ProviderConfig, Message, Tool, CompletionEvent, HealthStatus } from '@matatbread/matbot-plugin-api';
-import { parseSSE, fetchWithRetry } from '@matatbread/matbot-providers-base';
+import { parseSSE, fetchWithRetry, withCompletionDeadline, type CompletionDeadline } from '@matatbread/matbot-providers-base';
 import { toOAIMessages, toOAITools } from './convert.js';
 
 const DEFAULT_ENDPOINT   = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_MAX_TOKENS = 4096;
 
+/**
+ * Feature switches read from `parameters.capabilities` that gate optional request fields
+ * (tools, parallel tool calls) for endpoints with varying OpenAI compatibility.
+ */
 interface OpenAICompatCapabilities {
   tools?:                boolean;
   images?:               boolean;
@@ -14,6 +18,13 @@ interface OpenAICompatCapabilities {
   interleaved_reasoning?: boolean;
 }
 
+/**
+ * Extract the `capabilities` object from provider parameters.
+ *
+ * @param config - Provider configuration whose `parameters.capabilities` is consulted.
+ * @returns The capabilities object, or an empty object when absent or not a plain object.
+ * @throws Never.
+ */
 function capabilities(config: ProviderConfig): OpenAICompatCapabilities {
   const value = config.parameters?.['capabilities'];
   return (typeof value === 'object' && value !== null && !Array.isArray(value))
@@ -21,6 +32,15 @@ function capabilities(config: ProviderConfig): OpenAICompatCapabilities {
     : {};
 }
 
+/**
+ * Resolve the chat-completions URL: `config.endpoint`, else `parameters.apiUrl`, else the OpenAI
+ * default; trailing slashes are trimmed and `/chat/completions` is appended unless already
+ * present.
+ *
+ * @param config - Provider configuration.
+ * @returns The absolute chat-completions endpoint URL.
+ * @throws Never.
+ */
 function endpoint(config: ProviderConfig): string {
   const raw = config.endpoint ?? (
     typeof config.parameters?.['apiUrl'] === 'string'
@@ -32,6 +52,13 @@ function endpoint(config: ProviderConfig): string {
   return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`;
 }
 
+/**
+ * Determine the output token cap sent with the request.
+ *
+ * @param config - Provider configuration; `parameters.maxOutputTokens` wins over `parameters.maxTokens`.
+ * @returns The token limit, defaulting to 4096 when neither parameter is set.
+ * @throws Never.
+ */
 function outputTokenLimit(config: ProviderConfig): number {
   const maxOutput = config.parameters?.['maxOutputTokens'];
   if (typeof maxOutput === 'number') return maxOutput;
@@ -44,6 +71,13 @@ function outputTokenLimit(config: ProviderConfig): number {
 // legacy gpt-4/3.5) still wants `max_tokens`; DeepSeek in particular *silently ignores*
 // `max_completion_tokens`, leaving the cap unenforced. So the field is chosen per model, with an
 // explicit `tokenLimitParam` override for names this heuristic can't anticipate.
+/**
+ * Choose the wire field name for the output token limit.
+ *
+ * @param config - Provider configuration; `parameters.tokenLimitParam` overrides the model-name heuristic.
+ * @returns `'max_completion_tokens'` for o-series/gpt-5/4o-style models, `'max_tokens'` otherwise.
+ * @throws Never.
+ */
 function tokenLimitParam(config: ProviderConfig): 'max_tokens' | 'max_completion_tokens' {
   const override = config.parameters?.['tokenLimitParam'];
   if (override === 'max_tokens' || override === 'max_completion_tokens') return override;
@@ -53,6 +87,10 @@ function tokenLimitParam(config: ProviderConfig): 'max_tokens' | 'max_completion
     : 'max_tokens';
 }
 
+/**
+ * One streamed choice delta: text, reasoning content, and/or incremental tool-call fragments
+ * keyed by `tool_calls[].index`.
+ */
 interface OAIDelta {
   role?:               string;
   content?:            string | null;
@@ -64,7 +102,12 @@ interface OAIDelta {
   }>;
 }
 
+/**
+ * One chat-completions SSE chunk: an optional error, per-choice deltas with finish reasons, and
+ * trailing usage totals.
+ */
 interface OAIChunk {
+  error?: { message?: string; type?: string };
   choices?: Array<{ delta?: OAIDelta; finish_reason?: string | null }>;
   usage?:   { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
 }
@@ -72,6 +115,16 @@ interface OAIChunk {
 // A tool call whose arguments never parsed (truncated at the token limit, malformed provider
 // output) is surfaced as a failed call instead of aborting the whole turn — the runner feeds a
 // corrective `is_error` result back so the model can retry (spec R4).
+/**
+ * Finalize one accumulated tool call, parsing its streamed argument JSON.
+ *
+ * @param call - The accumulated block state: tool-call id, name, and raw argument text.
+ * @param finishReason - The stream's finish reason, echoed into the parse error for guidance.
+ * @returns A `tool-call` event with the parsed `input`; on parse failure the raw text is returned
+ *          as `input` alongside a `parseError` message (bytes received plus finish-reason
+ *          guidance) instead of throwing.
+ * @throws Never.
+ */
 function flushToolCall(
   call: { id: string; name: string; args: string },
   finishReason: string | null,
@@ -104,7 +157,8 @@ export class OpenAICompatAdapter implements ProviderAdapter {
   readonly name: string;
 
   /**
-   * @param name Adapter name; defaults to `'openai-compat'`.
+   * Create an adapter, optionally under a custom profile name.
+   * @param name - Adapter name; defaults to `'openai-compat'`.
    */
   constructor(name = 'openai-compat') {
     this.name = name;
@@ -125,15 +179,35 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     tools:    readonly Tool[],
     signal:   AbortSignal,
   ): AsyncIterable<CompletionEvent> {
-    return this.stream(messages, config, tools, signal);
+    return withCompletionDeadline(signal, config.parameters, deadline => this.stream(messages, config, tools, deadline));
   }
 
+  /**
+   * Stream one OpenAI-compatible chat completion and translate it into matbot completion events.
+   *
+   * Builds the request body (model, model-appropriate token-limit field, messages, `stream: true`
+   * with `include_usage`, tools unless `capabilities.tools` is `false`, optional
+   * `parallel_tool_calls` and `temperature`, opt-in Anthropic-style cache breakpoints) and POSTs
+   * it via {@link fetchWithRetry} bounded by `deadline.requestTimeoutMs`. Chunks are parsed with
+   * {@link parseSSE}: usage is split into fresh versus cached input tokens, `reasoning_content`
+   * streams as thinking deltas, `content` as text deltas, and tool-call arguments accumulate by
+   * index and are flushed after a recognized terminal `finish_reason` (`tool_calls`, `stop`, or
+   * `length`). A completion that produced nothing is logged as a warning rather than failing.
+   *
+   * @param messages - The conversation, including system, tool, and reasoning content.
+   * @param config - Provider configuration (endpoint/model/apiUrl, credentials, parameters such as `capabilities`, `promptCache`, `tokenLimitParam`).
+   * @param tools - Tools offered to the model (omitted when capabilities say `tools: false`).
+   * @param deadline - Completion lifetime combining the caller's signal with request/idle/overall deadlines.
+   * @returns Stream of usage/text/thinking/tool-call events ending with `done`.
+   * @throws Error - On a non-OK HTTP response, malformed JSON, a non-object event, a chunk carrying an `error` field, content arriving after the finish reason, or a missing/unrecognized terminal `finish_reason`. Caller/deadline aborts propagate the combined signal's reason.
+   */
   private async *stream(
     messages: Message[],
     config:   ProviderConfig,
     tools:    readonly Tool[],
-    signal:   AbortSignal,
+    deadline: CompletionDeadline,
   ): AsyncIterable<CompletionEvent> {
+    const signal = deadline.signal;
     const endpointUrl = endpoint(config);
     const apiKey   = config.credentials?.['apiKey'] ?? '';
     const caps     = capabilities(config);
@@ -171,7 +245,9 @@ export class OpenAICompatAdapter implements ProviderAdapter {
       },
       body:   JSON.stringify(body),
       signal,
-    });
+    }, undefined, { timeoutMs: deadline.requestTimeoutMs });
+
+    deadline.progress();
 
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => res.statusText);
@@ -187,9 +263,13 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     let sawAny     = false;
     let lastFinish: string | null | undefined;
 
-    for await (const line of parseSSE(res.body)) {
+    for await (const line of parseSSE(res.body, signal)) {
       let chunk: OAIChunk;
-      try { chunk = JSON.parse(line) as OAIChunk; } catch { continue; }
+      try { chunk = JSON.parse(line) as OAIChunk; }
+      catch { throw new Error('OpenAI-compatible stream contained malformed JSON.'); }
+      if (chunk === null || typeof chunk !== 'object') throw new Error('OpenAI-compatible stream contained an invalid event.');
+      if (chunk.error) throw new Error(`OpenAI-compatible stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
+      deadline.progress();
 
       // Usage (some providers send at end of stream). `prompt_tokens` is the full input including any
       // cache hit; `prompt_tokens_details.cached_tokens` is the cached portion (OpenAI auto-cache,
@@ -211,6 +291,9 @@ export class OpenAICompatAdapter implements ProviderAdapter {
 
       const delta = choice.delta ?? {};
 
+      if (lastFinish && (delta.content || delta.reasoning_content || delta.tool_calls?.length)) {
+        throw new Error('OpenAI-compatible stream contained content after its finish reason.');
+      }
       if (choice.finish_reason) lastFinish = choice.finish_reason;
 
       if (delta.reasoning_content) {
@@ -239,26 +322,15 @@ export class OpenAICompatAdapter implements ProviderAdapter {
         }
       }
 
-      // 'length' is OpenAI's truncation reason (the analogue of Anthropic's max_tokens) — treat
-      // it as terminal too, so a tool call cut off mid-arguments is flushed and surfaced here
-      // rather than silently dropped to the fallback below.
-      if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'stop' || choice.finish_reason === 'length') {
-        if (reasoningAcc) {
-          yield { type: 'reasoning-block', reasoning: reasoningAcc };
-          reasoningAcc = '';
-        }
-        for (const [, call] of toolAccum) {
-          yield flushToolCall(call, choice.finish_reason);
-        }
-        toolAccum.clear();
-        yield { type: 'done' };
-      }
     }
 
-    // Fallback if the stream ended without a finish_reason (e.g. a dropped connection).
+    // Wait through trailing usage/error frames before releasing executable calls.
+    if (!lastFinish || !['tool_calls', 'stop', 'length'].includes(lastFinish)) {
+      throw new Error(`OpenAI-compatible completion is incomplete or rejected: finish_reason=${lastFinish ?? '(missing)'}.`);
+    }
     if (reasoningAcc) yield { type: 'reasoning-block', reasoning: reasoningAcc };
     for (const [, call] of toolAccum) {
-      yield flushToolCall(call, lastFinish ?? null);
+      yield flushToolCall(call, lastFinish);
     }
 
     if (!sawAny) {

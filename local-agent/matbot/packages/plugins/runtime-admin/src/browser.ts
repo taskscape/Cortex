@@ -12,7 +12,21 @@ declare module '@matatbread/matbot-plugin-api' {
         readonly BrowserPluginPersistence?: ExtraPlugins;
     }
 }
-export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION, async setup(services) {
+export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION,
+    /**
+     * Boots the browser runtime-admin plugin: contributes the admin web UI, then registers the
+     * browser `plugin` and `provider` management tools.
+     *
+     * Assumes the browser host has already mounted `BrowserProviderAdmin` and
+     * `BrowserPluginPersistence` (provided by the browser persistence plugin); this plugin does not
+     * register them itself.
+     *
+     * @param services - The service registry handed to every plugin's setup; read for contributions,
+     *   the two required browser services, and the tool registration surface.
+     * @returns Resolves once both tools are registered.
+     * @throws Error - If `BrowserProviderAdmin` or `BrowserPluginPersistence` is absent.
+     */
+    async setup(services) {
         services.contributions?.register('webui', 'runtime', uiContribution);
         if (!services.BrowserProviderAdmin || !services.BrowserPluginPersistence)
             throw new Error('runtime-admin requires browser persistence');

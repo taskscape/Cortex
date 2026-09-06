@@ -1,6 +1,7 @@
 import type { KnowledgeEntry } from "./types.js";
 import { makeKnowledgeEntry } from "./entry.js";
 
+/** Options for constructing a {@link Mem0Client}. */
 export interface Mem0ClientOptions {
   baseUrl: string;
   apiKey?: string;
@@ -103,6 +104,16 @@ export class Mem0Client {
     }).filter(entry => entry.content.length > 0);
   }
 
+  /**
+   * POST to the first candidate endpoint that works: 404 responses fall through to the
+   * next path, other non-OK statuses and network errors are captured (a later path may
+   * still succeed), and the last error is rethrown once all paths are exhausted.
+   * @param paths Candidate endpoint paths, tried in order.
+   * @param init Fetch init (method, body, optional signal); content-type and the
+   *        bearer token header are added here.
+   * @returns The parsed JSON body, or `{}` for a 204 response.
+   * @throws Error — the last captured failure when every candidate endpoint fails.
+   */
   private async request(paths: string[], init: RequestInit): Promise<Record<string, unknown> | unknown[]> {
     let lastError: unknown;
 
@@ -139,20 +150,44 @@ export class Mem0Client {
   }
 }
 
+/**
+ * Coerce an unknown value into a plain object record.
+ * @param value Value to inspect.
+ * @returns The value when it is a non-array object, else `{}`.
+ * @throws Never.
+ */
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
 }
 
+/**
+ * Narrow an unknown value to a non-empty string.
+ * @param value Value to inspect.
+ * @returns The string, or undefined when empty or not a string.
+ * @throws Never.
+ */
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Narrow an unknown value to a finite number.
+ * @param value Value to inspect.
+ * @returns The number, or undefined when not a finite number.
+ * @throws Never.
+ */
 function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Narrow an unknown value to a non-empty array of non-empty strings.
+ * @param value Value to inspect.
+ * @returns The filtered strings, or undefined when absent, empty, or malformed.
+ * @throws Never.
+ */
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;

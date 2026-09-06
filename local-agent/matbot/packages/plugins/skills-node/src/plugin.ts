@@ -20,6 +20,10 @@ export interface SkillsNodePluginConfig {
  * local filesystem watch" — so it hard-depends on the base (declared in package.json) and reuses
  * its setup directly via {@link setupSkills}, then attaches a `.md` importer/watcher to the same
  * SkillManager. One plugin, one lifecycle: no second resident plugin, no service discovery.
+ *
+ * @param config - Plugin configuration; `skillsDir` is required, `pollMs` optional.
+ * @returns The plugin specification.
+ * @throws Never.
  */
 export function createSkillsNodePlugin(config: SkillsNodePluginConfig): MatbotPluginSpec {
   let abortController: AbortController | undefined;
@@ -32,6 +36,13 @@ export function createSkillsNodePlugin(config: SkillsNodePluginConfig): MatbotPl
       description: 'Node skills: embeds @matatbread/matbot-skills CRUD and adds a local filesystem (.md) import + watch.',
     },
 
+    /**
+     * Explains that skills load on demand by name and how to wire automatic application through
+     * the triggers plugin.
+     *
+     * @returns The installation message text.
+     * @throws Never.
+     */
     async installationMessage() {
       return 'Skills are active (skill_action, plus a local .md import + watch). A skill is loaded on ' +
         'demand by name; to make one apply automatically on a behavioural condition, add a trigger ' +
@@ -39,6 +50,15 @@ export function createSkillsNodePlugin(config: SkillsNodePluginConfig): MatbotPl
         '@matatbread/matbot-triggers for that.';
     },
 
+    /**
+     * Runs the shared skills setup and starts the `.md` directory watcher against a fresh abort
+     * controller; both are stopped again in teardown.
+     *
+     * @param services - Runtime machine passed through to {@link setupSkills}.
+     * @returns A promise that resolves once the manager is loaded and the watcher started (the
+     *   watcher itself runs detached).
+     * @throws Error - Propagates {@link setupSkills} failures (store load, registration).
+     */
     async setup(services) {
       const manager = await setupSkills(services);
       clear = () => manager.clear();
@@ -47,6 +67,13 @@ export function createSkillsNodePlugin(config: SkillsNodePluginConfig): MatbotPl
       void watchAndImportSkillDir(config.skillsDir, manager, abortController.signal, config.pollMs);
     },
 
+    /**
+     * Aborts the directory watcher and clears the manager's in-memory state (ending its
+     * mounted-swap subscription and in-flight analyses).
+     *
+     * @returns A promise that resolves once both stops have run (no-ops when setup never ran).
+     * @throws Never.
+     */
     async teardown() {
       abortController?.abort();
       clear?.();

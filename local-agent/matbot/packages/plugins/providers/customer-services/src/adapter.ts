@@ -30,10 +30,29 @@ const RESPONSES = [
   'For security purposes, please confirm your date of birth, mother’s maiden name, and the name of your first pet before we proceed.',
 ] as const;
 
+/**
+ * Pick a uniformly random element from a non-empty array.
+ *
+ * @typeParam T - The element type.
+ * @param arr - The array to pick from; assumed non-empty.
+ * @returns One element chosen at random.
+ * @throws Never.
+ */
 function pick<T>(arr: readonly T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]!;
 }
 
+/**
+ * Resolve after `ms` milliseconds, rejecting if `signal` aborts during the wait.
+ *
+ * Note that a signal already aborted before the call does not interrupt the wait — the `abort`
+ * event never fires a second time, so the timer runs to completion.
+ *
+ * @param ms - The delay duration in milliseconds.
+ * @param signal - Abort signal observed during the wait.
+ * @returns A promise that resolves once the delay elapses.
+ * @throws `Error('aborted')` - When `signal` fires before the delay elapses.
+ */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -65,6 +84,15 @@ export class CustomerServicesAdapter implements ProviderAdapter {
     return this.stream(signal);
   }
 
+  /**
+   * Produce the mock stream: two to five random "thinking" phrases spread over up to ~3 seconds,
+   * then one combined thinking-block with a fake signature, then a canned response streamed
+   * character by character, then `done`.
+   *
+   * @param signal - Aborting during the thinking delays ends the stream early and silently.
+   * @returns Stream of thinking/text events ending with `done`.
+   * @throws Never.
+   */
   private async *stream(signal: AbortSignal): AsyncIterable<CompletionEvent> {
     const count    = 2 + Math.floor(Math.random() * 4);
     const totalMs  = Math.random() * 3000;

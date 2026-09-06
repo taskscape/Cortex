@@ -22,7 +22,14 @@ declare module '@matatbread/matbot-plugin-api' {
 }
 
 /** One-shot reachability probe for a pinned provider, used only when forming installationMessage
- *  (install/reload) — never on the hot path. Fails soft: a thrown error becomes `{ ok: false }`. */
+ *  (install/reload) — never on the hot path. Fails soft: a thrown error becomes `{ ok: false }`.
+ *
+ * @param services - The captured machine; provides the probe turn and provider access.
+ * @param provider - The provider id to probe.
+ * @returns `{ ok: true }` when the provider answered, or `{ ok: false, error }` with the failure
+ *   message.
+ * @throws Never — all probe failures are captured into the result.
+ */
 async function testProvider(services: MatbotMachine, provider: string): Promise<{ ok: boolean; error?: string }> {
   try {
     await services.singleTurn({ provider, prompt: 'Reply with "ok".', signal: AbortSignal.timeout(15000) });
@@ -35,26 +42,41 @@ async function testProvider(services: MatbotMachine, provider: string): Promise<
 // Multiple fired triggers' results are joined with a separator.
 const JOIN = '\n\n---\n\n';
 
-// Out-of-band tool output is delivered by folding it onto the user turn (user phase / agent retract)
-// or as a robo turn (agent followup). Without a provenance marker the model reads it as the user
-// speaking — observed in testing: the model's own thinking said "the user wants me to follow the
-// skill…" about a system-injected directive. The dispatcher stays a dumb transport (it injects
-// whatever a tool yields); this fence is the triggers plugin's own framing, marking the payload as
-// system-supplied so the model treats it as context to act on, not a user utterance. A tool whose
-// result is already a directive (e.g. `skill_action(use)`) self-frames *what* to do; the fence adds
-// *who* supplied it — orthogonal, composes cleanly.
+/**
+ * Out-of-band tool output is delivered by folding it onto the user turn (user phase / agent retract)
+ * or as a robo turn (agent followup). Without a provenance marker the model reads it as the user
+ * speaking — observed in testing: the model's own thinking said "the user wants me to follow the
+ * skill…" about a system-injected directive. The dispatcher stays a dumb transport (it injects
+ * whatever a tool yields); this fence is the triggers plugin's own framing, marking the payload as
+ * system-supplied so the model treats it as context to act on, not a user utterance. A tool whose
+ * result is already a directive (e.g. `skill_action(use)`) self-frames *what* to do; the fence adds
+ * *who* supplied it — orthogonal, composes cleanly.
+ *
+ * @param body - The joined tool outputs to deliver.
+ * @returns The body wrapped in system-provenance open/close markers.
+ * @throws Never.
+ */
 function fence(body: string): string {
   return `[Additional context — supplied by the system, not part of the user's message. ` +
     `Take it into account when responding.]\n\n${body}\n\n[End of additional context.]`;
 }
 
-// A durable trace of a user-phase injection. For `ephemeral-inject` the injected `text` is never
-// otherwise persisted, so without this a post-mortem can't see what the system fed the model before it
-// answered; for `durable-inject` the text IS persisted (folded onto the user turn), so `text` is
-// omitted and the marker records only WHICH condition fired and why. LLM-invisible like any marker; a
-// frontend may ignore it (diagnostic, not user-facing). `triggers` are the firing sources (id +
-// matched conditions). (The agent-phase injections are traced elsewhere: a retract redo's context by
-// the core retraction marker, and a `followup` resubmit by its persisted robo turn.)
+/**
+ * A durable trace of a user-phase injection. For `ephemeral-inject` the injected `text` is never
+ * otherwise persisted, so without this a post-mortem can't see what the system fed the model before it
+ * answered; for `durable-inject` the text IS persisted (folded onto the user turn), so `text` is
+ * omitted and the marker records only WHICH condition fired and why. LLM-invisible like any marker; a
+ * frontend may ignore it (diagnostic, not user-facing). `triggers` are the firing sources (id +
+ * matched conditions). (The agent-phase injections are traced elsewhere: a retract redo's context by
+ * the core retraction marker, and a `followup` resubmit by its persisted robo turn.)
+ *
+ * @param event - Which delivery produced the injection: `'ephemeral-inject'` or `'durable-inject'`.
+ * @param triggers - The firing sources (trigger id + matched conditions) contributing to it.
+ * @param text - The joined injected text; only carried for ephemeral injections, whose text would
+ *   otherwise never be persisted.
+ * @returns The marker message content.
+ * @throws Never.
+ */
 function injectionMarker(event: 'ephemeral-inject' | 'durable-inject', triggers: FiredSource[], text?: string): MessageContent {
   return { type: 'marker', creator: 'triggers', data: { event, surface: 'user', triggers, ...(text !== undefined ? { text } : {}) } };
 }
@@ -64,37 +86,71 @@ function injectionMarker(event: 'ephemeral-inject' | 'durable-inject', triggers:
 // depends only on plugin-api, not core. Keep in sync with RETRACTION_CREATOR there.
 const RETRACTION_CREATOR = 'matbot-retraction';
 
-// Suppression is NEVER silent: when a guard holds a trigger back, it leaves this marker naming the
-// `cause` (a machine tag), a human `reason`, and the triggers (id + matched conditions) — so "why
-// didn't it fire?" is answerable from the session months later rather than from a remembered heuristic.
-// `retractFiredMarker` records which triggers/conditions caused a retract. Both are LLM-invisible
-// diagnostics. The convergence guard reads back BOTH retract-fired AND its own `retract-convergence`
-// suppressions (see retractActiveLastTurn).
+/**
+ * Why a firing was held back: the user turn was already processed on a retract redo (`user-redo`),
+ * a retract rule is still matching after firing last turn (`retract-convergence`), or a followup was
+ * superseded by a retract on the same turn (`followup-shadowed`). Recorded by
+ * {@link suppressedMarker}.
+ */
 type SuppressCause = 'user-redo' | 'retract-convergence' | 'followup-shadowed';
+/**
+ * Suppression is NEVER silent: when a guard holds a trigger back, it leaves this marker naming the
+ * `cause` (a machine tag), a human `reason`, and the triggers (id + matched conditions) — so "why
+ * didn't it fire?" is answerable from the session months later rather than from a remembered heuristic.
+ * LLM-invisible diagnostic. The convergence guard reads back BOTH {@link retractFiredMarker} output
+ * AND its own `retract-convergence` suppressions (see {@link retractActiveLastTurn}).
+ *
+ * @param cause - Machine-readable suppression cause (see {@link SuppressCause}).
+ * @param reason - Human-readable explanation, recorded verbatim.
+ * @param triggers - The firing sources that were held back.
+ * @returns The marker message content.
+ * @throws Never.
+ */
 function suppressedMarker(cause: SuppressCause, reason: string, triggers: FiredSource[]): MessageContent {
   return { type: 'marker', creator: 'triggers', data: { event: 'suppressed', cause, reason, triggers } };
 }
+/**
+ * Records which triggers/conditions caused a retract, so the next turn's convergence guard can see
+ * the firing (and a post-mortem can answer "why was the answer redone?"). LLM-invisible diagnostic.
+ *
+ * @param triggers - The retract firing sources.
+ * @returns The marker message content.
+ * @throws Never.
+ */
 function retractFiredMarker(triggers: FiredSource[]): MessageContent {
   return { type: 'marker', creator: 'triggers', data: { event: 'retract-fired', triggers } };
 }
 
-// True when the latest turn is a retract-redo: a `matbot-retraction` marker sits after the last genuine
-// (non-robo) user message — i.e. this user message was already processed on the original attempt, so
-// user-phase (ephemeral/contextual) triggers and their side effects already fired. Re-firing them on the
-// redo is the duplicate-side-effect bug; skip them.
+/**
+ * True when the latest turn is a retract-redo: a `matbot-retraction` marker sits after the last genuine
+ * (non-robo) user message — i.e. this user message was already processed on the original attempt, so
+ * user-phase (ephemeral/contextual) triggers and their side effects already fired. Re-firing them on the
+ * redo is the duplicate-side-effect bug; skip them.
+ *
+ * @param messages - The session messages to scan.
+ * @returns Whether the current user turn is a retraction redo.
+ * @throws Never.
+ */
 function isRetractRedo(messages: Message[]): boolean {
   const lastUser = messages.findLastIndex(m => m.role === 'user' && !m.content.every(c => c.origin === 'robo'));
   if (lastUser < 0) return false;
   return messages.slice(lastUser + 1).some(m => m.content.some(c => c.type === 'marker' && c.creator === RETRACTION_CREATOR));
 }
 
-// Retract trigger ids that were ACTIVE on the PREVIOUS turn (the region between the second-to-last and
-// last genuine user messages) — active meaning the rule either fired a retract OR was itself held off by
-// the convergence guard. Counting suppressions too is what makes the guard *converge* rather than
-// oscillate: a rule that keeps matching stays held off turn after turn (each suppression re-arms the
-// guard), instead of firing every other turn because a suppressed turn left no trace. It un-sticks only
-// when the rule genuinely stops matching for a turn (no marker), after which it may fire fresh. A
-// well-behaved rule self-terminates and never lands here.
+/**
+ * Retract trigger ids that were ACTIVE on the PREVIOUS turn (the region between the second-to-last and
+ * last genuine user messages) — active meaning the rule either fired a retract OR was itself held off by
+ * the convergence guard. Counting suppressions too is what makes the guard *converge* rather than
+ * oscillate: a rule that keeps matching stays held off turn after turn (each suppression re-arms the
+ * guard), instead of firing every other turn because a suppressed turn left no trace. It un-sticks only
+ * when the rule genuinely stops matching for a turn (no marker), after which it may fire fresh. A
+ * well-behaved rule self-terminates and never lands here.
+ *
+ * @param messages - The session messages to scan.
+ * @returns The set of trigger ids active on the previous turn (empty when there is no previous-turn
+ *   region to inspect).
+ * @throws Never.
+ */
 function retractActiveLastTurn(messages: Message[]): Set<string> {
   const userIdxs: number[] = [];
   messages.forEach((m, i) => { if (m.role === 'user' && !m.content.every(c => c.origin === 'robo')) userIdxs.push(i); });
@@ -117,6 +173,14 @@ function retractActiveLastTurn(messages: Message[]): Set<string> {
   return ids;
 }
 
+/**
+ * Joins a message's text blocks with newlines.
+ *
+ * @param msg - The message to read; undefined, or a message with no text blocks, yields the empty
+ *   string.
+ * @returns The concatenated text content.
+ * @throws Never.
+ */
 function textOf(msg: Message | undefined): string {
   return msg?.content.filter(c => c.type === 'text').map(c => c.text).join('\n') ?? '';
 }
@@ -140,6 +204,11 @@ function textOf(msg: Message | undefined): string {
  *
  * Returns the manager so a specialization (a node watcher, say) could attach to the same instance.
  * Uses only web-platform APIs.
+ *
+ * @param services - The matbot machine to wire into (stores, hooks, tools, registry, mount table).
+ * @returns The live manager; a second call on the same machine hands back the existing one
+ *   (idempotent on the registered `Triggers` service, not on any module flag).
+ * @throws If store creation, service registration, or hook registration rejects.
  */
 export async function setupTriggers(services: MatbotMachine): Promise<TriggerManager> {
   // Idempotent on the registered service, not a module flag (a re-import would reset a flag; the
@@ -322,6 +391,11 @@ export async function setupTriggers(services: MatbotMachine): Promise<TriggerMan
  * matched, invoke a tool. CRUD via `trigger_action`; the `agent`/`user` conditions are evaluated by a
  * classifier provider (pinned via `triggers_config`, else the turn's own provider). Runs in both Node
  * and the browser.
+ *
+ * @returns The plugin specification: `setup` wires the subsystem (idempotent), `teardown` clears the
+ *   manager, and `installationMessage` reports classifier-provider status (probing the pinned
+ *   provider with a 15 s timeout when one is set).
+ * @throws Never.
  */
 export function createTriggersPlugin(): MatbotPluginSpec {
   let manager:  TriggerManager  | undefined;
@@ -337,6 +411,14 @@ export function createTriggersPlugin(): MatbotPluginSpec {
       description: 'Data-driven hooks: stored conditions that invoke a tool when an LLM classifier judges them matched. CRUD via trigger_action. Cross-runtime (node + browser).',
     },
 
+    /**
+     * Reports trigger activation plus classifier-provider status: which provider judges conditions
+     * (pinned via triggers_config, the legacy default, or the turn's own) and — when pinned —
+     * whether it answered a test probe ({@link testProvider}).
+     *
+     * @returns The installation message text.
+     * @throws Never — probe failures are folded into the message.
+     */
     async installationMessage() {
       if (!captured) return base;
       const pinned    = await captured.settings().get<string>('classifierProvider');
@@ -359,11 +441,24 @@ export function createTriggersPlugin(): MatbotPluginSpec {
           : `did NOT respond: ${probe.error}. It falls back to the turn's own provider until fixed.`);
     },
 
+    /**
+     * Captures the machine and wires the triggers subsystem via {@link setupTriggers}.
+     *
+     * @param services - The machine to wire into.
+     * @returns Resolves when wiring completes.
+     * @throws If {@link setupTriggers} throws.
+     */
     async setup(services) {
       captured = services;
       manager  = await setupTriggers(services);
     },
 
+    /**
+     * Tears the manager down: aborts its lifecycle signal and drops in-memory trigger state.
+     *
+     * @returns Resolves immediately.
+     * @throws Never.
+     */
     async teardown() {
       manager?.clear();
     },

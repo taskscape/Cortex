@@ -1,9 +1,11 @@
 import type { Tool, ToolExecutor, ToolContext, ToolEvent, MatbotMachine } from '@matatbread/matbot-plugin-api';
 import type { SkillManager } from './manager.js';
 
-// The precise per-action contract. JSON Schema can't express "content required only for save"
-// without an awkward oneOf, so the schema stays loose and the description carries this TypeScript
-// discriminated union — which LLMs read accurately — as the source of truth. The executor enforces it.
+/**
+ * The precise per-action contract. JSON Schema can't express "content required only for save"
+ * without an awkward oneOf, so the schema stays loose and the description carries this TypeScript
+ * discriminated union — which LLMs read accurately — as the source of truth. The executor enforces it.
+ */
 type SkillInput =
   | { action: 'list' }
   | { action: 'load';     name: string }
@@ -17,6 +19,7 @@ type SkillInput =
  * bound to the given manager.
  * @param manager - The live skill set.
  * @returns The `skill_action` tool.
+ * @throws Never.
  */
 export function createSkillTool(manager: SkillManager): Tool {
   const executor: ToolExecutor = {
@@ -136,6 +139,10 @@ export function createSkillTool(manager: SkillManager): Tool {
  * providers, not a new one: unset, analysis falls back to the first configured provider (so it works
  * with zero config); set it to pin a specific — e.g. cheap, fast — model. Resolved per analysis, so a
  * change takes effect on the next reindex without a restart.
+ *
+ * @param services - Runtime machine providing settings and the configured providers.
+ * @returns The `skills_config` tool.
+ * @throws Never.
  */
 export function createSkillsConfigTool(services: MatbotMachine): Tool {
   const KEY = 'analysisProvider';

@@ -8,8 +8,21 @@ import { isBinary, recordRead, requireFreshRead, summarizeDiff } from './fsutil.
 const READ_LINE_CAP   = 2000;
 const READ_BYTE_CAP   = 50_000;
 
+/**
+ * Parsed input of the `read` tool: an absolute workspace path plus an optional
+ * 1-indexed line window.
+ */
 interface ReadInput { filePath: string; offset?: number; limit?: number }
 
+/**
+ * Formats lines with 6-character space-padded 1-based line numbers followed by a
+ * tab, truncating any line longer than {@link READ_LINE_CAP} characters with an
+ * ellipsis marker.
+ *
+ * @param lines Lines to render.
+ * @param startLine Number assigned to the first line of `lines`.
+ * @returns The numbered listing joined with newlines.
+ */
 function formatNumbered(lines: readonly string[], startLine: number): string {
   return lines.map((line, i) => {
     const text = line.length > READ_LINE_CAP ? `${line.slice(0, READ_LINE_CAP)}… [line truncated]` : line;
@@ -104,6 +117,9 @@ export const readTool: Tool = defineTool({
   },
 });
 
+/**
+ * Parsed input of the `write` tool: an absolute workspace path and the full new contents.
+ */
 interface WriteInput { filePath: string; content: string }
 
 export const writeTool: Tool = defineTool({
@@ -154,8 +170,23 @@ export const writeTool: Tool = defineTool({
   },
 });
 
+/**
+ * Parsed input of the `edit` tool: target path, exact text to replace, its
+ * replacement, and an optional replace-all flag.
+ */
 interface EditInput { filePath: string; oldString: string; newString: string; replaceAll?: boolean }
 
+/**
+ * Counts occurrences of `oldString` in `content` and replaces them, enforcing
+ * uniqueness unless `replaceAll` is set.
+ *
+ * @param content Text to search.
+ * @param oldString Exact text to replace; must occur at least once.
+ * @param newString Replacement text.
+ * @param replaceAll When true, replace every occurrence; otherwise more than one occurrence is an error.
+ * @returns The updated text and the number of replacements performed.
+ * @throws HarnessError - With code `invalid_input` when `oldString` matches more than once and `replaceAll` is false, or code `not_found` when it matches nothing.
+ */
 export function applyReplacement(content: string, oldString: string, newString: string, replaceAll: boolean): { text: string; replacements: number } {
   let count = 0;
   let idx = content.indexOf(oldString);

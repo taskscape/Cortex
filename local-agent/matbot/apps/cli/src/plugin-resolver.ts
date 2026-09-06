@@ -5,7 +5,14 @@ import { startDir } from './plugin-description.js';
 
 const VALID_RUNTIMES: readonly Runtime[] = ['node', 'browser'];
 
-/** Coerce a raw package.json `matbotRuntime` value into a runtime list, or undefined if absent/malformed. */
+/**
+ * Coerce a raw package.json `matbotRuntime` value into a runtime list, or undefined if absent/malformed.
+ * Logs a warning for non-array values and for unknown entries, filtering the latter out.
+ * @param raw - The raw value; `undefined` means "not declared".
+ * @param pkgName - Package name used in warning messages.
+ * @returns The valid entries (possibly empty), or `undefined` when the value is absent or not an array.
+ * @throws Never.
+ */
 function normalizeRuntimes(raw: unknown, pkgName: string): readonly Runtime[] | undefined {
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw)) {
@@ -29,9 +36,20 @@ function normalizeRuntimes(raw: unknown, pkgName: string): readonly Runtime[] | 
  * A bare npm name is already the package name and passes through. A path / file: URL is resolved to
  * a start directory and the nearest package.json walked up to; its `name` wins, falling back to the
  * directory's basename if no package.json carries one.
+ * @param baseDir - Project directory that path/module resolution anchors against.
+ * @returns A {@link PluginResolver} whose `identify`/`runtimes` read the plugin's package.json.
+ * @throws Never.
  */
 export function nodePluginResolver(baseDir: string): PluginResolver {
   return {
+    /**
+     * Derive a plugin's canonical name from its specifier: bare npm names pass through; path-like
+     * specifiers resolve to a start directory and walk up to the nearest package.json carrying a
+     * `name`, falling back to the start directory's basename at the filesystem root.
+     * @param specifier - The specifier the plugin was loaded with.
+     * @returns The canonical package name.
+     * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
+     */
     async identify(specifier: string): Promise<string> {
       const bare = (specifier.split('?')[0]) ?? specifier;
       const isPathLike = bare.startsWith('file://') || bare.startsWith('./') ||
@@ -53,9 +71,13 @@ export function nodePluginResolver(baseDir: string): PluginResolver {
       }
     },
 
-    // Read `matbotRuntime` off the plugin's package.json — the nearest one with a `name`, the same
-    // boundary identify() uses — so a declaration on the plugin (not an enclosing monorepo root) wins.
-    // Undefined means "not declared": the loader then imports and falls back to load/rollback.
+    /**
+     * Read `matbotRuntime` off the plugin's package.json — the nearest one with a `name`, the same
+     * boundary identify() uses — so a declaration on the plugin (not an enclosing monorepo root) wins.
+     * @param specifier - The specifier the plugin was loaded with.
+     * @returns The declared, normalized runtime list, or `undefined` meaning "not declared": the loader then imports and falls back to load/rollback.
+     * @throws TypeError - For a malformed `file:` specifier (via {@link startDir}).
+     */
     async runtimes(specifier: string): Promise<readonly Runtime[] | undefined> {
       let dir = startDir(specifier, baseDir);
       if (dir === undefined) return undefined;

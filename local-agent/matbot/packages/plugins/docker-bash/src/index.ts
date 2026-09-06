@@ -10,6 +10,10 @@ import process from 'node:process';
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+/**
+ * Static configuration for the persistent bash container. Defaults live in {@link CONTAINER};
+ * only the fields in {@link BashConfigOverrides} are user-configurable at runtime.
+ */
 interface ContainerConfig {
   /** Docker image to create the container from. */
   image:       string;
@@ -54,6 +58,17 @@ const SETTINGS_KEY = 'configOverrides';
 // timeout of e.g. 99999999999 would kill the command instantly.
 const MAX_TIMEOUT_MS = 2_147_000_000;
 
+/**
+ * Clamp a tool-supplied timeout to a safe setTimeout value.
+ *
+ * setTimeout wraps delays above 2^31-1 (and below 1) down to ~1ms, so an unsanitized
+ * LLM-supplied timeout such as 99999999999 would kill the command instantly. Non-positive,
+ * non-finite, and non-numeric inputs yield undefined (no timeout).
+ *
+ * @param timeout - Requested timeout in milliseconds; undefined or invalid means "no timeout".
+ * @returns The truncated timeout capped at {@link MAX_TIMEOUT_MS}, or undefined when no valid timeout was supplied.
+ * @throws Never.
+ */
 function sanitizeTimeout(timeout: number | undefined): number | undefined {
   return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
     ? Math.min(Math.trunc(timeout), MAX_TIMEOUT_MS)
@@ -65,6 +80,13 @@ type BashConfigOverrides = Partial<Pick<ContainerConfig, 'dns' | 'name' | 'maxOu
 
 // ── Docker helpers ────────────────────────────────────────────────────────────
 
+/**
+ * Run the Docker CLI and capture its trimmed stdout.
+ *
+ * @param args - Argument vector passed to the `docker` executable (no shell).
+ * @returns The command's trimmed stdout.
+ * @throws Error - "Docker CLI not found" when docker is missing from PATH (ENOENT); otherwise the trimmed stderr or the underlying error message.
+ */
 function dockerExec(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile('docker', args, (err, stdout, stderr) => {
@@ -81,6 +103,11 @@ function dockerExec(args: string[]): Promise<string> {
  * Kill the whole process group of a running command (best-effort). docker exec does not propagate
  * signals to the in-container process, so the host reads the group-leader PID the wrapper recorded
  * and KILLs the negative pid (the process group) — taking the script and every child it spawned.
+ *
+ * @param containerName - Container to run the group kill in.
+ * @param hostPidfile - Host-side pidfile holding the recorded process-group leader pid.
+ * @returns Nothing.
+ * @throws Never - Missing or invalid pidfiles and docker failures are swallowed.
  */
 async function killGroup(containerName: string, hostPidfile: string): Promise<void> {
   let pid: string;
@@ -96,6 +123,13 @@ async function killGroup(containerName: string, hostPidfile: string): Promise<vo
 /** The literal `dns` entry that expands to the host's resolvers at container-create time. */
 const HOST_DNS_TOKEN = 'host';
 
+/**
+ * Remove a trailing :port from a DNS server address.
+ *
+ * @param addr - Address, optionally carrying a port (`[v6]:port`, `v4:port`, or bare).
+ * @returns The address without its port; bare addresses pass through unchanged.
+ * @throws Never.
+ */
 function stripPort(addr: string): string {
   const v6 = /^\[(.+)\]:\d+$/.exec(addr);              // [2001:db8::1]:53
   if (v6) return v6[1]!;
@@ -104,12 +138,23 @@ function stripPort(addr: string): string {
   return addr;                                          // bare IPv4 / IPv6
 }
 
-/** Addresses no container could usefully use as a DNS server: invalid, loopback, or link-local. */
+/**
+ * Addresses no container could usefully use as a DNS server: invalid, loopback, or link-local.
+ *
+ * @param addr - Candidate resolver address (already stripped of any port).
+ * @returns True when the address is a valid IP that is neither loopback nor link-local.
+ * @throws Never.
+ */
 function isReachableResolver(addr: string): boolean {
   return isIP(addr) !== 0 && !addr.startsWith('127.') && addr !== '::1' && !addr.startsWith('169.254.');
 }
 
-/** This machine's non-internal IPv4 addresses (LAN IP, Docker bridge gateway, …) via os, cross-platform. */
+/**
+ * This machine's non-internal IPv4 addresses (LAN IP, Docker bridge gateway, …) via os, cross-platform.
+ *
+ * @returns All IPv4 addresses of non-internal interfaces, in interface order; duplicates are possible.
+ * @throws Never.
+ */
 function localMachineIPv4s(): string[] {
   const out: string[] = [];
   for (const ifaces of Object.values(networkInterfaces())) {
@@ -126,6 +171,9 @@ function localMachineIPv4s(): string[] {
  * on 127.x that a container can't reach — fall back to this machine's own IP(s), so the container
  * queries the host over the network (the resolver must be listening off-loopback). Empty ⇒ emit no
  * --dns and let Docker's default handling take over.
+ *
+ * @returns De-duplicated reachable resolver addresses; empty when nothing usable is found.
+ * @throws Never.
  */
 function hostResolvers(): string[] {
   const upstream = getServers().map(stripPort).filter(isReachableResolver);
@@ -136,13 +184,23 @@ function hostResolvers(): string[] {
 /**
  * Expand `dns` config into concrete --dns values. The `"host"` token is replaced by the host's
  * reachable resolvers (resolved fresh here, not persisted).
+ *
+ * @param dns - Configured dns entries, or undefined for no --dns flags at all.
+ * @returns Concrete --dns values in config order, with "host" entries expanded in place.
+ * @throws Never.
  */
 function resolveDnsServers(dns: string[] | undefined): string[] {
   if (dns === undefined) return [];
   return dns.flatMap(entry => entry === HOST_DNS_TOKEN ? hostResolvers() : [entry]);
 }
 
-/** Force-remove a container by name — swallow "not found" errors. */
+/**
+ * Force-remove a container by name — swallow "not found" errors.
+ *
+ * @param name - Name of the container to remove.
+ * @returns Nothing.
+ * @throws Never - All docker failures are swallowed.
+ */
 async function removeContainer(name: string): Promise<void> {
   try {
     await dockerExec(['rm', '-f', name]);
@@ -155,7 +213,20 @@ async function removeContainer(name: string): Promise<void> {
 // creates under the same --name. One chain per container name; failures never poison the chain.
 const provisionLocks = new Map<string, Promise<unknown>>();
 
-/** Serialize async work keyed by name — later callers queue behind earlier ones even across failures. */
+/**
+ * Serialize async work keyed by name — later callers queue behind earlier ones even across failures.
+ *
+ * Chains `fn` onto the pending tail for `name`, so concurrent exec calls cannot both observe
+ * "container missing" and race duplicate `docker run` creates under the same --name. The tracked
+ * tail swallows rejections so one failure never poisons the chain; this call still propagates
+ * the outcome.
+ *
+ * @typeParam T - Resolution type of `fn`.
+ * @param name - Lock key (the container name).
+ * @param fn - Async work to run once earlier work for this key settles.
+ * @returns The result of `fn`.
+ * @throws Error - Whatever `fn` rejects with.
+ */
 export async function withContainerLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
   const tail    = provisionLocks.get(name) ?? Promise.resolve();
   const result  = tail.then(fn, fn);
@@ -168,6 +239,18 @@ export async function withContainerLock<T>(name: string, fn: () => Promise<T>): 
   }
 }
 
+/**
+ * Ensure the configured container exists and is running, creating it on first use.
+ *
+ * Inspects by name; when absent, creates the container (network, resolved --dns, read-only
+ * projectRoot mount at mountPoint, read-write dataSubdir mount, `sleep infinity` entrypoint);
+ * when present but stopped, starts it. Serialized per container name via
+ * {@link withContainerLock} so concurrent calls cannot race duplicate creates.
+ *
+ * @param cfg - Effective container configuration.
+ * @returns Nothing.
+ * @throws Error - Propagates docker CLI failures from inspect, create, or start.
+ */
 async function ensureContainerRunning(cfg: ContainerConfig): Promise<void> {
   await withContainerLock(cfg.name, async () => {
     let running: string;
@@ -204,17 +287,35 @@ async function ensureContainerRunning(cfg: ContainerConfig): Promise<void> {
 /**
  * Return the effective ContainerConfig — immutable defaults merged with any
  * persisted overrides.
+ *
+ * @param overrides - Persisted user overrides to merge over the defaults.
+ * @returns The merged container configuration.
+ * @throws Never.
  */
 function effectiveConfig(overrides: BashConfigOverrides): ContainerConfig {
   return { ...CONTAINER, ...overrides };
 }
 
-/** Order-sensitive array equality — DNS nameserver order is significant. */
+/**
+ * Order-sensitive array equality — DNS nameserver order is significant.
+ *
+ * @param a - First array; undefined is treated as empty.
+ * @param b - Second array; undefined is treated as empty.
+ * @returns True when both arrays have the same length and pairwise-identical entries.
+ * @throws Never.
+ */
 function sameStrings(a: readonly string[] = [], b: readonly string[] = []): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-/** True when the two configs differ in a way that requires recreating the container. */
+/**
+ * True when the two configs differ in a way that requires recreating the container.
+ *
+ * @param a - Current effective config.
+ * @param b - Proposed effective config.
+ * @returns True when the name or DNS list changed; maxOutputBytes is host-enforced per call and needs no rebuild.
+ * @throws Never.
+ */
 function containerAffectingChange(a: ContainerConfig, b: ContainerConfig): boolean {
   return a.name !== b.name || !sameStrings(a.dns, b.dns);
 }
@@ -222,11 +323,34 @@ function containerAffectingChange(a: ContainerConfig, b: ContainerConfig): boole
 /** Docker container names: letters/digits first, then letters, digits, `_`, `.`, `-`. */
 const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
+/**
+ * Render an arbitrary value for an error message.
+ *
+ * @param v - Value to describe.
+ * @returns Its JSON form, or the string coercion when no JSON form exists (e.g. undefined, functions).
+ * @throws Never.
+ */
 function describeValue(v: unknown): string {
   const s = JSON.stringify(v);
   return s ?? String(v);
 }
 
+/**
+ * Execute `bash_config` actions: inspect, change, or recreate the container configuration.
+ *
+ * Validates raw input at the boundary instead of trusting the cast — direct invocations (e.g.
+ * over HTTP) bypass opt-in json-validation, and unknown fields are ignored. `get` reports
+ * defaults, persisted overrides, and the effective config. `set` merges validated overrides into
+ * persisted settings (the source of truth) and removes the running container only when a
+ * container-affecting field (dns/name) changed, so the next bash command recreates it.
+ * `restart` removes and recreates the container unconditionally — recovering a wedged container
+ * and re-resolving "host" DNS against the host's current resolvers.
+ *
+ * @param input - Raw tool input object; a non-object input is treated as empty.
+ * @param settings - Plugin settings store holding the persisted overrides under {@link SETTINGS_KEY}.
+ * @returns Tool events: one result or error event per invocation.
+ * @throws Error - Propagates failures from reading or writing plugin settings; container failures (restart) and validation failures are yielded as error events.
+ */
 async function* bashConfigExecutor(
   input: unknown,
   settings: PluginSettings,
@@ -343,6 +467,25 @@ async function* bashConfigExecutor(
 
 // ── Streaming helper ──────────────────────────────────────────────────────────
 
+/**
+ * Bridge event-emitter callbacks to an AsyncIterable<ToolEvent>, with stdin payload and
+ * in-container kill support.
+ *
+ * Spawns `command` with `args` (no shell), optionally writes `stdin` before closing it, and
+ * forwards stdout/stderr chunks as streaming `stdout`/`stderr` events capped at `opts.maxBytes`.
+ * Stopping means both running `opts.terminate` (the in-container process-group kill — docker exec
+ * does not propagate signals) and SIGKILLing the local docker exec client; overflow, timeout, and
+ * abort all route through it. The terminal event is exactly one of: an error event (overflow,
+ * timeout/abort kill, non-zero exit, or spawn error — each carrying the accumulated output where
+ * present) or a result event with `{ exitCode, stdout, stderr }`, followed by stream end.
+ * Abandoning the iterator early stops the child.
+ *
+ * @param command - Executable to spawn.
+ * @param args - Argument vector passed verbatim (no shell).
+ * @param opts - Spawn options: child environment (fully replaces the parent env), optional timeout in milliseconds, abort signal, output byte cap, optional stdin payload, and optional in-container kill callback.
+ * @returns An async iterable of tool events ending with a terminal result/error event; consumers must drain it or abandon it to trigger cleanup.
+ * @throws Never - Spawn and EPIPE failures arrive as error events through the iterable.
+ */
 function spawnAndStream(
   command: string,
   args:    string[],
@@ -360,6 +503,13 @@ function spawnAndStream(
   const queue: Array<ToolEvent | null> = [];
   let wakeup: (() => void) | null = null;
 
+  /**
+   * Queue an event and wake the awaiting consumer.
+   *
+   * @param ev - Event to deliver, or null to end the stream.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const push = (ev: ToolEvent | null): void => {
     queue.push(ev);
     wakeup?.();
@@ -378,6 +528,14 @@ function spawnAndStream(
   // the process group inside the container (terminate) and detaching the local client (child.kill).
   let stopReason: 'timeout' | 'aborted' | 'overflow' | null = null;
   let stopped = false;
+  /**
+   * Stop the command for the given reason: run the in-container group kill (when provided) and
+   * SIGKILL the local docker exec client.
+   *
+   * @param reason - Why the process is being stopped; shapes the terminal error event.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const stop = (reason: 'timeout' | 'aborted' | 'overflow'): void => {
     if (stopped) return;
     stopped = true;
@@ -386,6 +544,12 @@ function spawnAndStream(
     child.kill('SIGKILL');
   };
 
+  /**
+   * Abort listener that stops the command with the "aborted" reason.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   const killOnAbort = (): void => { stop('aborted'); };
   opts.signal.addEventListener('abort', killOnAbort, { once: true });
 
@@ -394,6 +558,17 @@ function spawnAndStream(
   let totalBytes = 0;
   let finalized = false;
 
+  /**
+   * Accumulate and forward one stdout/stderr chunk, stopping the command on overflow.
+   *
+   * Bytes beyond `opts.maxBytes` are discarded; the terminal error event carries the accumulated
+   * output and names the `bash_config` remedy for raising the limit.
+   *
+   * @param d - Raw chunk from the child stream.
+   * @param kind - Which stream the chunk arrived on.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const onData = (d: Buffer, kind: 'stdout' | 'stderr'): void => {
     if (finalized) return;
     const remaining = opts.maxBytes - totalBytes;
@@ -450,8 +625,19 @@ function spawnAndStream(
   }
 
   return {
+    /**
+     * Lazily expose the queued events as an async iterator.
+     *
+     * @returns An iterator yielding each streamed event and completing after the terminal null sentinel.
+     */
     [Symbol.asyncIterator]() {
       return {
+        /**
+         * Await and deliver the next event, running cleanup once the stream ends.
+         *
+         * @returns The next event, or a done result once the terminal sentinel is consumed.
+         * @throws Never.
+         */
         async next(): Promise<IteratorResult<ToolEvent>> {
           while (queue.length === 0) {
             await new Promise<void>(r => { wakeup = r; });
@@ -464,6 +650,12 @@ function spawnAndStream(
           }
           return { done: false, value: item };
         },
+        /**
+         * Stop the command and clean up when the consumer abandons the stream early.
+         *
+         * @returns A done result.
+         * @throws Never.
+         */
         async return(): Promise<IteratorResult<ToolEvent>> {
           stop('aborted'); // consumer abandoned us early — don't leave the command running
           if (timer !== undefined) clearTimeout(timer);
@@ -477,14 +669,36 @@ function spawnAndStream(
 
 // ── Executor ──────────────────────────────────────────────────────────────────
 
+/** Tool input for the container `bash` tool: the script to run plus optional environment additions and timeout. */
 interface BashInput {
   script:   string;
   env?:     Record<string, string>;
   timeout?: number;
 }
 
+/**
+ * Build the executor that runs scripts inside the persistent container.
+ *
+ * @param settings - Plugin settings read per call for the effective container configuration.
+ * @returns An executor whose `execute` ensures the container is running, prepares the exec cwd and pidfile directories, and streams the script through {@link spawnAndStream}.
+ * @throws Never.
+ */
 function createContainerExecutor(settings: PluginSettings) {
   return {
+    /**
+     * Run the requested script inside the container, streaming its output.
+     *
+     * Reads the effective config per call (settings are the source of truth), ensures the
+     * container runs, creates the host-side exec cwd and pid directories, then `docker exec`s
+     * `setsid bash` reading the script from stdin, so the recorded process-group pid allows the
+     * host to kill the whole group on timeout or abort. The pidfile is removed in a finally that
+     * waits for the kill promise first.
+     *
+     * @param input - Raw tool input cast to {@link BashInput}.
+     * @param ctx - Tool context; supplies the abort signal.
+     * @returns Streamed tool events ending in a result or error event (see {@link spawnAndStream}).
+     * @throws Error - When creating the exec cwd or pidfile directories fails; container provisioning and process failures are yielded as error events.
+     */
     async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
       // settings is the source of truth; derive the effective config per call (a
       // cheap read, dwarfed by the docker exec it precedes — not a restart).
@@ -596,6 +810,17 @@ const BASH_CONFIG_INPUT_SCHEMA = {
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Register the `bash` and `bash_config` tools.
+   *
+   * Deliberately does not reconcile a stale container at boot: a sleeping container from a
+   * previous run is reused as-is when its name matches (a container created under different
+   * mounts/dns is taken as-is; use bash_config set of dns/name to force a rebuild).
+   *
+   * @param services - Host machine services; the settings service is captured for both tools.
+   * @returns Nothing.
+   * @throws Never.
+   */
   async setup(services) {
     const settings = services.settings();
 

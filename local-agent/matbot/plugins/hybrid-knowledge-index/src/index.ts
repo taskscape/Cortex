@@ -39,6 +39,7 @@ export function workspaceScopedMem0UserId(baseUserId: string, workspaceId: strin
  */
 export class HybridKnowledgeIndex implements KnowledgeIndex {
   /**
+   * Creates a hybrid index over the two remote backends.
    * @param mem0 Client for the Mem0 memory service.
    * @param fileIndex Client for the local file-index search service.
    */

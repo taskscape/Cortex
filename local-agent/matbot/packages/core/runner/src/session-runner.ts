@@ -44,6 +44,10 @@ export interface SessionRunnerDeps {
   observability?:  () => ObservabilitySink | undefined;
 }
 
+/**
+ * One pending submission in a session's FIFO queue: the user content to run, its trace lineage,
+ * provider and principal, and pump controls (concat merging, resubmit depth, retract-redo).
+ */
 interface QueuedItem {
   traceId:     string;
   // The originating human turn's traceId, carried down a resubmission chain (a human submit is its
@@ -75,6 +79,7 @@ const MAX_RESUBMIT_DEPTH = 8;
 // because the pop is a pump operation, not a plugin's.
 const RETRACTION_CREATOR = 'matbot-retraction';
 
+/** Per-session mutable runner state: the pending queue, turn activity, subscribers, and replay. */
 interface SessionState {
   // The queue is deliberately a plain array, drained FIFO. concatQueue is per-submission: a non-concat
   // submission is its own turn — faithful, and correct when one submission's tools/state are a
@@ -91,19 +96,35 @@ interface SessionState {
   replay:      PipelineEvent[];
 }
 
+/** One live event subscriber: a push channel with an explicit close and its async event stream. */
 interface Sink {
   push(ev: PipelineEvent): void;
   close(): void;
   iterable: AsyncIterable<PipelineEvent>;
 }
 
-// A single-consumer push channel surfaced as an AsyncIterable. `dispose` runs when the consumer
-// stops (break/return) or the channel closes, so an abandoned subscriber unregisters itself.
+/**
+ * A single-consumer push channel surfaced as an AsyncIterable. `dispose` runs when the consumer
+ * stops (break/return) or the channel closes, so an abandoned subscriber unregisters itself.
+ *
+ * @param dispose - Unregisters the subscriber; invoked when the consumer stops iterating and on
+ *                  close.
+ * @returns A sink with `push` (hand to a waiting consumer or buffer), `close` (end the stream),
+ *           and `iterable` (FIFO event iteration; early return disposes).
+ * @throws Never.
+ */
 function createSink(dispose: () => void): Sink {
   const buffer: PipelineEvent[] = [];
   let waiting: ((r: IteratorResult<PipelineEvent>) => void) | null = null;
   let closed = false;
 
+  /**
+   * Mark the channel closed and complete a waiting consumer with `done`; later pushes are
+   * dropped. Idempotent.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   const finish = (): void => {
     if (closed) return;
     closed = true;
@@ -147,6 +168,13 @@ function createSink(dispose: () => void): Sink {
 export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
   const states = new Map<string, SessionState>();
 
+  /**
+   * Return the session's state, creating (and registering) an empty one on first touch.
+   *
+   * @param id - Session id.
+   * @returns The existing or newly created state.
+   * @throws Never.
+   */
   const stateFor = (id: string): SessionState => {
     let s = states.get(id);
     if (s === undefined) {
@@ -156,27 +184,76 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
     return s;
   };
 
+  /**
+   * Drop the session's state when it is fully idle — no running turn, empty queue, no
+   * subscribers — so finished sessions do not leak map entries.
+   *
+   * @param id - Session id whose state is considered for removal.
+   * @param s - The state to test.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const maybeCleanup = (id: string, s: SessionState): void => {
     if (!s.running && s.queue.length === 0 && s.subscribers.size === 0) states.delete(id);
   };
 
-  // Turn events go to the replay buffer (so a mid-flight subscriber sees the in-progress turn) and
-  // all live subscribers.
+  /**
+   * Turn events go to the replay buffer (so a mid-flight subscriber sees the in-progress turn) and
+   * all live subscribers.
+   *
+   * @param s - The session whose replay and subscribers receive the event.
+   * @param ev - The pipeline event to record and broadcast.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const emit = (s: SessionState, ev: PipelineEvent): void => {
     s.replay.push(ev);
     for (const sink of s.subscribers) sink.push(ev);
   };
 
-  // Subscribers-only (no replay buffer): used for the `queued` events that describe the pending
-  // queue. Pending is NOT kept in `replay` (which is per-turn) — it's reconstructed from `s.queue`
-  // when a subscriber joins, so it survives turn boundaries correctly.
+  /**
+   * Subscribers-only (no replay buffer): used for the `queued` events that describe the pending
+   * queue. Pending is NOT kept in `replay` (which is per-turn) — it's reconstructed from `s.queue`
+   * when a subscriber joins, so it survives turn boundaries correctly.
+   *
+   * @param s - The session whose subscribers receive the event.
+   * @param ev - The pipeline event to broadcast.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const notify = (s: SessionState, ev: PipelineEvent): void => {
     for (const sink of s.subscribers) sink.push(ev);
   };
 
-  // How many submissions sit ahead of the item at queue index `i` (the running turn counts as one).
+  /**
+   * How many submissions sit ahead of the item at queue index `i` (the running turn counts as one).
+   *
+   * @param s - The session whose queue is measured.
+   * @param i - Index of the item within `s.queue`.
+   * @returns The number of submissions ahead of it, including any running turn.
+   * @throws Never.
+   */
   const aheadOf = (s: SessionState, i: number): number => (s.running ? 1 : 0) + i;
 
+  /**
+   * Drain the session's queue, one turn per iteration — or one merged turn per maximal run of
+   * consecutive concat submissions. For each turn: persist-at-turn-start the merged user message
+   * (deriving a title on the session's first turn; skipped for a redo, which re-runs an existing
+   * committed user turn), resolve the provider, and run {@link runSession} under the submitter's
+   * principal via {@link contextSwitch} so the whole turn is the transactional unit (a deferred
+   * StorageBackend swap lands at this scope's quiescent edge, never mid-CAS). After a
+   * non-aborted commit, `followup` hooks may append durable markers, head-enqueue robo
+   * resubmissions (depth capped at {@link MAX_RESUBMIT_DEPTH}), or retract-and-rerun the
+   * just-committed turn. Events stream to subscribers and the replay buffer; turn and
+   * persistence failures are emitted as `error` events.
+   *
+   * Runs detached (`void pump`): it is the turn's async root, so the principal scope lives here.
+   *
+   * @param id - Session id to pump.
+   * @param s - The session's mutable state (queue, running flag, abort controller, subscribers).
+   * @returns Resolves when the queue is drained.
+   * @throws Never - Failures are caught and emitted as `error` events.
+   */
   const pump = async (id: string, s: SessionState): Promise<void> => {
     if (s.running) return;
     s.running = true;
@@ -399,6 +476,21 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
   };
 
   return {
+    /**
+     * Submit content and/or attach to a session's live event stream. With content: validates the
+     * submission, enqueues it, announces it as a `queued` event, and kicks the pump. Always:
+     * loads the committed history and returns a view whose `events` iterable delivers the
+     * in-progress turn's replay followed by the pending queue (the delta region). Pure reads do
+     * not materialize a state entry.
+     *
+     * @param opts - Session id plus, for a submission, content/provider/principal (with optional
+     *               ephemeral context, concat flag, prompt, and trace id); `signal` closes the
+     *               event stream when aborted.
+     * @returns The committed session, the pending count, the submission trace id (when
+     *           submitting), and the lazily-created event stream.
+     * @throws Error - When a submission lacks provider or principal, or the session does not
+     *           exist in the store.
+     */
     async open(opts: OpenOpts | SubmitOpenOpts): Promise<SessionView> {
       // For a pure read (no content, events never tapped) we must not materialise a state entry —
       // otherwise every session_action `get` would leak one. State is created only when there is
@@ -445,9 +537,22 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
         session: base,
         queued: s !== undefined ? s.queue.length : 0,
         ...(traceId !== undefined ? { traceId } : {}),
+        /**
+         * The session's live delta: replay of the in-progress turn, then a `queued` event per
+         * pending submission. Created once per view; closes and unregisters when `opts.signal`
+         * aborts or the consumer stops iterating.
+         *
+         * @returns A single-consumer async iterable of pipeline events.
+         */
         get events(): AsyncIterable<PipelineEvent> {
           if (cached === undefined) {
             const st = stateFor(opts.sessionId);
+            /**
+             * Unregister this subscriber and release the session's state if now idle.
+             *
+             * @returns Nothing.
+             * @throws Never.
+             */
             const remove = (): void => { st.subscribers.delete(sink); maybeCleanup(opts.sessionId, st); };
             const sink = createSink(remove);
             st.subscribers.add(sink);
@@ -465,6 +570,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
       return view;
     },
 
+    /**
+     * Cancel everything for a session: each queued submission is drained from the queue and
+     * announced with a `cancelled` event, and the running turn (if any) is aborted with reason
+     * `user-abort` — its completed work is still persisted and paired.
+     *
+     * @param sessionId - Session whose queued and running work to cancel.
+     * @returns Nothing; a no-op for unknown sessions.
+     * @throws Never.
+     */
     abort(sessionId: string): void {
       const s = states.get(sessionId);
       if (s === undefined) return;
@@ -474,6 +588,15 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
       s.ac?.abort('user-abort');
     },
 
+    /**
+     * Abandon only the running turn, aborting it with reason `user-cancel`. Queued submissions
+     * are deliberately untouched: they are separate operations the user lined up and survive
+     * into the next pump iteration.
+     *
+     * @param sessionId - Session whose running turn to cancel.
+     * @returns Nothing; a no-op for unknown sessions.
+     * @throws Never.
+     */
     cancelTurn(sessionId: string): void {
       const s = states.get(sessionId);
       if (s === undefined) return;
@@ -482,6 +605,14 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
       s.ac?.abort('user-cancel');
     },
 
+    /**
+     * Snapshot the session's activity.
+     *
+     * @param sessionId - Session to inspect.
+     * @returns `running` (a turn is executing), `queued` (pending submissions), and `busy`
+     *           (either of the former); all false/0 for unknown sessions.
+     * @throws Never.
+     */
     status(sessionId: string): { busy: boolean; running: boolean; queued: number } {
       const s = states.get(sessionId);
       const running = s?.running ?? false;

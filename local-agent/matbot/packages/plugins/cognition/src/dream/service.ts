@@ -9,6 +9,16 @@ import { DREAM_MERGER_PROVIDER_KEY, DREAM_RANKER_PROVIDER_KEY } from '../inner-v
 // settles in order. Manual dream_time calls and the automatic scheduler both come through here.
 let runChain: Promise<unknown> = Promise.resolve();
 
+/**
+ * Runs `fn` only after every previously queued function has settled, serialising concurrent
+ * callers (manual `dream_time` tool calls and the automatic scheduler) through one process-local
+ * chain.
+ * @typeParam T The resolution type of `fn`'s promise.
+ * @param fn The async function to run exclusively.
+ * @returns A promise that settles with `fn`'s outcome.
+ * @throws Error - Whatever `fn` rejects with is propagated to this caller; the shared chain
+ *          swallows the rejection so later callers are not poisoned by it.
+ */
 function serialise<T>(fn: () => Promise<T>): Promise<T> {
   const next = runChain.then(fn, fn);
   runChain = next.catch(() => undefined);
@@ -31,7 +41,11 @@ export function resolveDreamFallbackProvider(services: MatbotMachine): string | 
  * @param fallbackProvider Provider used when no ranker/merger provider is pinned.
  * @param signal Abort signal cancelling the pass.
  * @returns The completed dream run.
- * @throws If no fallback provider is configured or the named one is missing.
+ * @throws If no fallback provider is configured or the named one is missing, or if the pass
+ *         hits a setup-shaped failure (invalid dream-time settings, missing SkillManager,
+ *         skill metadata gaps). Judgement-call and per-fact failures are recorded on the run
+ *         record instead. Persisting the record never throws — a persistence failure is logged
+ *         and the run is still returned.
  */
 export async function runDreamTimePass(
   services: MatbotMachine,

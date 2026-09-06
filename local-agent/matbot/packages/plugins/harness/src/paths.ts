@@ -1,8 +1,20 @@
 import { isAbsolute, resolve, sep } from 'node:path';
 
-/** A harness failure surfaced as an `is_error` tool result. */
+/**
+ * A harness failure surfaced as an `is_error` tool result.
+ *
+ * Carries a machine-readable `code` (e.g. `invalid_input`, `not_found`, `conflict`,
+ * `permission_denied`, `internal`) so failures can be categorized; `name` is fixed
+ * to `HarnessError` for detection.
+ */
 export class HarnessError extends Error {
   readonly code: string;
+  /**
+   * Creates a harness error.
+   *
+   * @param message Human-readable explanation shown to the model.
+   * @param code Machine-readable failure category.
+   */
   constructor(message: string, code: string) {
     super(message);
     this.code = code;
@@ -10,10 +22,21 @@ export class HarnessError extends Error {
   }
 }
 
+/**
+ * Minimal context shape carrying the session's workspace root; `workdir` is the
+ * absolute directory all harness file operations are confined to.
+ */
 export interface Rooted {
   workdir?: string;
 }
 
+/**
+ * Resolves the workspace root for a tool context, requiring a configured `workdir`.
+ *
+ * @param ctx Tool context (or any {@link Rooted}) whose `workdir` supplies the root.
+ * @returns The absolute, resolved workspace root path.
+ * @throws HarnessError - With code `internal` when `workdir` is missing or empty.
+ */
 export function requireRoot(ctx: Rooted): string {
   if (ctx.workdir === undefined || ctx.workdir === '') {
     throw new HarnessError('No workspace root is configured for this session (workdir missing).', 'internal');
@@ -26,6 +49,12 @@ export function requireRoot(ctx: Rooted): string {
  * relative paths are refused outright; search tools accept workspace-relative convenience paths.
  * Anything resolving outside the root — including sibling prefixes like `/root-x` vs `/root` —
  * is refused either way.
+ *
+ * @param root Absolute workspace root as returned by {@link requireRoot}.
+ * @param requested Requested path; `undefined` resolves to the root itself.
+ * @param opts `absolute: true` additionally refuses relative inputs.
+ * @returns The resolved absolute path, guaranteed to equal or lie under `root`.
+ * @throws HarnessError - With code `invalid_input` when a relative path is passed while `absolute` is set, or code `permission_denied` when the resolved path escapes the root.
  */
 export function confine(
   root: string,

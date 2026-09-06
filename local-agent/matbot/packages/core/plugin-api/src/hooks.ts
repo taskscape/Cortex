@@ -50,6 +50,15 @@ export class HookRegistry {
   // array (rather than splicing) leaves any in-flight run loop — which iterates the array reference
   // it captured before the mutation — to finish over the old list; the next run sees the new one.
   // Idempotent: removing an already-absent hook is a no-op, so calling removeHook() twice is safe.
+  /**
+   * Drop one hook by identity: the channel's list is filtered into a fresh array, so an in-flight
+   * run loop keeps iterating the list it captured and the next run sees the removal. Idempotent.
+   *
+   * @param point - The channel the hook is registered under.
+   * @param hook - The exact hook object to remove.
+   * @returns Nothing.
+   * @throws Never.
+   */
   private removeOne(point: HookPoint, hook: Hook): void {
     const list = this.hooks.get(point);
     if (list) this.hooks.set(point, list.filter(h => h !== hook));
@@ -57,6 +66,16 @@ export class HookRegistry {
 
   // Run one handler, isolating a throw: log it, record it for a one-time marker, and return undefined
   // — which every run* method already treats as "no contribution from this hook".
+  /**
+   * Run one handler, isolating a throw: a throwing handler is logged and recorded once for a
+   * durable `matbot-hooks` marker, and the call reads as "returned nothing".
+   *
+   * @typeParam R - The handler's result type.
+   * @param hook - The hook being invoked (used for logging, marker attribution, and failure dedup).
+   * @param run - Thunk that invokes the handler with its fully-built context.
+   * @returns The handler's result, or `undefined` when the handler threw.
+   * @throws Never.
+   */
   private async invoke<R>(hook: Hook, run: () => R | Promise<R>): Promise<R | undefined> {
     try {
       return await run();
@@ -81,6 +100,15 @@ export class HookRegistry {
   // returned session the runner persists — so failures surface durably and exactly once. Returns the
   // appended marker content blocks too, so the runner can carry them live (a session reload is the
   // fallback path, not the only one).
+  /**
+   * Append a `marker` message for each queued hook failure to the session, then clear the queue.
+   * Called from {@link HookRegistry.runScreen} — the once-per-turn, session-owning channel — so
+   * failures surface durably and exactly once.
+   *
+   * @param session - The session to append markers to (not mutated; a copy is returned).
+   * @returns The updated session and the appended marker content blocks (for live emission).
+   * @throws Never.
+   */
   private drainFailureMarkers(session: Session): { session: Session; markers: MessageContent[] } {
     if (this.pendingFailureMarkers.length === 0) return { session, markers: [] };
     const messages: Message[] = this.pendingFailureMarkers.map(f => ({
@@ -118,6 +146,14 @@ export class HookRegistry {
     // Handler-returned markers: appended to the session here (so they persist) and accumulated so the
     // runner can also emit them live — keeping a live draw and a reload identical.
     const handlerMarkers: MessageContent[] = [];
+    /**
+     * Append marker blocks to the running session (so they persist) and accumulate them for live
+     * emission by the runner.
+     *
+     * @param blocks - Marker content blocks returned by a screen hook.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const appendMarkers = (blocks: MessageContent[]): void => {
       handlerMarkers.push(...blocks);
       session = { ...session, messages: [...session.messages, {
@@ -131,6 +167,14 @@ export class HookRegistry {
     // blocks are dropped rather than orphaned (a screen hook only runs when a turn is being submitted,
     // so a user message is present in practice; this is defensive).
     const durable: MessageContent[] = [];
+    /**
+     * Fold durable blocks onto the last user message of the running session, so they persist into
+     * history and ride subsequent provider calls. Dropped (not orphaned) when no user message exists.
+     *
+     * @param blocks - Durable content blocks returned by a screen hook.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const foldDurable = (blocks: MessageContent[]): void => {
       const idx = session.messages.findLastIndex(m => m.role === 'user');
       if (idx < 0) return;

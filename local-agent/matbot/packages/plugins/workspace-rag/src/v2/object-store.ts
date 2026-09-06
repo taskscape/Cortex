@@ -8,6 +8,13 @@ import type { RagV2SourceObject } from './types.js';
 
 const DEFAULT_MAX_RANGE_BYTES = 8 * 1024 * 1024;
 
+/**
+ * Guards against path traversal outside the store root.
+ * @param root - Root directory the candidate must stay within.
+ * @param candidate - Path to check.
+ * @returns Nothing.
+ * @throws Error - When `candidate` lies outside `root` and is not the root itself.
+ */
 function assertInsideRoot(root: string, candidate: string): void {
   const relative = path.relative(root, candidate);
   if (relative === '' || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) {
@@ -15,6 +22,12 @@ function assertInsideRoot(root: string, candidate: string): void {
   }
 }
 
+/**
+ * Checks whether a path is accessible.
+ * @param filePath - Path to test.
+ * @returns True when `filePath` can be accessed; false on any access error.
+ * @throws Never.
+ */
 async function exists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -32,6 +45,16 @@ export class RagV2LineIndexWriter {
   private closed = false;
   private streamError: Error | undefined;
 
+  /**
+   * Opens a fresh index file for writing.
+   *
+   * The file is created exclusively (`wx`), so a pre-existing destination
+   * fails asynchronously rather than here; underlying stream failures are
+   * captured and surface from {@link RagV2LineIndexWriter.add} or
+   * {@link RagV2LineIndexWriter.close}.
+   * @param filePath - Destination path of the line-index file.
+   * @throws Never.
+   */
   constructor(filePath: string) {
     this.stream = createWriteStream(filePath, { flags: 'wx', encoding: 'utf8' });
     // A standing listener keeps a mid-stream failure from crashing the
@@ -45,6 +68,8 @@ export class RagV2LineIndexWriter {
    * Appends one line entry.
    * @param line - 1-based line number.
    * @param byteOffset - Byte offset of the line start in the source object.
+   * @returns Resolves once the entry is accepted by the stream (awaiting drain under backpressure).
+   * @throws Error - When the writer is already closed or the underlying stream has failed.
    */
   async add(line: number, byteOffset: number): Promise<void> {
     if (this.closed) throw new Error('Workspace RAG V2 line index is already closed.');
@@ -58,6 +83,12 @@ export class RagV2LineIndexWriter {
     }
   }
 
+  /**
+   * Ends the stream and waits for it to flush and finish; a second call
+   * resolves immediately or rethrows the stored stream error.
+   * @returns Resolves once the file is fully written.
+   * @throws Error - When the stream failed at any point; the captured stream error is rethrown.
+   */
   async close(): Promise<void> {
     if (this.closed) {
       if (this.streamError) throw this.streamError;
@@ -84,6 +115,14 @@ export class RagV2ObjectStore {
   private readonly maxRangeBytes: number;
   private readonly externalRoot: string | undefined;
 
+  /**
+   * Resolves and records the store configuration without touching disk.
+   * @param root - Managed store root; resolved to an absolute path.
+   * @param maxRangeBytes - Default byte cap for single range or line reads; defaults to 8 MiB.
+   * @param retentionMode - Whether bytes are managed here, external and immutable, or manifest-only; defaults to `managed`.
+   * @param externalRoot - Root holding externally managed objects (read source for `external_immutable`); resolved to an absolute path.
+   * @throws Never.
+   */
   constructor(
     root: string,
     maxRangeBytes = DEFAULT_MAX_RANGE_BYTES,
@@ -96,6 +135,14 @@ export class RagV2ObjectStore {
     this.externalRoot = externalRoot ? path.resolve(externalRoot) : undefined;
   }
 
+  /**
+   * Creates the store's directory layout.
+   *
+   * Creates `objects/sha256` and `staging` beneath the root as needed; safe
+   * to call repeatedly.
+   * @returns Resolves once the directories exist.
+   * @throws Error - When the directories cannot be created (fs errors propagate).
+   */
   async initialize(): Promise<void> {
     await mkdir(path.join(this.root, 'objects', 'sha256'), { recursive: true });
     await mkdir(path.join(this.root, 'staging'), { recursive: true });
@@ -103,8 +150,18 @@ export class RagV2ObjectStore {
 
   /**
    * Stores a file by content hash; identical content is deduplicated.
-   * @param params - Source path, bytes and hashing inputs.
-   * @returns The stored object reference.
+   *
+   * Managed mode copies the source through a staging file and atomically
+   * renames it into the hash-addressed layout, rejecting sources that change
+   * (size or mtime) mid-copy. `external_immutable` mode verifies the object
+   * already exists under the external root with the expected size.
+   * `manifest_only` mode writes only a manifest recording the original path;
+   * historical bytes are not guaranteed.
+   * @param sourcePath - File to ingest; must exist and stay unchanged for the duration.
+   * @param signal - Optional signal cancelling the copy or hash; the abort reason becomes the rejection.
+   * @param onChunk - Optional async progress callback invoked per chunk with its byte length; the copy waits for each call.
+   * @returns Content-addressed reference with hash, object path, line-index path, and byte length.
+   * @throws Error - When the source is not a file, changes while being copied, or an external immutable object is missing or has the wrong size; fs and abort errors propagate.
    */
   async putFile(
     sourcePath: string,
@@ -199,6 +256,7 @@ export class RagV2ObjectStore {
    * Opens a line-index writer for an existing object.
    * @param contentSha256 - Content hash of the object.
    * @returns A writer, or undefined when an index already exists.
+   * @throws Error - When the line-index directory cannot be created.
    */
   async createLineIndexWriter(contentSha256: string): Promise<RagV2LineIndexWriter | undefined> {
     const finalPath = this.lineIndexPath(contentSha256);
@@ -221,8 +279,12 @@ export class RagV2ObjectStore {
 
   /**
    * Reads a byte range out of a stored object.
-   * @param params - Object hash plus byte range.
-   * @returns The requested bytes decoded as UTF-8 text.
+   * @param contentSha256 - Hash of the stored object.
+   * @param startByte - Inclusive 0-based start offset in bytes.
+   * @param endByte - Exclusive end offset in bytes; must be greater than `startByte`.
+   * @param maxBytes - Optional per-call cap in bytes; the effective cap is the smaller of this and the store maximum.
+   * @returns A buffer of exactly `endByte - startByte` bytes.
+   * @throws Error - When the offsets are not a valid increasing integer pair, the range exceeds the cap, or the file ends early; fs errors propagate.
    */
   async fetchRange(
     contentSha256: string,
@@ -253,8 +315,12 @@ export class RagV2ObjectStore {
 
   /**
    * Reads a 1-based inclusive line range via the line index.
-   * @param params - Object hash, line index path, and line range.
-   * @returns The lines joined with newlines (empty when no index exists).
+   * @param contentSha256 - Hash of the stored object.
+   * @param startLine - First line to return (1-based, inclusive).
+   * @param endLine - Last line to return (inclusive, at least `startLine`).
+   * @param maxBytes - Optional per-call cap in bytes; the effective cap is the smaller of this and the store maximum.
+   * @returns The selected lines joined with their newlines plus the absolute covered byte range, falling back to the checkpoint offset when nothing matched.
+   * @throws Error - When the line numbers are invalid or the result exceeds the byte cap; source-resolution and fs errors propagate.
    */
   async fetchLines(
     contentSha256: string,
@@ -327,6 +393,7 @@ export class RagV2ObjectStore {
    * Resolves the on-disk path for a content hash.
    * @param contentSha256 - Content hash.
    * @returns Absolute object path.
+   * @throws Error - When the hash is not a lowercase 64-hex SHA-256.
    */
   objectPath(contentSha256: string): string {
     this.assertHash(contentSha256);
@@ -339,6 +406,7 @@ export class RagV2ObjectStore {
    * Resolves the on-disk path of a content hash's line index.
    * @param contentSha256 - Content hash.
    * @returns Absolute line-index path.
+   * @throws Error - When the hash is not a lowercase 64-hex SHA-256.
    */
   lineIndexPath(contentSha256: string): string {
     return path.join(path.dirname(this.objectPath(contentSha256)), 'lines.tsv');
@@ -347,6 +415,11 @@ export class RagV2ObjectStore {
   /**
    * Deletes old managed objects absent from the global repository reference
    * set. External and manifest-only stores are never owned by this collector.
+   * @param referencedHashes - Content hashes still referenced by any repository.
+   * @param olderThan - ISO-8601 cutoff; only blobs whose source file was modified strictly before it are eligible.
+   * @param limit - Maximum number of blob directories to delete per call; defaults to 500.
+   * @returns Number of blob directories deleted.
+   * @throws Error - When the cutoff is not a valid timestamp or a blob directory cannot be removed; fs errors from deletion propagate.
    */
   async pruneUnreferenced(
     referencedHashes: ReadonlySet<string>,
@@ -382,6 +455,13 @@ export class RagV2ObjectStore {
     return deleted;
   }
 
+  /**
+   * Builds the hash-addressed path of an object's source file under a root.
+   * @param root - Store root to place the object under.
+   * @param contentSha256 - Lowercase 64-hex SHA-256 of the content.
+   * @returns The absolute path under `root` at `objects/sha256`, sharded by the first four hash characters and ending in `source.md`.
+   * @throws Error - When the hash is malformed.
+   */
   private contentPath(root: string, contentSha256: string): string {
     this.assertHash(contentSha256);
     return path.join(
@@ -395,10 +475,26 @@ export class RagV2ObjectStore {
     );
   }
 
+  /**
+   * Resolves the manifest file path beside an object.
+   * @param contentSha256 - Lowercase 64-hex SHA-256 of the content.
+   * @returns The absolute `manifest.json` path in the object's directory.
+   * @throws Error - When the hash is malformed (via the object path check).
+   */
   private manifestPath(contentSha256: string): string {
     return path.join(path.dirname(this.objectPath(contentSha256)), 'manifest.json');
   }
 
+  /**
+   * Resolves the readable path of an object per the retention mode.
+   *
+   * Managed mode returns the managed path; `external_immutable` returns the
+   * path under the external root; `manifest_only` reads the manifest and
+   * re-hashes the recorded original file, requiring it to still match.
+   * @param contentSha256 - Lowercase 64-hex SHA-256 of the content.
+   * @returns The path the object's bytes can be read from.
+   * @throws Error - When the hash is malformed, the manifest is missing fields or mismatched, or a manifest-only source changed on disk; fs errors propagate.
+   */
   private async sourcePath(contentSha256: string): Promise<string> {
     if (this.retentionMode === 'managed') return this.objectPath(contentSha256);
     if (this.retentionMode === 'external_immutable') {
@@ -420,6 +516,17 @@ export class RagV2ObjectStore {
     return manifest.sourcePath;
   }
 
+  /**
+   * Streams a file once to compute its hash and length.
+   *
+   * Size and mtime are taken before and after the stream; a mismatch rejects
+   * the result as unreliable.
+   * @param sourcePath - File to hash.
+   * @param signal - Optional signal cancelling the stream; the abort reason is thrown.
+   * @param onChunk - Optional async progress callback invoked per chunk with its byte length.
+   * @returns The lowercase SHA-256 hex digest and the byte length.
+   * @throws Error - When the source changes while being hashed or the signal aborts; fs errors propagate.
+   */
   private async hashStableSource(
     sourcePath: string,
     signal?: AbortSignal,
@@ -442,12 +549,24 @@ export class RagV2ObjectStore {
     return { contentSha256: hash.digest('hex'), byteLength };
   }
 
+  /**
+   * Validates that a value is a lowercase SHA-256 hex digest.
+   * @param contentSha256 - Value to check.
+   * @returns Nothing.
+   * @throws Error - When the value is not 64 lowercase hex characters.
+   */
   private assertHash(contentSha256: string): void {
     if (!/^[a-f0-9]{64}$/u.test(contentSha256)) {
       throw new Error('Workspace RAG V2 content hash must be a lowercase SHA-256 value.');
     }
   }
 
+  /**
+   * Parses a line-index file into checkpoints.
+   * @param contentSha256 - Hash whose line index should be read.
+   * @returns The recorded checkpoints of 1-based line numbers and byte offsets; a single origin checkpoint when the index is absent or contains no valid entries.
+   * @throws Error - When the index file exists but cannot be read; malformed entries are skipped.
+   */
   private async readLineIndex(contentSha256: string): Promise<Array<{ line: number; byte: number }>> {
     const indexPath = this.lineIndexPath(contentSha256);
     if (!await exists(indexPath)) return [{ line: 1, byte: 0 }];

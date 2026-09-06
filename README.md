@@ -55,6 +55,7 @@ configuration, architecture, and development details.
 | [Expert Panel WebUI User Manual](docs/expert-panel.md) | Using the expert panel from the WebUI, modes, synthesis, citations, and troubleshooting. |
 | [WebUI](docs/webui.md) | WebUI capabilities and behavior. |
 | [Testing](docs/testing.md) | Node and Playwright test layers and coverage. |
+| [Reliability findings](reliability-issues.md) | Failure scenarios, implemented fixes, and regression validation. |
 | [Troubleshooting](docs/troubleshooting.md) | Common failures and their fixes. |
 
 A good reading order is this overview, the [Cortex User Guide](userguide.md),
@@ -157,6 +158,42 @@ temporary working material, and generated outputs; use Workspace RAG when
 Markdown folders should become persistent searchable knowledge. See
 [Use Files And Workspace RAG](userguide.md#use-files-and-workspace-rag) for
 upload, open, and delete instructions.
+
+Filesystem-backed workspace files keep their logical names and IDs. New writes
+store content versions under `.data/files/.cortex-versions` and atomically switch
+the corresponding metadata manifest. Use the Files panel or file tools to read
+the current version; a legacy payload at the original name is not authoritative
+after that entry is overwritten. Existing layouts remain readable. Unreferenced
+version blobs are reclaimed in batches of at most 100, after a 24-hour grace
+period, during periodic store maintenance triggered by writes or listing.
+
+### Provider request reliability
+
+OpenAI-compatible and Anthropic providers enforce three deadlines through their
+`parameters` settings: `requestTimeoutMs` (60,000 by default, covering headers and
+retries), `streamIdleTimeoutMs` (120,000), and `completionTimeoutMs` (600,000,
+covering the entire completion). Values must be positive integer milliseconds,
+at most 3,600,000. Increase these for slow local models when needed. SSE comments
+do not reset the idle deadline, and activity never extends the overall deadline.
+Completed tool rounds and partial responses are saved when a completion fails;
+the session records an interruption marker, including for timeouts.
+
+Provider streams must confirm completion. OpenAI-compatible streamed errors,
+malformed events, and premature EOF are reported as failures; buffered tool
+calls from an unconfirmed response are not executed. Trailing usage is collected
+before the single terminal completion event. Anthropic streams must reach their
+`message_stop` event.
+
+### Background schedule recovery
+
+Recurring schedules retry transient storage failures with backoff while retaining
+the same occurrence ID. `every_action list` reports `schedulerState`, an active
+`schedulerError` during recovery, and the last persisted scheduler error when
+available. Resume ensures that a stopped schedule has an armed loop. Startup
+respects the saved next-run time. If a previous process left an occurrence marked
+running, Cortex records that its effects are uncertain and schedules the next
+interval instead of immediately replaying it. Suspend/cancel changes are retained
+while completion records are retried.
 
 ### Switch the Workspace RAG embedding model
 
@@ -296,6 +333,23 @@ retrieval as its only index. It starts in `primary` mode, watches configured
 folders, and performs a periodic safety reconciliation. Search remains
 unavailable until the first validated generation is published.
 
+Ingestion checkpoints publish independent snapshots. The running job keeps a
+separate staging generation for new work and deletion reconciliation. If a later
+step fails or is cancelled, search retains the last successfully published
+snapshot; restarting can resume completed work in staging. A checkpoint alone
+does not mean the whole reconciliation job has completed.
+
+Setup failures and cancellation leave terminal job states with error details.
+If storage is unavailable, status reports that outage and retains the latest
+local job outcome; document counts in that response are unavailable and should
+not be interpreted as an empty index. The next ingestion marks an interrupted
+prior job as failed before attempting to resume its staging work.
+
+Semantic summaries have a two-minute deadline covering summary generation and
+its embedding. Set `CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS` to adjust it (10 to
+3,600,000 milliseconds). Cancelling ingestion releases producers waiting for
+summary queue space; shutdown cancels all summary workers before closing storage.
+
 1. Keep the default `CORTEX_RAG_V2_MODE=primary`. Set it to `off` only to disable
    Workspace RAG completely. Configure the V2 Postgres/object-store variables
    in the active workspace `.env`. For
@@ -344,6 +398,46 @@ unavailable until the first validated generation is published.
    emitted as citation evidence. Split books can declare `book_id` and
    `book_title` (or `collection_id` and `collection_title`) in front matter to
    add collection routing above their chapter files.
+
+### Reclaim orphaned Workspace RAG data
+
+Workspace RAG automatically reclaims database records that become unreachable
+after a folder is removed or a later successful reconciliation clears a
+previously deferred deletion. Cleanup also runs on an independent jittered
+timer, every six hours by default. A document version is orphaned only when no
+active or staging publication references it, so an in-progress generation and
+the currently queryable generation remain protected.
+
+Each sweep removes eligible document versions and their sections, passages,
+embeddings, routing summaries, and stale ingestion-job records in bounded
+transactions. Empty retired publication generations are removed after their
+separate retention period. Cleanup is serialized per workspace context, skips
+deletion while ingestion is non-terminal, and applies a one-hour grace period
+by default to avoid racing newly created jobs or content. If a sweep is skipped,
+it is retried with bounded exponential backoff.
+
+Run cleanup for the active context on demand with:
+
+```json
+{ "action": "gc" }
+```
+
+Add `"contextId"` to target another context in the current workspace. The
+result reports deletion counts, and subsequent Workspace RAG status responses
+include the latest counts, timestamp, and duration under `lastGc`. Manual cleanup
+remains available when automatic cleanup is disabled.
+
+Content-addressed source-object cleanup is separately controlled by
+`CORTEX_RAG_V2_BLOB_GC_ENABLED` and is off by default. When enabled, it deletes
+only stale, globally unreferenced objects from a `managed` store; objects still
+referenced by any workspace are retained, and `external_immutable` and
+`manifest_only` stores are never modified. Deleting an entire context purges its
+non-audit index state while retaining retrieval and evaluation audit records for
+their normal TTL-managed lifecycle.
+
+Configure the sweep interval, grace period, transaction batch size, retired
+generation retention, and managed-blob cleanup with the
+[Workspace RAG configuration](docs/configuration.md#workspace-rag) settings.
 
 For an operational rollback, set `CORTEX_RAG_V2_MODE=off`; this disables
 Workspace RAG rather than routing to an older index. Published V2 generations

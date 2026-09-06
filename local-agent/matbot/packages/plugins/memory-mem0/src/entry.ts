@@ -23,6 +23,7 @@ export interface EntryInput {
  * SHA-256 hash of text, used as a stable content/source identifier.
  * @param text Text to hash.
  * @returns Full hex digest.
+ * @throws Never.
  */
 export function hashText(text: string): string {
     return createHash("sha256").update(text).digest("hex");
@@ -32,6 +33,7 @@ export function hashText(text: string): string {
  * tags, summary, timestamps, and the source uuid from the given input.
  * @param input Partial entry data extracted from an untyped backend payload.
  * @returns A complete knowledge entry with derived defaults filled in.
+ * @throws Never.
  */
 export function makeKnowledgeEntry(input: EntryInput): KnowledgeEntry {
     const contentHash = hashText(input.content);
@@ -58,6 +60,13 @@ export function makeKnowledgeEntry(input: EntryInput): KnowledgeEntry {
     }
     return entry;
 }
+/**
+ * Derives a one-line summary from entry content: whitespace collapsed to
+ * single spaces, truncated to 240 characters with an ellipsis when longer.
+ * @param content - Raw content text to condense.
+ * @returns The single-line summary.
+ * @throws Never.
+ */
 function summarize(content: string): string {
     const singleLine = content.replace(/\s+/g, " ").trim();
     return singleLine.length <= 240 ? singleLine : `${singleLine.slice(0, 237)}...`;

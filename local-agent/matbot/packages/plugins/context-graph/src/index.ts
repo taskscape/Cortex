@@ -37,7 +37,7 @@ export type ContextEntityType =
 export type ContextSensitivity = 'public' | 'internal' | 'confidential' | 'restricted';
 /** How an assertion's content was derived. */
 export type ExtractionMethod = 'deterministic' | 'connector_metadata' | 'model_extracted' | 'user_confirmed';
-//** Lifecycle state of a queued Neo4j projection operation. */
+/** Lifecycle state of a queued Neo4j projection operation. */
 export type ProjectionStatus = 'queued' | 'applied' | 'failed';
 
 /** A canonical business entity (person, system, ticket, ...) in one workspace's graph. */
@@ -249,6 +249,11 @@ export interface ContextGraph {
   projectionOperations(query?: StoreQuery): Promise<Neo4jProjectionOperation[]>;
 }
 
+/**
+ * Minimal subset of a source-registry source record: identity plus the
+ * permission, health, and staleness metadata used for access checks,
+ * warnings, and fact hydration.
+ */
 interface SourceRecordLike {
   id: string;
   workspaceId: string;
@@ -266,12 +271,18 @@ interface SourceRecordLike {
   knownLimitations?: string[];
 }
 
+/**
+ * Minimal subset of a source-registry version record.
+ */
 interface SourceVersionLike {
   id: string;
   sourceId: string;
   observedAt: string;
 }
 
+/**
+ * Minimal subset of a resolved source citation.
+ */
 interface SourceCitationLike {
   sourceId: string;
   text: string;
@@ -281,12 +292,49 @@ interface SourceCitationLike {
   observedAt?: string;
 }
 
+/**
+ * Minimal SourceRegistry service subset used by the graph: source/version
+ * lookup, citation resolution, and access auditing. Optional methods may be
+ * absent, and registry calls are failure-tolerant where noted.
+ */
 interface SourceRegistryLike {
+  /**
+   * Fetches a source record by id.
+   * @param id - Source id.
+   * @returns The record, or null when absent.
+   */
   getSource(id: string): Promise<SourceRecordLike | null>;
+  /**
+   * Fetches a version record by id.
+   * @param id - Version id.
+   * @returns The record, or null when absent.
+   */
   getVersion(id: string): Promise<SourceVersionLike | null>;
+  /**
+   * Lists recorded versions; ordering is unspecified (callers sort).
+   * @param sourceId - Restrict to one source; all sources when undefined.
+   * @returns Version records.
+   */
   sourceVersions?(sourceId?: string): Promise<SourceVersionLike[]>;
+  /**
+   * Queries source records.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching records.
+   */
   querySources?(query?: StoreQuery): Promise<SourceRecordLike[]>;
+  /**
+   * Resolves display text citing a source (optionally a specific version).
+   * @param sourceId - Source to cite.
+   * @param versionId - Specific version to cite; registry default when undefined.
+   * @returns Citation metadata including text.
+   */
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitationLike>;
+  /**
+   * Records an access-audit event for a source.
+   * @param input - Access description: source, action, allow/deny, principal,
+   *   and optional message.
+   * @returns Registry-dependent acknowledgement.
+   */
   recordAccess(input: {
     sourceId: string;
     action: 'read' | 'retrieve' | 'cite' | 'write' | 'delete' | 'health_check';
@@ -301,23 +349,55 @@ const RELATIONSHIP_STORE = 'context_graph_relationship_assertions';
 const EXTRACTION_RUN_STORE = 'context_graph_extraction_runs';
 const PROJECTION_STORE = 'context_graph_projection_ops';
 
+/**
+ * Returns the current time as an ISO-8601 UTC string.
+ * @returns Current timestamp in ISO format.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Builds a deterministic prefixed id by hashing its parts with SHA-256.
+ * @param prefix - Id namespace prefix (e.g. `context-entity`).
+ * @param parts - Ordered components joined with a NUL separator before hashing.
+ * @returns `<prefix>:<32 hex chars>` derived from the parts.
+ * @throws Never.
+ */
 function hashId(prefix: string, parts: readonly string[]): string {
   const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
   return `${prefix}:${hash}`;
 }
 
+/**
+ * Computes the SHA-256 hex digest of a value's canonical JSON encoding.
+ * @param value - Value to hash; object keys are sorted before encoding.
+ * @returns 64-character lowercase hex digest.
+ * @throws TypeError - When the value cannot be JSON-encoded (e.g. circular).
+ */
 function hashPayload(value: unknown): string {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
+/**
+ * Encodes a value as JSON with object keys sorted recursively, so logically
+ * equal payloads encode identically regardless of key insertion order.
+ * @param value - Value to encode.
+ * @returns Deterministic JSON string.
+ * @throws TypeError - When the value cannot be JSON-encoded (e.g. circular).
+ */
 function canonicalJson(value: unknown): string {
   return JSON.stringify(sortForJson(value));
 }
 
+/**
+ * Recursively sorts object keys and maps array elements, producing the
+ * canonical structure used for stable JSON hashing.
+ * @param value - Value to normalise.
+ * @returns Deep key-sorted copy; primitives pass through unchanged.
+ * @throws Never.
+ */
 function sortForJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortForJson);
   if (value && typeof value === 'object') {
@@ -328,32 +408,79 @@ function sortForJson(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Normalises a name to a lowercase token: trims, lowercases, collapses
+ * characters outside `[a-z0-9_@./:#-]` to underscores, and strips edge
+ * underscores.
+ * @param value - Name to normalise.
+ * @returns Normalised name, or 'unnamed' when nothing remains.
+ * @throws Never.
+ */
 function normalizeName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9_@./:#-]+/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
 }
 
+/**
+ * Collapses whitespace runs to single spaces and trims the ends.
+ * @param value - Raw display name.
+ * @returns Cleaned display name.
+ * @throws Never.
+ */
 function displayName(value: string): string {
   return value.trim().replace(/\s+/g, ' ');
 }
 
+/**
+ * Trims, drops empties, and de-duplicates string values.
+ * @param values - Values to normalise.
+ * @returns New array of unique non-empty trimmed values, in first-occurrence order.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Coerces a confidence value into the range [0, 1], defaulting to 0.8 when
+ * undefined or non-finite.
+ * @param value - Raw confidence; undefined means "use the default".
+ * @returns Clamped confidence.
+ * @throws Never.
+ */
 function clampConfidence(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return 0.8;
   return Math.max(0, Math.min(1, value));
 }
 
+/**
+ * Returns the ambient security principal id, falling back to 'system'.
+ * @returns Current principal id, or 'system' when no principal is in scope.
+ * @throws Never.
+ */
 function principalId(): string {
   return tryCurrentPrincipal()?.id ?? 'system';
 }
 
+/**
+ * Runs a store query and returns its items.
+ * @typeParam T - Stored record shape with `id` and `version`.
+ * @param store - Store to query.
+ * @param query - Filter/sort/paging query; undefined means all records.
+ * @returns Matching records.
+ * @throws Never.
+ */
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   const result = await store.query(query ?? {});
   return result.items;
 }
 
+/**
+ * Builds a human-readable warning for a source's permission, health, or
+ * staleness state.
+ * @param source - Source record to inspect.
+ * @returns Warning text, or undefined when the source is unremarkable.
+ * @throws Never.
+ */
 function sourceWarning(source: SourceRecordLike): string | undefined {
   if (source.permissionState === 'partial') return `Source "${source.title ?? source.id}" has partial permissions.`;
   if (source.healthState === 'degraded' || source.healthState === 'down') return `Source "${source.title ?? source.id}" health is ${source.healthState}.`;
@@ -361,15 +488,35 @@ function sourceWarning(source: SourceRecordLike): string | undefined {
   return undefined;
 }
 
+/**
+ * Converts a predicate into an upper-snake Cypher relationship type.
+ * @param predicate - Raw predicate name.
+ * @returns Normalised relationship type, or 'RELATED_TO' when nothing remains.
+ * @throws Never.
+ */
 function relationshipType(predicate: string): string {
   const normalized = normalizeName(predicate).toUpperCase().replace(/[^A-Z0-9_]/g, '_');
   return normalized === '' ? 'RELATED_TO' : normalized;
 }
 
+/**
+ * JSON-encodes a string, adding quotes and escapes.
+ * @param value - String to encode.
+ * @returns JSON string literal.
+ * @throws Never.
+ */
 function jsonString(value: string): string {
   return JSON.stringify(value);
 }
 
+/**
+ * Collects trimmed, non-empty matches of a global regex over text with their
+ * character offsets.
+ * @param regex - Global regular expression to apply.
+ * @param text - Text to scan.
+ * @returns Matches in document order as text/index pairs.
+ * @throws Never.
+ */
 function regexMatches(regex: RegExp, text: string): Array<{ text: string; index: number }> {
   const out: Array<{ text: string; index: number }> = [];
   for (const match of text.matchAll(regex)) {
@@ -379,6 +526,16 @@ function regexMatches(regex: RegExp, text: string): Array<{ text: string; index:
   return out;
 }
 
+/**
+ * Extracts deterministic entity/relationship candidates from text using fixed
+ * patterns: markdown headings, ticket keys and issue numbers, emails, URLs,
+ * file paths, ISO dates, and dotted identifiers. Each match carries an
+ * evidence span, a fixed confidence, and optional identifiers; candidates are
+ * de-duplicated by type/name/predicate.
+ * @param text - Text to scan.
+ * @returns Unique candidates in scan order.
+ * @throws Never.
+ */
 function deterministicCandidates(text: string): Array<{
   type: ContextEntityType;
   name: string;
@@ -485,6 +642,13 @@ function deterministicCandidates(text: string): Array<{
   return candidates;
 }
 
+/**
+ * Store-backed {@link ContextGraph}: entity and assertion upserts merge
+ * omitted fields from existing records and write with fresh versions via
+ * `set` (no compare-and-swap). Every write also enqueues a Neo4j MERGE
+ * projection operation in a durable outbox; traversal and retrieval tolerate
+ * an absent source registry by granting access.
+ */
 class StoreBackedContextGraph implements ContextGraph {
   private readonly entities: Store<ContextEntity>;
   private readonly relationships: Store<ContextRelationshipAssertion>;
@@ -492,6 +656,14 @@ class StoreBackedContextGraph implements ContextGraph {
   private readonly projectionOps: Store<Neo4jProjectionOperation>;
   private readonly sourceRegistry: SourceRegistryLike | undefined;
 
+  /**
+   * @param entities - Store for canonical entities.
+   * @param relationships - Store for relationship assertions.
+   * @param extractionRuns - Store for ingestion run records.
+   * @param projectionOps - Store for the Neo4j projection outbox.
+   * @param sourceRegistry - Optional source registry for permissions,
+   *   citations, and access auditing; checks degrade gracefully when absent.
+   */
   constructor(
     entities: Store<ContextEntity>,
     relationships: Store<ContextRelationshipAssertion>,
@@ -506,10 +678,27 @@ class StoreBackedContextGraph implements ContextGraph {
     this.sourceRegistry = sourceRegistry;
   }
 
+  /**
+   * Derives the deterministic store id for an entity from its workspace,
+   * type, and normalised canonical name.
+   * @param workspaceId - Owning workspace.
+   * @param type - Entity category.
+   * @param canonicalName - Canonical display name.
+   * @returns Hash-derived stable id.
+   * @throws Never.
+   */
   stableEntityId(workspaceId: string, type: ContextEntityType, canonicalName: string): string {
     return hashId('context-entity', [workspaceId, type, normalizeName(canonicalName)]);
   }
 
+  /**
+   * Derives the deterministic store id for a relationship assertion from its
+   * workspace, endpoints, normalised predicate, source identity, and validity
+   * window; re-asserting the same fields reuses the id.
+   * @param input - Assertion identity fields.
+   * @returns Hash-derived stable id.
+   * @throws Never.
+   */
   stableRelationshipAssertionId(input: ContextRelationshipAssertionInput): string {
     return hashId('context-relationship', [
       input.workspaceId,
@@ -523,6 +712,13 @@ class StoreBackedContextGraph implements ContextGraph {
     ]);
   }
 
+  /**
+   * Creates or updates an entity, merging aliases and identifiers with the
+   * existing record, then queues its Neo4j projection.
+   * @param input - Entity fields; id derives from workspace/type/name when omitted.
+   * @returns The stored {@link ContextEntity}.
+   * @throws Never.
+   */
   async upsertEntity(input: ContextEntityInput): Promise<ContextEntity> {
     const id = input.id ?? this.stableEntityId(input.workspaceId, input.type, input.canonicalName);
     const existing = await this.entities.get(id);
@@ -544,6 +740,16 @@ class StoreBackedContextGraph implements ContextGraph {
     return entity;
   }
 
+  /**
+   * Creates or updates a source-backed relationship assertion and queues its
+   * projection. Omitted fields keep existing values; confidence is clamped to
+   * [0, 1] with a 0.8 default.
+   * @param input - Assertion fields; both endpoint entities must already exist
+   *   in the same workspace.
+   * @returns The stored {@link ContextRelationshipAssertion}.
+   * @throws Error - When either endpoint entity is unknown or belongs to a
+   *   different workspace.
+   */
   async assertRelationship(input: ContextRelationshipAssertionInput): Promise<ContextRelationshipAssertion> {
     const subject = await this.entities.get(input.subjectEntityId);
     if (subject === null) throw new Error(`Unknown subject entity "${input.subjectEntityId}".`);
@@ -577,6 +783,16 @@ class StoreBackedContextGraph implements ContextGraph {
     return relationship;
   }
 
+  /**
+   * Runs deterministic extraction over a registered source: upserts the
+   * source entity, extracts candidates from the source metadata plus the
+   * optional text override, and asserts one relationship per candidate back
+   * to the source. Failures (unknown/denied source, registry errors) are
+   * recorded as a failed run and returned, never thrown.
+   * @param input - Source to ingest, optional text override and extraction method.
+   * @returns The completed (or failed) {@link ContextExtractionRun}.
+   * @throws Never.
+   */
   async ingestSource(input: ContextIngestSourceInput): Promise<ContextExtractionRun> {
     const startedAt = nowIso();
     const method = input.extractionMethod ?? 'deterministic';
@@ -664,6 +880,14 @@ class StoreBackedContextGraph implements ContextGraph {
     }
   }
 
+  /**
+   * Scores entities by normalised-term substring matches against canonical
+   * names, aliases, identifier values, and type.
+   * @param workspaceId - Workspace to search.
+   * @param terms - Terms to match; empty returns the first `limit` entities.
+   * @param limit - Maximum results (default 20).
+   * @returns Matching entities, best score first, ties broken by canonical name.
+   */
   async searchEntities(workspaceId: string, terms: string[], limit = 20): Promise<ContextEntity[]> {
     const normalized = terms.map(normalizeName).filter(Boolean);
     const entities = await this.queryEntities({ where: { op: 'eq', field: 'workspaceId', value: workspaceId } });
@@ -676,6 +900,17 @@ class StoreBackedContextGraph implements ContextGraph {
       .map(item => item.entity);
   }
 
+  /**
+   * Breadth-first expansion around one entity, bounded by depth and
+   * relationship count and skipping assertions whose source is unknown or
+   * denied.
+   * @param entityId - Starting entity.
+   * @param options - Traversal bounds (depth default 1 max 4; relationships
+   *   default 25 max 100).
+   * @returns Adjacent entities, relationships in traversal order, and
+   *   hydrated facts.
+   * @throws Error - When the starting entity is unknown.
+   */
   async neighbors(entityId: string, options: { depth?: number; maxRelationships?: number } = {}): Promise<{ entities: ContextEntity[]; relationships: ContextRelationshipAssertion[]; facts: ContextGraphFact[] }> {
     const start = await this.entities.get(entityId);
     if (start === null) throw new Error(`Unknown context entity "${entityId}".`);
@@ -708,6 +943,15 @@ class StoreBackedContextGraph implements ContextGraph {
     return { entities: [...entities.values()], relationships, facts };
   }
 
+  /**
+   * Finds up to `maxPaths` short paths (BFS) between two entities; returns an
+   * empty array when the endpoints live in different workspaces.
+   * @param startEntityId - Path origin.
+   * @param targetEntityId - Path destination.
+   * @param options - Bounds (maxDepth default 3 max 5; maxPaths default 3 max 10).
+   * @returns One entry per found path with entities, relationships, and facts.
+   * @throws Error - When either endpoint entity is unknown.
+   */
   async pathSearch(startEntityId: string, targetEntityId: string, options: { maxDepth?: number; maxPaths?: number } = {}): Promise<Array<{ entities: ContextEntity[]; relationships: ContextRelationshipAssertion[]; facts: ContextGraphFact[] }>> {
     const start = await this.entities.get(startEntityId);
     const target = await this.entities.get(targetEntityId);
@@ -745,6 +989,14 @@ class StoreBackedContextGraph implements ContextGraph {
     return out;
   }
 
+  /**
+   * Builds retrieval context from seed terms/entities/source ids, expanding
+   * each seed via {@link StoreBackedContextGraph.neighbors} until the
+   * relationship budget is spent; facts are de-duplicated by relationship id.
+   * @param input - Retrieval query.
+   * @returns Seed entities, facts, and unique per-source warnings.
+   * @throws Never.
+   */
   async retrieveGraphContext(input: GraphRetrievalInput): Promise<GraphRetrievalResult> {
     const maxRelationships = Math.max(1, Math.min(100, Math.trunc(input.maxRelationships ?? 20)));
     const seeds = new Map<string, ContextEntity>();
@@ -786,22 +1038,50 @@ class StoreBackedContextGraph implements ContextGraph {
     };
   }
 
+  /**
+   * Queries stored entities.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching records.
+   */
   queryEntities(query?: StoreQuery): Promise<ContextEntity[]> {
     return queryAll(this.entities, query);
   }
 
+  /**
+   * Queries stored relationship assertions.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching records.
+   */
   queryRelationships(query?: StoreQuery): Promise<ContextRelationshipAssertion[]> {
     return queryAll(this.relationships, query);
   }
 
+  /**
+   * Queries stored extraction runs.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching records.
+   */
   queryExtractionRuns(query?: StoreQuery): Promise<ContextExtractionRun[]> {
     return queryAll(this.extractionRuns, query);
   }
 
+  /**
+   * Queries stored projection operations.
+   * @param query - Optional filter/sort/paging; empty means all.
+   * @returns Matching records.
+   */
   projectionOperations(query?: StoreQuery): Promise<Neo4jProjectionOperation[]> {
     return queryAll(this.projectionOps, query);
   }
 
+  /**
+   * Counts how many normalised terms appear in the entity's searchable text
+   * (canonical name, aliases, identifier values, and type).
+   * @param entity - Entity to score.
+   * @param terms - Already-normalised search terms.
+   * @returns Term match count; 0 when nothing matches.
+   * @throws Never.
+   */
   private entitySearchScore(entity: ContextEntity, terms: readonly string[]): number {
     const haystack = [
       normalizeName(entity.canonicalName),
@@ -812,11 +1092,25 @@ class StoreBackedContextGraph implements ContextGraph {
     return terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
   }
 
+  /**
+   * Scans all stored relationships for those touching an entity.
+   * @param entityId - Entity to find relationships for.
+   * @returns Relationships where the entity is subject or object.
+   * @throws Never.
+   */
   private async relationshipsForEntity(entityId: string): Promise<ContextRelationshipAssertion[]> {
     const relationships = await this.queryRelationships();
     return relationships.filter(relationship => relationship.subjectEntityId === entityId || relationship.objectEntityId === entityId);
   }
 
+  /**
+   * Checks that a relationship's source exists, belongs to the relationship's
+   * workspace, and is not permission-denied. Always true when no registry is
+   * wired; registry lookup failures deny access.
+   * @param relationship - Assertion to check.
+   * @returns True when the relationship may be traversed.
+   * @throws Never.
+   */
   private async relationshipSourceAllowed(relationship: ContextRelationshipAssertion): Promise<boolean> {
     if (this.sourceRegistry === undefined) return true;
     const source = await this.sourceRegistry.getSource(relationship.sourceId).catch(() => null);
@@ -824,6 +1118,16 @@ class StoreBackedContextGraph implements ContextGraph {
     return source.workspaceId === relationship.workspaceId && source.permissionState !== 'denied';
   }
 
+  /**
+   * Hydrates relationships into {@link ContextGraphFact}s, resolving endpoint
+   * entities and per-source citation metadata. Relationships whose source is
+   * denied — or missing when a registry is wired — are skipped; the first
+   * retrieval per source is recorded as an access-audit event. Output follows
+   * input order.
+   * @param relationships - Assertions to hydrate, in input order.
+   * @returns Facts for hydratable, permitted relationships.
+   * @throws Never.
+   */
   private async factsForRelationships(relationships: readonly ContextRelationshipAssertion[]): Promise<ContextGraphFact[]> {
     const facts: ContextGraphFact[] = [];
     const sourceAccess = new Set<string>();
@@ -866,6 +1170,13 @@ class StoreBackedContextGraph implements ContextGraph {
     return facts;
   }
 
+  /**
+   * Resolves and permission-checks a source for ingestion.
+   * @param sourceId - Source to resolve.
+   * @returns The source record.
+   * @throws Error - When no registry is wired, the source is unknown, or the
+   *   source is permission-denied.
+   */
   private async requireSource(sourceId: string): Promise<SourceRecordLike> {
     if (this.sourceRegistry === undefined) throw new Error('Context graph source ingestion requires SourceRegistry.');
     const source = await this.sourceRegistry.getSource(sourceId);
@@ -874,12 +1185,24 @@ class StoreBackedContextGraph implements ContextGraph {
     return source;
   }
 
+  /**
+   * Resolves the most recently observed version id of a source.
+   * @param sourceId - Source to inspect.
+   * @returns Latest version id, or undefined when the registry lacks version
+   *   enumeration or the lookup fails.
+   * @throws Never.
+   */
   private async latestSourceVersionId(sourceId: string): Promise<string | undefined> {
     if (this.sourceRegistry?.sourceVersions === undefined) return undefined;
     const versions = await this.sourceRegistry.sourceVersions(sourceId).catch(() => []);
     return versions.sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0]?.id;
   }
 
+  /**
+   * Queues a `merge_entity` Cypher MERGE projection for an entity.
+   * @param entity - Entity to project.
+   * @throws Never.
+   */
   private async enqueueEntityProjection(entity: ContextEntity): Promise<void> {
     const cypher = [
       'MERGE (e:CortexEntity {id: $id})',
@@ -897,6 +1220,15 @@ class StoreBackedContextGraph implements ContextGraph {
     });
   }
 
+  /**
+   * Queues a `merge_relationship` Cypher MERGE projection (endpoints, typed
+   * relationship, properties) for an assertion.
+   * @param relationship - Assertion to project; its predicate supplies the
+   *   Cypher relationship type.
+   * @param subject - Resolved subject entity.
+   * @param object - Resolved object entity.
+   * @throws Never.
+   */
   private async enqueueRelationshipProjection(relationship: ContextRelationshipAssertion, subject: ContextEntity, object: ContextEntity): Promise<void> {
     const relType = relationshipType(relationship.predicate);
     const cypher = [
@@ -921,6 +1253,17 @@ class StoreBackedContextGraph implements ContextGraph {
     });
   }
 
+  /**
+   * Upserts one operation in the projection outbox, keyed by workspace,
+   * operation type, and graph target so repeated scans requeue the same row
+   * instead of appending duplicates. An unchanged operation hash preserves
+   * the existing status; a changed hash resets it to `queued`.
+   * @param operationType - Projection kind (entity or relationship merge).
+   * @param workspaceId - Owning workspace.
+   * @param cypher - Parameterised Cypher statement to record.
+   * @param parameters - Cypher parameters, hashed into the operation identity.
+   * @throws Never.
+   */
   private async upsertProjectionOperation(operationType: Neo4jProjectionOperation['operationType'], workspaceId: string, cypher: string, parameters: Record<string, unknown>): Promise<void> {
     const operationHash = hashPayload({ operationType, cypher, parameters });
     const targetId = typeof parameters['id'] === 'string'
@@ -948,6 +1291,10 @@ class StoreBackedContextGraph implements ContextGraph {
   }
 }
 
+/**
+ * Loose input shape accepted by the `context_graph_action` tool: the fields
+ * relevant to the chosen `action` are required, the rest are ignored.
+ */
 interface ContextGraphActionInput {
   action: string;
   entity?: ContextEntityInput;
@@ -967,6 +1314,13 @@ interface ContextGraphActionInput {
   query?: StoreQuery;
 }
 
+/**
+ * Builds the `context_graph_action` multi-action tool over a graph. Every
+ * action failure — including errors thrown by the graph — is yielded as an
+ * `error` event rather than propagated.
+ * @param graph - Graph backing the tool's actions.
+ * @returns The tool specification.
+ */
 function createContextGraphTool(graph: ContextGraph): Tool {
   return {
     name: 'context_graph_action',
@@ -1092,6 +1446,11 @@ export const plugin: MatbotPluginSpec = {
   manifest: {
     description: 'Registers ContextGraph and context_graph_action for source-backed entity and relationship retrieval.',
   },
+  /**
+   * Registers the web UI contribution, builds the graph, and registers the
+   * ContextGraph service plus the `context_graph_action` tool.
+   * @param services - Runtime machine to register services and tools into.
+   */
   async setup(services: MatbotMachine) {
     services.contributions?.register('webui','graph',uiContribution);
     const graph = createContextGraph(services);

@@ -1,31 +1,41 @@
 import type { RagV2RankedHit } from './types.js';
 import type { RagV2SearchScope } from './repository.js';
 
+/**
+ * Subset of the sidecar's JSON search response that the adapter consumes.
+ */
 interface ColbertResponse {
   model?: string;
   hits?: Array<Record<string, unknown>>;
 }
 
 /**
+ * Client for the ColBERT late-interaction sidecar used for reranking.
+ *
  * Measurement-gated adapter for a local ColBERT-compatible service. PostgreSQL
  * remains the catalog and authorization authority; every returned document
  * version is re-authorized and every byte range is rehashed before evidence is
  * delivered.
  */
-/**
- * Client for the ColBERT late-interaction sidecar used for reranking.
- */
 export class RagV2ColbertAdapter {
   readonly url: URL;
 
+  /**
+   * Parses and stores the sidecar base URL without contacting the service.
+   * @param url - Base URL of the ColBERT sidecar; endpoints are resolved relative to it.
+   * @throws TypeError - When `url` cannot be parsed as an absolute URL.
+   */
   constructor(url: string) {
     this.url = new URL(url);
   }
 
   /**
    * Reranks candidate passages against the query via the sidecar.
-   * @param params - Query text and candidate passages.
-   * @returns Passages with late-interaction scores (empty on sidecar failure).
+   * @param query - Query text sent to the sidecar.
+   * @param scope - Scope limiting workspace, context, generation, authorization tokens, and candidate ids; `limit` is clamped to 1..100 in the request and used to slice the response.
+   * @param callerSignal - Optional signal cancelling the request in addition to the fixed 3-second timeout.
+   * @returns The sidecar's model name (when reported) and hits with late-interaction scores, in retriever-rank order; malformed or non-positive-range hits are dropped, so the array may be empty.
+   * @throws Error - When the sidecar responds with a non-OK HTTP status. Network and abort failures propagate from the underlying fetch.
    */
   async search(
     query: string,

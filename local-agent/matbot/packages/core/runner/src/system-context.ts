@@ -1,5 +1,6 @@
 import type { Session, SystemContextContributor, SystemContextRegistry } from './types.js';
 
+/** Internal registry entry pairing a contributor with its owning plugin (for bulk removal). */
 interface TaggedContributor {
   fn:          SystemContextContributor;
   pluginName?: string;

@@ -17,12 +17,9 @@ export interface RagV2CensusFileAnalysis {
 }
 
 /**
- * Fixed-memory cardinality estimator used by the million-file census. It
- * avoids retaining a hash per source while still exposing the approximation
- * error in the census result.
- */
-/**
- * A HyperLogLog cardinality estimator used to size corpora cheaply during census.
+ * A HyperLogLog cardinality estimator used to size corpora cheaply during
+ * census. Fixed-memory: it avoids retaining a hash per source while still
+ * exposing the approximation error in the census result.
  */
 export class RagV2HyperLogLog {
   private readonly precision = 14;
@@ -31,6 +28,8 @@ export class RagV2HyperLogLog {
   /**
    * Adds one value to the sketch.
    * @param value - Value to count toward the estimate.
+   * @returns Nothing; the registers are updated in place.
+   * @throws Never.
    */
   add(value: string): void {
     const hash = createHash('sha256').update(value).digest();
@@ -46,7 +45,9 @@ export class RagV2HyperLogLog {
 
   /**
    * Estimates the number of distinct values added so far.
-   * @returns Approximate distinct count.
+   * @returns Approximate distinct count; linear counting is applied while the
+   *   sketch is still sparse.
+   * @throws Never.
    */
   estimate(): number {
     const count = this.registers.length;
@@ -65,12 +66,21 @@ export class RagV2HyperLogLog {
   /**
    * Reports the sketch's theoretical relative error bound.
    * @returns Relative error as a fraction (e.g. 0.016).
+   * @throws Never.
    */
   relativeError(): number {
     return 1.04 / Math.sqrt(this.registers.length);
   }
 }
 
+/**
+ * Computes a 64-bit SimHash-style similarity fingerprint: word tokens are
+ * hashed and their bits accumulated so that near-identical texts yield
+ * near-identical fingerprints.
+ * @param text - Text to fingerprint; only the first 50,000 tokens are weighed.
+ * @returns Hex-encoded fingerprint, zero-padded to 16 characters.
+ * @throws Never.
+ */
 function similarityFingerprint(text: string): string {
   const weights = new Int32Array(64);
   const tokens = text.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [];
@@ -88,6 +98,16 @@ function similarityFingerprint(text: string): string {
   return result.toString(16).padStart(16, '0');
 }
 
+/**
+ * Classifies one line and updates the running structural counters in place:
+ * Markdown headings, legal clause starts, table line runs, and paragraph
+ * starts.
+ * @param line - A single line without its trailing newline.
+ * @param state - Mutable counters plus paragraph/table position flags, both
+ *   read and updated by this function.
+ * @returns Nothing; `state` is mutated.
+ * @throws Never.
+ */
 function inspectLine(
   line: string,
   state: {
@@ -115,6 +135,21 @@ function inspectLine(
   }
 }
 
+/**
+ * Streams a file once to produce its census analysis: SHA-256 content hash, a
+ * similarity fingerprint of the leading sample, structural counts (headings,
+ * clauses, paragraphs, tables), language detection over the sample, and a
+ * passage-count estimate floored by the structural counts.
+ * @param filePath - File to read; streamed in 256 KiB chunks.
+ * @param byteLength - File size in bytes, used for the passage-count estimate
+ *   (roughly one passage per 3,200 bytes).
+ * @param signal - Abort signal checked between chunks; once aborted the scan
+ *   stops immediately and hashing is discarded.
+ * @returns Per-file statistics; `contentSha256` covers the entire file while
+ *   `similarityFingerprint` and `language` derive from the first 256 KiB.
+ * @throws Whatever `signal.reason` holds once the signal is aborted (an
+ *   `Error` is used when no reason is set).
+ */
 export async function analyzeCensusFile(
   filePath: string,
   byteLength: number,

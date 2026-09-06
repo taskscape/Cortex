@@ -3,6 +3,10 @@
 // consumer never blocks emit() or its peers. Acceptable because these events are rare and small
 // (registry/document CRUD); this is not a high-throughput data path. emit() is synchronous and never throws.
 
+/**
+ * One subscriber's fan-out state: a private unbounded queue of pending values, the wake resolver
+ * for its parked iterator, and a done flag set on abort.
+ */
 interface Subscriber<T> {
   queue: T[];
   wake:  (() => void) | undefined;
@@ -48,8 +52,23 @@ export interface Broadcaster<T> extends Subscribable<T> {
  * Wrap a bare subscribe generator into a full {@link Subscribable}, supplying the standard detached
  * `consume` loop. Use for a *derived* stream — e.g. a per-plugin scoped view of a shared broadcaster —
  * that owns its own subscribe generator but wants the same consume ergonomics as a real broadcaster.
+ *
+ * @typeParam T - The streamed value type.
+ * @param subscribe - Factory for the source async iterable; invoked once per `subscribe`/`consume`
+ *                    call, with the signal passed through unchanged.
+ * @returns A subscribable backed by the given generator.
+ * @throws Never.
  */
 export function subscribable<T>(subscribe: (signal?: AbortSignal) => AsyncIterable<T>): Subscribable<T> {
+  /**
+   * Detached observation loop: awaits each handler before pulling the next, isolates a throwing
+   * handler (logged, never propagated), and ends when the source ends or `signal` aborts.
+   *
+   * @param handler - Called with each value; may be async and may throw safely.
+   * @param signal - Optional abort signal that terminates the loop.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const consume = (handler: (value: T) => void | Promise<void>, signal?: AbortSignal): void => {
     void (async () => {
       for await (const v of subscribe(signal)) {
@@ -70,6 +89,13 @@ export function subscribable<T>(subscribe: (signal?: AbortSignal) => AsyncIterab
 export function createBroadcaster<T>(): Broadcaster<T> {
   const subs = new Set<Subscriber<T>>();
 
+  /**
+   * Push `value` onto every active subscriber's queue and wake any parked iterator.
+   *
+   * @param value - The value to deliver to all subscribers.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const emit = (value: T): void => {
     for (const sub of subs) {
       sub.queue.push(value);
@@ -77,6 +103,14 @@ export function createBroadcaster<T>(): Broadcaster<T> {
     }
   };
 
+  /**
+   * Register a private queue, yield queued values as they arrive, and park on a wake promise
+   * between events; ends when `signal` aborts, always deregistering the queue in a finally block.
+   *
+   * @param signal - Optional abort signal; aborting ends the iteration.
+   * @returns An async iterable yielding each emitted value as it arrives.
+   * @throws Never.
+   */
   async function* subscribe(signal?: AbortSignal): AsyncIterable<T> {
     const sub: Subscriber<T> = { queue: [], wake: undefined, done: false };
     subs.add(sub);

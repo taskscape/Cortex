@@ -59,33 +59,61 @@ const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const MIN_RECONCILE_INTERVAL_MS = 10_000;
 const WATCH_DEBOUNCE_MS = 500;
 const MAX_CONTEXT_CHUNKS = 4;
+/**
+ * Shape of the workspace registry file (`cortex-workspaces.json`) read when
+ * no `WorkspaceManager` service is mounted.
+ */
 interface WorkspaceRegistry {
   active: string;
   workspaces: Array<{ id: string; name: string; configPath: string }>;
 }
 
+/**
+ * A single named RAG context: an id, a human-facing name, and the local roots
+ * (folders or individual Markdown files) indexed for it.
+ */
 interface RagContextConfig {
   id: string;
   name: string;
   paths: string[];
 }
 
+/**
+ * Persisted per-workspace RAG configuration (`cortex-rag.json`) listing all
+ * contexts and which one is active. Invariants: at least one context exists
+ * and `activeContextId` always refers to an entry of `contexts`.
+ */
 interface RagConfig {
   activeContextId: string;
   contexts: RagContextConfig[];
 }
 
+/**
+ * {@link RagConfig} flattened with the active context's name and paths for
+ * presentation and tool output.
+ */
 interface RagConfigView extends RagConfig {
   contextName: string;
   paths: string[];
 }
 
+/**
+ * Partial update payload for a context edit. Omitted fields keep their
+ * current values; `contextId` selects the context to edit and defaults to
+ * the active one.
+ */
 interface RagConfigInput {
   contextId?: string;
   contextName?: string;
   paths?: string[];
 }
 
+/**
+ * A workspace known to the plugin, either listed by the `WorkspaceManager`
+ * service or synthesized from the active `matbot.yaml` path. `configDir` is
+ * the directory containing `matbot.yaml` and therefore the workspace's
+ * `cortex-rag.json` and ingestion log.
+ */
 interface WorkspaceRef {
   id: string;
   name: string;
@@ -94,6 +122,11 @@ interface WorkspaceRef {
   active: boolean;
 }
 
+/**
+ * Deletion-readiness report for a workspace: `locked` is true while any of
+ * its contexts has a reconciliation queued or running, with the blocking
+ * job's state and message when available.
+ */
 interface WorkspaceRagLockStatus {
   locked: boolean;
   reason?: string;
@@ -101,6 +134,12 @@ interface WorkspaceRagLockStatus {
   message?: string;
 }
 
+/**
+ * Coalescing state for one workspace/context reconciliation pipeline.
+ * Triggers and changed paths accumulate until the running drain loop picks
+ * them up; `promise` holds the active loop so concurrent requests await the
+ * same run.
+ */
 interface V2ReconcileState {
   pending: boolean;
   triggers: Set<RagV2Job['trigger']>;
@@ -117,12 +156,26 @@ const SKIPPABLE_WATCH_ROOT_ERROR_CODES = new Set([
   'EACCES', 'EBUSY', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOTDIR', 'EPERM',
 ]);
 
+/**
+ * Extracts the Node.js filesystem error code (for example `ENOENT`) from an
+ * unknown thrown value.
+ *
+ * @param error - Thrown value to inspect.
+ * @returns The stringified `code` property, or undefined when the value is
+ *   not an object carrying a code.
+ * @throws Never.
+ */
 function filesystemErrorCode(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error
     ? String((error as { code?: unknown }).code)
     : undefined;
 }
 
+/**
+ * Full status payload for the active context: the underlying `RagV2Status`
+ * extended with context identity, watcher health, and embedding acceleration
+ * details surfaced by the `workspace_rag` tool and the health probe.
+ */
 interface WorkspaceRagStatus extends RagV2Status {
   contextName: string;
   paths: string[];
@@ -149,9 +202,23 @@ interface WorkspaceRagStatus extends RagV2Status {
   accelerationMessage: string;
 }
 
+/**
+ * Health of a registered source as tracked by the optional `SourceRegistry`
+ * service: `degraded` after failed reads, `down` once the file disappears
+ * from the active publication.
+ */
 type SourceHealthState = 'unknown' | 'healthy' | 'degraded' | 'down';
+/**
+ * Freshness classification for a registered source, attached to retrieved
+ * evidence; `stale` and `expired` states are surfaced as retrieval warnings
+ * by {@link sourceWarningsForHit}.
+ */
 type SourceStalenessState = 'unknown' | 'fresh' | 'stale' | 'expired';
 
+/**
+ * Minimal subset of a `SourceRegistry` source record consumed by this
+ * plugin.
+ */
 interface SourceRegistrySourceLike {
   id: string;
   healthState: SourceHealthState;
@@ -160,10 +227,17 @@ interface SourceRegistrySourceLike {
   uri?: string;
 }
 
+/**
+ * Minimal subset of a `SourceRegistry` immutable source version record.
+ */
 interface SourceRegistryVersionLike {
   id: string;
 }
 
+/**
+ * Resolved citation for a source, as returned by the optional
+ * `SourceRegistry` service and attached to search hits for presentation.
+ */
 interface SourceCitationLike {
   sourceId: string;
   text: string;
@@ -174,6 +248,12 @@ interface SourceCitationLike {
   observedAt?: string;
 }
 
+/**
+ * Structural subset of the optional `SourceRegistry` service used to track
+ * workspace files as sources, record health and access audits, and resolve
+ * citations. Resolved dynamically from the machine registry, so it may be
+ * absent at runtime.
+ */
 interface SourceRegistryLike {
   stableSourceId(input: {
     workspaceId: string;
@@ -203,6 +283,10 @@ interface SourceRegistryLike {
   resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitationLike>;
 }
 
+/**
+ * Structural subset of the optional `ContextGraph` service used to ingest
+ * extracted source text as graph content.
+ */
 interface ContextGraphLike {
   ingestSource(input: {
     sourceId: string;
@@ -212,6 +296,12 @@ interface ContextGraphLike {
   }): Promise<unknown>;
 }
 
+/**
+ * A single retrieved passage. V2 evidence fields (document/section ids, byte
+ * and line ranges, retrieval reasons) are populated when the underlying V2
+ * result carries them; the registry fields describe the source's health and
+ * freshness after {@link WorkspaceRagManager.enrichSearchHits} enrichment.
+ */
 interface SearchHit {
   workspaceId: string;
   contextName: string;
@@ -236,6 +326,10 @@ interface SearchHit {
   retrievalRunId?: string;
 }
 
+/**
+ * Caveat attached to a hit whose source is degraded, down, stale, or
+ * expired, rendered into retrieval context and markers.
+ */
 interface SourceWarning {
   path: string;
   severity: 'warning' | 'critical';
@@ -244,6 +338,10 @@ interface SourceWarning {
   sourceId?: string;
 }
 
+/**
+ * Observability correlation ids threaded into retrieval calls; every field
+ * is individually optional and omitted from recorded spans when absent.
+ */
 interface RetrievalTraceContext {
   traceId?: string;
   rootTraceId?: string;
@@ -252,24 +350,53 @@ interface RetrievalTraceContext {
   toolCallId?: string;
 }
 
+/**
+ * Conversation context used for query rewriting: the turns preceding the
+ * latest user message plus the provider that should perform the rewrite.
+ */
 interface RetrievalConversationContext {
   turns: RagV2ConversationTurn[];
   provider?: string;
 }
 
+/**
+ * Result of a detailed search: presentation-ready hits plus the raw V2
+ * result (plan, answerability) when V2 produced one.
+ */
 interface WorkspaceSearchOutcome {
   hits: SearchHit[];
   v2Result?: RagV2SearchResult;
 }
 
+/**
+ * Returns the current UTC time as an ISO-8601 timestamp.
+ *
+ * @returns ISO-8601 string for the current instant.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Extracts a human-readable message from an unknown thrown value.
+ *
+ * @param error - Thrown value to describe.
+ * @returns `error.message` for Error instances, otherwise `String(error)`.
+ * @throws Never.
+ */
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Checks whether a path is accessible to the current process.
+ *
+ * @param filePath - Path probed with `fs.access`.
+ * @returns True when the path is accessible; false on any access error,
+ *   including missing paths and permission failures.
+ * @throws Never.
+ */
 async function exists(filePath: string): Promise<boolean> {
   try { await access(filePath); return true; } catch { return false; }
 }
@@ -278,6 +405,13 @@ async function exists(filePath: string): Promise<boolean> {
  * Validates newly supplied context paths. Editing a context tolerates a mix of
  * available and unavailable roots because ingestion skips unavailable roots
  * gracefully; creating a context stays strict so typos fail fast.
+ *
+ * @param paths - Absolute paths to probe; an empty list always passes.
+ * @param mode - `all` rejects when any path is inaccessible; `any` rejects
+ *   only when every path is inaccessible.
+ * @returns Resolves once every path has been probed.
+ * @throws Error - When the mode rejects and at least one path is
+ *   inaccessible; the first inaccessible path names the error.
  */
 async function assertAccessibleContextPaths(paths: readonly string[], mode: 'all' | 'any'): Promise<void> {
   const inaccessible: string[] = [];
@@ -290,24 +424,64 @@ async function assertAccessibleContextPaths(paths: readonly string[], mode: 'all
   }
 }
 
+/**
+ * Hashes text with SHA-256.
+ *
+ * @param text - UTF-8 text to hash.
+ * @returns Lowercase hexadecimal digest.
+ * @throws Never.
+ */
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
+/**
+ * Derives a stable identifier from arbitrary text.
+ *
+ * @param text - Text to hash.
+ * @returns First 32 hexadecimal characters of the SHA-256 digest.
+ * @throws Never.
+ */
 function stableId(text: string): string {
   return sha256(text).slice(0, 32);
 }
 
+/**
+ * Canonicalizes a path for use as an identifier.
+ *
+ * @param filePath - Path resolved against the current working directory.
+ * @returns Absolute path with forward slashes on every platform.
+ * @throws Never.
+ */
 function normalizePathForId(filePath: string): string {
   return path.resolve(filePath).replace(/\\/g, '/');
 }
 
+/**
+ * Normalizes arbitrary text into a context id slug.
+ *
+ * @param value - Raw id or name; null and undefined fall back to `fallback`.
+ * @param fallback - Value used (after trimming and lowercasing) when `value`
+ *   is null or undefined.
+ * @returns Lowercase slug of at most 48 characters drawn from
+ *   `[a-z0-9_-]`, or `'default'` when normalization empties the value.
+ * @throws Never.
+ */
 function normalizeContextId(value: unknown, fallback: string): string {
   const raw = String(value ?? fallback).trim().toLowerCase();
   const normalized = raw.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
   return normalized || 'default';
 }
 
+/**
+ * Allocates a context id that does not collide with existing ones.
+ *
+ * @param base - Desired id or name, normalized via
+ *   {@link normalizeContextId}.
+ * @param existing - Ids already taken; mutated to include the returned id.
+ * @returns The normalized id, suffixed `-2`, `-3`, ... on collisions.
+ * @throws Never.
+ */
 function uniqueContextId(base: string, existing: Set<string>): string {
   const normalized = normalizeContextId(base, 'context');
   let candidate = normalized;
@@ -319,6 +493,15 @@ function uniqueContextId(base: string, existing: Set<string>): string {
   return candidate;
 }
 
+/**
+ * Coerces and deduplicates configured root paths.
+ *
+ * @param paths - Unknown value expected to be a string array; non-arrays
+ *   yield an empty result and blank entries are dropped.
+ * @returns Resolved absolute paths, deduplicated case-insensitively on
+ *   Windows and case-sensitively elsewhere, in first-seen order.
+ * @throws Never.
+ */
 function normalizeFolderPaths(paths: unknown): string[] {
   if (!Array.isArray(paths)) return [];
   const normalized = new Map<string, string>();
@@ -332,6 +515,18 @@ function normalizeFolderPaths(paths: unknown): string[] {
   return [...normalized.values()];
 }
 
+/**
+ * Parses unknown JSON into a valid {@link RagConfig}, tolerating missing or
+ * malformed files. Guarantees at least one context (synthesizing a default
+ * one from legacy top-level fields when necessary) and falls back to the
+ * first context when `activeContextId` does not resolve.
+ *
+ * @param value - Parsed file contents; may be null or arbitrary.
+ * @param workspace - Workspace used to name a synthesized default context.
+ * @returns Normalized configuration whose `activeContextId` always refers
+ *   to an entry of `contexts`.
+ * @throws Never.
+ */
 function normalizeConfig(value: unknown, workspace: WorkspaceRef): RagConfig {
   const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const contexts: RagContextConfig[] = [];
@@ -367,10 +562,26 @@ function normalizeConfig(value: unknown, workspace: WorkspaceRef): RagConfig {
   return { activeContextId, contexts };
 }
 
+/**
+ * Resolves a configuration's active context.
+ *
+ * @param config - Configuration with at least one context.
+ * @returns The context matching `activeContextId`, or the first context
+ *   when the id does not resolve.
+ * @throws Never.
+ */
 function activeContext(config: RagConfig): RagContextConfig {
   return config.contexts.find(context => context.id === config.activeContextId) ?? config.contexts[0]!;
 }
 
+/**
+ * Flattens a configuration with its active context for presentation.
+ *
+ * @param config - Configuration to project.
+ * @returns Copy of the configuration extended with `contextName` and
+ *   `paths` taken from the active context.
+ * @throws Never.
+ */
 function configView(config: RagConfig): RagConfigView {
   const active = activeContext(config);
   return {
@@ -380,6 +591,16 @@ function configView(config: RagConfig): RagConfigView {
   };
 }
 
+/**
+ * Reads and parses a JSON file, falling back on any failure.
+ *
+ * @typeParam T - Expected parsed shape; the result is cast, not validated.
+ * @param filePath - File read as UTF-8.
+ * @param fallback - Returned when the file is missing, unreadable, or not
+ *   valid JSON.
+ * @returns The parsed value or the fallback.
+ * @throws Never.
+ */
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   try {
     return JSON.parse(await readFile(filePath, 'utf8')) as T;
@@ -388,17 +609,41 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   }
 }
 
+/**
+ * Atomically writes a JSON document: creates the parent directory, stages a
+ * uniquely named temporary file, then renames it into place.
+ *
+ * @param filePath - Destination file.
+ * @param value - Value serialized with two-space indentation and a trailing
+ *   newline.
+ * @throws Error - Propagates filesystem failures from directory creation,
+ *   writing, or the final rename.
+ */
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   const temporary=filePath+'.tmp-'+randomUUID();
   try{await writeFile(temporary,JSON.stringify(value,null,2)+'\n','utf8');await rename(temporary,filePath);}finally{await rm(temporary,{force:true});}
 }
 
+/**
+ * `KnowledgeIndex` decorator layering workspace RAG search on top of an
+ * upstream index. Only `search` contributes workspace content: entries are
+ * delegated verbatim to the upstream index, and upstream search failures are
+ * logged and treated as empty results rather than failing the merged search.
+ */
 class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
   private readonly manager: WorkspaceRagManager;
   private readonly workspaceId: string;
   private readonly upstream: KnowledgeIndex | undefined;
 
+  /**
+   * Creates a decorator around an optional upstream index.
+   *
+   * @param manager - Manager supplying workspace-scoped V2 search.
+   * @param workspaceId - Workspace whose contexts are searched.
+   * @param upstream - Optional upstream index that continues to receive
+   *   indexed entries and contribute merged search results.
+   */
   constructor(
     manager: WorkspaceRagManager,
     workspaceId: string,
@@ -409,15 +654,43 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
     this.upstream = upstream;
   }
 
+  /**
+   * Yields entries from the upstream index only; workspace RAG content is
+   * served through {@link search} rather than enumerated here.
+   *
+   * @returns Iterable of upstream knowledge entries.
+   * @throws Error - Propagates failures thrown by the upstream iterator.
+   */
   *entries(): Iterable<KnowledgeEntry> {
     const upstreamEntries = this.upstream?.entries?.();
     if (upstreamEntries) yield* upstreamEntries;
   }
 
+  /**
+   * Delegates indexing to the upstream index; workspace RAG content is
+   * ingested by its own V2 pipeline and stored nowhere here.
+   *
+   * @param entry - Knowledge entry forwarded upstream.
+   * @throws Error - Propagates upstream indexing failures.
+   */
   async index(entry: KnowledgeEntry): Promise<void> {
     await this.upstream?.index(entry);
   }
 
+  /**
+   * Searches the workspace RAG index and the upstream index in parallel and
+   * merges the results. Upstream search failures are logged and contribute
+   * no entries; duplicates are removed by `type:uuid:id` key, keeping the
+   * first occurrence.
+   *
+   * @param terms - Terms to search; each `context` is appended after its
+   *   `term` for the workspace query while the upstream index receives the
+   *   terms unchanged.
+   * @param signal - Cancellation signal; an already-aborted signal yields
+   *   empty workspace hits.
+   * @returns Merged entries with workspace results first, in stable order.
+   * @throws Error - Propagates workspace search failures.
+   */
   async search(terms: Array<{ term: string; context?: string }>, signal: AbortSignal): Promise<KnowledgeEntry[]> {
     const query = terms.map(term => term.context ? `${term.term} ${term.context}` : term.term).join('\n');
     const [workspaceEntries, upstreamEntries] = await Promise.all([
@@ -438,6 +711,15 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
     return merged;
   }
 
+  /**
+   * Runs a workspace RAG search and maps hits into knowledge entries with
+   * stable ids, derived entities and tags, and the hit score as confidence.
+   *
+   * @param query - Query text assembled by {@link search}.
+   * @param signal - Cancellation signal forwarded to the manager.
+   * @returns One entry per hit, in hit-score order.
+   * @throws Error - Propagates {@link WorkspaceRagManager.search} failures.
+   */
   private async searchWorkspace(query: string, signal: AbortSignal): Promise<KnowledgeEntry[]> {
     const hits = await this.manager.search(this.workspaceId, query, MAX_CONTEXT_CHUNKS, signal);
     const timestamp = nowIso();
@@ -457,6 +739,15 @@ class WorkspaceRagKnowledgeIndex implements KnowledgeIndex {
   }
 }
 
+/**
+ * Orchestrates per-workspace RAG contexts for the V2-only pipeline. Owns the
+ * persisted `cortex-rag.json` configuration, file watchers with debounced
+ * reconciliation, the V2 manager lifecycle (ingestion, GC, census, search,
+ * evaluation), the ingestion log, and deletion leases shared with the
+ * `WorkspaceManager`. Optional peer services (`SourceRegistry`,
+ * `ContextGraph`, `WorkspaceManager`) are resolved through the machine
+ * registry and used opportunistically when present.
+ */
 class WorkspaceRagManager {
   private readonly logRotationChecked = new Set<string>();
   private readonly reconcileStates = new Map<string, V2ReconcileState>();
@@ -476,7 +767,23 @@ class WorkspaceRagManager {
   private readonly workspaceMountAbort = new AbortController();
   private disposed = false;
   private readonly activeConfigPath: string;
+  /**
+   * Optional `SourceRegistry` service, resolved from the machine registry on
+   * every access.
+   *
+   * @returns The registered service, or undefined when no plugin provides
+   *   it.
+   * @throws Never.
+   */
   private get sourceRegistry(): SourceRegistryLike | undefined { return this.services.get('SourceRegistry' as never) as SourceRegistryLike | undefined; }
+  /**
+   * Optional `ContextGraph` service, resolved from the machine registry on
+   * every access.
+   *
+   * @returns The registered service, or undefined when no plugin provides
+   *   it.
+   * @throws Never.
+   */
   private get contextGraph(): ContextGraphLike | undefined { return this.services.get('ContextGraph' as never) as ContextGraphLike | undefined; }
   private readonly services: MatbotMachine;
   private readonly v2Mode: RagV2Mode = ragV2ModeFromEnv();
@@ -484,6 +791,15 @@ class WorkspaceRagManager {
   private v2: WorkspaceRagV2Manager | undefined;
   private v2Message = 'Workspace RAG V2 is disabled.';
 
+  /**
+   * Creates an idle manager; call {@link start} before use.
+   *
+   * @param activeConfigPath - Absolute path to the workspace's
+   *   `matbot.yaml`; used to derive the workspace id, config directory, and
+   *   registry search root when no `WorkspaceManager` service is mounted.
+   * @param services - Machine providing tools, hooks, contributions, and
+   *   optional peer services.
+   */
   constructor(
     activeConfigPath: string,
     services: MatbotMachine,
@@ -492,6 +808,19 @@ class WorkspaceRagManager {
     this.services = services;
   }
 
+  /**
+   * Reserves a workspace for deletion and returns a lease coordinating the
+   * purge. The reservation rejects concurrent deletions and blocks new
+   * reconciliations for the workspace until released.
+   *
+   * @param workspaceId - Workspace to reserve.
+   * @returns Lease whose `commit` purges every context's V2 index, cancels
+   *   pending reconciles, and closes the workspace's watchers, and whose
+   *   `release` frees the reservation without deleting anything.
+   * @throws Error - When the workspace is already reserved, its indexing is
+   *   busy or queued, or the workspace is unknown; the reservation is
+   *   released again before rethrowing.
+   */
   async acquireWorkspaceDeletion(workspaceId: string): Promise<WorkspaceDeletionLease> {
     if (this.deletionReservations.has(workspaceId)) throw new Error('Workspace deletion already reserved');
     this.deletionReservations.add(workspaceId);
@@ -518,6 +847,19 @@ class WorkspaceRagManager {
     } catch (error) { this.deletionReservations.delete(workspaceId); throw error; }
   }
 
+  /**
+   * Starts the manager: registers the workspace lifecycle participant
+   * (rebinding on `WorkspaceManager` remounts), launches the embedding
+   * vectorizer, initializes the V2 manager, refreshes watchers, schedules
+   * the periodic reconcile interval (clamped to a 10 second minimum) and the
+   * GC timer, and kicks off a startup reconciliation.
+   *
+   * @returns Resolves once startup scheduling is complete; failures of the
+   *   background startup reconcile are recorded as watcher degradation
+   *   instead of rejecting.
+   * @throws Error - If the embedding vectorizer or the V2 repository backend
+   *   cannot be created.
+   */
   async start(): Promise<void> {
     const participant: WorkspaceLifecycleParticipant = {
       id: 'workspace-rag',
@@ -553,6 +895,14 @@ class WorkspaceRagManager {
     });
   }
 
+  /**
+   * Stops the manager: releases the lifecycle participant, clears the
+   * reconcile, GC, and debounce timers, closes all watchers, marks the
+   * manager disposed, and closes the V2 manager (logging close failures).
+   *
+   * @returns Resolves when the V2 manager has been closed.
+   * @throws Never.
+   */
   async stop(): Promise<void> {
     this.workspaceMountAbort.abort();
     this.releaseWorkspaceParticipant?.();
@@ -569,10 +919,27 @@ class WorkspaceRagManager {
     });
   }
 
+  /**
+   * Builds the map key identifying a workspace/context reconciliation state.
+   *
+   * @param workspaceId - Owning workspace id.
+   * @param contextId - Context id within the workspace.
+   * @returns Key joining both ids with a NUL separator.
+   * @throws Never.
+   */
   private reconcileKey(workspaceId: string, contextId: string): string {
     return `${workspaceId}\0${contextId}`;
   }
 
+  /**
+   * Returns the reconciliation state for a workspace/context pair, creating
+   * and caching an empty one on first use.
+   *
+   * @param workspaceId - Owning workspace id.
+   * @param contextId - Context id within the workspace.
+   * @returns The shared mutable state for this pair.
+   * @throws Never.
+   */
   private reconcileState(workspaceId: string, contextId: string): V2ReconcileState {
     const key = this.reconcileKey(workspaceId, contextId);
     const existing = this.reconcileStates.get(key);
@@ -587,6 +954,29 @@ class WorkspaceRagManager {
     return created;
   }
 
+  /**
+   * Requests a V2 reconciliation for one context, coalescing concurrent
+   * requests into a single drain loop. Recorded triggers are prioritized
+   * manual > configuration > watch > retry > interval > startup, changed
+   * paths accumulate across coalesced requests, and non-watch triggers
+   * cancel a pending watch debounce. Loop failures are recorded on the
+   * state's `lastError` rather than thrown; when the loop finishes with
+   * pending work it re-requests itself as a `retry`.
+   *
+   * @param workspace - Workspace owning the context.
+   * @param context - Context to reconcile; the latest seen wins when
+   *   requests coalesce.
+   * @param trigger - Reconciliation trigger to record.
+   * @param wait - When true, awaits the coalesced run before returning.
+   * @param changedPaths - Specific paths forced through re-ingestion,
+   *   normalized before accumulation; defaults to none.
+   * @param forceAll - When true, forces every discovered file through the
+   *   pipeline regardless of change detection.
+   * @returns The most recent V2 job for this pair, or undefined when the
+   *   manager is disposed, V2 mode is off, the workspace is reserved for
+   *   deletion, or nothing has run yet.
+   * @throws Error - When the V2 manager is unavailable.
+   */
   private async requestV2Reconcile(
     workspace: WorkspaceRef,
     context: RagContextConfig,
@@ -664,6 +1054,17 @@ class WorkspaceRagManager {
     return state.currentJob;
   }
 
+  /**
+   * Schedules a reconciliation for every context of every workspace, active
+   * workspace first, skipping workspaces reserved for deletion or whose
+   * config cannot be read. Per-context failures are recorded on the
+   * corresponding reconcile state.
+   *
+   * @param trigger - `startup` or `interval` trigger recorded for each
+   *   scheduled reconciliation.
+   * @returns Resolves once every reconciliation has been requested.
+   * @throws Never.
+   */
   private async reconcileAll(trigger: Extract<RagV2Job['trigger'], 'startup' | 'interval'>): Promise<void> {
     if (this.disposed || this.v2Mode === 'off' || !this.v2) return;
     const scheduled: Array<Promise<unknown>> = [];
@@ -686,6 +1087,13 @@ class WorkspaceRagManager {
     await Promise.all(scheduled);
   }
 
+  /**
+   * Schedules the next periodic orphan-GC run with ±10% jitter on an unref'd
+   * timer and reschedules itself after each run. No-op when the manager is
+   * disposed, GC is disabled, or V2 is off or unavailable.
+   *
+   * @throws Never.
+   */
   private scheduleGcTimer(): void {
     if (this.disposed || !this.gcSettings.enabled || this.v2Mode === 'off' || !this.v2) return;
     const jitter = 0.9 + Math.random() * 0.2;
@@ -698,6 +1106,14 @@ class WorkspaceRagManager {
     this.gcTimer.unref?.();
   }
 
+  /**
+   * Runs V2 orphan garbage collection for every context of every workspace,
+   * active workspace first. Skips workspaces whose config cannot be read and
+   * aborts the sweep for a workspace reserved for deletion.
+   *
+   * @throws Error - Propagates V2 garbage-collection failures for the
+   *   current workspace.
+   */
   private async garbageCollectAll(): Promise<void> {
     if (this.disposed || !this.gcSettings.enabled || !this.v2) return;
     for (const workspace of this.workspacesActiveFirst(await this.listWorkspaces())) {
@@ -716,6 +1132,19 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Debounces a watch-triggered reconciliation for a context, resetting the
+   * 500 ms timer on every event. Changed Markdown paths are accumulated for
+   * forced re-ingestion; other events only refresh the debounce. When the
+   * timer fires, the workspace and context are re-resolved and the
+   * reconciliation requested; failures are recorded on the reconcile state
+   * and degrade the watcher.
+   *
+   * @param workspaceId - Workspace whose context changed.
+   * @param contextId - Context whose roots changed.
+   * @param changedPath - Normalized path of the changed file, when known.
+   * @throws Never.
+   */
   private scheduleWatchReconcile(workspaceId: string, contextId: string, changedPath?: string): void {
     if(this.disposed||this.deletionReservations.has(workspaceId))return;
     const key = this.reconcileKey(workspaceId, contextId);
@@ -742,6 +1171,17 @@ class WorkspaceRagManager {
     }, WATCH_DEBOUNCE_MS));
   }
 
+  /**
+   * Rebuilds all file watchers from current configurations, closing previous
+   * watchers first. Single-file roots watch their parent directory and
+   * filter events to the exact file; `change` events are ignored for
+   * non-Markdown files while creations, deletions, and renames always
+   * reconcile. Unavailable roots are skipped for well-known filesystem
+   * error codes; other setup failures and runtime watcher errors degrade the
+   * watcher state instead of throwing.
+   *
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   private async refreshWatchers(): Promise<void> {
     for (const { watcher } of this.watchers.splice(0)) watcher.close();
     this.watcherState = this.v2Mode === 'off' || !this.v2 ? 'stopped' : 'active';
@@ -786,6 +1226,14 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Resolves the ambient workspace id: the mounted `WorkspaceContext` id
+   * when present, otherwise the `/workspaces/<id>/matbot.yaml` segment of
+   * the active config path, otherwise `'default'`.
+   *
+   * @returns The current workspace id.
+   * @throws Never.
+   */
   currentWorkspaceId(): string {
     if(this.services.WorkspaceContext)return this.services.WorkspaceContext.id;
     const normalized = normalizePathForId(this.activeConfigPath);
@@ -794,10 +1242,63 @@ class WorkspaceRagManager {
   }
 
   private configQueue:Promise<unknown>=Promise.resolve();
+  /**
+   * Serializes an async configuration mutation onto a per-manager queue so
+   * read-modify-write cycles cannot interleave.
+   *
+   * @typeParam T - Operation result type.
+   * @param operation - Mutation run once all prior operations settle.
+   * @returns The operation's result; the queue itself never rejects.
+   * @throws Error - Propagates the operation's own failure.
+   */
   private async mutateConfig<T>(operation:()=>Promise<T>):Promise<T>{const next=this.configQueue.catch(()=>{}).then(operation);this.configQueue=next;return next;}
+  /**
+   * Builds an optimistic-concurrency snapshot of the current configuration:
+   * a SHA-256 version token over the serialized view plus the editable
+   * fields.
+   *
+   * @returns Object pairing a `version` hash with a `value` of context id,
+   *   name, and paths.
+   * @throws Error - Propagates configuration read failures.
+   */
   async configurationSnapshot(){const value=await this.configCurrent();return {version:createHash('sha256').update(JSON.stringify(value)).digest('hex'),value:{contextId:value.activeContextId,contextName:value.contextName,paths:value.paths}};}
+  /**
+   * Applies a configuration update guarded by compare-and-swap on the
+   * snapshot version.
+   *
+   * @param value - Raw configuration payload, validated and normalized by
+   *   {@link configureOwned}.
+   * @param expectedVersion - Version token from a previous
+   *   {@link configurationSnapshot} call.
+   * @returns Snapshot of the newly written configuration.
+   * @throws Error - When `expectedVersion` no longer matches (reload before
+   *   editing) or the update is rejected (blank or duplicate name,
+   *   inaccessible paths).
+   */
   async updateConfiguration(value:unknown,expectedVersion:string){return this.mutateConfig(async()=>{const current=await this.configurationSnapshot();if(current.version!==expectedVersion)throw new Error('Configuration conflict; reload before editing');await this.configureOwned(value as RagConfigInput);return this.configurationSnapshot();});}
+  /**
+   * Queues an edit of the active or targeted context.
+   *
+   * @param config - Context fields to change; omitted fields keep their
+   *   current values.
+   * @returns View of the updated configuration.
+   * @throws Error - Propagates {@link configureOwned} failures.
+   */
   async configureCurrent(config:RagConfigInput):Promise<RagConfigView>{return this.mutateConfig(()=>this.configureOwned(config));}
+  /**
+   * Edits a context without queueing: resolves the target context by
+   * `contextId` (defaulting to the active one), validates the name (non-blank
+   * and unique under accent-insensitive comparison), normalizes and
+   * accessibility-checks replacement paths, writes the configuration, logs a
+   * `configure` event, refreshes watchers, and schedules a
+   * `configuration`-triggered reconcile when paths changed (not awaited).
+   *
+   * @param config - Context fields to change; `paths` undefined keeps the
+   *   current paths while an explicit array replaces them.
+   * @returns View of the updated configuration.
+   * @throws Error - When the name is blank or already in use, a replacement
+   *   path is inaccessible, or the configuration file cannot be written.
+   */
   private async configureOwned(config: RagConfigInput): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
@@ -836,7 +1337,22 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
+  /**
+   * Queues activation of a context by id.
+   *
+   * @param contextId - Context to make active.
+   * @returns View of the updated configuration.
+   * @throws Error - Propagates {@link selectContextOwned} failures.
+   */
   async selectContextCurrent(contextId: string): Promise<RagConfigView>{return this.mutateConfig(()=>this.selectContextOwned(contextId));}
+  /**
+   * Activates a context without queueing and logs a `select_context` event.
+   *
+   * @param contextId - Context to make active.
+   * @returns View of the updated configuration.
+   * @throws Error - When the context id is unknown or the configuration
+   *   file cannot be written.
+   */
   private async selectContextOwned(contextId: string): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
@@ -852,7 +1368,31 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
+  /**
+   * Queues creation of a new context, which becomes active immediately.
+   *
+   * @param contextName - Human-facing name; defaults to `Context <n>` when
+   *   undefined.
+   * @param paths - Initial roots; all must be accessible.
+   * @returns View of the updated configuration with the new context active.
+   * @throws Error - Propagates {@link createContextOwned} failures.
+   */
   async createContextCurrent(contextName?: string, paths?: string[]): Promise<RagConfigView>{return this.mutateConfig(()=>this.createContextOwned(contextName,paths));}
+  /**
+   * Creates a context without queueing: validates the name (non-blank and
+   * unique under accent-insensitive comparison), allocates a unique id,
+   * requires every path to be accessible, persists the configuration, logs a
+   * `create_context` event, refreshes watchers, and schedules a
+   * `configuration`-triggered reconcile (not awaited).
+   *
+   * @param contextName - Human-facing name; defaults to `Context <n>` when
+   *   undefined.
+   * @param paths - Initial roots; all must be accessible, and an empty or
+   *   undefined list is allowed.
+   * @returns View of the updated configuration with the new context active.
+   * @throws Error - When the name is blank or already in use, a path is
+   *   inaccessible, or the configuration file cannot be written.
+   */
   private async createContextOwned(contextName?: string, paths?: string[]): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
@@ -885,7 +1425,25 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
+  /**
+   * Queues deletion of a context by id.
+   *
+   * @param contextId - Context to delete.
+   * @returns View of the updated configuration.
+   * @throws Error - Propagates {@link deleteContextOwned} failures.
+   */
   async deleteContextCurrent(contextId: string): Promise<RagConfigView>{return this.mutateConfig(()=>this.deleteContextOwned(contextId));}
+  /**
+   * Deletes a context without queueing: refuses to remove the last remaining
+   * context, reassigns the active context when needed, purges the context's
+   * V2 index, awaits any in-flight reconciliation, logs `gc` and
+   * `delete_context` events, and refreshes watchers.
+   *
+   * @param contextId - Context to delete.
+   * @returns View of the updated configuration.
+   * @throws Error - When the context id is unknown, it is the only context,
+   *   the configuration cannot be written, or the V2 purge fails.
+   */
   private async deleteContextOwned(contextId: string): Promise<RagConfigView> {
     const workspace = await this.currentWorkspace();
     const current = await this.readConfig(workspace);
@@ -917,6 +1475,14 @@ class WorkspaceRagManager {
     return configView(next);
   }
 
+  /**
+   * Builds the full status payload for the current workspace's active
+   * context: V2 status extended with context identity, watcher state,
+   * reconcile flags, and embedding acceleration details.
+   *
+   * @returns Aggregated status snapshot.
+   * @throws Error - Propagates workspace enumeration or V2 status failures.
+   */
   async statusCurrent(): Promise<WorkspaceRagStatus> {
     const workspace = await this.currentWorkspace();
     const context = activeContext(await this.readConfig(workspace));
@@ -940,6 +1506,15 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Reports whether any context of a workspace has a reconciliation queued
+   * or running; used for deletion readiness.
+   *
+   * @param workspaceId - Workspace to inspect.
+   * @returns Lock report carrying the blocking job's state and message when
+   *   locked, otherwise `{ locked: false }`.
+   * @throws Never.
+   */
   workspaceLockStatus(workspaceId: string): WorkspaceRagLockStatus {
     const states = [...this.reconcileStates.entries()]
       .filter(([key]) => key.startsWith(`${workspaceId}\0`))
@@ -954,10 +1529,31 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Reads the current workspace's configuration.
+   *
+   * @returns View of the active context and all contexts.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   async configCurrent(): Promise<RagConfigView> {
     return configView(await this.readConfig(await this.currentWorkspace()));
   }
 
+  /**
+   * Searches the current workspace's active context and returns only the
+   * hits.
+   *
+   * @param query - Query text; blank queries return no hits.
+   * @param limit - Maximum hits to return.
+   * @param signal - Cancellation signal.
+   * @param trace - Optional observability correlation ids recorded with
+   *   retrieval access.
+   * @param conversation - Optional conversation turns used for query
+   *   rewriting.
+   * @returns Hits ordered by relevance; empty when aborted, V2 is
+   *   unavailable, or the search fails.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   async searchCurrent(
     query: string,
     limit: number,
@@ -968,10 +1564,37 @@ class WorkspaceRagManager {
     return (await this.searchDetailed(this.currentWorkspaceId(), query, limit, signal, trace, conversation)).hits;
   }
 
+  /**
+   * Searches a specific workspace's active context and returns only the
+   * hits.
+   *
+   * @param workspaceId - Workspace to search; unknown ids return no hits.
+   * @param query - Query text; blank queries return no hits.
+   * @param limit - Maximum hits to return.
+   * @param signal - Cancellation signal.
+   * @param trace - Optional observability correlation ids.
+   * @returns Hits ordered by relevance; empty when aborted, V2 is
+   *   unavailable, or the search fails.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   async search(workspaceId: string, query: string, limit: number, signal: AbortSignal, trace?: RetrievalTraceContext): Promise<SearchHit[]> {
     return (await this.searchDetailed(workspaceId, query, limit, signal, trace)).hits;
   }
 
+  /**
+   * Searches the current workspace, returning hits plus the raw V2 result
+   * for answerability inspection.
+   *
+   * @param query - Query text; blank queries return no hits.
+   * @param limit - Maximum hits to return.
+   * @param signal - Cancellation signal.
+   * @param trace - Optional observability correlation ids.
+   * @param conversation - Optional conversation turns used for query
+   *   rewriting.
+   * @returns Hits plus the underlying V2 search result when one was
+   *   produced.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   async searchCurrentDetailed(
     query: string,
     limit: number,
@@ -982,6 +1605,23 @@ class WorkspaceRagManager {
     return this.searchDetailed(this.currentWorkspaceId(), query, limit, signal, trace, conversation);
   }
 
+  /**
+   * Core V2-only search: resolves the workspace and its active context, runs
+   * the V2 hybrid retrieval (with conversation-based query rewriting when
+   * turns are supplied), maps evidence to hits, and enriches them with
+   * source registry health and citations. Returns no hits when the signal is
+   * already aborted, the workspace is unknown, the query is blank, or V2 is
+   * disabled; search failures are logged and returned as no hits.
+   *
+   * @param workspaceId - Workspace to search.
+   * @param query - Query text.
+   * @param limit - Maximum hits to return.
+   * @param signal - Cancellation signal forwarded to V2 retrieval.
+   * @param trace - Optional observability correlation ids.
+   * @param conversation - Optional conversation turns and rewrite provider.
+   * @returns Hits ordered by relevance plus the raw V2 result.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   private async searchDetailed(
     workspaceId: string,
     query: string,
@@ -1014,6 +1654,13 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Returns the V2 status for the current workspace's active context, or a
+   * degraded placeholder payload when the V2 manager is unavailable.
+   *
+   * @returns V2 status object; shape varies with availability.
+   * @throws Error - Propagates V2 status failures.
+   */
   async v2StatusCurrent(): Promise<unknown> {
     const workspace = await this.currentWorkspace();
     const context = activeContext(await this.readConfig(workspace));
@@ -1030,18 +1677,43 @@ class WorkspaceRagManager {
     return this.v2.status(this.v2Mode, this.v2Workspace(workspace), context);
   }
 
+  /**
+   * Queues a manual or retry-triggered ingestion for the active context and
+   * returns the resulting status without waiting for completion.
+   *
+   * @param trigger - `manual` (default) or `retry`.
+   * @returns Current status snapshot.
+   * @throws Error - When the V2 manager is unavailable.
+   */
   async v2StartCurrent(trigger: Extract<RagV2Job['trigger'], 'manual' | 'retry'> = 'manual'): Promise<unknown> {
     const { workspace, context } = await this.v2Current();
     await this.requestV2Reconcile(workspace, context, trigger, false);
     return this.statusCurrent();
   }
 
+  /**
+   * Queues a manual reconciliation and waits for the coalesced run to finish
+   * before returning status.
+   *
+   * @param forceAll - When true, re-ingests every discovered file
+   *   (`reindex_now`); otherwise performs an incremental reconcile.
+   * @returns Current status snapshot after reconciliation.
+   * @throws Error - When the V2 manager is unavailable.
+   */
   async v2ReconcileCurrent(forceAll = false): Promise<unknown> {
     const { workspace, context } = await this.v2Current();
     await this.requestV2Reconcile(workspace, context, 'manual', true, [], forceAll);
     return this.statusCurrent();
   }
 
+  /**
+   * Waits for the active context's pending reconciliation and ingestion to
+   * finish.
+   *
+   * @returns Current status snapshot.
+   * @throws Error - When the V2 manager is unavailable or ingestion
+   *   monitoring fails.
+   */
   async v2WaitCurrent(): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     await this.reconcileState(workspace.id, context.id).promise;
@@ -1049,21 +1721,48 @@ class WorkspaceRagManager {
     return this.statusCurrent();
   }
 
+  /**
+   * Pauses the active context's ingestion.
+   *
+   * @returns Pause result as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the pause fails.
+   */
   async v2PauseCurrent(): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.pause(workspace.id, context.id);
   }
 
+  /**
+   * Resumes the active context's paused ingestion.
+   *
+   * @returns Resume result as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the resume fails.
+   */
   async v2ResumeCurrent(): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.resume(workspace.id, context.id);
   }
 
+  /**
+   * Cancels the active context's current or queued ingestion.
+   *
+   * @returns Cancellation result as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or cancellation
+   *   fails.
+   */
   async v2CancelCurrent(): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.cancel(workspace.id, context.id);
   }
 
+  /**
+   * Evicts the oldest cold passage-vector derivatives for the active
+   * context.
+   *
+   * @param limit - Maximum derivatives to remove.
+   * @returns Eviction result as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or eviction fails.
+   */
   async v2EvictCurrent(limit: number): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.evictColdPassageEmbeddings(
@@ -1073,6 +1772,14 @@ class WorkspaceRagManager {
     );
   }
 
+  /**
+   * Runs orphan garbage collection for the active or named context.
+   *
+   * @param contextId - Context to collect; defaults to the active context.
+   * @returns Garbage-collection result as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the context id is
+   *   unknown.
+   */
   async v2GcCurrent(contextId?: string): Promise<unknown> {
     if (!this.v2) throw new Error(this.v2Message);
     const workspace = await this.currentWorkspace();
@@ -1084,6 +1791,18 @@ class WorkspaceRagManager {
     return this.v2.garbageCollect(this.v2Workspace(workspace), context);
   }
 
+  /**
+   * Censuses the active context's configured roots, measuring structure,
+   * language, and duplicate forecasts; supports deep scans and resuming an
+   * interrupted run.
+   *
+   * @param signal - Optional cancellation signal for the census stream.
+   * @param options - `deep` streams every file rather than sampling;
+   *   `resumeAfter` resumes after the normalized checkpoint path returned by
+   *   an interrupted run.
+   * @returns Census report as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the census fails.
+   */
   async v2CensusCurrent(
     signal?: AbortSignal,
     options: { deep?: boolean; resumeAfter?: string } = {},
@@ -1092,6 +1811,20 @@ class WorkspaceRagManager {
     return manager.census(context.paths, signal, options);
   }
 
+  /**
+   * Runs a full V2 hybrid search for the active context and, when a
+   * `SourceRegistry` is mounted, annotates evidence with source health and
+   * staleness (registry lookup failures leave evidence unchanged).
+   *
+   * @param query - Query text.
+   * @param limit - Maximum evidence items to return.
+   * @param signal - Cancellation signal.
+   * @param filters - Optional document-type, jurisdiction, and as-of-date
+   *   filters, conversation turns, rewrite provider, and iterative retrieval
+   *   toggle.
+   * @returns V2 search result including plan, answerability, and evidence.
+   * @throws Error - Propagates V2 search failures.
+   */
   async v2SearchCurrent(
     query: string,
     limit: number,
@@ -1124,6 +1857,16 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Fetches a byte range from an immutable document version.
+   *
+   * @param documentVersionId - V2 document version to read.
+   * @param startByte - Inclusive byte offset into the source.
+   * @param endByte - Exclusive byte offset into the source.
+   * @returns Range payload as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the range cannot
+   *   be read.
+   */
   async v2FetchRangeCurrent(documentVersionId: string, startByte: number, endByte: number): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.fetchSourceRange(
@@ -1131,6 +1874,16 @@ class WorkspaceRagManager {
     );
   }
 
+  /**
+   * Fetches a line range from an immutable document version.
+   *
+   * @param documentVersionId - V2 document version to read.
+   * @param startLine - Inclusive one-based line number.
+   * @param endLine - Inclusive one-based line number.
+   * @returns Lines payload as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the lines cannot
+   *   be read.
+   */
   async v2FetchLinesCurrent(documentVersionId: string, startLine: number, endLine: number): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.fetchLines(
@@ -1138,6 +1891,16 @@ class WorkspaceRagManager {
     );
   }
 
+  /**
+   * Runs a bounded regular-expression search across specific immutable
+   * document versions.
+   *
+   * @param documentVersionIds - Authorized document versions to scan.
+   * @param pattern - Regular expression to match.
+   * @param limit - Maximum matches to return.
+   * @returns Match list as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the search fails.
+   */
   async v2GrepCurrent(documentVersionIds: string[], pattern: string, limit: number): Promise<unknown> {
     const { workspace, context, manager } = await this.v2Current();
     return manager.grepDocuments(
@@ -1145,6 +1908,18 @@ class WorkspaceRagManager {
     );
   }
 
+  /**
+   * Runs a retrieval ablation evaluation for the active context using the
+   * supplied cases and retrieval variant.
+   *
+   * @param cases - Evaluation cases with queries and relevance judgments.
+   * @param k - Rank cutoff for Recall, Precision, nDCG, and MRR.
+   * @param variant - Retrieval variant to measure.
+   * @param signal - Cancellation signal.
+   * @returns Evaluation metrics as produced by the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or the evaluation
+   *   fails.
+   */
   async v2EvaluateCurrent(
     cases: RagV2EvaluationCase[],
     k: number,
@@ -1155,6 +1930,14 @@ class WorkspaceRagManager {
     return manager.evaluate(this.v2Workspace(workspace), context, cases, k, variant, signal);
   }
 
+  /**
+   * Orders workspaces so the active one (or the ambient current workspace)
+   * comes first, preserving input order otherwise.
+   *
+   * @param workspaces - Workspaces to order; not mutated.
+   * @returns New array with active and current workspaces first.
+   * @throws Never.
+   */
   private workspacesActiveFirst(workspaces: WorkspaceRef[]): WorkspaceRef[] {
     const current = this.currentWorkspaceId();
     return workspaces
@@ -1167,10 +1950,27 @@ class WorkspaceRagManager {
       .map(item => item.workspace);
   }
 
+  /**
+   * Builds the stable external id identifying a file within a context.
+   *
+   * @param contextId - Owning context id.
+   * @param normalizedPath - Forward-slash normalized absolute path.
+   * @returns External id of the form `<contextId>:<path>`.
+   * @throws Never.
+   */
   private fileSourceExternalId(contextId: string, normalizedPath: string): string {
     return `${contextId}:${normalizedPath}`;
   }
 
+  /**
+   * Resolves the registry's stable source id for a file-based external id.
+   *
+   * @param workspace - Workspace owning the file.
+   * @param externalId - External id from {@link fileSourceExternalId}.
+   * @returns Stable source id, or undefined when no `SourceRegistry` is
+   *   mounted.
+   * @throws Never.
+   */
   private sourceId(workspace: WorkspaceRef, externalId: string): string | undefined {
     return this.sourceRegistry?.stableSourceId({
       workspaceId: workspace.id,
@@ -1179,6 +1979,18 @@ class WorkspaceRagManager {
     });
   }
 
+  /**
+   * Feeds source text into the optional `ContextGraph` service. No-op when
+   * the service is absent; ingestion failures are logged as
+   * `context_graph_extract_error` events rather than thrown.
+   *
+   * @param workspace - Workspace owning the source.
+   * @param sourceId - Registry source id.
+   * @param sourceVersionId - Registry source version id.
+   * @param text - Extracted text to ingest.
+   * @param extractionMethod - Provenance of the extraction.
+   * @throws Never.
+   */
   private async extractContextGraphSource(
     workspace: WorkspaceRef,
     sourceId: string,
@@ -1198,6 +2010,17 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Records a failed read against the source registry: upserts the source as
+   * degraded and stale with a partial permission state, then appends a
+   * degraded health event. No-op when no `SourceRegistry` is mounted.
+   *
+   * @param workspace - Workspace owning the file.
+   * @param context - Context under which the file is indexed.
+   * @param normalizedPath - Forward-slash normalized absolute path.
+   * @param error - Read failure recorded in the health message.
+   * @throws Error - Propagates source-registry failures.
+   */
   private async registerFileReadFailure(
     workspace: WorkspaceRef,
     context: RagContextConfig,
@@ -1232,6 +2055,20 @@ class WorkspaceRagManager {
     });
   }
 
+  /**
+   * Annotates search hits with source registry data: resolves each hit's
+   * stable source, records a `retrieve` access audit event, and attaches
+   * health, staleness, and citation details. Returns hits unchanged when no
+   * registry is mounted or a source is unknown.
+   *
+   * @param workspace - Workspace the hits belong to.
+   * @param context - Context the hits were retrieved from.
+   * @param hits - Hits to enrich, in retrieval order.
+   * @param trace - Optional correlation ids recorded with each access.
+   * @returns New array of enriched hits in input order.
+   * @throws Error - Propagates source-registry failures for source lookups
+   *   and access recording; citation resolution failures are ignored.
+   */
   private async enrichSearchHits(
     workspace: WorkspaceRef,
     context: RagContextConfig,
@@ -1266,6 +2103,14 @@ class WorkspaceRagManager {
     }));
   }
 
+  /**
+   * Projects the current vectorizer's embedding and acceleration details
+   * into the status payload; optional fields are spread only when present.
+   *
+   * @returns Subset of {@link WorkspaceRagStatus} describing the active
+   *   embedding backend.
+   * @throws Never.
+   */
   private accelerationStatusFields(): Pick<
     WorkspaceRagStatus,
     | 'nvidiaAvailable'
@@ -1299,6 +2144,16 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Initializes the V2 manager: creates the storage-backed repository
+   * (backend from `CORTEX_RAG_V2_STORAGE`, defaulting to `postgres`), an
+   * embedder adapter over the launched vectorizer, the source registry
+   * bridge, and semantic services, and wires a GC event logger into the
+   * ingestion log. Initialization failures close the manager and degrade the
+   * plugin to a descriptive unavailable message instead of throwing.
+   *
+   * @throws Error - If the requested repository backend name is unsupported.
+   */
   private async startV2(): Promise<void> {
     if (this.v2Mode === 'off') return;
     const storageMode = String(process.env['CORTEX_RAG_V2_STORAGE'] ?? 'postgres').trim().toLowerCase();
@@ -1351,6 +2206,17 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Builds the bridge the V2 manager uses to mirror ingestion into the
+   * source registry and context graph. Registration upserts source and
+   * version records (restoring health for previously degraded sources),
+   * removals record `down` health, and read failures record degraded
+   * health.
+   *
+   * @returns Bridge callbacks, or undefined when no `SourceRegistry` is
+   *   mounted.
+   * @throws Never.
+   */
   private v2SourceBridge(): RagV2SourceBridge | undefined {
     if (!this.sourceRegistry) return undefined;
     return {
@@ -1459,6 +2325,14 @@ class WorkspaceRagManager {
   }
 
 
+  /**
+   * Resolves the triple (workspace, active context, manager) required by the
+   * `v2*` operations.
+   *
+   * @returns Current workspace, its active context, and the V2 manager.
+   * @throws Error - When the V2 manager is unavailable or workspace
+   *   enumeration fails.
+   */
   private async v2Current(): Promise<{
     workspace: WorkspaceRef;
     context: RagContextConfig;
@@ -1470,10 +2344,28 @@ class WorkspaceRagManager {
     return { workspace, context, manager: this.v2 };
   }
 
+  /**
+   * Projects a workspace reference onto the id, name, and config dir triple
+   * the V2 manager expects.
+   *
+   * @param workspace - Workspace to project.
+   * @returns Plain object with `id`, `name`, and `configDir`.
+   * @throws Never.
+   */
   private v2Workspace(workspace: WorkspaceRef): { id: string; name: string; configDir: string } {
     return { id: workspace.id, name: workspace.name, configDir: workspace.configDir };
   }
 
+  /**
+   * Maps V2 evidence items into presentation-ready search hits, including
+   * positional ranges, retrieval reasons, and a path-based citation block.
+   *
+   * @param workspace - Workspace the evidence belongs to.
+   * @param context - Context the evidence was retrieved from.
+   * @param result - Raw V2 search result.
+   * @returns One hit per evidence item, in evidence order.
+   * @throws Never.
+   */
   private v2SearchHits(
     workspace: WorkspaceRef,
     context: RagContextConfig,
@@ -1509,6 +2401,14 @@ class WorkspaceRagManager {
     }));
   }
 
+  /**
+   * Resolves the ambient workspace reference, synthesizing a placeholder
+   * (marked active and anchored at the active config path) when the id is
+   * not among the listed workspaces.
+   *
+   * @returns Current workspace reference.
+   * @throws Error - Propagates workspace enumeration failures.
+   */
   private async currentWorkspace(): Promise<WorkspaceRef> {
     const current = this.currentWorkspaceId();
     return (await this.listWorkspaces()).find(item => item.id === current) ?? {
@@ -1520,6 +2420,17 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Enumerates known workspaces. Prefers the mounted `WorkspaceManager`
+   * service; otherwise reads the workspace registry file (resolved via
+   * `CORTEX_WORKSPACES_FILE` or by walking up from the active config
+   * directory), falling back to a single synthesized current workspace when
+   * no registry exists or it lists nothing.
+   *
+   * @returns Workspace references with absolute config paths and active
+   *   flags.
+   * @throws Error - Propagates `WorkspaceManager` list failures.
+   */
   private async listWorkspaces(): Promise<WorkspaceRef[]> {
     if (this.services.WorkspaceManager) {
       const list = await this.services.WorkspaceManager.list();
@@ -1545,6 +2456,13 @@ class WorkspaceRagManager {
     });
   }
 
+  /**
+   * Builds the single-workspace fallback reference anchored at the active
+   * config path.
+   *
+   * @returns Workspace reference marked active and named after its id.
+   * @throws Never.
+   */
   private async currentWorkspaceFallback(): Promise<WorkspaceRef> {
     const id = this.currentWorkspaceId();
     return {
@@ -1556,6 +2474,14 @@ class WorkspaceRagManager {
     };
   }
 
+  /**
+   * Locates the workspace registry file: honors `CORTEX_WORKSPACES_FILE`
+   * when it points at an existing file, otherwise walks up from the active
+   * config directory looking for `cortex-workspaces.json`.
+   *
+   * @returns Absolute registry path, or null when none can be found.
+   * @throws Never.
+   */
   private async registryPath(): Promise<string | null> {
     const env = process.env['CORTEX_WORKSPACES_FILE'];
     if (env && await exists(env)) return path.resolve(env);
@@ -1569,18 +2495,54 @@ class WorkspaceRagManager {
     }
   }
 
+  /**
+   * Resolves a workspace's RAG configuration file path.
+   *
+   * @param workspace - Workspace to resolve for.
+   * @returns Path to `cortex-rag.json` inside the workspace config
+   *   directory.
+   * @throws Never.
+   */
   private configPath(workspace: WorkspaceRef): string {
     return path.join(workspace.configDir, CONFIG_FILE);
   }
 
+  /**
+   * Reads and normalizes a workspace's RAG configuration; a missing or
+   * malformed file yields a synthesized default configuration.
+   *
+   * @param workspace - Workspace to read for.
+   * @returns Normalized configuration.
+   * @throws Never.
+   */
   private async readConfig(workspace: WorkspaceRef): Promise<RagConfig> {
     return normalizeConfig(await readJson<unknown>(this.configPath(workspace), null), workspace);
   }
 
+  /**
+   * Resolves a workspace's ingestion log path.
+   *
+   * @param workspace - Workspace to resolve for.
+   * @returns Path to `ingestion.log` under the workspace's
+   *   `.data/workspace-rag` directory.
+   * @throws Never.
+   */
   private logPath(workspace: WorkspaceRef): string {
     return path.join(workspace.configDir, '.data', 'workspace-rag', LOG_FILE);
   }
 
+  /**
+   * Appends a JSON line to the workspace's ingestion log, rotating the file
+   * to `ingestion.log.1` once it exceeds 25 MiB (rotation is checked once
+   * per workspace per process). Write failures are logged to the console
+   * instead of thrown.
+   *
+   * @param workspace - Workspace the event belongs to.
+   * @param event - Event name recorded in the entry's `event` field.
+   * @param fields - Additional fields merged into the log entry.
+   * @returns Resolves once the entry is appended or its failure logged.
+   * @throws Never.
+   */
   private async log(workspace: WorkspaceRef, event: string, fields: Record<string, unknown> = {}): Promise<void> {
     const logPath = this.logPath(workspace);
     const entry = {
@@ -1611,6 +2573,21 @@ class WorkspaceRagManager {
 
 }
 
+/**
+ * Records a completed retriever span with the `Observability` service when
+ * mounted and a trace id is supplied. Sink failures are logged rather than
+ * thrown.
+ *
+ * @param services - Machine providing the optional `Observability` service.
+ * @param trace - Correlation ids for the span.
+ * @param query - Query text; recorded only as a SHA-256 hash.
+ * @param hits - Hits returned by retrieval, ranked as presented.
+ * @param startedAt - `Date.now()` value captured before retrieval began, in
+ *   milliseconds.
+ * @param spanId - Fresh span id for the retriever span.
+ * @returns Resolves once the span is recorded or its failure logged.
+ * @throws Never.
+ */
 async function observeRetrieval(
   services: MatbotMachine,
   trace: RetrievalTraceContext,
@@ -1643,6 +2620,17 @@ async function observeRetrieval(
   }
 }
 
+/**
+ * Builds the `workspace_rag` tool exposing status, configuration editing,
+ * context management, ingestion control, corpus census, V2 search and range
+ * retrieval, grep, and evaluation actions. Executor failures are reported as
+ * `error` tool events rather than thrown.
+ *
+ * @param manager - Manager backing every action.
+ * @param services - Machine used for retrieval observability.
+ * @returns The tool specification.
+ * @throws Never.
+ */
 function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMachine): Tool {
   return {
     name: 'workspace_rag',
@@ -1947,6 +2935,14 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
   };
 }
 
+/**
+ * Extracts the text of the latest user message in a session.
+ *
+ * @param session - Session whose messages are scanned.
+ * @returns Concatenated text parts of the latest user message joined with
+ *   newlines, or an empty string when there is none.
+ * @throws Never.
+ */
 function latestUserText(session: { messages: Array<{ role: string; content: MessageContent[] }> }): string {
   const last = session.messages.findLast(message => message.role === 'user');
   if (!last) return '';
@@ -1956,6 +2952,15 @@ function latestUserText(session: { messages: Array<{ role: string; content: Mess
     .join('\n');
 }
 
+/**
+ * Builds the conversation history preceding the latest user message for
+ * query rewriting: user and assistant turns only, robo-originated text parts
+ * excluded, empty turns dropped, capped at the 8 most recent turns.
+ *
+ * @param session - Session to scan; undefined yields no turns.
+ * @returns Up to 8 conversation turns in chronological order.
+ * @throws Never.
+ */
 function conversationBeforeLatestUser(
   session: { messages: Array<{ role: string; content: MessageContent[] }> } | undefined,
 ): RagV2ConversationTurn[] {
@@ -1976,6 +2981,16 @@ function conversationBeforeLatestUser(
     .slice(-8);
 }
 
+/**
+ * Renders the ephemeral context injected when V2 retrieval abstains for lack
+ * of verified evidence.
+ *
+ * @param result - V2 search result whose plan and answerability data are
+ *   echoed into the text.
+ * @returns Multi-line instruction block warning against over-claiming
+ *   corpus support.
+ * @throws Never.
+ */
 function renderAbstention(result: RagV2SearchResult): string {
   return [
     '[Workspace RAG retrieval result]',
@@ -1987,6 +3002,19 @@ function renderAbstention(result: RagV2SearchResult): string {
   ].join('\n');
 }
 
+/**
+ * Renders retrieved hits into the ephemeral per-turn context block: a header
+ * with usage guidance, an optional conflicting-sources warning, one numbered
+ * source section per hit (score, registry state, ranges, warnings,
+ * citation, text), and a closing marker.
+ *
+ * @param hits - Hits to render, in retrieval order.
+ * @param answerability - V2 answerability verdict; a `conflicting` status
+ *   adds the conflict warning.
+ * @returns Rendered context text, or an empty string when there are no
+ *   hits.
+ * @throws Never.
+ */
 function renderContext(hits: SearchHit[], answerability?: RagV2SearchResult['answerability']): string {
   if (hits.length === 0) return '';
   return [
@@ -2013,6 +3041,14 @@ function renderContext(hits: SearchHit[], answerability?: RagV2SearchResult['ans
   ].join('\n\n');
 }
 
+/**
+ * Derives user-facing warnings from a hit's source registry state.
+ *
+ * @param hit - Hit to inspect.
+ * @returns Zero to two warnings: critical for `down` and `expired`
+ *   sources, warning for `degraded` and `stale` ones.
+ * @throws Never.
+ */
 function sourceWarningsForHit(hit: SearchHit): SourceWarning[] {
   const warnings: SourceWarning[] = [];
   if (hit.sourceHealthState === 'down') {

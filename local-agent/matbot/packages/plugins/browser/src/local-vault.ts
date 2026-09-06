@@ -3,6 +3,12 @@ import { WebCryptoVault } from './webcrypto-vault.js';
 
 const STORAGE_KEY = 'matbot.vault';
 
+/**
+ * Read the persisted secret mirror from `localStorage`.
+ * @returns Name-to-secret map parsed from the stored JSON, or an empty map when storage is
+ *          unavailable or the payload is corrupt.
+ * @throws Never.
+ */
 function load(): Record<string, string> {
   try {
     const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
@@ -22,6 +28,11 @@ export class LocalStorageVault extends WebCryptoVault implements Vault {
   // The base keeps secrets in a private map; we keep a parallel mirror purely to persist it.
   private readonly mirror: Record<string, string>;
 
+  /**
+   * Restores previously persisted secrets into the in-memory map (and primes the mirror) so
+   * keys entered in an earlier realm still resolve after a reload.
+   * @throws Never.
+   */
   constructor() {
     const seed = load();
     super(seed);
@@ -32,6 +43,9 @@ export class LocalStorageVault extends WebCryptoVault implements Vault {
    * Writes a secret to the in-memory map and mirrors it to `localStorage`.
    * @param name Secret name.
    * @param value Secret value.
+   * @returns Resolves once both the in-memory map and the mirror are updated; a failing
+   *          `localStorage` write leaves the secret in memory only.
+   * @throws Never — storage failures (quota/unavailable) are caught and ignored.
    */
   override async writeSecret(name: string, value: string): Promise<void> {
     await super.writeSecret(name, value);

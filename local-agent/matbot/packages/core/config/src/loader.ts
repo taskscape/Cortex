@@ -3,7 +3,9 @@ import { parseYaml, type YamlMap, type YamlValue } from './yaml.js';
 
 /** Parsed contents of a `matbot.yaml` file (optionally merged over a base document). */
 export interface MatbotConfig {
+  /** Optional tool-invocation policy (ordered permission rules plus a default action). */
   permissions?:NonNullable<import('@matatbread/matbot-plugin-api').MatbotServices['ToolInvocationPolicy']>;
+  /** Optional capability profile selecting a preset policy tier. */
   capabilityProfile?:'standard'|'minimal'|'compatibility';
   /** Ordered list of plugin specifiers to load at startup (npm names or URL paths) */
   plugins:    readonly string[];
@@ -20,11 +22,27 @@ export interface MatbotConfig {
   principal?:        Principal;
 }
 
+/**
+ * Coerce a YAML value to a string, failing with a labeled error otherwise.
+ *
+ * @param v - The raw value (must already be a string).
+ * @param label - Dotted path used in the error message.
+ * @returns The string value.
+ * @throws Error When `v` is not a string.
+ */
 function asString(v: YamlValue | undefined, label: string): string {
   if (typeof v === 'string') return v;
   throw new Error(`Config: expected string for "${label}", got ${v === undefined ? 'undefined' : typeof v}`);
 }
 
+/**
+ * Coerce a YAML value to a mapping, failing with a labeled error otherwise.
+ *
+ * @param v - The raw value (must be a non-array object).
+ * @param label - Dotted path used in the error message.
+ * @returns The mapping.
+ * @throws Error When `v` is not a mapping.
+ */
 function asRecord(v: YamlValue | undefined, label: string): YamlMap {
   if (typeof v === 'object' && v !== null && !Array.isArray(v)) return v as YamlMap;
   throw new Error(`Config: expected mapping for "${label}", got ${v === undefined ? 'undefined' : typeof v}`);
@@ -39,6 +57,15 @@ const NUMERIC_PARAMETER_NAMES = new Set([
   'maxCompletionTokens',
 ]);
 
+/**
+ * Convert a raw YAML mapping into model parameters, coercing well-known numeric settings
+ * (e.g. `temperature`, `maxTokens`) written as strings into numbers. Non-scalar values are
+ * warned about and skipped.
+ *
+ * @param raw - The raw `parameters` mapping of a provider profile.
+ * @returns The normalized parameters object.
+ * @throws Never.
+ */
 function toModelParameters(raw: YamlMap): ModelParameters {
   const params: ModelParameters = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -60,6 +87,16 @@ function toModelParameters(raw: YamlMap): ModelParameters {
   return params;
 }
 
+/**
+ * Build one named provider profile from its raw YAML mapping. `module` and `model` are required
+ * strings; `credentials`, `endpoint`, `fallback`, and `parameters` are optional.
+ *
+ * @param name - The provider profile name (its key under `providers`).
+ * @param raw - The raw profile mapping.
+ * @returns The typed provider configuration.
+ * @throws Error When a required field is missing or mis-typed, or an optional one is malformed
+ *                (via {@link asString}/{@link asRecord}/{@link toModelParameters}).
+ */
 function toProviderConfig(name: string, raw: YamlMap): ProviderConfig {
   const module_ = asString(raw['module'], `providers.${name}.module`);
   const model   = asString(raw['model'],  `providers.${name}.model`);
@@ -88,14 +125,41 @@ function toProviderConfig(name: string, raw: YamlMap): ProviderConfig {
   return config;
 }
 
+/**
+ * Accept only a numeric YAML value.
+ *
+ * @param v - The raw YAML value.
+ * @returns The number, or `undefined` for anything else (including numeric strings).
+ * @throws Never.
+ */
 function optionalNumber(v: YamlValue | undefined): number | undefined {
   return typeof v === 'number' ? v : undefined;
 }
 
+/**
+ * Derive the provider name for one model entry of an `openai_compatible` group: the bare group
+ * name when the group declares a single model, otherwise `group-model`.
+ *
+ * @param groupName - The group name in the config.
+ * @param models - The group's model entries (its length decides the naming shape).
+ * @param modelName - The current entry's model name.
+ * @returns The provider key to register the model under.
+ * @throws Never.
+ */
 function providerNameForModel(groupName: string, models: YamlValue[], modelName: string): string {
   return models.length === 1 ? groupName : `${groupName}-${modelName}`;
 }
 
+/**
+ * Insert a provider into the accumulator map, warning when the name is already taken (the later
+ * definition replaces the earlier one).
+ *
+ * @param providers - The accumulator map of provider configs.
+ * @param name - The provider key to set.
+ * @param config - The provider configuration to store.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function setProvider(providers: Map<string, ProviderConfig>, name: string, config: ProviderConfig): void {
   if (providers.has(name)) {
     console.warn(`Config: provider "${name}" is defined more than once; the later definition replaces the earlier one`);
@@ -103,6 +167,17 @@ function setProvider(providers: Map<string, ProviderConfig>, name: string, confi
   providers.set(name, config);
 }
 
+/**
+ * Expand the legacy `language_models.openai_compatible` section into one provider profile per
+ * model, all routed through the built-in OpenAI-compatible adapter. Provider keys are derived
+ * by {@link providerNameForModel}; `max_tokens`/`max_output_tokens`/`max_completion_tokens`
+ * map onto the matching model parameters (falling back to 4096 output tokens).
+ *
+ * @param raw - The raw `openai_compatible` value; `undefined` yields an empty map.
+ * @returns The derived provider configs, keyed by provider name.
+ * @throws Error When the section is malformed (a non-mapping group, a missing `api_url`, a
+ *                non-sequence `available_models`, or a malformed model entry).
+ */
 function toOpenAICompatibleProviderConfigs(raw: YamlValue | undefined): Map<string, ProviderConfig> {
   const providers = new Map<string, ProviderConfig>();
   if (raw === undefined) return providers;
@@ -217,6 +292,15 @@ export function parseConfig(
 }
 
 // principal: either a bare string id (type defaults to 'user') or a mapping { id, type? }.
+/**
+ * Convert the `principal` config value into a {@link Principal}: a bare string is an id of type
+ * `user`; a mapping must carry a non-empty string `id` with an optional `type` (anything other
+ * than `agent`/`system` coerces to `user`).
+ *
+ * @param v - The raw `principal` value (may be `undefined`).
+ * @returns The principal, or `undefined` when unset.
+ * @throws Error When the value is neither a string nor a mapping with a string `id`.
+ */
 function toPrincipal(v: YamlValue | undefined): Principal | undefined {
   if (v === undefined) return undefined;
   if (typeof v === 'string') return { id: v, type: 'user' };
@@ -230,9 +314,25 @@ function toPrincipal(v: YamlValue | undefined): Principal | undefined {
   throw new Error('Config: "principal" must be a string id or a mapping with a string "id" (and optional "type").');
 }
 
+/**
+ * Validate and normalize the `permissions` node into the ToolInvocationPolicy shape. Every
+ * action must be `allow`, `ask`, or `deny`; `defaultAction` defaults to `allow`.
+ *
+ * @param value - The raw `permissions` value.
+ * @returns The normalized invocation policy.
+ * @throws Error When `permissions` is not a mapping, `rules` is not an array, a rule is
+ *                malformed, or an action is invalid.
+ */
 function parseInvocationPolicy(value:YamlValue):NonNullable<MatbotConfig['permissions']>{
  const raw=asRecord(value,'permissions');const action=(v:YamlValue|undefined)=>{if(v!=='allow'&&v!=='ask'&&v!=='deny')throw new Error('Invalid permission action');return v;};
  const rules=raw['rules'];if(rules!==undefined&&!Array.isArray(rules))throw new Error('permissions.rules must be an array');
  return {defaultAction:raw['defaultAction']===undefined?'allow':action(raw['defaultAction']),rules:(rules as YamlValue[]??[]).map(row=>{const rule=asRecord(row,'permission rule');return {permission:asString(rule['permission'],'permission'),pattern:asString(rule['pattern'],'pattern'),action:action(rule['action'])};})};
 }
+/**
+ * Validate the `capabilityProfile` value against the known profiles.
+ *
+ * @param value - The raw `capabilityProfile` value.
+ * @returns The profile name.
+ * @throws Error When the value is not one of `standard`, `minimal`, or `compatibility`.
+ */
 function parseCapabilityProfile(value:YamlValue):NonNullable<MatbotConfig['capabilityProfile']>{if(value==='standard'||value==='minimal'||value==='compatibility')return value;throw new Error('Unknown capabilityProfile');}

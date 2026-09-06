@@ -78,6 +78,17 @@ export async function listDirectory(directoryPath: string): Promise<Array<{ name
   });
 }
 
+/**
+ * Maps items to worker results with at most `concurrency` workers running at
+ * once; workers pull the next index from a shared cursor, so results land in
+ * input order regardless of completion order. Assumes `concurrency >= 1`.
+ *
+ * @param items - Items to process.
+ * @param concurrency - Maximum simultaneously in-flight workers.
+ * @param worker - Async function applied to each item.
+ * @returns Results in the same order as `items`.
+ * @throws The first worker rejection; already-started workers keep running.
+ */
 async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let cursor = 0;

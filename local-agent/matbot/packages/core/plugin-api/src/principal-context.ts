@@ -38,11 +38,21 @@ export interface PrincipalCarrier {
 
 let carrier: PrincipalCarrier | undefined;
 
-/** Install the host's platform carrier. Called once at boot, before any turn or request runs. */
+/**
+ * Install the host's platform carrier. Called once at boot, before any turn or request runs.
+ *
+ * @param impl - The platform implementation to install as the process-wide carrier.
+ */
 export function installPrincipalCarrier(impl: PrincipalCarrier): void {
   carrier = impl;
 }
 
+/**
+ * Return the installed carrier, enforcing that the host booted one.
+ *
+ * @returns The currently installed {@link PrincipalCarrier}.
+ * @throws Error When no carrier has been installed yet (host boot-order bug).
+ */
 function need(): PrincipalCarrier {
   if (carrier === undefined) {
     throw new Error('No PrincipalCarrier installed — the host must call installPrincipalCarrier() at boot.');
@@ -61,12 +71,26 @@ export function tryCurrentPrincipal(): Principal | undefined {
   return carrier?.tryCurrent();
 }
 
-/** Run `fn` with `principal` established as the ambient identity for its async extent. */
+/** Run `fn` with `principal` established as the ambient identity for its async extent.
+ *
+ * @typeParam T - The return type of `fn`.
+ * @param principal - The principal to establish for the extent of `fn`.
+ * @param fn - The operation to run; may be sync or async.
+ * @returns Whatever `fn` returns (a promise stays a promise; the scope spans its settlement).
+ * @throws Error When no carrier is installed; any error thrown by `fn` propagates unchanged.
+ */
 export function runAs<T>(principal: Principal, fn: () => T): T {
   return need().run(principal, fn);
 }
 
-/** Imperatively establish `principal` for the current flow (entry points only). */
+/**
+ * Imperatively establish `principal` for the current flow (entry points only).
+ *
+ * @param principal - The principal to establish for the remainder of the flow.
+ * @returns Nothing.
+ * @throws Error When no carrier is installed, or a principal is already established here
+ *                (re-entry is a wiring bug; delegate through {@link runAs} instead).
+ */
 export function enterPrincipal(principal: Principal): void {
   need().enter(principal);
 }
@@ -74,6 +98,10 @@ export function enterPrincipal(principal: Principal): void {
 /**
  * A carrier for single-principal realms (the browser, tests): every read returns the same
  * `principal` and `run` is a passthrough, since there is no second identity to isolate from.
+ *
+ * @param principal - The constant principal every scope reads.
+ * @returns The carrier implementation.
+ * @throws Never.
  */
 export function createConstantPrincipalCarrier(principal: Principal): PrincipalCarrier {
   return {

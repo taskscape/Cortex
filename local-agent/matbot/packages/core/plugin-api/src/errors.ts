@@ -6,6 +6,10 @@
 export class MissingSecretError extends Error {
   readonly missingKeys: readonly string[];
 
+  /**
+   * @param missingKeys - The unresolved `${NAME}` key names, joined into the message.
+   * @throws Never.
+   */
   constructor(missingKeys: readonly string[]) {
     super(`Vault: secret(s) not found: ${missingKeys.join(', ')}`);
     this.name        = 'MissingSecretError';
@@ -25,6 +29,12 @@ export class IncompatibleRuntimeError extends Error {
   readonly declared:     readonly string[];
   readonly hostRuntime:  string;
 
+  /**
+   * @param specifier - The load specifier of the incompatible plugin.
+   * @param declared - The `matbotRuntime` values the plugin declares.
+   * @param hostRuntime - The current host's runtime identifier.
+   * @throws Never.
+   */
   constructor(specifier: string, declared: readonly string[], hostRuntime: string) {
     super(`Cannot load plugin "${specifier}": declares matbotRuntime [${declared.join(', ')}], host runtime is "${hostRuntime}".`);
     this.name        = 'IncompatibleRuntimeError';
@@ -48,6 +58,11 @@ export class NotAPluginError extends Error {
   readonly specifier: string;
   readonly reason:    string;
 
+  /**
+   * @param specifier - The load specifier of the non-plugin module.
+   * @param reason - The precise shape defect; becomes the error message.
+   * @throws Never.
+   */
   constructor(specifier: string, reason: string) {
     super(reason);
     this.name      = 'NotAPluginError';
@@ -62,6 +77,10 @@ export class NotAPluginError extends Error {
  * it into a tool error that closes the tool call, while the host separately abandons the turn.
  */
 export class PromptCancelledError extends Error {
+  /**
+   * @param message - Overrides the default "User cancelled — cannot proceed." message.
+   * @throws Never.
+   */
   constructor(message = 'User cancelled — cannot proceed.') {
     super(message);
     this.name = 'PromptCancelledError';

@@ -142,6 +142,10 @@ export type SourceRecordInput = SourceIdentityInput & {
   retentionPolicyId?: string;
 };
 
+/**
+ * A point-in-time observation of a source's content, with provenance linking it to the
+ * activity, ingestion run, or connector audit event that produced it.
+ */
 export interface SourceVersion {
   id: string;
   version: string;
@@ -159,6 +163,10 @@ export interface SourceVersion {
   validTo?: string;
 }
 
+/**
+ * Input for creating or updating a source version. `observedAt` defaults to the existing
+ * version's value, else now.
+ */
 export type SourceVersionInput = {
   id?: string;
   sourceId: string;
@@ -170,6 +178,7 @@ export type SourceVersionInput = {
   validTo?: string;
 };
 
+/** Recorded health-check result for a single source. */
 export interface SourceHealthEvent {
   id: string;
   version: string;
@@ -180,6 +189,8 @@ export interface SourceHealthEvent {
   details?: Record<string, unknown>;
 }
 
+/** Fields accepted by `recordHealth`; `checkedAt` defaults to now and `message`/`details`
+ *  are secret-redacted before storage. */
 export type SourceHealthInput = {
   sourceId: string;
   state: SourceHealthState;
@@ -188,6 +199,7 @@ export type SourceHealthInput = {
   details?: Record<string, unknown>;
 };
 
+/** Immutable audit record of one access operation performed against a source. */
 export interface SourceAccessEvent {
   id: string;
   version: string;
@@ -232,6 +244,8 @@ export interface SourceCitation {
   observedAt?: string;
 }
 
+/** One detected health issue for a source, carrying severity, detection time, and the
+ *  source/connector context needed to act on it. */
 export interface SourceHealthFinding {
   id: string;
   version: string;
@@ -251,6 +265,7 @@ export interface SourceHealthFinding {
   details?: Record<string, unknown>;
 }
 
+/** Point-in-time health of one connector instance, embedded in health reports. */
 export interface SourceHealthConnectorSnapshot {
   connectorInstanceId: string;
   displayName: string;
@@ -405,23 +420,65 @@ const HEALTH_STORE = 'source_health_events';
 const ACCESS_STORE = 'source_access_events';
 const HEALTH_REPORT_STORE = 'source_health_reports';
 
+/**
+ * Current wall-clock time as an ISO-8601 UTC timestamp.
+ *
+ * @returns The timestamp, e.g. `2026-01-01T00:00:00.000Z`.
+ * @throws Never.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Derives a deterministic, collision-resistant id from ordered identity parts.
+ *
+ * The parts are NUL-joined, SHA-256 hashed, and truncated to 32 hex characters, so equal
+ * parts always yield the same id.
+ *
+ * @param prefix - Id namespace, used verbatim before the colon.
+ * @param parts - Ordered identity parts; their order determines the id.
+ * @returns `${prefix}:<32 hex chars>`.
+ * @throws Never.
+ */
 function hashId(prefix: string, parts: readonly string[]): string {
   const hash = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
   return `${prefix}:${hash}`;
 }
 
+/**
+ * Trims, drops empties, and de-duplicates string values.
+ *
+ * @param values - Raw values; may contain duplicates and surrounding whitespace.
+ * @returns Unique, trimmed, non-empty values in first-occurrence order.
+ * @throws Never.
+ */
 function uniq(values: readonly string[]): string[] {
   return [...new Set(values.map(value => value.trim()).filter(Boolean))];
 }
 
+/**
+ * Classifies an optional value for conditional-spread object construction under
+ * `exactOptionalPropertyTypes`: the key is either included with a value or omitted entirely.
+ *
+ * @typeParam T - The optional value's type.
+ * @param value - Value to classify.
+ * @returns `{ include: false }` for `undefined`, otherwise the value wrapped for inclusion.
+ * @throws Never.
+ */
 function optional<T>(value: T | undefined): { include: false } | { include: true; value: T } {
   return value === undefined ? { include: false } : { include: true, value };
 }
 
+/**
+ * Redacts secret-looking assignments (`api_key=…`, `token: …`, `password=…`, `secret: …`)
+ * from strings, and applies the same pass recursively to arrays and plain objects. Values
+ * of other types pass through unchanged.
+ *
+ * @param value - Value to redact (health/access event messages and details).
+ * @returns The redacted copy; the input is not mutated.
+ * @throws Never.
+ */
 function redactAuditValue(value: unknown): unknown {
   if (typeof value === 'string') {
     return value.replace(/\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, match => {
@@ -436,6 +493,15 @@ function redactAuditValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Computes when a source becomes stale: an explicit `staleAfter` wins; otherwise it is the
+ * last successful read plus the freshness SLA. Yields `undefined` when the SLA or read time
+ * is missing, or the read time does not parse.
+ *
+ * @param input - Freshness inputs; all fields optional.
+ * @returns ISO staleness deadline, or `undefined` when it cannot be derived.
+ * @throws Never.
+ */
 function computeStaleAfter(input: {
   lastSuccessfulReadAt?: string | undefined;
   freshnessSlaSeconds?: number | undefined;
@@ -469,6 +535,13 @@ export function effectiveStaleness(input: {
   return staleAt <= at ? 'stale' : 'fresh';
 }
 
+/**
+ * Sort rank for a health severity: `info` < `warning` < `critical`.
+ *
+ * @param severity - Severity to rank.
+ * @returns Numeric rank; higher means more severe.
+ * @throws Never.
+ */
 function severityRank(severity: SourceHealthSeverity): number {
   switch (severity) {
     case 'info': return 0;
@@ -477,6 +550,14 @@ function severityRank(severity: SourceHealthSeverity): number {
   }
 }
 
+/**
+ * Whether a source should surface in a health report: degraded or down health, stale or
+ * expired staleness, or denied permission.
+ *
+ * @param source - Source record to test.
+ * @returns `true` when the source needs attention.
+ * @throws Never.
+ */
 function sourceNeedsAttention(source: SourceRecord): boolean {
   return source.healthState === 'degraded'
     || source.healthState === 'down'
@@ -485,6 +566,14 @@ function sourceNeedsAttention(source: SourceRecord): boolean {
     || source.permissionState === 'denied';
 }
 
+/**
+ * Human-readable finding message for a source health issue.
+ *
+ * @param source - Source the issue was detected on.
+ * @param issueType - Issue class.
+ * @returns The message text.
+ * @throws Never.
+ */
 function sourceHealthMessage(source: SourceRecord, issueType: SourceHealthIssueType): string {
   switch (issueType) {
     case 'stale':
@@ -502,11 +591,29 @@ function sourceHealthMessage(source: SourceRecord, issueType: SourceHealthIssueT
   }
 }
 
+/**
+ * Runs a store query and returns just the matching records.
+ *
+ * @typeParam T - Record type; must carry `id` and `version`.
+ * @param store - Store to query.
+ * @param query - Optional filter/sort/paging query; omitted means match all.
+ * @returns Matching records in store order.
+ * @throws Error - When the store query fails.
+ */
 async function queryAll<T extends { id: string; version: string }>(store: Store<T>, query?: StoreQuery): Promise<T[]> {
   const result = await store.query(query ?? {});
   return result.items;
 }
 
+/**
+ * Queries a source-scoped store, optionally restricted to one source.
+ *
+ * @typeParam T - Record type; must carry `id`, `version`, and `sourceId`.
+ * @param store - Store to query.
+ * @param sourceId - Source to filter on; `undefined` matches all sources.
+ * @returns Matching records.
+ * @throws Error - When the store query fails.
+ */
 async function queryBySource<T extends { id: string; version: string; sourceId: string }>(
   store: Store<T>,
   sourceId?: string,
@@ -515,6 +622,11 @@ async function queryBySource<T extends { id: string; version: string; sourceId: 
   return queryAll(store, { where: { op: 'eq', field: 'sourceId', value: sourceId } });
 }
 
+/**
+ * {@link SourceRegistry} implementation backed by five dedicated stores (sources, versions,
+ * health events, access events, health reports). Writes mint a fresh random `version`;
+ * source queries recompute effective staleness on read.
+ */
 class StoreBackedSourceRegistry implements SourceRegistry {
   private readonly sources: Store<SourceRecord>;
   private readonly versions: Store<SourceVersion>;
@@ -522,6 +634,16 @@ class StoreBackedSourceRegistry implements SourceRegistry {
   private readonly access: Store<SourceAccessEvent>;
   private readonly reports: Store<SourceHealthReport>;
 
+  /**
+   * Captures the pre-created stores; no I/O occurs at construction.
+   *
+   * @param sources - Store for {@link SourceRecord} records.
+   * @param versions - Store for {@link SourceVersion} records.
+   * @param health - Store for {@link SourceHealthEvent} records.
+   * @param access - Store for {@link SourceAccessEvent} records.
+   * @param reports - Store for {@link SourceHealthReport} records.
+   * @throws Never.
+   */
   constructor(
     sources: Store<SourceRecord>,
     versions: Store<SourceVersion>,
@@ -536,6 +658,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     this.reports = reports;
   }
 
+  /**
+   * Hash-derived stable id for the source identified by workspace, connector type, optional
+   * connector instance, and external id.
+   *
+   * @param input - Source identity; an unset connector instance hashes as empty.
+   * @returns `source:<32 hex chars>`.
+   * @throws Never.
+   */
   stableSourceId(input: SourceIdentityInput): string {
     return hashId('source', [
       input.workspaceId,
@@ -545,6 +675,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     ]);
   }
 
+  /**
+   * Hash-derived stable id for a source version: source id plus content and schema hashes
+   * (unset hashes count as empty), so unchanged content maps to the same version record.
+   *
+   * @param input - Version identity fields.
+   * @returns `source-version:<32 hex chars>`.
+   * @throws Never.
+   */
   stableSourceVersionId(input: Pick<SourceVersionInput, 'sourceId' | 'contentHash' | 'schemaHash'>): string {
     return hashId('source-version', [
       input.sourceId,
@@ -553,10 +691,29 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     ]);
   }
 
+  /**
+   * Hash-derived stable id for a workspace's health report; one report per workspace, and
+   * `undefined` maps to the all-workspaces report id.
+   *
+   * @param workspaceId - Workspace scope; omit for all workspaces.
+   * @returns `source-health-report:<32 hex chars>`.
+   * @throws Never.
+   */
   stableSourceHealthReportId(workspaceId?: string): string {
     return hashId('source-health-report', [workspaceId ?? 'all']);
   }
 
+  /**
+   * Creates or updates a source record, deriving its id from the input or the stable-id
+   * derivation. Omitted classification fields keep the existing record's values (new-record
+   * defaults: sensitivity `'internal'`, permission/trust/health `'unknown'`, citation
+   * `'cite_path'`); `lastObservedAt` defaults to now and staleness is recomputed from the
+   * freshness SLA. `createdAt` is preserved and a fresh random `version` is minted.
+   *
+   * @param input - Source fields.
+   * @returns The stored record.
+   * @throws Error - When the source store read or write fails.
+   */
   async upsertSource(input: SourceRecordInput): Promise<SourceRecord> {
     const id = input.id ?? this.stableSourceId(input);
     const existing = await this.sources.get(id);
@@ -606,6 +763,15 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return source;
   }
 
+  /**
+   * Creates or updates a source version, deriving its id from the input or the stable-id
+   * derivation. `observedAt` defaults to the existing record's value, else now; other
+   * fields are written as given.
+   *
+   * @param input - Version fields including provenance.
+   * @returns The stored version.
+   * @throws Error - When the version store read or write fails.
+   */
   async upsertVersion(input: SourceVersionInput): Promise<SourceVersion> {
     const id = input.id ?? this.stableSourceVersionId(input);
     const existing = await this.versions.get(id);
@@ -624,18 +790,48 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return version;
   }
 
+  /**
+   * Fetches a source record.
+   *
+   * @param id - Source id.
+   * @returns The record, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getSource(id: string): Promise<SourceRecord | null> {
     return this.sources.get(id);
   }
 
+  /**
+   * Fetches a source version.
+   *
+   * @param id - Version id.
+   * @returns The version, or `null` when absent.
+   * @throws Error - When the store read fails.
+   */
   getVersion(id: string): Promise<SourceVersion | null> {
     return this.versions.get(id);
   }
 
+  /**
+   * Lists source versions, optionally filtered by source.
+   *
+   * @param sourceId - Source to filter on; `undefined` matches all sources.
+   * @returns Matching versions.
+   * @throws Error - When the store query fails.
+   */
   sourceVersions(sourceId?: string): Promise<SourceVersion[]> {
     return queryBySource(this.versions, sourceId);
   }
 
+  /**
+   * Records a health check event and, when the source exists, updates its health state and
+   * recomputes its staleness. The event's `message` and `details` are secret-redacted
+   * before storage.
+   *
+   * @param input - Health observation; `checkedAt` defaults to now.
+   * @returns The persisted event, with a fresh random id and version.
+   * @throws Error - When the source or health store write fails.
+   */
   async recordHealth(input: SourceHealthInput): Promise<SourceHealthEvent> {
     const source = await this.sources.get(input.sourceId);
     if (source !== null) {
@@ -660,6 +856,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return event;
   }
 
+  /**
+   * Records an audited access event. The `message` is secret-redacted; unset optional
+   * fields are omitted from the record.
+   *
+   * @param input - Access observation; `timestamp` defaults to now.
+   * @returns The persisted event, with a fresh random id and version.
+   * @throws Error - When the access store write fails.
+   */
   async recordAccess(input: SourceAccessInput): Promise<SourceAccessEvent> {
     const event: SourceAccessEvent = {
       id: randomUUID(),
@@ -679,6 +883,17 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return event;
   }
 
+  /**
+   * Renders a citation for a source per its citation policy: `cite_path`/`cite_link` show
+   * the URI, `cite_query` shows the source id, `do_not_cite` suppresses. Unknown sources
+   * yield a `do_not_cite` placeholder rather than an error; when `versionId` names a
+   * missing version, version details are simply omitted.
+   *
+   * @param sourceId - Source to cite.
+   * @param versionId - Optional version to cite specifically.
+   * @returns The rendered citation.
+   * @throws Error - When the source or version store read fails.
+   */
   async resolveCitation(sourceId: string, versionId?: string): Promise<SourceCitation> {
     const source = await this.sources.get(sourceId);
     if (source === null) {
@@ -708,6 +923,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     }
   }
 
+  /**
+   * Queries source records; each returned record carries effective (recomputed) staleness
+   * rather than the stored `stalenessState`.
+   *
+   * @param query - Optional filter/sort/paging query; omitted means all.
+   * @returns Matching records.
+   * @throws Error - When the store query fails.
+   */
   async querySources(query?: StoreQuery): Promise<SourceRecord[]> {
     const sources = await queryAll(this.sources, query);
     return sources.map(source => ({
@@ -716,6 +939,13 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     }));
   }
 
+  /**
+   * Lists sources past their freshness SLA.
+   *
+   * @param workspaceId - Workspace to filter on; `undefined` matches all workspaces.
+   * @returns Sources whose effective staleness is `stale` or `expired`.
+   * @throws Error - When the store query fails.
+   */
   async staleSources(workspaceId?: string): Promise<SourceRecord[]> {
     const sources = await this.querySources(workspaceId === undefined
       ? undefined
@@ -723,14 +953,39 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return sources.filter(source => source.stalenessState === 'stale' || source.stalenessState === 'expired');
   }
 
+  /**
+   * Lists recorded health events, optionally restricted to one source.
+   *
+   * @param sourceId - Source to filter on; `undefined` matches all sources.
+   * @returns Matching events.
+   * @throws Error - When the store query fails.
+   */
   healthEvents(sourceId?: string): Promise<SourceHealthEvent[]> {
     return queryBySource(this.health, sourceId);
   }
 
+  /**
+   * Lists recorded access events, optionally restricted to one source.
+   *
+   * @param sourceId - Source to filter on; `undefined` matches all sources.
+   * @returns Matching events.
+   * @throws Error - When the store query fails.
+   */
   accessEvents(sourceId?: string): Promise<SourceAccessEvent[]> {
     return queryBySource(this.access, sourceId);
   }
 
+  /**
+   * Evaluates health findings across sources and persists the report (overwriting the
+   * scope's previous report). Findings are ranked critical-first, then by source id;
+   * the report's counters derive from the findings. Pass connector snapshots (see
+   * {@link connectorHealthSnapshots}) to include connector health in the report.
+   *
+   * @param input - Scope and options; defaults to all workspaces without the
+   *   unknown-freshness finding.
+   * @returns The persisted report.
+   * @throws Error - When the source, version, or report store operations fail.
+   */
   async evaluateHealth(input: SourceHealthEvaluationInput = {}): Promise<SourceHealthReport> {
     const sources = await this.querySources(input.workspaceId === undefined
       ? undefined
@@ -804,12 +1059,27 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return report;
   }
 
+  /**
+   * Lists previously generated health reports.
+   *
+   * @param workspaceId - Workspace to filter on; `undefined` matches all workspaces.
+   * @returns Stored reports.
+   * @throws Error - When the store query fails.
+   */
   async healthReports(workspaceId?: string): Promise<SourceHealthReport[]> {
     return queryAll(this.reports, workspaceId === undefined
       ? undefined
       : { where: { op: 'eq', field: 'workspaceId', value: workspaceId } });
   }
 
+  /**
+   * Maps each source id to the id of its most recently observed version, scanning the
+   * version store.
+   *
+   * @param sourceIds - Source ids to resolve.
+   * @returns Source id to latest version id; sources without versions are absent.
+   * @throws Error - When the version store query fails.
+   */
   private async latestSourceVersionIds(sourceIds: ReadonlySet<string>): Promise<Map<string, string>> {
     if (sourceIds.size === 0) return new Map();
     const versions = await queryAll(this.versions);
@@ -824,6 +1094,15 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return new Map([...latest].map(([sourceId, version]) => [sourceId, version.id]));
   }
 
+  /**
+   * Health issue classes for one source: down or degraded health, denied permission, and
+   * expired or stale staleness (or unknown freshness, when opted in).
+   *
+   * @param source - Source to assess.
+   * @param includeUnknownFreshness - Whether unknown freshness counts as an issue.
+   * @returns Issue types; empty when the source is healthy.
+   * @throws Never.
+   */
   private issueTypesForSource(source: SourceRecord, includeUnknownFreshness: boolean): SourceHealthIssueType[] {
     const issues: SourceHealthIssueType[] = [];
     if (source.healthState === 'down') issues.push('down');
@@ -835,6 +1114,14 @@ class StoreBackedSourceRegistry implements SourceRegistry {
     return issues;
   }
 
+  /**
+   * Severity for a health issue: expired, down, and permission denials are `critical`;
+   * stale, degraded, and unknown freshness are `warning`.
+   *
+   * @param issueType - Issue to classify.
+   * @returns The severity.
+   * @throws Never.
+   */
   private severityForIssue(issueType: SourceHealthIssueType): SourceHealthSeverity {
     switch (issueType) {
       case 'expired':
@@ -849,6 +1136,10 @@ class StoreBackedSourceRegistry implements SourceRegistry {
   }
 }
 
+/**
+ * Parsed input shape accepted by the `source_action` tool; fields beyond `action` are
+ * consumed by the matching action (see {@link createSourceActionTool}).
+ */
 interface SourceActionInput {
   action: string;
   id?: string;
@@ -858,6 +1149,7 @@ interface SourceActionInput {
   query?: StoreQuery;
 }
 
+/** Structural subset of connector-fabric's health event records, used for cross-plugin reads. */
 interface ConnectorHealthEventLike {
   connectorInstanceId: string;
   state: SourceHealthState;
@@ -865,6 +1157,7 @@ interface ConnectorHealthEventLike {
   message?: string;
 }
 
+/** Structural subset of connector-fabric's connector instance records, used for cross-plugin reads. */
 interface ConnectorInstanceLike {
   id: string;
   displayName: string;
@@ -873,17 +1166,35 @@ interface ConnectorInstanceLike {
   healthState: SourceHealthState;
 }
 
+/**
+ * Minimal structural view of the optional `ConnectorRegistry` service, so connector health
+ * snapshots can be gathered without a dependency on connector-fabric.
+ */
 interface ConnectorRegistryLike {
   queryInstances(query?: StoreQuery): Promise<ConnectorInstanceLike[]>;
   healthEvents(connectorInstanceId?: string): Promise<ConnectorHealthEventLike[]>;
 }
 
+/**
+ * Parsed input shape accepted by the `source_health_action` tool (see
+ * {@link createSourceHealthActionTool}).
+ */
 interface SourceHealthActionInput {
   action: string;
   workspaceId?: string;
   includeUnknownFreshness?: boolean;
 }
 
+/**
+ * Builds the `source_action` inspection tool over the registry: list/get sources, health
+ * events, stale sources, citation rendering, and combined access/health/version event
+ * listings. Validation failures, unknown actions, and registry errors are reported as
+ * `error` events rather than thrown.
+ *
+ * @param registry - Registry the tool reads from.
+ * @returns The tool definition.
+ * @throws Never.
+ */
 function createSourceActionTool(registry: SourceRegistry): Tool {
   return {
     name: 'source_action',
@@ -952,6 +1263,15 @@ function createSourceActionTool(registry: SourceRegistry): Tool {
   };
 }
 
+/**
+ * Gathers a health snapshot per registered connector instance, using each instance's most
+ * recent health event when one exists and the instance's stored state otherwise. Yields an
+ * empty array when the optional `ConnectorRegistry` service is absent.
+ *
+ * @param services - Machine whose registry provides connector instances and health events.
+ * @returns One snapshot per connector instance.
+ * @throws Error - When the connector registry queries fail.
+ */
 async function connectorHealthSnapshots(services: MatbotMachine): Promise<SourceHealthConnectorSnapshot[]> {
   const connectorRegistry = services.get('ConnectorRegistry' as never) as ConnectorRegistryLike | undefined;
   if (connectorRegistry === undefined) return [];
@@ -972,6 +1292,17 @@ async function connectorHealthSnapshots(services: MatbotMachine): Promise<Source
   }));
 }
 
+/**
+ * Builds the `source_health_action` tool: generate a health report, extract its warnings,
+ * snapshot connector health, and list stored reports. Reports include live connector
+ * snapshots; validation failures, unknown actions, and registry errors are reported as
+ * `error` events rather than thrown.
+ *
+ * @param registry - Registry the tool evaluates against.
+ * @param services - Machine used to snapshot connector health.
+ * @returns The tool definition.
+ * @throws Never.
+ */
 function createSourceHealthActionTool(registry: SourceRegistry, services: MatbotMachine): Tool {
   return {
     name: 'source_health_action',
@@ -1065,6 +1396,13 @@ export const plugin: MatbotPluginSpec = {
   manifest: {
     description: 'Registers SourceRegistry, source_action, and source_health_action for source provenance, freshness, health, citations, and health reports.',
   },
+  /**
+   * Plugin entry point: registers the web UI contribution, the `SourceRegistry` service,
+   * and the `source_action` / `source_health_action` tools.
+   *
+   * @param services - Machine to register into.
+   * @throws Error - When registration fails.
+   */
   async setup(services: MatbotMachine) {
     services.contributions?.register('webui','sources',uiContribution);
     const registry = createSourceRegistry(services);

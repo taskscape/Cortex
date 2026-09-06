@@ -4,6 +4,13 @@ import { compileFilter } from './compile.js';
 import { applySort } from './sort.js';
 import { encodeCursor, decodeCursor, type PageState } from './paginate.js';
 
+/**
+ * Project a page state back to a query shape (dropping the offset) so it can be re-validated.
+ *
+ * @param p - The page state carried by a cursor, or built from the incoming query.
+ * @returns The equivalent {@link StoreQuery}.
+ * @throws Never.
+ */
 function toQuery(p: PageState): StoreQuery {
   return {
     ...(p.where !== undefined ? { where: p.where } : {}),

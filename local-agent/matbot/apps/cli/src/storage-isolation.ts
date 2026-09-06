@@ -3,7 +3,10 @@ import type { CASResult, QueryResult, StorageBackend, Store, StoreQuery } from '
 import { executeQuery } from '@matatbread/matbot-storage-base';
 import { FilesystemStore } from '@matatbread/matbot-storage-filesystem';
 
-/** In-memory store used for every namespace in an ephemeral host process. */
+/**
+ * In-memory store used for every namespace in an ephemeral host process.
+ * @typeParam T - Document type held by the store; must carry `id` and `version`.
+ */
 export class MemoryStore<T extends { id: string; version: string }> implements Store<T> {
   private readonly items = new Map<string, T>();
 
@@ -11,6 +14,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
    * Retrieve a document by id.
    * @param id Document identifier.
    * @returns The stored document, or null when absent.
+   * @throws Never.
    */
   async get(id: string): Promise<T | null> {
     return this.items.get(id) ?? null;
@@ -21,6 +25,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
    * @param id Document identifier.
    * @param value Full document to store.
    * @returns Resolves when the write completes.
+   * @throws Never.
    */
   async set(id: string, value: T): Promise<void> {
     this.items.set(id, value);
@@ -32,6 +37,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
    * @param expected Version the caller believes is current.
    * @param next Replacement document.
    * @returns `{ ok: true, doc }` on success, or `{ ok: false, current }` with the live document (possibly null) otherwise.
+   * @throws Never.
    */
   async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
     const current = this.items.get(id) ?? null;
@@ -45,6 +51,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
    * @param id Document identifier.
    * @param expectedVersion When given, deletion only proceeds if the stored version matches.
    * @returns True if the document was deleted (or was already absent without a version guard).
+   * @throws Never.
    */
   async delete(id: string, expectedVersion?: string): Promise<boolean> {
     if (expectedVersion !== undefined) {
@@ -58,6 +65,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
    * Filter/sort/limit over all in-memory documents.
    * @param q Translatable store query.
    * @returns Matching items plus the total count before limit.
+   * @throws Never.
    */
   async query(q: StoreQuery): Promise<QueryResult<T>> {
     return executeQuery([...this.items.values()], q);
@@ -69,6 +77,7 @@ export class MemoryStore<T extends { id: string; version: string }> implements S
  * `.data` sibling of `matbot.yaml`.
  * @param configPath Path to the workspace's matbot.yaml.
  * @returns Absolute path of the adjacent `.data` directory.
+ * @throws Never.
  */
 export function workspaceDataDirectory(configPath: string): string {
   return join(dirname(configPath), '.data');
@@ -80,6 +89,7 @@ export function workspaceDataDirectory(configPath: string): string {
  * otherwise the configured backend is used with FilesystemStore as fallback.
  * @param options Ephemeral flag, namespace name, `.data` directory, sessions directory, and optional backend.
  * @returns A Store bound to the namespace (in-memory when ephemeral).
+ * @throws Error - Propagates initialization failures from the selected backend's `createStore` or the `FilesystemStore` fallback (the ephemeral in-memory path never throws).
  */
 export function createWorkspaceStore<T extends { id: string; version: string }>(options: {
   ephemeral: boolean;

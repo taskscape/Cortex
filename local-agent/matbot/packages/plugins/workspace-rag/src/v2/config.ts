@@ -2,6 +2,9 @@ import type { RagV2IngestionPolicy, RagV2Mode } from './types.js';
 
 const MIB = 1024 * 1024;
 
+/**
+ * Orphan-GC cadence, grace, batching, and feature-gate settings.
+ */
 export interface RagV2GcSettings {
   enabled: boolean;
   intervalMs: number;
@@ -11,22 +14,52 @@ export interface RagV2GcSettings {
   blobGcEnabled: boolean;
 }
 
+/**
+ * Parses a raw string as a positive safe integer.
+ * @param value - Raw value (typically an environment variable); undefined or empty yields the fallback.
+ * @param fallback - Returned when `value` is not a safe integer greater than zero.
+ * @returns The parsed integer, or `fallback`.
+ * @throws Never.
+ */
 export function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/**
+ * Parses a raw string as a non-negative safe integer.
+ * @param value - Raw value or undefined; undefined yields the fallback.
+ * @param fallback - Returned when `value` is not a safe integer of at least zero.
+ * @returns The parsed integer, or `fallback`.
+ * @throws Never.
+ */
 function nonNegativeInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+/**
+ * Parses a raw string as an integer clamped into an inclusive range.
+ * @param value - Raw value or undefined; non-finite or below-1 values yield the fallback rather than being clamped.
+ * @param fallback - Returned when `value` is unusable.
+ * @param min - Inclusive lower clamp.
+ * @param max - Inclusive upper clamp.
+ * @returns The floored and clamped integer, or `fallback`.
+ * @throws Never.
+ */
 function boundedInteger(value: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 1) return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
+/**
+ * Reads a positive integer from a named environment variable.
+ * @param name - Environment variable to read.
+ * @param fallback - Returned when the variable is unset, empty, or not a positive safe integer; the invalid value is logged first.
+ * @returns The parsed value, or `fallback`.
+ * @throws Never.
+ */
 function gcPositiveInteger(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -36,6 +69,13 @@ function gcPositiveInteger(name: string, fallback: number): number {
   return fallback;
 }
 
+/**
+ * Reads a boolean from a named environment variable.
+ * @param name - Environment variable to read.
+ * @param fallback - Returned when the variable is unset, empty, or not one of `true`, `1`, `false`, `0` (case-insensitive); the invalid value is logged first.
+ * @returns The parsed value, or `fallback`.
+ * @throws Never.
+ */
 function gcBoolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -46,7 +86,11 @@ function gcBoolean(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
-/** Reads orphan-GC cadence, grace, batching, and feature gates. */
+/**
+ * Reads orphan-GC cadence, grace, batching, and feature gates.
+ * @returns Settings resolved from the `CORTEX_RAG_V2_GC_*` and `CORTEX_RAG_V2_RETIRED_GENERATION_TTL_MS` variables with built-in defaults.
+ * @throws Never.
+ */
 export function ragV2GcSettingsFromEnv(): RagV2GcSettings {
   return {
     enabled: gcBoolean('CORTEX_RAG_V2_GC_ENABLED', true),
@@ -138,6 +182,7 @@ export function ragV2RrfFromEnv(): { k: number; weights: Record<string, number> 
 /**
  * Reads cold-object retention settings from the environment.
  * @returns Retention thresholds controlling eviction of passage embeddings.
+ * @throws Error - When retention mode is `external_immutable` and no `CORTEX_RAG_V2_EXTERNAL_OBJECT_ROOT` is set.
  */
 export function ragV2ObjectRetentionFromEnv(): {
   mode: 'managed' | 'external_immutable' | 'manifest_only';
@@ -185,6 +230,15 @@ export function ragV2SummaryConcurrencyFromEnv(): number {
  */
 export function ragV2SummaryQueueLimitFromEnv(): number {
   return boundedInteger(process.env['CORTEX_RAG_V2_SUMMARY_QUEUE_LIMIT'], 256, 16, 4_096);
+}
+
+/**
+ * Maximum time for one semantic summary and its embedding; default two minutes.
+ * @returns Timeout in milliseconds, clamped to the range 10..3,600,000.
+ * @throws Never.
+ */
+export function ragV2SummaryTimeoutMsFromEnv(): number {
+  return boundedInteger(process.env['CORTEX_RAG_V2_SUMMARY_TIMEOUT_MS'], 120_000, 10, 3_600_000);
 }
 
 /**

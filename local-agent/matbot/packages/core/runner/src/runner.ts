@@ -105,7 +105,50 @@ export interface RunSessionOpts {
  *          (`done`, `aborted`, or `error`).
  */
 export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineEvent> {
+  const traceId = opts.config.traceId ?? crypto.randomUUID();
+  try {
+    yield* runSessionTurn({ ...opts, config: { ...opts.config, traceId } });
+  } catch (error) {
+    yield { type: 'error', error: error instanceof Error ? error.message : String(error), traceId };
+  }
+}
+
+/**
+ * Drive one agentic turn end-to-end: screen the submission, build system context, then loop
+ * provider calls and parallel tool executions until the model replies without tool calls or a
+ * budget/abort condition ends the turn. The session is persisted after every complete tool
+ * round-trip and at every exit path, and `matbot.turn`/`gen_ai.chat`/tool spans are reported to
+ * the observability sink when one is configured.
+ *
+ * Internal: called only by {@link runSession}, which maps any thrown failure into an `error`
+ * event, so callers never see these exceptions directly.
+ *
+ * @param opts - Session, provider wiring, registries, and injection points, with
+ *               `config.traceId` already resolved.
+ * @returns The pipeline event stream, ending with exactly one terminal event (`done`,
+ *           `aborted`, or `error`).
+ * @throws Error - If a session persistence write fails on an exit path not guarded here
+ *           (persist wraps store failures in a descriptive error).
+ * @throws The abort signal's reason if abort lands inside a tool execution after its gates but
+ *           before executor dispatch.
+ */
+async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEvent> {
   const { config, provider, providerConfig, store, signal } = opts;
+  /**
+   * Persist a session snapshot to the store so the latest output and completed actions survive
+   * any later failure.
+   *
+   * @param session - The session snapshot to write.
+   * @returns Resolves when the store has accepted the write.
+   * @throws Error - If the store write fails; the original failure is attached as `cause` and
+   *           the message warns that the latest output may not be saved.
+   */
+  const persist = async (session: Session): Promise<void> => {
+    try { await store.set(session.id, session); }
+    catch (error) {
+      throw new Error(`Session persistence failed; the latest output and completed actions may not be saved: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+  };
   // Tools fully denied by permission rules never reach the model's menu (spec R8) — the gate
   // below still covers them for direct callers that pass their own snapshot.
   const declaredTools = opts.tools ?? new Map<string, Tool>();
@@ -114,6 +157,16 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     ? new Map([...declaredTools].filter(([name]) => !isToolHiddenByRules(denyRules, name)))
     : declaredTools;
   const hookReg = opts.hooks   ?? new HookRegistry();
+  /**
+   * Fallback prompt function for non-interactive contexts (when `opts.prompt` is absent):
+   * resolves with the default answer when one is available, otherwise rejects — tools cannot
+   * ask interactive questions here.
+   *
+   * @param p - The question text, or a form field whose `default` supplies the answer.
+   * @param def - Default answer for a plain-string prompt; ignored for form fields.
+   * @returns Resolves with the available default answer.
+   * @throws Error - Via a rejected promise when no default answer exists.
+   */
   const promptFn: PromptFn = opts.prompt ?? (((p: string | FormField, def?: string): Promise<string> => {
     const fallback = typeof p === 'string' ? def : p.default;
     if (fallback !== undefined) return Promise.resolve(fallback);
@@ -133,6 +186,15 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   const turnSpanId = crypto.randomUUID();
   const turnStartedAt = Date.now();
   let turnFinished = false;
+  /**
+   * Record one observability span event, stamping the turn's trace/root-trace ids and a
+   * timestamp. Sink failures are logged as warnings and swallowed so telemetry problems never
+   * break the turn.
+   *
+   * @param event - Span event without correlation fields; `timestamp` is filled in when absent.
+   * @returns Resolves once the sink has been invoked (or the event was dropped).
+   * @throws Never.
+   */
   const observe = async (event: Omit<ObservabilityEvent, 'traceId' | 'rootTraceId' | 'timestamp'> & { timestamp?: string }): Promise<void> => {
     if (opts.observability === undefined) return;
     try {
@@ -146,6 +208,15 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       console.warn(`[runner] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
+  /**
+   * Emit the terminal `matbot.turn` span end exactly once per turn, with the total duration, the
+   * given status, and any terminal attributes; later calls are no-ops.
+   *
+   * @param status - Terminal span status (`ok` on success, `error` on abort or failure).
+   * @param attributes - Extra attributes describing the terminal event (kind, reason, counts).
+   * @returns Resolves when the end event has been observed.
+   * @throws Never.
+   */
   const finishTurn = async (status: ObservabilityStatus, attributes?: Record<string, unknown>): Promise<void> => {
     if (turnFinished) return;
     turnFinished = true;
@@ -154,6 +225,15 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       status, durationMs: Date.now() - turnStartedAt, ...(attributes !== undefined ? { attributes } : {}),
     });
   };
+  /**
+   * Scrub a span attribute through the vault before observability: strings pass through the
+   * vault's scrubber directly; objects are serialized, scrubbed, and re-parsed, degrading to a
+   * placeholder when not round-trippable; other values pass through unchanged.
+   *
+   * @param value - The span attribute value to scrub.
+   * @returns The scrubbed value, safe to attach to an observability event.
+   * @throws Never.
+   */
   const scrubSpanValue = (value: unknown): unknown => {
     if (typeof value === 'string') return vault.scrub(value);
     if (value === null || typeof value !== 'object') return value;
@@ -178,8 +258,16 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   // answers are visible to sibling calls before they prompt.
   const invocationState = createInvocationState();
 
-  // Append isError tool results for any assistant tool-call block that never received one — an
-  // aborted turn must persist paired calls/results so provider submissions stay valid (spec R19).
+  /**
+   * Append isError tool results for any assistant tool-call block that never received one — an
+   * aborted turn must persist paired calls/results so provider submissions stay valid (spec R19).
+   *
+   * @param target - The session to scan for unanswered tool calls.
+   * @param errorText - Error text placed on each synthesized `aborted` tool result.
+   * @returns The session unchanged when every tool call is answered; otherwise a copy with one
+   *           `tool`-role message carrying the synthesized results appended.
+   * @throws Never.
+   */
   const finalizeOrphanToolCalls = (target: Session, errorText: string): Session => {
     const answered = new Set<string>();
     for (const m of target.messages) {
@@ -198,12 +286,26 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     return appendMessage(target, createMessage({ role: 'tool', content: orphans, traceId }));
   };
 
-  // Push-based event queue so concurrent tool executions can stream pipeline events while the
-  // generator yields them in arrival order.
+  /**
+   * Push-based event queue so concurrent tool executions can stream pipeline events while the
+   * generator yields them in arrival order.
+   *
+   * @typeParam T - Queued event type.
+   * @returns A queue with `push` (buffer a value and wake a waiting consumer), `end` (mark the
+   *           stream finished), and an async iterator yielding buffered values FIFO, then
+   *           completing after `end` once the buffer is drained.
+   * @throws Never.
+   */
   function createEventQueue<T>() {
     const buffer: T[] = [];
     let ended = false;
     let wakeup: (() => void) | null = null;
+    /**
+     * Wake a parked consumer, if any.
+     *
+     * @returns Nothing.
+     * @throws Never.
+     */
     const release = (): void => { if (wakeup !== null) { const w = wakeup; wakeup = null; w(); } };
     return {
       push(v: T): void { buffer.push(v); release(); },
@@ -230,7 +332,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     // Hook-failure (and any other screen-injected) markers carried live, even on abort, so a
     // misconfigured hook surfaces this turn rather than only on a later reload.
     if (screen.markers.length > 0) yield { type: 'marker', content: screen.markers, traceId };
-    await store.set(screen.session.id, screen.session);
+    await persist(screen.session);
     yield { type: 'aborted', reason: screen.abort, session: screen.session, traceId };
     await finishTurn('error', { terminal: 'aborted', reason: screen.abort });
     return;
@@ -288,7 +390,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     // Respect an abort that arrived between turns (e.g. during tool execution).
     if (signal.aborted) {
       session = finalizeOrphanToolCalls(session, typeof signal.reason === 'string' ? `aborted: ${signal.reason}` : 'turn aborted');
-      await store.set(session.id, session);
+      await persist(session);
       yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
       await finishTurn('error', { terminal: 'aborted', reason: String(signal.reason ?? 'user-abort') });
       return;
@@ -340,6 +442,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     let providerCostUsd = 0;
     let providerCacheReadTokens = 0;
     let providerCacheCreationTokens = 0;
+    let providerDone = false;
     await observe({
       phase: 'start', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
       parentSpanId: turnSpanId, sessionId,
@@ -386,9 +489,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
               ...(ev.cacheCreationTokens !== undefined ? { cacheCreationTokens: ev.cacheCreationTokens } : {}) };
             break;
           case 'done':
+            providerDone = true;
             break;
         }
       }
+      if (!providerDone) throw new Error('Provider stream ended without a terminal done event.');
       await observe({
         phase: 'end', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
         parentSpanId: turnSpanId, sessionId, status: 'ok', durationMs: Date.now() - providerStartedAt,
@@ -424,15 +529,27 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
           ...(stack !== undefined ? { errorStack: stack } : {}),
         },
       });
+      // Preserve partial prose and completed rounds, but never release buffered
+      // tool calls from an unconfirmed provider completion.
+      if (textAcc) assistantParts.push({ type: 'text', text: textAcc });
+      if (assistantParts.length > 0) {
+        session = appendMessage(session, createMessage({
+          role: 'assistant', content: assistantParts, traceId, providerName: config.provider,
+          metadata: { incomplete: true },
+        }));
+      }
+      session = appendMessage(session, createMessage({
+        role: 'marker', content: [{ type: 'text', text: `Completion interrupted: ${detail}` }], traceId,
+        metadata: { incomplete: true, providerError: detail },
+      }));
+      try { await persist(session); }
+      catch (persistenceError) {
+        const failure = `${detail}. ${persistenceError instanceof Error ? persistenceError.message : String(persistenceError)}`;
+        yield { type: 'error', error: failure, traceId };
+        await finishTurn('error', { terminal: 'error', error: failure });
+        return;
+      }
       if (signal.aborted) {
-        // Save whatever the LLM streamed before the abort hit.
-        if (textAcc) assistantParts.push({ type: 'text', text: textAcc });
-        if (assistantParts.length > 0) {
-          session = appendMessage(session, createMessage({
-            role: 'assistant', content: assistantParts, traceId, providerName: config.provider,
-          }));
-        }
-        await store.set(session.id, session);
         yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
         await finishTurn('error', { terminal: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort' });
         return;
@@ -484,8 +601,34 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     const serialBatch = pendingCalls.some(tc => tools.get(tc.name)?.serial === true);
 
     const queue = createEventQueue<PipelineEvent>();
+    /**
+     * Execute the pending tool calls — up to 4 workers in parallel, or serially when any called
+     * tool demands serial execution — recording each outcome in `toolResults` and streaming
+     * `tool:start`/`tool:end` events through the queue. Calls refused by the budget, argument
+     * -parse, doom-loop, or tool-resolution gates receive error results without running the tool;
+     * calls that never ran (abort mid-batch) get paired `aborted` results in `finally`.
+     *
+     * @returns Resolves when every pending call has a recorded result and the queue is closed.
+     * @throws The abort signal's reason if abort lands inside {@link executeToolInvocation} after
+     *           its gates but before executor dispatch; other per-call failures are captured as
+     *           error results, not rethrown.
+     */
     const batch = (async (): Promise<void> => {
       try {
+        /**
+         * Record a call refused without executing (budget, parse, doom-loop, or unknown tool):
+         * store its error result at the call's index, push a `tool:end` event, and close its
+         * tool span with `error` status.
+         *
+         * @param tc - The skipped call (id and name).
+         * @param index - Position of the call in `pendingCalls`; `toolResults` is written here.
+         * @param spanId - Tool span id opened for this call.
+         * @param startedAt - Epoch ms at which the span opened (span duration basis).
+         * @param result - Error payload recorded as the call's result.
+         * @param push - Sink for the pipeline event.
+         * @returns Nothing; the span observation is fire-and-forget.
+         * @throws Never.
+         */
         const finishSkipped = (
           tc: { id: string; name: string },
           index: number,
@@ -503,6 +646,18 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
           });
         };
 
+        /**
+         * Execute one pending tool call end-to-end: open its observability span, then apply the
+         * per-turn tool-call budget, argument-parse, doom-loop, and tool-resolution gates — each
+         * yielding an error result without running the tool — before delegating the survivor to
+         * {@link executeToolInvocation} and recording its outcome and any abort request.
+         *
+         * @param index - Position of the call in `pendingCalls`.
+         * @param push - Sink for the call's `tool:start`/`tool:end` pipeline events.
+         * @returns Resolves when the call has a recorded result in `toolResults`.
+         * @throws The abort signal's reason if abort lands inside {@link executeToolInvocation}
+         *           after its gates but before executor dispatch.
+         */
         const execOne = async (index: number, push: (ev: PipelineEvent) => void): Promise<void> => {
           const tc = pendingCalls[index]!;
           const toolSpanId = crypto.randomUUID();
@@ -566,6 +721,15 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         };
 
         let nextIndex = 0;
+        /**
+         * Take call indexes until exhausted or an abort is observed, executing them one at a time;
+         * a fixed pool of these workers covers the batch (a single worker when the batch must run
+         * serially). In-flight calls finish so every emitted call still gets a persisted result.
+         *
+         * @returns Resolves when the worker has no more calls to take.
+         * @throws The abort signal's reason if abort lands inside an execution after its gates but
+         *           before executor dispatch.
+         */
         const worker = async (): Promise<void> => {
           for (;;) {
             const i = nextIndex++;
@@ -601,12 +765,13 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
       session = appendMessage(session, createMessage({ role: 'marker', content: toolMarkers, traceId }));
       yield { type: 'marker', content: toolMarkers, traceId };
     }
+    await persist(session);
 
     // A hook/cancelled-prompt abort during execution: results are now paired and persisted, so the
     // turn terminates cleanly with an `aborted` event.
     if (abortReason !== undefined) {
       session = finalizeOrphanToolCalls(session, abortReason);
-      await store.set(session.id, session);
+      await persist(session);
       yield { type: 'aborted', reason: abortReason, session, traceId };
       await finishTurn('error', { terminal: 'aborted', reason: abortReason });
       return;
@@ -629,7 +794,7 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
   // ── 4. Persist and finish ──────────────────────────────────────────────────
   // `react` fires post-commit, in pump (the queue owner) — not here.
 
-  await store.set(session.id, session);
+  await persist(session);
 
   yield { type: 'done', session, traceId };
   await finishTurn('ok', { terminal: 'done', messageCount: session.messages.length });

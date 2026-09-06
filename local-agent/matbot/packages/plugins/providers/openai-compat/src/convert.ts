@@ -2,6 +2,7 @@ import type { Message, Tool, JSONSchema } from '@matatbread/matbot-plugin-api';
 
 // ── Internal OpenAI API types ─────────────────────────────────────────────────
 
+/** The four chat-completions message roles. */
 type OAIRole    = 'system' | 'user' | 'assistant' | 'tool';
 
 /** One message in OpenAI chat-completions wire format. */
@@ -13,12 +14,15 @@ export interface OAIMessage {
   name?:        string;
 }
 
+/** Anthropic-style `cache_control` directive, honoured by OpenRouter-routed providers. */
 type CacheControl = { type: 'ephemeral' };
 
+/** One multimodal content part: text (optionally ending a cache breakpoint) or an image URL. */
 type OAIContentPart =
   | { type: 'text';      text: string; cache_control?: CacheControl }
   | { type: 'image_url'; image_url: { url: string } };
 
+/** One function tool call emitted by the model. */
 interface OAIToolCall {
   id:       string;
   type:     'function';
@@ -40,6 +44,13 @@ export interface OAIToolDef {
 // must never see it, so the default stays the flat OpenAI wire shape. Mirrors the native anthropic
 // adapter: cache the system prefix, the tool defs, and the second-to-last user turn (the newest
 // content is left fresh — it changes next request anyway, so caching it just churns the write).
+/**
+ * Mark one message's last text content with an ephemeral `cache_control` breakpoint, converting a
+ * plain-string `content` to a single text part when necessary.
+ *
+ * @param msg - The message to mark; mutated in place.
+ * @throws Never.
+ */
 function markCacheable(msg: OAIMessage): void {
   if (typeof msg.content === 'string') {
     msg.content = [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }];
@@ -53,6 +64,13 @@ function markCacheable(msg: OAIMessage): void {
   }
 }
 
+/**
+ * Add cache breakpoints to a converted message list: on the last `system` message and on the
+ * second-to-last user turn. The newest user turn stays fresh — it changes next request anyway.
+ *
+ * @param result - The converted messages; mutated in place.
+ * @throws Never.
+ */
 function applyCacheBreakpoints(result: OAIMessage[]): void {
   for (let i = result.length - 1; i >= 0; i--) {
     if (result[i]!.role === 'system') { markCacheable(result[i]!); break; }
@@ -65,6 +83,12 @@ function applyCacheBreakpoints(result: OAIMessage[]): void {
  * Serialize a matbot tool result for the `tool` role. Error results carry an explicit `is_error`
  * marker inside the JSON payload so OpenAI-compatible models can distinguish failures from
  * successful payloads (the wire format itself has no error flag — spec R4).
+ *
+ * @param result - The tool's return value; `undefined` and `null` both become JSON `null`.
+ * @param isError - When true, embeds `is_error: true` in the payload: object results are spread
+ *                  and extended, anything else is wrapped as `{ result: String(result) }`.
+ * @returns The JSON string sent as the tool message's `content`.
+ * @throws When `result` is not JSON-serializable (e.g. a circular structure).
  */
 export function serializeToolResult(result: unknown, isError?: boolean): string {
   if (!isError) return JSON.stringify(result ?? null);

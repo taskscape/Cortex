@@ -38,11 +38,14 @@ const PROVIDER_SETTING_KEYS = [
 const DREAM_SETTING_KEYS = ['strongThreshold', 'weakThreshold', 'maxClusterSize', 'blocklist', 'weakDeferralMs'] as const;
 
 /**
- * Constructs the `ask_inner_voice` tool: records a durable fact about the user
- * into the remembered_facts store (with optional provenance), using a pinned or
- * turn provider.
- * @param services The matbot machine.
+ * Constructs the `ask_inner_voice` tool: consults a second model (the Inner voice
+ * critic) via the machine's `singleTurn` service and returns its text and token
+ * usage. The answering provider is the `innerVoiceProvider` setting when it names
+ * a configured provider, else the current turn's provider; with neither available
+ * the tool yields an `error` event instead of a result.
+ * @param services - The matbot machine, used for settings, the provider registry, and single-turn completion.
  * @returns The `ask_inner_voice` tool.
+ * @throws Never - Missing input or provider problems surface as yielded `error` ToolEvents, not throws.
  */
 export function createAskInnerVoiceTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {
@@ -108,6 +111,16 @@ export interface CognitionProviderConfig {
  *  teaches the model both the current values and the object's shape. */
 export type CognitionConfig = CognitionProviderConfig & DreamSettings;
 
+/**
+ * Reads the effective cognition configuration: the three provider pins as raw
+ * values (`null` when unpinned — the fallback is each call's own turn provider,
+ * so there is no resolved value to report), the stored dream settings
+ * defaults-merged over {@link DEFAULT_DREAM_SETTINGS}, and the configured
+ * provider names.
+ * @param services - The matbot machine, used for settings reads and the provider registry.
+ * @returns The effective {@link CognitionConfig} plus `available`: every configured provider name.
+ * @throws If a settings read fails.
+ */
 async function readEffectiveConfig(services: MatbotMachine): Promise<CognitionConfig & { available: string[] }> {
   const settings = services.settings();
   const [innerVoiceProvider, dreamRankerProvider, dreamMergerProvider, storedDream] = await Promise.all([
@@ -128,9 +141,12 @@ async function readEffectiveConfig(services: MatbotMachine): Promise<CognitionCo
 
 /**
  * Constructs the `cognition_config` tool: view/pin/clear the providers used by
- * inner-voice and dream rank/merge, and get/set dream settings.
- * @param services The matbot machine.
+ * inner-voice and dream rank/merge, and get/set dream settings. `set` validates
+ * the entire patch before committing anything, so an invalid field never leaves
+ * an earlier field of the same call persisted (all-or-nothing).
+ * @param services - The matbot machine, used for settings, the provider registry, and dream-settings validation.
  * @returns The `cognition_config` tool.
+ * @throws Never - Validation failures surface as yielded `error` ToolEvents, not throws.
  */
 export function createCognitionConfigTool(services: MatbotMachine): Tool {
   const executor: ToolExecutor = {

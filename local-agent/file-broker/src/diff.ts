@@ -1,17 +1,3 @@
-/**
- * Produces a unified-style diff of two text versions of one file using an
- * LCS-based line comparison, so a single inserted line renders as one small
- * hunk instead of shifting the whole tail into +/- pairs. Hunks carry three
- * lines of context and are split when separated by more than six unchanged
- * lines. Inputs larger than {@link MAX_LCS_LINES} per side fall back to the
- * cheaper positional comparison (noted inline) to bound quadratic DP cost.
- *
- * @param filePath - Path shown in the diff headers.
- * @param before - Previous content.
- * @param after - New content.
- * @returns A unified-diff-style text joined with newlines.
- */
-
 /** Maximum per-side line count for exact LCS matching before falling back. */
 const MAX_LCS_LINES = 5000;
 
@@ -25,6 +11,22 @@ interface DiffOp {
   text: string;
 }
 
+/**
+ * Produces a unified-style diff of two text versions of one file using an
+ * LCS-based line comparison, so a single inserted line renders as one small
+ * hunk instead of shifting the whole tail into +/- pairs. Hunks carry three
+ * lines of context and are split when separated by more than six unchanged
+ * lines. Inputs larger than {@link MAX_LCS_LINES} per side fall back to the
+ * cheaper positional comparison (noted inline) to bound quadratic DP cost.
+ *
+ * Assumes inputs are UTF-8 text; lines are split on `\r?\n`.
+ *
+ * @param filePath - Path shown in the diff headers.
+ * @param before - Previous content.
+ * @param after - New content.
+ * @returns A unified-diff-style text joined with newlines.
+ * @throws Never; all failure modes degrade to the positional fallback.
+ */
 export function createUnifiedDiff(filePath: string, before: string, after: string): string {
   const beforeLines = before.split(/\r?\n/);
   const afterLines = after.split(/\r?\n/);
@@ -46,6 +48,11 @@ export function createUnifiedDiff(filePath: string, before: string, after: strin
  * Computes the line-level edit script via LCS dynamic programming. Common
  * prefixes/suffixes are trimmed first so mid-file edits run on small middles;
  * the DP table is allocated only over the trimmed range.
+ *
+ * @param before - Previous lines.
+ * @param after - New lines.
+ * @returns The ordered edit script (`same`/`delete`/`insert` ops) covering the
+ * full transformation of `before` into `after`.
  */
 function lcsOps(before: string[], after: string[]): DiffOp[] {
   const ops: DiffOp[] = [];
@@ -80,7 +87,13 @@ function lcsOps(before: string[], after: string[]): DiffOp[] {
   return ops;
 }
 
-/** Fills `ops` with the minimal edit script between two non-empty middles. */
+/**
+ * Fills `ops` with the minimal edit script between two non-empty middles.
+ *
+ * @param ops - Accumulator the ops are appended to.
+ * @param midB - The non-empty trimmed "before" middle.
+ * @param midA - The non-empty trimmed "after" middle.
+ */
 function walkLcsTable(ops: DiffOp[], midB: readonly string[], midA: readonly string[]): void {
   // LCS lengths never exceed MAX_LCS_LINES, so Uint16 cells are sufficient
   // and keep the worst-case table (~25M cells) bounded.
@@ -120,7 +133,14 @@ function walkLcsTable(ops: DiffOp[], midB: readonly string[], midA: readonly str
   }
 }
 
-/** Groups the edit script into hunks with {@link CONTEXT_LINES} context. */
+/**
+ * Groups the edit script into hunks with {@link CONTEXT_LINES} context, merging
+ * neighbouring changes separated by at most six unchanged lines.
+ *
+ * @param lines - Output accumulator; hunk headers and body lines are pushed
+ * onto it in order.
+ * @param ops - The complete ordered edit script from {@link lcsOps}.
+ */
 function appendHunks(lines: string[], ops: DiffOp[]): void {
   const changed = ops.map((op, index) => op.type === "same" ? -1 : index).filter(index => index >= 0);
   if (changed.length === 0) return;
@@ -161,7 +181,14 @@ function appendHunks(lines: string[], ops: DiffOp[]): void {
   }
 }
 
-/** Legacy positional rendering used only above the LCS size cap. */
+/**
+ * Legacy positional rendering used only above the LCS size cap: compares lines
+ * by index alone, so an insertion shifts the whole tail into +/- pairs.
+ *
+ * @param lines - Output accumulator; context and +/- lines are pushed onto it.
+ * @param beforeLines - Previous lines.
+ * @param afterLines - New lines.
+ */
 function appendPositional(lines: string[], beforeLines: string[], afterLines: string[]): void {
   const max = Math.max(beforeLines.length, afterLines.length);
 

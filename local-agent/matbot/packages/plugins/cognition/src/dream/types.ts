@@ -137,7 +137,6 @@ export interface MergeResult {
 export type DreamRunOutcome = 'no-facts' | 'no-match' | 'merged' | 'error';
 
 /** Per-call telemetry: which interface was invoked, how big the input was, how long it took. */
-/** Per-call telemetry: which interface was invoked, how big the input was, how long it took. */
 export interface JudgementCallStat {
   /** Which pluggable interface was invoked. */
   role:        'rank' | 'merge';
@@ -181,6 +180,7 @@ export interface DreamRun {
    *  `buildEnrichedFact` in runOnce.ts). Absent/false means the first-pass score already
    *  cleared (or failed to clear) the weak threshold with no enrichment needed. */
   enriched?:           boolean;
+  /** Failure message when `outcome` is `error`; otherwise absent. */
   error?:              string;
 }
 
@@ -285,6 +285,11 @@ export const DREAM_SETTINGS_KEY = 'dream-time';
  * with a descriptive message on the first violation found. Callers decide how to surface it:
  * `runOnce`'s loader treats a violation as a setup-shaped failure worth crashing the pass on;
  * `cognition_config`'s `set` catches it and reports a tool error so a bad patch is never persisted.
+ * @param s The effective settings to validate (defaults already merged in).
+ * @returns Nothing; the function communicates solely by throwing.
+ * @throws Error - On the first violation found: a threshold outside [0, 1], `weakThreshold`
+ *          greater than `strongThreshold`, `maxClusterSize` not an integer >= 1, or a negative
+ *          `weakDeferralMs`.
  */
 export function validateDreamSettings(s: DreamSettings): void {
   if (s.strongThreshold < 0 || s.strongThreshold > 1) {

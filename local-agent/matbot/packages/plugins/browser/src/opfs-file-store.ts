@@ -1,5 +1,9 @@
 import type { FileEvent, FileFilter, FileHandle, FileStore, MimeType } from '@matatbread/matbot-core';
 
+/**
+ * Metadata sidecar persisted as `<id>.meta.json` beside each `<id>.data` blob in OPFS; its
+ * fields are spread into the FileHandle returned to readers.
+ */
 interface OPFSMeta {
   id:          string;
   version:     string;
@@ -13,14 +17,32 @@ interface OPFSMeta {
   allowed?:    boolean;
 }
 
+/**
+ * Resolve (creating when absent) the `matbot-files` directory in the origin's OPFS root.
+ * @returns A directory handle holding every file's data and metadata for this store.
+ * @throws DOMException - OPFS access fails (no storage permission, quota errors).
+ */
 async function filesDir(): Promise<FileSystemDirectoryHandle> {
   const root = await navigator.storage.getDirectory();
   return root.getDirectoryHandle('matbot-files', { create: true });
 }
 
+/**
+ * Build a FileHandle carrying the metadata plus a lazy content streamer.
+ * @param meta - Metadata to spread onto the handle.
+ * @param dir - OPFS directory holding the `<id>.data` blob.
+ * @returns A handle whose `stream()` reads the stored blob chunk by chunk.
+ * @throws Never — read failures surface from the returned stream during iteration.
+ */
 function makeHandle(meta: OPFSMeta, dir: FileSystemDirectoryHandle): FileHandle {
   return {
     ...meta,
+    /**
+     * Stream the file's bytes until the end or `signal` aborts.
+     * @param signal - Optional abort signal; when aborted, iteration stops early.
+     * @returns Yields successive chunks of the stored blob.
+     * @throws DOMException - The blob cannot be opened or read.
+     */
     async *stream(signal?: AbortSignal): AsyncIterable<Uint8Array> {
       const fh   = await dir.getFileHandle(`${meta.id}.data`);
       const file = await fh.getFile();
@@ -39,6 +61,13 @@ function makeHandle(meta: OPFSMeta, dir: FileSystemDirectoryHandle): FileHandle 
   };
 }
 
+/**
+ * Persist a metadata sidecar as `<id>.meta.json`, creating or overwriting it.
+ * @param dir - OPFS directory to write into.
+ * @param meta - Metadata serialized as JSON.
+ * @returns Resolves once the metadata file is written and closed.
+ * @throws DOMException - The write fails (quota, permission).
+ */
 async function writeMeta(dir: FileSystemDirectoryHandle, meta: OPFSMeta): Promise<void> {
   const metaFh = await dir.getFileHandle(`${meta.id}.meta.json`, { create: true });
   const metaW  = await metaFh.createWritable();
@@ -46,6 +75,16 @@ async function writeMeta(dir: FileSystemDirectoryHandle, meta: OPFSMeta): Promis
   await metaW.close();
 }
 
+/**
+ * Stream chunks into the `<id>.data` file and report the byte size. Each chunk is copied into a
+ * fresh ArrayBuffer-backed view because OPFS writables reject shared-buffer-backed views.
+ * @param dir - OPFS directory to write into.
+ * @param id - File id naming the data blob.
+ * @param data - Chunked content to store.
+ * @returns Total number of bytes written.
+ * @throws Error - Any failure while consuming `data` or writing to OPFS; the writable is
+ *          aborted first so it cannot leak or leave the OPFS swap-to-file pending forever.
+ */
 async function writeData(dir: FileSystemDirectoryHandle, id: string, data: AsyncIterable<Uint8Array>): Promise<number> {
   const dataFh   = await dir.getFileHandle(`${id}.data`, { create: true });
   const writable = await dataFh.createWritable();
@@ -79,12 +118,15 @@ export class OPFSFileStore implements FileStore {
   private inFlight = new Map<string, Promise<unknown>>();
 
   /**
-   * Writes a file to OPFS, creating a new entry or upserting by name.
+   * Writes a file to OPFS, creating a new entry or upserting by name. Named writes are
+   * serialized per (namespace, name) through an in-flight mutex so concurrent puts of the same
+   * name cannot race into duplicate entries.
    * @param name File name; when provided and an entry with the same name (+namespace) exists, its content is replaced in place.
    * @param mimeType MIME type of the file.
    * @param data Chunked file content to stream into storage.
    * @param meta Optional session/message/namespace/allowed annotations stored with the file.
    * @returns A handle for reading the stored file's metadata and content.
+   * @throws Error - OPFS read/write failures propagate.
    */
   async put(
     name:     string | undefined,
@@ -100,6 +142,18 @@ export class OPFSFileStore implements FileStore {
     return tail;
   }
 
+  /**
+   * Perform the get-or-upsert write without concurrency control (callers serialize named puts).
+   * When `name` is provided and an entry with that name (+namespace) exists, its data blob is
+   * replaced in place (same id, fresh version, preserved createdAt); otherwise a new id is
+   * minted and named after the id when `name` is undefined.
+   * @param name File name; undefined always creates a new entry.
+   * @param mimeType MIME type of the file.
+   * @param data Chunked content to stream into the data blob.
+   * @param meta Optional session/message/namespace/allowed annotations stored with the file.
+   * @returns A handle for the stored file.
+   * @throws Error - Any failure while writing the data or metadata files.
+   */
   private async putNow(
     name:     string | undefined,
     mimeType: MimeType,
@@ -154,6 +208,7 @@ export class OPFSFileStore implements FileStore {
    * Fetches a file handle by id.
    * @param id File identifier.
    * @returns The file's handle, or `null` if no metadata exists for `id`.
+   * @throws Never — all lookup/parse failures resolve to `null`.
    */
   async get(id: string): Promise<FileHandle | null> {
     try {
@@ -172,6 +227,7 @@ export class OPFSFileStore implements FileStore {
    * @param name File name to look up.
    * @param namespace Optional namespace to restrict the search to.
    * @returns The matching handle, or `null` if none found.
+   * @throws Error - Propagates failures from listing the store.
    */
   async getByName(name: string, namespace?: string): Promise<FileHandle | null> {
     for await (const handle of this.list(namespace !== undefined ? { namespace } : {})) {
@@ -183,6 +239,9 @@ export class OPFSFileStore implements FileStore {
   /**
    * Removes a file's data and metadata entries.
    * @param id File identifier.
+   * @returns Resolves once both removals have been attempted.
+   * @throws Never — removal failures (absent entries, quota/permission errors) are logged via
+   *          `console.warn`, not thrown.
    */
   async delete(id: string): Promise<void> {
     const dir = await filesDir();
@@ -204,6 +263,7 @@ export class OPFSFileStore implements FileStore {
    * Yields handles of stored files matching the given filter.
    * @param filter Optional namespace/session/MIME/date filters.
    * @returns An async iterable of matching file handles.
+   * @throws Error - Propagates failures from reading the OPFS directory.
    */
   async *list(filter?: FileFilter): AsyncIterable<FileHandle> {
     const dir = await filesDir();
@@ -231,6 +291,7 @@ export class OPFSFileStore implements FileStore {
    * @param mimeType MIME type of the file.
    * @param data Chunked content to store.
    * @returns A handle for the stored temp file.
+   * @throws Error - Same failures as put().
    */
   async putTemp(name: string, mimeType: MimeType, data: AsyncIterable<Uint8Array>): Promise<FileHandle> {
     return this.put(name, mimeType, data);
@@ -243,6 +304,7 @@ export class OPFSFileStore implements FileStore {
    * and resolves when the signal aborts.
    * @param signal Abort signal that terminates the (empty) watch.
    * @returns An empty async iterable of file events.
+   * @throws Never.
    */
   async *watch(signal?: AbortSignal): AsyncIterable<FileEvent> {
     if (signal === undefined || signal.aborted) return;

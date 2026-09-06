@@ -28,18 +28,36 @@ export const HIGH_CARDINALITY_NAMESPACES = new Set([
   'context_graph_projection_ops',
 ]);
 
+/**
+ * Minimal shape every persisted document must have; extra fields pass through
+ * untouched.
+ */
 interface StoredDocument {
   id: string;
   version: string;
   [key: string]: unknown;
 }
 
+/**
+ * Structural guard for values read from legacy JSON files.
+ * @param value - Parsed JSON value.
+ * @returns True when `value` is an object with string `id` and `version`.
+ * @throws Never.
+ */
 function isStoredDocument(value: unknown): value is StoredDocument {
   if (value === null || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
   return typeof record['id'] === 'string' && typeof record['version'] === 'string';
 }
 
+/**
+ * Splits a read-only sequence into fixed-size batches.
+ * @typeParam T - Element type.
+ * @param values - Elements to batch, in order.
+ * @param size - Batch size in elements (must be positive).
+ * @returns The batches in order; the last may be short.
+ * @throws Never.
+ */
 function chunks<T>(values: readonly T[], size: number): T[][] {
   const result: T[][] = [];
   for (let start = 0; start < values.length; start += size) {
@@ -48,6 +66,15 @@ function chunks<T>(values: readonly T[], size: number): T[][] {
   return result;
 }
 
+/**
+ * Derives a deterministic projection id from a projection-op document's
+ * `workspaceId`, `operationType` and `parameters.id`, so re-running an
+ * operation maps to the same id.
+ * @param document - Candidate projection-op document.
+ * @returns The stable id (`context-neo4j-projection:<32 hex chars>`), or
+ *   undefined when the document lacks the required fields.
+ * @throws Never.
+ */
 function stableProjectionId(document: StoredDocument): string | undefined {
   if (
     typeof document['workspaceId'] !== 'string'
@@ -62,12 +89,26 @@ function stableProjectionId(document: StoredDocument): string | undefined {
   return `context-neo4j-projection:${hash}`;
 }
 
+/**
+ * A {@link StorageBackend} routing high-cardinality namespaces (see
+ * {@link HIGH_CARDINALITY_NAMESPACES}) to tables in a shared WAL-mode SQLite
+ * database under `<dotData>`, while every other namespace keeps the filesystem
+ * JSON-store layout and files stay under `<dotData>/files`. On open it imports
+ * each high-cardinality namespace's legacy per-id JSON files into SQLite, once.
+ */
 export class HighCardinalityStorageBackend implements StorageBackend {
+  /** FileStore rooted at `<dotData>/files`. */
   readonly fileStore: FileStore;
   private readonly db: DatabaseSync;
   private readonly dotData: string;
   private readonly sqliteStores = new Map<string, SQLiteStore<StoredDocument>>();
 
+  /**
+   * Creates the backend over an already-opened database.
+   * @param dotData - Root data directory.
+   * @param db - SQLite connection shared by all high-cardinality stores.
+   * @throws Never.
+   */
   private constructor(dotData: string, db: DatabaseSync) {
     this.dotData = dotData;
     this.db = db;
@@ -79,6 +120,8 @@ export class HighCardinalityStorageBackend implements StorageBackend {
    * legacy-JSON migration for every high-cardinality namespace.
    * @param dotData - Root data directory.
    * @returns The initialised backend.
+   * @throws Propagates filesystem errors from creating the data directory and
+   *   SQLite errors from opening the database or running migrations.
    */
   static async open(dotData: string): Promise<HighCardinalityStorageBackend> {
     await mkdir(dotData, { recursive: true });
@@ -106,6 +149,8 @@ export class HighCardinalityStorageBackend implements StorageBackend {
    * @param namespace - Store namespace.
    * @returns A store persisting documents of type `T`.
    * @template T - Stored document shape ({ id, version } at minimum).
+   * @throws Propagates SQLite errors if table creation for a high-cardinality
+   *   namespace fails.
    */
   createStore<T extends { id: string; version: string }>(namespace: string): Store<T> {
     if (!HIGH_CARDINALITY_NAMESPACES.has(namespace)) {
@@ -121,11 +166,25 @@ export class HighCardinalityStorageBackend implements StorageBackend {
 
   /**
    * Closes the underlying SQLite database.
+   * @returns Resolves once the database is closed.
+   * @throws If SQLite reports an error while closing.
    */
   async close(): Promise<void> {
     this.db.close();
   }
 
+  /**
+   * One-time import of a namespace's legacy per-id JSON files into SQLite,
+   * guarded by a row in the `_high_cardinality_migrations` table. Readable
+   * `{ id, version }` documents are imported idempotently (`importMissing`, or
+   * stable-id normalisation plus cleanup of superseded ids for the projection
+   * namespace); malformed files are skipped and legacy files are retained.
+   * Progress and totals go to `console.warn`.
+   * @param namespace - Namespace to migrate.
+   * @returns Resolves once the migration marker row is written.
+   * @throws Propagates non-ENOENT directory-read errors and SQLite errors from
+   *   the import.
+   */
   private async migrateLegacyNamespace(namespace: string): Promise<void> {
     const migrationKey = namespace === PROJECTION_NAMESPACE
       ? `${namespace}:${PROJECTION_MIGRATION_VERSION}`

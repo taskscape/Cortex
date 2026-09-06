@@ -11,6 +11,13 @@ import type { MatbotPluginSpec, Message, MessageContent } from '@matatbread/matb
 const TAG = '[hook-logger]';
 const FNARR_PROMPT = "Ask the user 'are we having fun yet?'";
 
+/**
+ * Find the most recent user message in a session.
+ *
+ * @param messages - Session messages, in conversation order.
+ * @returns The index of the last message with role `user`, or -1 if there is none.
+ * @throws Never.
+ */
 function latestUserIndex(messages: readonly Message[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role === 'user') return i;
@@ -18,6 +25,13 @@ function latestUserIndex(messages: readonly Message[]): number {
   return -1;
 }
 
+/**
+ * Concatenate the text parts of a message's content.
+ *
+ * @param content - The message content blocks.
+ * @returns All text parts joined with single spaces; `''` when there are none.
+ * @throws Never.
+ */
 function textOf(content: readonly MessageContent[]): string {
   return content
     .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
@@ -25,6 +39,14 @@ function textOf(content: readonly MessageContent[]): string {
     .join(' ');
 }
 
+/**
+ * Text of the most recent message with a given role.
+ *
+ * @param messages - Session messages, in conversation order.
+ * @param role - The role to search for, scanning from the end.
+ * @returns The {@link textOf} value of the last matching message; `''` if there is none.
+ * @throws Never.
+ */
 function lastTextOfRole(messages: readonly Message[], role: Message['role']): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -35,10 +57,26 @@ function lastTextOfRole(messages: readonly Message[], role: Message['role']): st
 
 // Hard-redaction demo: blank out key-shaped material wherever it appears in a tool result, however
 // deeply nested. The bash tool in particular is good at surfacing secrets from a filesystem.
+/**
+ * Blank out key-shaped material in one string: any whitespace-delimited value assigned to (or
+ * labelled with) a name containing KEY, TOKEN, SECRET, PASSWORD, or PWD (case-insensitive) is
+ * replaced by `[**********]`, keeping the label.
+ *
+ * @param s - The string to redact.
+ * @returns The redacted copy; unchanged when nothing matches.
+ * @throws Never.
+ */
 function redactString(s: string): string {
   return s.replace(/((?:[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PWD).*)\s*[=:]\s*)(\S+)/gi, '$1[**********]');
 }
 
+/**
+ * Apply {@link redactString} to every string in an arbitrarily nested structure.
+ *
+ * @param value - The value to redact; strings, arrays, and plain objects are processed recursively.
+ * @returns A redacted copy (arrays and objects are rebuilt); other primitives pass through unchanged.
+ * @throws Never.
+ */
 function redactDeep(value: unknown): unknown {
   if (typeof value === 'string') return redactString(value);
   if (Array.isArray(value)) return value.map(redactDeep);
@@ -56,6 +94,15 @@ function redactDeep(value: unknown): unknown {
 export const plugin: MatbotPluginSpec = {
   apiVersion: PLUGIN_API_VERSION,
 
+  /**
+   * Register one hook per channel: `screen` (logging plus the durable "fnarr" fragment injection
+   * demo), `contribute`, `toolcall`, `toolresult` (timing/size audit plus key-material redaction),
+   * and `followup` (the "42" robo-turn resubmit demo).
+   *
+   * @param services - Machine services; the hook registry is used.
+   * @returns Nothing.
+   * @throws Never.
+   */
   async setup(services) {
     services.hooks.register({
       on: 'screen',

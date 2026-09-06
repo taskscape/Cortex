@@ -1,10 +1,20 @@
 import type { Filter, Orderable } from '@matatbread/matbot-core';
 import { getField, pathSegments } from './access.js';
 
+/** A compiled filter predicate over one document row. */
 type Predicate = (row: unknown) => boolean;
 
 // null and absent collapse to a single "missing" state — no comparison ever matches a missing
 // value (so `neq` excludes missing rows too). Only `exists` observes missing-ness.
+/**
+ * Read a field value with null collapsed to `undefined`, so null and absent form a single
+ * "missing" state that no comparison matches (only `exists` observes missing-ness).
+ *
+ * @param row - The document to read from.
+ * @param seg - The ordered path segments.
+ * @returns The field value, or `undefined` when missing or null.
+ * @throws Never.
+ */
 function resolve(row: unknown, seg: string[]): unknown {
   const v = getField(row, seg);
   return v === null ? undefined : v;
@@ -12,6 +22,15 @@ function resolve(row: unknown, seg: string[]): unknown {
 
 // Ordering is defined only within a type (numeric for numbers, codepoint for strings). A
 // cross-type comparison yields undefined → the predicate is false (type-mismatch no-match).
+/**
+ * Compare two values for ordering, defined only within a type (numeric for numbers, codepoint
+ * for strings); a cross-type pair has no ordering.
+ *
+ * @param a - The resolved field value.
+ * @param b - The filter's constant operand.
+ * @returns A comparison result, or `undefined` for a cross-type pair (the predicate no-matches).
+ * @throws Never.
+ */
 function order(a: unknown, b: Orderable): number | undefined {
   if (typeof a === 'number' && typeof b === 'number') return a - b;
   if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;

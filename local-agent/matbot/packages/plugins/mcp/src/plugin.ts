@@ -6,10 +6,20 @@ import process from 'node:process';
 import type { MCPServerConfigLocal, MCPPersistedLocal } from './types.js';
 import { createStdioClient } from './client.js';
 
+/** One connected local server: its config, live client, advertised tools, and optional instructions. */
 interface ActiveLocal { config: MCPServerConfigLocal; client: MCPClient; tools: MCPToolDef[]; instructions?: string }
 
 // RemoteMcpManager persists under a fixed 'servers' key; scope it beneath ours so the embedded remote
 // store never collides with our local 'servers'. One settings document, two non-overlapping owners.
+/**
+ * Wrap the plugin's settings in a view whose keys are prefixed with `remote:`, so the embedded
+ * {@link RemoteMcpManager} persists under a namespace disjoint from this plugin's own `servers`
+ * document.
+ *
+ * @param base - The plugin's underlying settings backend.
+ * @returns A settings view delegating to `base` with every key scoped as `remote:<key>`.
+ * @throws Never.
+ */
 function remoteSettings(base: PluginSettings): PluginSettings {
   const scoped = (key: string): string => `remote:${key}`;
   return {
@@ -25,6 +35,10 @@ function remoteSettings(base: PluginSettings): PluginSettings {
  * `mcp_action` tool spanning both transports: local (stdio) servers handled here, remote (HTTP) ones
  * delegated to the embedded manager. Owning the manager outright keeps its whole lifecycle (connect,
  * reconnect, teardown) under this plugin, so there is no order-dependent cleanup between two plugins.
+ *
+ * @returns The plugin spec; its `setup` registers `mcp_action` and reconnects persisted servers,
+ *          its `teardown` closes every connection.
+ * @throws Never.
  */
 export function createMCPPlugin(): MatbotPluginSpec {
   const localActive = new Map<string, ActiveLocal>();
@@ -32,8 +46,25 @@ export function createMCPPlugin(): MatbotPluginSpec {
   let remote:   RemoteMcpManager | undefined;
   let registry: MatbotMachine['tools'] | undefined;
 
+  /**
+   * Resolve the live client for a local server, used as the proxy tools' connection resolver so
+   * each invocation targets the current connection.
+   *
+   * @param name - Local server name.
+   * @returns The connected {@link MCPClient}, or `undefined` if the server was removed.
+   * @throws Never.
+   */
   const resolveLocalClient = (name: string): MCPClient | undefined => localActive.get(name)?.client;
 
+  /**
+   * Spawn a local stdio server, complete the initialize handshake, cache its entry, and register
+   * one proxy tool per advertised tool under `mcp__<server>__<tool>`.
+   *
+   * @param config - The server definition (command, optional args/env).
+   * @returns The tool definitions the server advertised, in server order.
+   * @throws Error - If the process cannot be spawned, the handshake fails or times out, or tool
+   *           listing fails. Partial registrations are not rolled back.
+   */
   async function connectLocal(config: MCPServerConfigLocal): Promise<MCPToolDef[]> {
     const client = await createStdioClient(config.command, config.args ?? [], config.env);
     const tools  = await client.listTools();
@@ -45,12 +76,27 @@ export function createMCPPlugin(): MatbotPluginSpec {
     return tools;
   }
 
+  /**
+   * Input shape of the `mcp_action` tool: connect a local or remote server, list the connected
+   * servers, or remove one by name.
+   */
   type McpAction =
     | { action: 'add'; name: string; type: 'local';  command: string; args?: string[]; env?: Record<string, string> }
     | { action: 'add'; name: string; type: 'remote'; endpoint: string; headers?: Record<string, string> }
     | { action: 'list' }
     | { action: 'remove'; name: string };
 
+  /**
+   * Handle the `add` action: validate the request, connect the server (remote via the embedded
+   * {@link RemoteMcpManager}, local via {@link connectLocal}), and persist local configs under the
+   * `servers` settings key. Progress is streamed as `stdout` events; the outcome is a `result`
+   * event on success or an `error` event on failure.
+   *
+   * @param raw - The `add` payload, discriminated on `type` (`local` or `remote`).
+   * @returns Tool events: `stdout` progress, then a final `result` (message, proxy tool names,
+   *          optional server instructions) or `error`.
+   * @throws Never - Connection failures are reported as `error` events.
+   */
   async function* doAdd(raw: Extract<McpAction, { action: 'add' }>): AsyncIterable<ToolEvent> {
     if (localActive.has(raw.name) || remote!.has(raw.name)) {
       yield { type: 'error', message: `An MCP server named "${raw.name}" is already connected. Remove it first.` };
@@ -90,6 +136,13 @@ export function createMCPPlugin(): MatbotPluginSpec {
     } };
   }
 
+  /**
+   * Summarize every connected local server.
+   *
+   * @returns A generator yielding one descriptor per server in connection order: name, type,
+   *          command, optional server instructions, and proxy tool names with descriptions.
+   * @throws Never.
+   */
   function* listLocal(): Generator<unknown> {
     for (const s of localActive.values()) {
       yield {
@@ -100,6 +153,16 @@ export function createMCPPlugin(): MatbotPluginSpec {
     }
   }
 
+  /**
+   * Handle the `remove` action: confirm via {@link ToolContext.prompt}, then disconnect a remote
+   * server through the embedded manager, or close a local one, unregister its proxy tools, and
+   * drop it from the persisted `servers` list.
+   *
+   * @param name - Server name to remove.
+   * @param ctx - Tool context; its `prompt` gathers the y/N confirmation.
+   * @returns Tool events: a final `result` (cancelled or removed message) or `error` (unknown name).
+   * @throws Never.
+   */
   async function* doRemove(name: string, ctx: ToolContext): AsyncIterable<ToolEvent> {
     // Remote servers belong to the delegated service; everything else is local.
     if (remote!.has(name)) {
@@ -182,6 +245,17 @@ SHAPE  (TypeScript)
     // No static tools: mcp_action is registered in setup(), once the embedded RemoteMcpManager exists
     // for its executor to delegate remote work to.
 
+    /**
+     * Register `mcp_action`, embed the {@link RemoteMcpManager} over a `remote:`-scoped settings
+     * view, and reconnect persisted servers. Remote entries found in this plugin's legacy shared
+     * `servers` document are handed to the manager (which re-persists them under its own key);
+     * local entries reconnect and stay. A server that fails to reconnect is logged to stderr and
+     * its config kept, so a transient outage does not lose it.
+     *
+     * @param services - Machine services used for tool registration, settings, and the registry.
+     * @returns Nothing.
+     * @throws Never.
+     */
     async setup(services) {
       registry = services.tools;
       settings = services.settings();
@@ -221,6 +295,13 @@ SHAPE  (TypeScript)
       }
     },
 
+    /**
+     * Close every local client and all remote connections. Persisted configs are kept so the
+     * next setup reconnects them.
+     *
+     * @returns Nothing.
+     * @throws Never.
+     */
     async teardown() {
       for (const s of localActive.values()) s.client.close();
       localActive.clear();

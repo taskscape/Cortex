@@ -1,12 +1,15 @@
 import type { ProviderAdapter, ProviderConfig, Message, Tool, CompletionEvent, HealthStatus } from '@matatbread/matbot-plugin-api';
-import { parseSSE, fetchWithRetry } from '@matatbread/matbot-providers-base';
+import { parseSSE, fetchWithRetry, withCompletionDeadline, type CompletionDeadline } from '@matatbread/matbot-providers-base';
 import { toAnthropicMessages, toAnthropicSystem, toAnthropicTools } from './convert.js';
 
 const DEFAULT_ENDPOINT   = 'https://api.anthropic.com';
 const ANTHROPIC_VERSION  = '2023-06-01';
 const DEFAULT_MAX_TOKENS = 4096;
 
-// Minimal shapes for Anthropic SSE events — enough to drive CompletionEvent
+/**
+ * Minimal shape of an Anthropic SSE event — just the discriminating `type` plus loose payload
+ * fields, enough to drive completion-event emission without modelling the full API.
+ */
 interface AEvent { type: string; [k: string]: unknown }
 
 /**
@@ -34,15 +37,38 @@ export class AnthropicAdapter implements ProviderAdapter {
     tools:    readonly Tool[],
     signal:   AbortSignal,
   ): AsyncIterable<CompletionEvent> {
-    return this.stream(messages, config, tools, signal);
+    return withCompletionDeadline(signal, config.parameters, deadline => this.stream(messages, config, tools, deadline));
   }
 
+  /**
+   * Stream one Anthropic Messages API completion and translate it into matbot completion events.
+   *
+   * Builds the request from the neutral conversation via {@link toAnthropicMessages},
+   * {@link toAnthropicSystem}, and {@link toAnthropicTools}; always sets `stream: true`; takes
+   * `max_tokens` from `parameters.maxTokens` (default 4096) and `temperature` when configured;
+   * sends the prompt-caching beta header plus the interleaved-thinking beta when
+   * `parameters.thinking` is set. The POST goes through {@link fetchWithRetry} bounded by
+   * `deadline.requestTimeoutMs`, and SSE frames are parsed with {@link parseSSE}:
+   * `message_start` yields input usage (including cache read/creation counts),
+   * `content_block_delta` yields text and thinking deltas, closed blocks yield
+   * thinking/redacted-thinking/unknown-block/tool-call events, `message_delta` tracks the stop
+   * reason and output usage, and `message_stop` flushes any tool block left open (truncation can
+   * end the response before `content_block_stop`) before `done`.
+   *
+   * @param messages - The conversation, including system, tool, and thinking content.
+   * @param config - Provider configuration (endpoint, model, credentials, parameters).
+   * @param tools - Tools offered to the model.
+   * @param deadline - Completion lifetime combining the caller's signal with request/idle/overall deadlines.
+   * @returns Stream of completion events ending with `done`.
+   * @throws Error - On a non-OK HTTP response (status plus body text), a mid-stream `error` event, or when the stream ends before `message_stop`. Caller/deadline aborts propagate the combined signal's reason.
+   */
   private async *stream(
     messages: Message[],
     config:   ProviderConfig,
     tools:    readonly Tool[],
-    signal:   AbortSignal,
+    deadline: CompletionDeadline,
   ): AsyncIterable<CompletionEvent> {
+    const signal = deadline.signal;
     const endpoint = config.endpoint ?? DEFAULT_ENDPOINT;
     const apiKey   = config.credentials?.['apiKey'] ?? '';
 
@@ -79,7 +105,9 @@ export class AnthropicAdapter implements ProviderAdapter {
       headers,
       body:   JSON.stringify(body),
       signal,
-    });
+    }, undefined, { timeoutMs: deadline.requestTimeoutMs });
+
+    deadline.progress();
 
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => res.statusText);
@@ -89,6 +117,16 @@ export class AnthropicAdapter implements ProviderAdapter {
     // A tool_use block whose argument JSON failed to parse — almost always truncation mid-stream
     // (max_tokens) or malformed provider output. Surfaced as a failed call (parseError) so the
     // runner feeds a corrective error back to the model instead of aborting the turn (spec R4).
+    /**
+     * Finalize one accumulated tool call, parsing its streamed argument JSON.
+     *
+     * @param call - The accumulated block state: tool-use id, name, and raw argument text.
+     * @param stop - The stop reason observed so far, echoed into the parse error when present.
+     * @returns A `tool-call` event with the parsed `input`; on parse failure the raw text is
+     *          returned as `input` alongside a `parseError` message (bytes received plus
+     *          stop-reason guidance) instead of throwing.
+     * @throws Never.
+     */
     const flushToolCall = (
       call: { id: string; name: string; json: string },
       stop: string | undefined,
@@ -118,9 +156,10 @@ export class AnthropicAdapter implements ProviderAdapter {
     let inputTokens = 0;
     let stopReason: string | undefined;
 
-    for await (const line of parseSSE(res.body)) {
+    for await (const line of parseSSE(res.body, signal)) {
       let ev: AEvent;
       try { ev = JSON.parse(line) as AEvent; } catch { continue; }
+      if (ev.type !== 'ping') deadline.progress();
 
       switch (ev['type']) {
         case 'message_start': {
@@ -214,7 +253,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           }
           toolInputs.clear();
           yield { type: 'done' };
-          break;
+          return;
         }
 
         case 'error': {
@@ -223,6 +262,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         }
       }
     }
+    throw new Error('Anthropic completion is incomplete: stream ended before message_stop.');
   }
 
   /**

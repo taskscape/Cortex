@@ -22,7 +22,10 @@ export class FilesystemStorageBackend implements StorageBackend {
   private readonly dotData: string;
 
   /**
+   * Creates the backend. Nothing is opened or created eagerly — the file store
+   * root and namespace directories materialise on first use.
    * @param dotData - Root directory for all namespaces and files.
+   * @throws Never.
    */
   constructor(dotData: string) {
     this.dotData   = dotData;

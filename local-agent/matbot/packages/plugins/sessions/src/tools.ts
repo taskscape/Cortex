@@ -1,5 +1,13 @@
 import type { Tool, ToolEvent, ToolContext, Session, Store } from '@matatbread/matbot-plugin-api';
 
+/**
+ * Builds a one-line preview of a session: the text of its first user message, truncated to 60
+ * characters with an ellipsis when longer.
+ *
+ * @param session - Session to preview.
+ * @returns The preview text; empty when the session has no user text message.
+ * @throws Never.
+ */
 function sessionPreview(session: Session): string {
   const first = session.messages.find(m => m.role === 'user');
   const text  = first?.content.find(
@@ -12,20 +20,33 @@ function sessionPreview(session: Session): string {
  * Builds the session management tools bound to the given session store.
  * @param store - Store holding the {@link Session} documents.
  * @returns The registered tool set (currently just `session_action`).
+ * @throws Never.
  */
 export function makeSessionTools(store: Store<Session>): readonly Tool[] {
   return [makeSessionActionTool(store)];
 }
 
-// The precise per-action contract. JSON Schema can't express "title required only for rename"
-// without an awkward oneOf, so the schema stays loose and the description carries this TypeScript
-// discriminated union — which LLMs read accurately — as the source of truth. The executor enforces it.
+/**
+ * The precise per-action contract. JSON Schema can't express "title required only for rename"
+ * without an awkward oneOf, so the schema stays loose and the description carries this TypeScript
+ * discriminated union — which LLMs read accurately — as the source of truth. The executor enforces it.
+ */
 type SessionInput =
   | { action: 'list';   includeArchived?: boolean }
   | { action: 'get';    sessionId: string }
   | { action: 'rename'; sessionId: string; title: string }
   | { action: 'hide';   sessionId: string };
 
+/**
+ * Builds the `session_action` tool (list/get/rename/hide) bound to the given session store. The
+ * executor enforces the per-action contract (see {@link SessionInput}) and surfaces validation,
+ * not-found and concurrent-modification failures as `error` tool events rather than throws; the
+ * rename and hide writes go through compare-and-swap on the store.
+ *
+ * @param store - Session store backing every read and CAS write.
+ * @returns The `session_action` tool definition.
+ * @throws Never.
+ */
 function makeSessionActionTool(store: Store<Session>): Tool {
   return {
     name: 'session_action',

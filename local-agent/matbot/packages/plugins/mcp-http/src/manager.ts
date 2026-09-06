@@ -5,6 +5,7 @@ import type {
 import { createHttpClient } from './client.js';
 import { makeProxyTool, proxyToolName } from './proxy-tool.js';
 
+/** One connected remote server: its config, live client, advertised tools, and optional instructions. */
 interface ActiveRemote { config: MCPRemoteConfig; client: MCPClient; tools: MCPToolDef[]; instructions?: string }
 
 const PERSIST_KEY = 'servers';
@@ -19,14 +20,37 @@ export class RemoteMcpManager implements McpRemoteService {
   private readonly services: MatbotMachine;
   private readonly settings: PluginSettings;
 
-  /** @param services The machine used to register/unregister proxy tools. @param settings Persistence for the server list. */
+  /**
+   * Store the machine and settings used for proxy-tool registration and persistence.
+   *
+   * @param services The machine used to register/unregister proxy tools.
+   * @param settings Persistence for the server list.
+   * @throws Never.
+   */
   constructor(services: MatbotMachine, settings: PluginSettings) {
     this.services = services;
     this.settings = settings;
   }
 
+  /**
+   * Resolve the live client for a server, used as the proxy tools' connection resolver so each
+   * invocation targets the current connection.
+   *
+   * @param name - Server name.
+   * @returns The connected {@link MCPClient}, or `undefined` if the server was removed.
+   * @throws Never.
+   */
   private resolveClient = (name: string): MCPClient | undefined => this.active.get(name)?.client;
 
+  /**
+   * Connect to a remote server, list its tools, cache the entry, and register one proxy tool per
+   * advertised tool under `mcp__<server>__<tool>`.
+   *
+   * @param config - The server definition (endpoint and optional headers).
+   * @returns The tool definitions the server advertised, in server order.
+   * @throws Error - If the connection, initialize handshake, or tool listing fails. Partial
+   *           registrations are not rolled back.
+   */
   private async connect(config: MCPRemoteConfig): Promise<MCPToolDef[]> {
     const client = await createHttpClient(config);
     const tools  = await client.listTools();
@@ -65,7 +89,13 @@ export class RemoteMcpManager implements McpRemoteService {
     };
   }
 
-  /** @returns Info for every currently connected server, including proxy tool names. */
+  /**
+   * Summarize every currently connected remote server.
+   *
+   * @returns Info for every currently connected server, including proxy tool names, in connection
+   *          order; empty when none are connected.
+   * @throws Never.
+   */
   list(): MCPRemoteServerInfo[] {
     return [...this.active.values()].map(s => ({
       name:     s.config.name,
@@ -75,13 +105,20 @@ export class RemoteMcpManager implements McpRemoteService {
     }));
   }
 
-  /** @param name Candidate server name. @returns Whether it is currently connected here. */
+  /**
+   * Report whether a server name is currently connected.
+   *
+   * @param name Candidate server name.
+   * @returns Whether it is currently connected here.
+   * @throws Never.
+   */
   has(name: string): boolean { return this.active.has(name); }
 
   /**
    * Disconnect a server, unregister its proxy tools, and remove it from persistence.
    * @param name The server name.
    * @returns `false` if no such server is connected or persisted, otherwise `true`.
+   * @throws Never - A missing server is reported by the `false` return, not an error.
    */
   async remove(name: string): Promise<boolean> {
     const persisted = await this.settings.get<MCPPersistedRemote>(PERSIST_KEY);
@@ -105,6 +142,8 @@ export class RemoteMcpManager implements McpRemoteService {
    * Reconnect every persisted server (e.g. at plugin setup). Failures are reported per server,
    * never thrown.
    * @param onError Called with each server name and error when its reconnect fails.
+   * @returns Nothing; resolves after every persisted server has been attempted.
+   * @throws Never.
    */
   async reconnectPersisted(onError: (name: string, err: unknown) => void): Promise<void> {
     const persisted = await this.settings.get<MCPPersistedRemote>(PERSIST_KEY);
@@ -113,7 +152,12 @@ export class RemoteMcpManager implements McpRemoteService {
     }
   }
 
-  /** Close every live connection without touching persistence. */
+  /**
+   * Close every live connection without touching persistence.
+   *
+   * @returns Nothing.
+   * @throws Never.
+   */
   closeAll(): void {
     for (const s of this.active.values()) s.client.close();
     this.active.clear();

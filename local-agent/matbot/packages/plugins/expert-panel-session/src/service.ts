@@ -1,5 +1,9 @@
 import type { Session, Store, Message, MessageContent, Tool, ToolContext, ToolEvent, SessionRunner } from '@matatbread/matbot-plugin-api';
 import { appendMessage, createMessage } from '@matatbread/matbot-core';
+/**
+ * Normalized request body for an expert panel submission. Built by
+ * {@link normaliseExpertPanelSubmitBody} from a raw request payload.
+ */
 interface ExpertPanelSubmitBody {
     question: string;
     provider: string;
@@ -9,8 +13,28 @@ interface ExpertPanelSubmitBody {
     maxCitationsPerExpert?: number;
     traceId?: string;
 }
+/**
+ * Checks whether a value is a plain, non-array object.
+ * @param value - Value to test.
+ * @returns True when `value` is a non-null, non-array object.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+/** Resolves after `ms` milliseconds; the only waiting primitive used by CAS retries. */
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+/**
+ * Validates and normalizes a raw expert panel submission payload.
+ *
+ * Requires a `question` and a `provider`; tolerates missing or malformed
+ * optional fields by dropping them. `mode` defaults to `parallel` for anything
+ * unrecognized, and `experts` entries that are not strings are silently
+ * filtered out (an array of only empty/invalid entries becomes no `experts`
+ * field at all, meaning "all experts").
+ *
+ * @param value - Raw request body of unknown shape.
+ * @returns Either `{ ok: true, body }` with the normalized submission, or
+ *   `{ ok: false, error }` with a client-facing message.
+ * @throws Never - validation failures are reported in the returned `ok: false` shape.
+ */
 function normaliseExpertPanelSubmitBody(value: unknown): {
     ok: true;
     body: ExpertPanelSubmitBody;
@@ -54,6 +78,18 @@ function normaliseExpertPanelSubmitBody(value: unknown): {
         },
     };
 }
+/**
+ * Builds the user-visible text appended to the session when an expert panel
+ * question is queued: a header with mode, expert selection, and synthesis flag,
+ * followed by the question itself.
+ *
+ * @param question - The submitted question text.
+ * @param selected - Selected expert ids, or `undefined` meaning all experts.
+ * @param mode - Panel mode label (`parallel`, `review`, or `debate`).
+ * @param synthesize - Whether a synthesis step was requested.
+ * @returns The multi-line summary text.
+ * @throws Never.
+ */
 function expertUserSummary(question: string, selected: readonly string[] | undefined, mode: string, synthesize: boolean): string {
     return [
         `Expert panel (${mode})`,
@@ -63,9 +99,26 @@ function expertUserSummary(question: string, selected: readonly string[] | undef
         question,
     ].join('\n');
 }
+/**
+ * Returns `value` when it is a string, otherwise `fallback`.
+ * @param value - Value to coerce.
+ * @param fallback - Value to use when `value` is not a string; defaults to `''`.
+ * @returns The string value or the fallback.
+ * @throws Never.
+ */
 function textValue(value: unknown, fallback = ''): string {
     return typeof value === 'string' ? value : fallback;
 }
+/**
+ * Formats an expert panel tool result as markdown for the session transcript:
+ * one section per expert opinion (with optional citation list) plus an optional
+ * synthesis section, or a "no response" note when nothing was returned.
+ *
+ * @param result - Raw tool result of unknown shape (the `expert_panel` tool's
+ *   result value with `experts` opinions and optional `synthesis`).
+ * @returns The formatted markdown text.
+ * @throws Never.
+ */
 function formatExpertPanelResult(result: unknown): string {
     const record = isRecord(result) ? result : {};
     const lines = [
@@ -95,6 +148,13 @@ function formatExpertPanelResult(result: unknown): string {
     }
     return lines.join('\n');
 }
+/**
+ * Sums the token usage reported across all expert opinions in a panel result.
+ * @param result - Raw tool result of unknown shape.
+ * @returns Total `inputTokens`/`outputTokens`, or `null` when no opinion
+ *   reported any usage at all.
+ * @throws Never.
+ */
 function expertPanelUsage(result: unknown): {
     inputTokens: number;
     outputTokens: number;
@@ -113,16 +173,39 @@ function expertPanelUsage(result: unknown): {
     }
     return inputTokens || outputTokens ? { inputTokens, outputTokens } : null;
 }
+/**
+ * Derives a session title from a question: the first eight words, truncated to
+ * 60 characters when longer.
+ * @param question - Question text to summarize.
+ * @returns The derived title, or `undefined` when the question has no words.
+ * @throws Never.
+ */
 function titleFromQuestion(question: string): string | undefined {
     const words = question.trim().split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
     if (!words)
         return undefined;
     return words.length > 60 ? `${words.slice(0, 60)}...` : words;
 }
+/**
+ * HTTP-style error raised by the expert session service. `status` carries the
+ * transport-level status code the web layer should reply with (e.g. 400 for
+ * invalid input, 409 for conflicts, 503 when the service is unloaded).
+ */
 export class ExpertSessionError extends Error {
     readonly status: number;
+    /**
+     * Creates the error.
+     * @param status - HTTP-style status code for the failure.
+     * @param message - Human-readable failure description.
+     */
     constructor(status: number, message: string) { super(message); this.status = status; }
 }
+/**
+ * Dependencies of the {@link ExpertSessionService}: the session store and
+ * runner status it operates on, plus pluggable tool resolution, tool
+ * invocation, and optional async session titling. Supplied by the plugin's
+ * `setup` and easily replaced in tests.
+ */
 export interface ExpertSessionDeps {
     store: Store<Session>;
     run: Pick<SessionRunner, 'status'>;
@@ -133,14 +216,68 @@ export interface ExpertSessionDeps {
         provider: string;
     }) => Promise<unknown>;
 }
+/**
+ * Runs one-shot expert panel consultations inside existing sessions.
+ *
+ * Each {@link ExpertSessionService.submit} validates the request, guards
+ * against busy sessions, invokes the `expert_panel` tool under an
+ * {@link AbortController} linked to the caller's signal, and appends both the
+ * queued user message and the assistant answer to the session via
+ * compare-and-swap appends. Only one submit may run per session at a time;
+ * `close` aborts every in-flight submit.
+ */
 export class ExpertSessionService {
     private active = new Map<string, AbortController>();
     private closed = false;
     private readonly deps: ExpertSessionDeps;
+    /**
+     * Creates the service.
+     * @param deps - Session store, runner status accessor, tool resolve/invoke
+     *   functions, and optional titler; see {@link ExpertSessionDeps}.
+     */
     constructor(deps: ExpertSessionDeps) { this.deps = deps; }
+    /**
+     * Checks whether a submit is currently in flight for a session.
+     * @param id - Session id to check.
+     * @returns True while a submit for this session is active.
+     * @throws Never.
+     */
     busy(id: string) { return this.active.has(id); }
+    /**
+     * Marks the service closed and aborts every in-flight submit. Subsequent
+     * submits are rejected with 503 until the service is unloaded.
+     */
     close() { this.closed = true; for (const ac of this.active.values())
         ac.abort(); }
+    /**
+     * Runs one expert panel consultation in a session and persists the
+     * transcript.
+     *
+     * Normalizes and validates the raw payload, rejects busy sessions, resolves
+     * the `expert_panel` tool, and streams its events while capturing the
+     * result, stdout/stderr, markers, and errors. The formatted answer (or
+     * failure text) is appended as an assistant message; markers are appended
+     * as a marker-role message first. Emits web-style events (`queued`,
+     * `marker`, `text-delta`, `usage`, `done`) through `emit`. Session titles
+     * are derived from the question when the session has none, and async
+     * titling is kicked off fire-and-forget when a `titleSession` dep is set.
+     * All appends go through CAS with bounded retries; the caller's abort
+     * signal cancels the underlying tool invocation.
+     *
+     * @param sessionId - Target session id; must exist in the store.
+     * @param raw - Raw request payload, validated by
+     *   {@link normaliseExpertPanelSubmitBody}.
+     * @param ctx - Tool context whose `signal` aborts the consultation; its
+     *   session/provider fields are overridden for the tool invocation.
+     * @param emit - Optional sink for transport events; defaults to a no-op.
+     *   Event ordering matches the flow above; `done` is always last.
+     * @returns The trace id, the committed session after the assistant message,
+     *   the raw tool `result` when produced, and `isError`/`error` reflecting
+     *   whether the panel itself failed (tool errors do not reject this promise).
+     * @throws ExpertSessionError - 503 when closed, 400 for invalid input, 409
+     *   when the session is busy or was concurrently modified beyond the CAS
+     *   retry budget, 404 when the session or tool is missing.
+     */
     async submit(sessionId: string, raw: unknown, ctx: ToolContext, emit: (event: Record<string, unknown> & {
         type: string;
     }) => void = () => { }) {
@@ -221,6 +358,23 @@ export class ExpertSessionService {
             ac.abort();
         }
     }
+    /**
+     * Appends messages to a session using compare-and-swap with randomized
+     * backoff retries (at most 10 attempts, sub-second retry window).
+     *
+     * A contended append never bypasses CAS: it re-reads the session and
+     * retries, and fails the request with 409 rather than dropping concurrent
+     * messages. Optionally reshapes the freshly read session (e.g. to set a
+     * derived title) before applying the appends.
+     *
+     * @param sessionId - Session to append to; must exist in the store.
+     * @param messages - Messages to append, in order.
+     * @param shapeSession - Optional pure transform applied to the current
+     *   session before the messages are appended.
+     * @returns The committed session document, or `null` when the session does
+     *   not exist.
+     * @throws ExpertSessionError - 409 when every CAS attempt loses the race.
+     */
     private async append(sessionId: string, messages: readonly Message[], shapeSession?: (session: Session) => Session): Promise<Session | null> {
         // Never bypass CAS on a shared session document: a contended append retries with randomized
         // backoff and then fails the request with 409 instead of dropping concurrent messages.

@@ -17,6 +17,11 @@ const CSS = `
 `;
 
 let stylesInjected = false;
+/**
+ * Inject the wizard stylesheet into `document.head` once per page load; later calls are no-ops.
+ * @returns Nothing.
+ * @throws Never.
+ */
 function ensureStyles(): void {
   if (stylesInjected) return;
   const s = document.createElement('style');
@@ -25,6 +30,13 @@ function ensureStyles(): void {
   stylesInjected = true;
 }
 
+/**
+ * Wrap a form control in a label so its caption is programmatically associated with it.
+ * @param labelText - Caption rendered inside the label.
+ * @param input - Form control to nest inside the label.
+ * @returns The label element containing `input`.
+ * @throws Never.
+ */
 function field(labelText: string, input: HTMLElement): HTMLLabelElement {
   const l = document.createElement('label');
   l.textContent = labelText;
@@ -35,6 +47,17 @@ function field(labelText: string, input: HTMLElement): HTMLLabelElement {
 /**
  * Render the provider setup form and resolve with the user's entries. Shown at first startup when no
  * provider is configured (not cancelable then), and reusable later to add another (cancelable).
+ *
+ * Injects the form stylesheet once and appends a modal overlay to `#matbot-root` (falling back to
+ * `document.body`). Submission validates the form: invalid entries set an inline error message and
+ * keep the form open instead of resolving.
+ * @param available - Adapter types the wizard offers; the selected entry supplies the module and
+ *                    endpoint/model placeholders.
+ * @param opts - `title` overrides the card heading; `cancelable` adds a Cancel button.
+ * @returns Resolves with the validated draft once saved — fields trimmed, and empty
+ *          endpoint/model/apiKey for a self-contained adapter.
+ * @throws Error - When cancelled (only possible with `opts.cancelable`): rejects with
+ *          'setup cancelled'.
  */
 export function runProviderSetup(
   available: AvailableProvider[],
@@ -74,6 +97,12 @@ export function runProviderSetup(
     const modelField    = field('Model', model);
     const apiKeyField   = field('API key', apiKey);
 
+    /**
+     * Adapt the endpoint/model/key fields to the selected adapter type: hide them for a
+     * self-contained adapter and refresh their placeholders from its hints.
+     * @returns Nothing.
+     * @throws Never.
+     */
     const applyHints = (): void => {
       const a = available[Number(type.value)];
       // A self-contained adapter (e.g. a local demo LLM) needs no endpoint/model/key — hide them.
@@ -94,6 +123,13 @@ export function runProviderSetup(
     save.className = 'save';
     save.textContent = 'Save & start';
 
+    /**
+     * Validate the form and finish the setup: on success remove the overlay and resolve the
+     * enclosing promise with the draft; otherwise write a validation message to the inline
+     * error element and leave the form open.
+     * @returns Nothing.
+     * @throws Never — validation failures are reported inline, not thrown.
+     */
     const submit = (): void => {
       const a = available[Number(type.value)];
       const sc = !!a?.selfContained;

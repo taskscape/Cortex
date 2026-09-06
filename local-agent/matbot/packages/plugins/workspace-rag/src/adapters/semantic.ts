@@ -1,8 +1,29 @@
 import type { MatbotMachine } from '@matatbread/matbot-plugin-api';
 import type { RagV2SemanticServices } from '../v2/semantic.js';
+/**
+ * Builds the RAG v2 semantic services (query rewriting and optional document
+ * summarization) on top of the machine's provider registry. Summarization is
+ * included only when `CORTEX_RAG_V2_SUMMARY_PROVIDER` names a registered
+ * provider; the provider used for query rewriting is chosen per call.
+ *
+ * @param services - Machine whose provider registry and `singleTurn` back the returned services.
+ * @returns A {@link RagV2SemanticServices} with `rewriteQuery` and, when a summary provider is configured, `summarizerSignature` plus `summarize`.
+ * @throws Never.
+ */
 export function createSemanticServices(services: MatbotMachine): RagV2SemanticServices {
     const summaryProvider = process.env['CORTEX_RAG_V2_SUMMARY_PROVIDER']?.trim();
     const summaryModel = summaryProvider ? services.providers.get(summaryProvider)?.model : undefined;
+    /**
+     * Extracts a named string field from a raw LLM response.
+     *
+     * Tries the first JSON object embedded in the text; if it cannot be parsed
+     * or lacks the key, falls back to the whole text with code fences stripped.
+     *
+     * @param text - Raw model response text.
+     * @param key - JSON field to read, e.g. "standaloneQuery" or "summary".
+     * @returns The trimmed field value, else the fence-stripped trimmed text, else undefined when both are empty.
+     * @throws Never; JSON parse failures are swallowed by design.
+     */
     const parseJsonString = (text: string, key: string): string | undefined => {
         const match = /\{[\s\S]*\}/u.exec(text);
         if (match) {
@@ -19,6 +40,15 @@ export function createSemanticServices(services: MatbotMachine): RagV2SemanticSe
         return value || undefined;
     };
     return {
+        /**
+         * Rewrites a conversational follow-up as one standalone retrieval query
+         * with a single LLM turn. Returns undefined instead of throwing when
+         * the provider is missing or the response cannot be parsed.
+         *
+         * @param input - `provider` names a registered provider (absent or unknown short-circuits to undefined), `compactConversation` is the bounded recent transcript used to resolve references, `latestQuestion` is the follow-up to rewrite, and `signal` aborts the call.
+         * @returns The standalone query extracted from the JSON response, or undefined when no provider is available or the output cannot be parsed.
+         * @throws {Error} When the provider request fails or is aborted.
+         */
         rewriteQuery: async (input) => {
             if (!input.provider || !services.providers.has(input.provider))
                 return undefined;
@@ -37,6 +67,16 @@ export function createSemanticServices(services: MatbotMachine): RagV2SemanticSe
         },
         ...(summaryProvider && services.providers.has(summaryProvider) ? {
             summarizerSignature: `${summaryProvider}:${summaryModel ?? 'unknown'}:rag-routing-summary-v1`,
+            /**
+             * Produces a concise routing summary of one indexed unit via the
+             * configured summary provider; source text is capped at 12000
+             * characters before the request.
+             *
+             * @param input - Level, title, breadcrumb, and source text of the unit to summarize.
+             * @param signal - Optional abort signal for the provider call.
+             * @returns The summary extracted from the JSON response, or undefined when the output cannot be parsed.
+             * @throws {Error} When the provider request fails or is aborted.
+             */
             summarize: async (input, signal) => {
                 const result = await services.singleTurn({
                     provider: summaryProvider,

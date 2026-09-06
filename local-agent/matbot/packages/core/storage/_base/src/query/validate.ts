@@ -5,10 +5,27 @@ import { StoreQueryError } from '@matatbread/matbot-core';
 // detailed StoreQueryError so an LLM author can fix the offending clause and retry. Input is
 // treated as untrusted (LLM/JSON-sourced) — the static types are only a convenience for callers.
 
+/**
+ * Whether a value is a valid comparison operand (string, number, or boolean — never null).
+ *
+ * @param v - The value to test.
+ * @returns `true` when `v` is a string, number, or boolean.
+ * @throws Never.
+ */
 function isComparable(v: unknown): boolean {
   return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
 }
 
+/**
+ * Enforce that an equality/membership operand is a non-null comparable; null gets a dedicated
+ * hint pointing at the `exists` idiom.
+ *
+ * @param v - The operand value.
+ * @param ptr - JSON pointer to the operand node, for the error.
+ * @param op - The offending operator name, for the error message.
+ * @returns Nothing.
+ * @throws {StoreQueryError} With code `NULL_OPERAND` or `OPERAND_TYPE`.
+ */
 function requireComparable(v: unknown, ptr: string, op: string): void {
   if (v === null)
     throw new StoreQueryError(`'${op}' cannot compare to null — use { op: 'exists', value: false } to match absent-or-null`, ptr, 'NULL_OPERAND');
@@ -16,6 +33,15 @@ function requireComparable(v: unknown, ptr: string, op: string): void {
     throw new StoreQueryError(`'${op}' requires a string|number|boolean value`, ptr, 'OPERAND_TYPE');
 }
 
+/**
+ * Enforce that a range operand is a non-null string or number.
+ *
+ * @param v - The operand value.
+ * @param ptr - JSON pointer to the operand node, for the error.
+ * @param op - The offending operator name, for the error message.
+ * @returns Nothing.
+ * @throws {StoreQueryError} With code `NULL_OPERAND` or `OPERAND_TYPE`.
+ */
 function requireOrderable(v: unknown, ptr: string, op: string): void {
   if (v === null)
     throw new StoreQueryError(`'${op}' cannot compare to null — use { op: 'exists', value: false }`, ptr, 'NULL_OPERAND');
@@ -23,6 +49,15 @@ function requireOrderable(v: unknown, ptr: string, op: string): void {
     throw new StoreQueryError(`'${op}' requires a string|number value`, ptr, 'OPERAND_TYPE');
 }
 
+/**
+ * Enforce the field-path shape: a non-empty string, or a non-empty array of non-empty string
+ * segments.
+ *
+ * @param field - The field reference to check.
+ * @param ptr - JSON pointer to the field node, for the error.
+ * @returns Nothing.
+ * @throws {StoreQueryError} With code `EMPTY_FIELD` or `MALFORMED`.
+ */
 function validateField(field: unknown, ptr: string): void {
   if (typeof field === 'string') {
     if (field.length === 0) throw new StoreQueryError('field path is empty', ptr, 'EMPTY_FIELD');
@@ -39,6 +74,15 @@ function validateField(field: unknown, ptr: string): void {
   throw new StoreQueryError('field must be a string or array of strings', ptr, 'MALFORMED');
 }
 
+/**
+ * Recursively validate one filter node and its children: op-specific operand types, non-empty
+ * `and`/`or` clause lists, and a known `op` on every node.
+ *
+ * @param f - The filter node to validate (treated as untrusted input).
+ * @param ptr - JSON pointer to this node, threaded into child errors.
+ * @returns Nothing.
+ * @throws {StoreQueryError} Pointing at the offending node with a machine-readable code.
+ */
 function validateFilter(f: Filter, ptr: string): void {
   if (f === null || typeof f !== 'object' || typeof (f as { op?: unknown }).op !== 'string')
     throw new StoreQueryError('filter node must be an object with an `op`', ptr, 'MALFORMED');

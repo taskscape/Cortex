@@ -1,4 +1,18 @@
 import type { WebUiContribution } from '@matatbread/matbot-capabilities-types';
+/**
+ * Factory for the diagnostics architecture panel. Serialized into the
+ * `uiContribution` module source and executed in the browser, where it wires
+ * the panel's refresh button and output `<pre>` to the `runtime_diagnostics`
+ * tool via the host transport. Stale responses (a newer refresh started, or
+ * the panel was disposed) are discarded; all listeners share one lifetime
+ * {@link AbortController}.
+ *
+ * @param host - Web host object exposing `transport.callTool(name, input)`.
+ * @returns Feature object with `activate` (fetch and render the health
+ *   report), `status` (output element accessor), `mount` (attaches the
+ *   refresh listener), and `dispose` (aborts the lifetime and invalidates
+ *   in-flight renders).
+ */
 function createFeature(host: any) { const lifetime = new AbortController(); const root = document.getElementById('architecture-panel-diagnostics')!; const output = root.querySelector('pre')!; let request = 0; const activate = async () => { const seq = ++request; try {
     const health = await host.transport.callTool('runtime_diagnostics', {});
     if (!lifetime.signal.aborted && seq === request)

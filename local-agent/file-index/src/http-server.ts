@@ -1,6 +1,18 @@
 import http from 'node:http';
 import { assertLoopbackRequest, assertSharedToken, isJsonObject, readJsonBody, requestAbortSignal, sendJson, sendJsonError } from '@local-agent/http-utils';
 import type { FileIndexService } from './service.js';
+/**
+ * Creates the file-index HTTP server exposing `FileIndexService` over
+ * loopback-only endpoints: `GET /health` (no token required), plus
+ * token-gated `POST /index`, `POST /search`, and `POST /cancel`. Every request
+ * must carry a loopback `Host` header (DNS-rebinding defense). All thrown
+ * errors (including `HttpError` from authorization) are reported via
+ * {@link sendJsonError}.
+ *
+ * @param service - The backing service; health/index/search plus `cancel`.
+ * @param token - Optional shared secret checked on every non-health request.
+ * @returns An `http.Server` the caller must `listen()` itself.
+ */
 export function createFileIndexServer(service: Pick<FileIndexService, 'health' | 'index' | 'search'> & {
     cancel(id?: string): unknown | Promise<unknown>;
 }, token?: string) {

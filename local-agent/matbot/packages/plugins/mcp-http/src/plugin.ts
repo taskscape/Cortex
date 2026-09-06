@@ -2,11 +2,23 @@ import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import { RemoteMcpManager } from './manager.js';
 
+/**
+ * Input shape of the standalone `mcp_action` tool: connect a remote server, list the connected
+ * servers, or remove one by name.
+ */
 type McpRemoteAction =
   | { action: 'add'; name: string; endpoint: string; headers?: Record<string, string> }
   | { action: 'list' }
   | { action: 'remove'; name: string };
 
+/**
+ * Build the standalone (remote-only) `mcp_action` tool bound to a manager.
+ *
+ * @param manager - The manager the tool delegates connect/list/remove to.
+ * @returns The `mcp_action` tool; validation failures, connection failures, and unknown actions
+ *          are reported as `error` events rather than thrown.
+ * @throws Never.
+ */
 function remoteMcpActionTool(manager: RemoteMcpManager): Tool {
   return {
     name: 'mcp_action',
@@ -74,6 +86,10 @@ SHAPE  (TypeScript)
  * Build the cross-platform (browser + Node) remote-MCP plugin. On setup it creates a
  * {@link RemoteMcpManager} backed by the machine's settings, registers it as the
  * `McpRemoteService`, registers the `mcp_action` tool, and reconnects persisted servers.
+ *
+ * @returns The plugin spec; its `setup` registers the service and tool, its `teardown` closes all
+ *          connections.
+ * @throws Never.
  */
 export function createMcpHttpPlugin(): MatbotPluginSpec {
   let manager: RemoteMcpManager | undefined;
@@ -81,6 +97,14 @@ export function createMcpHttpPlugin(): MatbotPluginSpec {
     apiVersion: PLUGIN_API_VERSION,
     manifest: { description: 'Cross-platform remote MCP client (HTTP/SSE). Registers mcp_action and the McpRemoteService delegation service.' },
 
+    /**
+     * Create the {@link RemoteMcpManager}, register it as the `McpRemoteService`, register the
+     * `mcp_action` tool, and reconnect persisted servers (failures logged, not fatal).
+     *
+     * @param services - Machine services used for registration, settings, and tools.
+     * @returns Nothing.
+     * @throws Never.
+     */
     async setup(services) {
       manager = new RemoteMcpManager(services, services.settings());
       await services.register('McpRemoteService', manager);
@@ -88,6 +112,12 @@ export function createMcpHttpPlugin(): MatbotPluginSpec {
       await manager.reconnectPersisted((name, err) => console.warn(`[mcp-http] Failed to reconnect "${name}":`, err));
     },
 
+    /**
+     * Close every live remote connection. Persisted configs are kept.
+     *
+     * @returns Nothing.
+     * @throws Never.
+     */
     async teardown() { manager?.closeAll(); },
   };
 }

@@ -1,6 +1,30 @@
 import type { FileStore, MessageContent } from '@matatbread/matbot-plugin-api';
 const MAX_WORKSPACE_ATTACHMENTS = 20;
+/**
+ * Narrows a value to a non-null, non-array object.
+ *
+ * @param value Value to test.
+ * @returns True when `value` is a plain object record.
+ */
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+/**
+ * Validates and resolves explicit workspace-file attachments on an incoming message.
+ *
+ * Each attachment must be `{ namespace: "workspace", path }`; paths must be relative
+ * (no leading slash/drive, no `..` segments), 1-1024 characters, and are deduplicated.
+ * Every path is looked up in the `workspace` namespace of the file store; `refs`
+ * receives `file-ref` content blocks and `ephemeral` receives a robo text block
+ * instructing the model to read the attached files with `workspace_action`.
+ * Validation fails closed: any invalid entry rejects the whole batch.
+ *
+ * @param files File store to resolve against; may be `undefined` only when no attachments are supplied.
+ * @param rawAttachments Raw `attachments` argument; `undefined` short-circuits to empty lists.
+ * @param signal Optional abort signal checked between lookups.
+ * @returns Resolved `file-ref` blocks plus an ephemeral instruction block (both empty when there are no attachments).
+ * @throws Error - If `rawAttachments` is not an array, exceeds {@link MAX_WORKSPACE_ATTACHMENTS}
+ *   entries, arrives without a configured file store, contains a malformed or escaping
+ *   path, or names a file missing from the workspace namespace.
+ */
 export async function prepareWorkspaceAttachments(files: FileStore | undefined, rawAttachments: unknown, signal?: AbortSignal): Promise<{
     refs: MessageContent[];
     ephemeral: MessageContent[];
@@ -60,12 +84,18 @@ export async function prepareWorkspaceAttachments(files: FileStore | undefined, 
             }],
     };
 }
+/**
+ * Pluggable strategy for resolving a message's raw attachments into `file-ref`
+ * content blocks plus ephemeral context; provided as the optional
+ * `AttachmentResolver` service by this plugin.
+ */
 export interface AttachmentResolver {
     resolve(files: FileStore | undefined, refs: unknown, signal?: AbortSignal): Promise<{
         refs: MessageContent[];
         ephemeral: MessageContent[];
     }>;
 }
+/** The {@link AttachmentResolver} implementation registered by this plugin, resolving via {@link prepareWorkspaceAttachments}. */
 export const workspaceAttachmentResolver: AttachmentResolver = { resolve: prepareWorkspaceAttachments };
 declare module '@matatbread/matbot-plugin-api' {
     interface MatbotServices {

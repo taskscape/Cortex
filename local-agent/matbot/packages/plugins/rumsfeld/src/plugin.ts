@@ -7,14 +7,39 @@ import type { MatbotPluginSpec, MatbotMachine, ToolExecutor, ToolContext, ToolEv
 import {searchRememberedFacts,factDedupeKey} from '@matatbread/matbot-cognition/recall';
 export {searchRememberedFacts} from '@matatbread/matbot-cognition/recall';
 import type {RememberedFactMatch} from '@matatbread/matbot-cognition/recall';
+/** One search request: the unknown term plus the sentence fragment it appeared in. */
 interface SearchTerm{term:string;context?:string;}
+/** One hit from the workspace RAG manager: source location, relevance score and text. */
 interface WorkspaceRagHit{contextName:string;path:string;score:number;text:string;}
+/** Structural subset of the optional WorkspaceRagManager service, resolved untyped via the registry. */
 interface WorkspaceRagManagerLike{searchCurrent(query:string,limit:number,signal:AbortSignal):Promise<WorkspaceRagHit[]>;}
+/**
+ * Flattens search terms into a single query string, appending each term's context after the term.
+ *
+ * @param terms - Terms to flatten; `context` is optional per term.
+ * @returns Space-joined query of `<term>[ <context>]` fragments.
+ * @throws Never.
+ */
 const queryText=(terms:readonly SearchTerm[])=>terms.map(t=>t.context?t.term+' '+t.context:t.term).join(' ');
+/**
+ * Renders remembered-fact matches as a bulleted list under a "Remembered facts:" heading.
+ *
+ * @param matches - Matches to render, in list order.
+ * @returns Newline-joined text block (just the heading when there are no matches).
+ * @throws Never.
+ */
 function rememberedFactsContent(matches: readonly RememberedFactMatch[]): string {
   return ['Remembered facts:', ...matches.map(match => `- ${match.fact.fact}`)].join('\n');
 }
 
+/**
+ * Renders workspace RAG hits as numbered, scored source blocks under a heading naming the first
+ * hit's context (when known).
+ *
+ * @param hits - Hits to render; numbering follows this order.
+ * @returns Blocks separated by blank lines (a bare heading when empty).
+ * @throws Never.
+ */
 function workspaceRagContent(hits: readonly WorkspaceRagHit[]): string {
   return [
     `Workspace RAG results${hits[0]?.contextName ? ` (${hits[0].contextName})` : ''}:`,
@@ -25,6 +50,16 @@ function workspaceRagContent(hits: readonly WorkspaceRagHit[]): string {
   ].join('\n\n');
 }
 
+/**
+ * Composes the `contextual_search` result payload: a remembered-facts section, the best knowledge
+ * entry, and workspace RAG hits — each section omitted when empty, joined by blank lines.
+ *
+ * @param remembered - Remembered-fact matches; omitted from the output when empty.
+ * @param best - Top knowledge-index entry; omitted from the output when undefined.
+ * @param workspaceRag - Workspace RAG hits; omitted from the output when empty. Defaults to `[]`.
+ * @returns The joined content string (empty only when all inputs are empty).
+ * @throws Never.
+ */
 function combinedContent(
   remembered: readonly RememberedFactMatch[],
   best: KnowledgeEntry | undefined,
@@ -38,18 +73,39 @@ function combinedContent(
   return parts.join('\n\n');
 }
 
+/**
+ * Display name for a knowledge entry: its first entity, falling back to the entry id when it has
+ * no entities.
+ *
+ * @param entry - Entry to name.
+ * @returns First entity, or the entry id.
+ * @throws Never.
+ */
 function knowledgeName(entry: KnowledgeEntry): string {
   return entry.entities[0] ?? entry.id;
 }
 
 
+/**
+ * Concatenates a message's text blocks with newlines.
+ *
+ * @param msg - Message to read; may be undefined (e.g. no user message yet).
+ * @returns The joined text, or the empty string when `msg` is undefined or holds no text blocks.
+ * @throws Never.
+ */
 function textOf(msg: Message | undefined): string {
   return msg?.content.filter(c => c.type === 'text').map(c => c.text).join('\n') ?? '';
 }
 
-// Marks the injected block as system-supplied, so the model doesn't read remembered facts as the user
-// having just said them. (Deliberately a local copy of the same framing `triggers` applies to its own
-// injections: same idea, no dependency between two plugins that don't otherwise know about each other.)
+/**
+ * Marks the injected block as system-supplied, so the model doesn't read remembered facts as the user
+ * having just said them. (Deliberately a local copy of the same framing `triggers` applies to its own
+ * injections: same idea, no dependency between two plugins that don't otherwise know about each other.)
+ *
+ * @param body - Already-rendered content to wrap.
+ * @returns The body enclosed in system-supplied framing markers.
+ * @throws Never.
+ */
 function fence(body: string): string {
   return '[Recalled from durable memory — supplied by the system, not part of the user\'s message. ' +
     `Use it if relevant; ignore it if not.]\n\n${body}\n\n[End of recalled memory.]`;
@@ -64,6 +120,11 @@ function fence(body: string): string {
  * (locally — no LLM call, no added latency) and matches ride in as `ephemeral` context. The tool stays
  * registered for deliberate mid-turn lookups; this is what makes a *new conversation* start knowing
  * what earlier ones established.
+ *
+ * @param services - Runtime machine the fact search reads its store and settings through.
+ * @returns A `screen` hook: the handler scores the turn's last genuine user message against the
+ *   fact store and, on matches, returns `ephemeral` context plus a durable `memory-inject` marker.
+ * @throws Never.
  */
 export function createMemoryInjectionHook(services: MatbotMachine): Hook {
   return {
@@ -97,11 +158,21 @@ export function createMemoryInjectionHook(services: MatbotMachine): Hook {
  * injection hook.
  *
  * @returns The plugin specification.
+ * @throws Never.
  */
 export function createRumsfeldPlugin(): MatbotPluginSpec {
   return {
     apiVersion: PLUGIN_API_VERSION,
 
+    /**
+     * Registers the `contextual_search` tool — served by the retrieval federation when present,
+     * else by knowledge index + remembered facts + workspace RAG — and the memory-injection hook.
+     *
+     * @param services - Runtime machine providing the knowledge index, retrieval services, tools
+     *   and hooks.
+     * @returns A promise that resolves once the tool and hook are registered.
+     * @throws Never.
+     */
     async setup(services: MatbotMachine) {
       const executor: ToolExecutor = {
         async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {

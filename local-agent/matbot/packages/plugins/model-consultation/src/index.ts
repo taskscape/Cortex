@@ -10,8 +10,13 @@ import type { Tool, ToolExecutor, ToolContext, ToolEvent, MatbotMachine } from '
  * `provider` is optional: omitted, the call runs on the current turn's provider ({@link ToolContext.provider}).
  * This is the general case — name a provider to switch models, or leave it off to relay through the
  * model already in use. The optional model-consultation plugin owns this tool in both runtimes.
+ *
+ * @param services - Machine services; the provider registry and `singleTurn` runner come from here.
+ * @returns The `single_turn` tool specification; its executor performs no writes.
+ * @throws Never - request failures are reported as yielded `error` events.
  */
 export function createSingleTurnTool(services: MatbotMachine): Tool {
+    /** Executor for the `single_turn` tool; validates arguments and runs one one-shot completion. */
     const executor: ToolExecutor = {
         async *execute(input: unknown, ctx: ToolContext): AsyncIterable<ToolEvent> {
             const args = input as {
@@ -66,4 +71,8 @@ export function createSingleTurnTool(services: MatbotMachine): Tool {
         executor,
     };
 }
+/**
+ * Plugin specification for model consultation: registers the `single_turn` tool.
+ * @returns The matbot plugin specification.
+ */
 export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION, async setup(services) { services.tools.register(createSingleTurnTool(services)); } };

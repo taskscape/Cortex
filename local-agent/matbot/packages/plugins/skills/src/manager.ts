@@ -2,9 +2,18 @@ import type { Store, KnowledgeIndex, KnowledgeEntry, MatbotMachine } from '@mata
 import { createBroadcaster } from '@matatbread/matbot-plugin-api';
 import type { SkillDoc, SkillEvent } from './types.js';
 
+/** Derived catalogue metadata for a skill: entities and tags for matching plus a search summary. */
 type SkillAnalysis  = { entities: string[]; tags: string[]; summary: string };
+/** The cached-analysis shape stored on a {@link SkillDoc}, keyed by a content hash. */
 type SkillKnowledge = NonNullable<SkillDoc['knowledge']>;
 
+/**
+ * SHA-256 digest of a UTF-8 string, hex-encoded.
+ *
+ * @param text - Text to hash.
+ * @returns Lowercase hex digest (64 characters).
+ * @throws Error - If the SubtleCrypto digest operation fails.
+ */
 async function sha256Hex(text: string): Promise<string> {
   // SubtleCrypto is a web-platform primitive (allowed in shared packages). In a non-secure browser
   // context (plain-HTTP local hosting) `crypto.subtle` is withheld; the web-bundle loader installs a
@@ -14,7 +23,13 @@ async function sha256Hex(text: string): Promise<string> {
 }
 
 /** Cheap, deterministic analysis from the skill's name and tags — the fallback when no analysis
- *  provider is configured (or the LLM call fails). Cheap enough that it is never worth caching. */
+ *  provider is configured (or the LLM call fails). Cheap enough that it is never worth caching.
+ *
+ *  @param doc - Skill to analyse.
+ *  @returns Entities derived from the name, the doc's own tags, and the first 500 characters of
+ *    content as the summary.
+ *  @throws Never.
+ */
 function heuristicAnalysis(doc: SkillDoc): SkillAnalysis {
   const nameLower  = doc.name.toLowerCase();
   const nameTokens = nameLower.split(/[\s\-_]+/).filter(t => t.length > 1);
@@ -38,6 +53,19 @@ Return your answer as valid JSON only — no markdown fences, no explanations. T
 
 const ANALYSIS_TIMEOUT_MS = 6000_000;
 
+/**
+ * Analyses a skill's content with an LLM (`singleTurn` on the given provider), expecting JSON with
+ * "summary", "entities" and "tags". Degrades to `undefined` — never throws — when the provider is
+ * unconfigured, the reply is unparseable or empty, or the call fails or is aborted.
+ *
+ * @param doc - Skill whose `content` is the analysis prompt.
+ * @param services - Runtime machine used for the provider lookup and the `singleTurn` call.
+ * @param provider - Provider name; must already be configured.
+ * @param signal - Optional abort signal; an aborted call returns `undefined` without warning.
+ * @returns The parsed analysis (non-string array entries filtered out), or `undefined` when no
+ *   usable analysis was produced.
+ * @throws Never.
+ */
 async function analyseSkill(
   doc:      SkillDoc,
   services: MatbotMachine,
@@ -71,6 +99,15 @@ async function analyseSkill(
   }
 }
 
+/**
+ * Assembles the knowledge-index entry mirroring a skill doc and its analysis.
+ *
+ * @param doc - Source skill; id, version, content and timestamps are copied onto the entry.
+ * @param a - Analysis supplying entities, tags and summary.
+ * @param contentHash - SHA-256 of `doc.content`, stored for cache invalidation.
+ * @returns The entry, keyed by the skill's id with `source: { type: 'skill' }`.
+ * @throws Never.
+ */
 function buildEntry(doc: SkillDoc, a: SkillAnalysis, contentHash: string): KnowledgeEntry {
   return {
     id:        doc.id,
@@ -92,7 +129,15 @@ function buildEntry(doc: SkillDoc, a: SkillAnalysis, contentHash: string): Knowl
  * a real cost, so it is keyed on a SHA-256 of the content: an unchanged skill reuses the cache on
  * `doc.knowledge` and makes no LLM call. A freshly generated analysis is returned in `cache` for the
  * caller to persist back onto the doc; a heuristic fallback (no provider, or a failed/empty call) is
- * returned without a `cache`, so it is re-derived next time rather than masking a later real analysis.
+ *   returned without a `cache`, so it is re-derived next time rather than masking a later real analysis.
+ *
+ * @param doc - Skill to build the entry for.
+ * @param services - Runtime machine used for the analysis LLM call.
+ * @param provider - Provider name for the analysis.
+ * @param signal - Optional abort signal forwarded to the analysis.
+ * @returns The knowledge entry, plus `cache` holding the freshly generated analysis when one was
+ *   produced (absent on cache hits and heuristic fallbacks).
+ * @throws Error - If the content hashing fails (propagated from the digest).
  */
 export async function skillToKnowledgeEntry(
   doc:      SkillDoc,
@@ -148,13 +193,22 @@ export class SkillManager {
   // Aborts on teardown (clear()), ending the mounted-swap subscription set up in setupSkills.
   private readonly lifecycle = new AbortController();
 
-  // Read live so a runtime register('KnowledgeIndex', …) swap is honoured (the member is a
-  // capture-safe forwarding proxy, but resolving it per call keeps that guarantee explicit).
+  /**
+   * Read live so a runtime register('KnowledgeIndex', …) swap is honoured (the member is a
+   * capture-safe forwarding proxy, but resolving it per call keeps that guarantee explicit).
+   *
+   * @returns The currently active knowledge index.
+   * @throws Never.
+   */
   private get knowledge(): KnowledgeIndex { return this.services.KnowledgeIndex; }
 
   /**
+   * Constructs an empty manager over the given store; call {@link load} (or run
+   * {@link setupSkills}) to populate it from persistence.
+   *
    * @param store - Persistent store backing the skill set.
    * @param services - Runtime machine providing settings, providers and knowledge.
+   * @throws Never.
    */
   constructor(store: Store<SkillDoc>, services: MatbotMachine) {
     this.store    = store;
@@ -162,14 +216,23 @@ export class SkillManager {
   }
 
   /** Ends with the manager (teardown). Hand to `services.mounted.consume` so a StorageBackend swap
-   *  re-reads the new backend's skills, and the loop stops when the plugin unloads. */
+   *  re-reads the new backend's skills, and the loop stops when the plugin unloads.
+   *
+   *  @returns The lifecycle abort signal, aborted by {@link clear}.
+   *  @throws Never.
+   */
   get signal(): AbortSignal { return this.lifecycle.signal; }
 
-  // The provider used to derive a skill's catalogue summary / knowledge analysis. The user pins one
-  // via the `analysisProvider` setting (skills_config); absent (or stale), it falls back to the first
-  // configured provider — there is always at least one — so analysis works with zero config. Resolved
-  // per reindex, not cached, so a skills_config change takes effect on the next analysis without reload.
-  // (analyseSkill degrades to a heuristic if this resolves to nothing, e.g. no providers at all.)
+  /**
+   * The provider used to derive a skill's catalogue summary / knowledge analysis. The user pins one
+   * via the `analysisProvider` setting (skills_config); absent (or stale), it falls back to the first
+   * configured provider — there is always at least one — so analysis works with zero config. Resolved
+   * per reindex, not cached, so a skills_config change takes effect on the next analysis without reload.
+   * (analyseSkill degrades to a heuristic if this resolves to nothing, e.g. no providers at all.)
+   *
+   * @returns The pinned provider name, else the first configured provider, else `''`.
+   * @throws Error - If the settings read rejects.
+   */
   async resolveAnalysisProvider(): Promise<string> {
     const pinned = await this.services.settings().get<string>('analysisProvider');
     if (pinned !== undefined && this.services.providers.has(pinned)) return pinned;
@@ -179,7 +242,12 @@ export class SkillManager {
   /** (Re)load persisted skills into memory and index each one. Re-runnable: the initial boot load and
    *  every later StorageBackend swap funnel through here. Reading `this.store` (a swap-following proxy)
    *  always hits the live backend, so a swap re-reads the new backend's skills. Clears first — old
-   *  in-memory skills and their in-flight analyses belong to the displaced backend. */
+   *  in-memory skills and their in-flight analyses belong to the displaced backend.
+   *
+   *  @returns A promise that resolves once the store query has run and every doc was committed
+   *    (each commit fires a detached reindex).
+   *  @throws Error - If the backing store rejects the query.
+   */
   async load(): Promise<void> {
     for (const ac of this.inflight.values()) ac.abort();
     this.inflight.clear();
@@ -188,10 +256,22 @@ export class SkillManager {
     for (const doc of items) this.commit(doc, true);
   }
 
+  /** Snapshot of every in-memory skill document.
+   *
+   *  @returns The docs in insertion order (load order, then later saves; a deleted-then-recreated
+   *    skill moves to the end).
+   *  @throws Never.
+   */
   all(): SkillDoc[] {
     return [...this.skills.values()];
   }
 
+  /** Compact descriptors of every skill, for listings.
+   *
+   *  @returns One {@link SkillSummary} per skill, in {@link all} order; `toolBinding` omitted when
+   *    unset.
+   *  @throws Never.
+   */
   list(): SkillSummary[] {
     return this.all().map(s => ({
       id:   s.id,
@@ -202,23 +282,37 @@ export class SkillManager {
 
   /**
    * Looks a skill up by name, case-insensitively.
-   * @param name - Skill name.
+   * @param name - Skill name (any casing).
    * @returns The skill document, or undefined when absent.
+   * @throws Never.
    */
   get(name: string): SkillDoc | undefined {
     return this.skills.get(name.toLowerCase());
   }
 
   /** Observe skill content CRUD (save/delete), including saves made by the LLM mid-turn via
-   *  `skill_action` — the source a UI needs to refresh a skills list live. */
+   *  `skill_action` — the source a UI needs to refresh a skills list live.
+   *
+   *  @param signal - Optional abort signal unsubscribing the consumer.
+   *  @returns An async iterable of {@link SkillEvent}s in emission order.
+   *  @throws Never.
+   */
   watch(signal?: AbortSignal): AsyncIterable<SkillEvent> {
     return this.events.subscribe(signal);
   }
 
-  /** Create a new skill or update an existing one's content by name. */
-  // `catalogue` (the system-prompt advertisement flag) is optional: omitted ⇒ left unchanged (the
-  // common content-only save), present ⇒ set. It rides on `save` so the editor persists content,
-  // triggers, and the flag in one action.
+  /** Create a new skill or update an existing one's content by name.
+   *
+   *  `catalogue` (the system-prompt advertisement flag) is optional: omitted ⇒ left unchanged (the
+   *  common content-only save), present ⇒ set. It rides on `save` so the editor persists content,
+   *  triggers, and the flag in one action.
+   *
+   *  @param name - Skill name, matched case-insensitively; an unknown name creates the skill.
+   *  @param content - New Markdown body.
+   *  @param catalogue - Advertisement flag; omit to leave the current value unchanged.
+   *  @returns The saved document (fresh id/version on create, bumped version on update).
+   *  @throws Error - If the store write or a CAS-retry read rejects.
+   */
   async save(name: string, content: string, catalogue?: boolean): Promise<SkillDoc> {
     const now = new Date().toISOString();
     const key = name.toLowerCase();
@@ -245,7 +339,14 @@ export class SkillManager {
     return saved;
   }
 
-  /** Delete a skill by name. Returns the removed doc, or `undefined`. */
+  /** Delete a skill by name. Returns the removed doc, or `undefined`.
+   *
+   *  Aborts any in-flight analysis for the skill first — no point analysing a skill being removed.
+   *
+   *  @param name - Skill name, matched case-insensitively.
+   *  @returns The removed document, or `undefined` when no skill of that name exists.
+   *  @throws Error - If the store delete rejects.
+   */
   async delete(name: string): Promise<SkillDoc | undefined> {
     const key = name.toLowerCase();
     const doc = this.skills.get(key);
@@ -263,6 +364,12 @@ export class SkillManager {
    * Used by the node filesystem watcher to seed `.md` files without clobbering edits, and by
    * plugins that ship built-in skills (e.g. cognition) — hence the optional `catalogSummary`.
    * Returns `true` if a new skill was imported.
+   *
+   * @param name - Skill name to create, matched case-insensitively.
+   * @param content - Markdown body for the new skill.
+   * @param catalogSummary - Optional hand-written catalogue blurb stored on the doc.
+   * @returns `true` when a new skill was imported; `false` when one already existed.
+   * @throws Error - If the store write rejects.
    */
   async importIfAbsent(
     name:           string,
@@ -290,6 +397,9 @@ export class SkillManager {
   /**
    * Drops all in-memory state and aborts in-flight analyses and subscriptions.
    * Ends the manager's lifecycle (teardown only).
+   *
+   * @returns Nothing; the manager is left empty and its lifecycle signal aborted.
+   * @throws Never.
    */
   clear(): void {
     this.lifecycle.abort();                                // end the mounted-swap subscription
@@ -298,18 +408,40 @@ export class SkillManager {
     this.skills.clear();
   }
 
+  /** Copies a doc with a fresh version token and `updatedAt` timestamp.
+   *
+   *  @param doc - Doc to bump; not mutated.
+   *  @returns Shallow copy with `version` set to the current epoch milliseconds and `updatedAt`
+   *    set to now.
+   *  @throws Never.
+   */
   private bump(doc: SkillDoc): SkillDoc {
     return { ...doc, version: Date.now().toString(), updatedAt: new Date().toISOString() };
   }
 
+  /** Inserts/updates the in-memory index, optionally firing a detached reindex.
+   *
+   *  @param doc - Doc to commit; indexed under its lower-cased name.
+   *  @param reindex - When true, fires (and forgets) a knowledge reindex for the doc.
+   *  @returns Nothing.
+   *  @throws Never.
+   */
   private commit(doc: SkillDoc, reindex: boolean): void {
     this.skills.set(doc.name.toLowerCase(), doc);
     if (reindex) void this.reindex(doc);
   }
 
-  // Detached: analysis may make an LLM call, so it must not block the write that triggered it. A
-  // freshly generated analysis is cached back onto the doc (a plain store write, NOT another commit,
-  // so it doesn't re-trigger reindex) so subsequent restarts re-index from cache for free.
+  /**
+   * Detached: analysis may make an LLM call, so it must not block the write that triggered it. A
+   * freshly generated analysis is cached back onto the doc (a plain store write, NOT another commit,
+   * so it doesn't re-trigger reindex) so subsequent restarts re-index from cache for free.
+   *
+   * Supersedes any in-flight analysis for the same skill; every failure is warned and swallowed.
+   *
+   * @param doc - Skill to re-index from.
+   * @returns A promise that resolves when the pass finishes (or is superseded/aborted); never rejects.
+   * @throws Never.
+   */
   private async reindex(doc: SkillDoc): Promise<void> {
     this.inflight.get(doc.id)?.abort();   // supersede any in-flight analysis for this skill
     const ac = new AbortController();
@@ -332,6 +464,16 @@ export class SkillManager {
     }
   }
 
+  /**
+   * Persists a freshly generated analysis back onto the stored skill doc via compare-and-swap,
+   * retrying indefinitely against concurrent writers. Deleted or already-current docs return
+   * immediately; on success the in-memory index is refreshed with the new doc.
+   *
+   * @param id - Skill id whose doc gains the cached analysis.
+   * @param knowledge - Analysis (with the content hash it was derived from) to cache.
+   * @returns A promise that resolves when the cache write lands or the doc is found deleted/current.
+   * @throws Error - If the store reads/writes reject.
+   */
   private async cacheKnowledge(id: string, knowledge: SkillKnowledge): Promise<void> {
     for (;;) {
       const cur = await this.store.get(id);
@@ -343,6 +485,18 @@ export class SkillManager {
     }
   }
 
+  /**
+   * Applies a mutation to a skill doc through compare-and-swap, retrying against concurrent
+   * writers: on CAS failure the stored doc is re-read and the mutation re-applied to it; if the
+   * doc vanished, the mutated copy is written back wholesale. The result is committed in memory
+   * (optionally reindexed) and returned.
+   *
+   * @param doc - Doc snapshot to mutate from.
+   * @param mutate - Function producing the next doc from the current one.
+   * @param reindex - Whether the committed result should trigger a knowledge reindex.
+   * @returns The committed doc.
+   * @throws Error - If the store reads/writes reject.
+   */
   private async casMutate(doc: SkillDoc, mutate: (cur: SkillDoc) => SkillDoc, reindex: boolean): Promise<SkillDoc> {
     let cur = doc;
     for (;;) {

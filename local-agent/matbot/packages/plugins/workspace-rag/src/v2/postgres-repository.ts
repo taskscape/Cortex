@@ -41,6 +41,14 @@ const TERMINAL_JOB_STATES = [
   'quarantined',
 ] as const;
 
+/**
+ * Builds the zeroed {@link RagV2GcResult} used as the aggregation base for a
+ * garbage-collection pass.
+ *
+ * @param deletionsSkipped - Whether the pass aborted before deleting (safety gate).
+ * @returns An all-zero result carrying the given `deletionsSkipped` flag.
+ * @throws Never.
+ */
 function emptyGcResult(deletionsSkipped = false): RagV2GcResult {
   return {
     documentsDeleted: 0,
@@ -54,12 +62,22 @@ function emptyGcResult(deletionsSkipped = false): RagV2GcResult {
   };
 }
 
+/**
+ * Connection settings for the Postgres RAG v2 repository: the application
+ * pool config, an optional dedicated migration pool config, and the target
+ * schema name.
+ */
 interface PostgresSettings {
   poolConfig: PoolConfig;
   migrationPoolConfig?: PoolConfig;
   schema: string;
 }
 
+/**
+ * Raw shape of one search-result row as Postgres returns it, before mapping
+ * into {@link RagV2RankedHit}. Byte/line ranges arrive as strings or nulls,
+ * and `score` carries the retriever-specific ranking expression value.
+ */
 interface SearchRow {
   level: RagV2Level;
   id: string;
@@ -85,6 +103,16 @@ interface SearchRow {
   score: number;
 }
 
+/**
+ * Reduces an arbitrary string to a safe PostgreSQL identifier: disallowed
+ * characters become underscores, leading/trailing underscores are trimmed, the
+ * result is capped at 48 characters, and a leading digit is prefixed with an
+ * underscore. Falls back to the default schema when nothing remains.
+ *
+ * @param value - Raw schema name, typically from the environment.
+ * @returns A sanitized identifier safe to pass through {@link quoteIdentifier}.
+ * @throws Never.
+ */
 function sanitizeIdentifier(value: string): string {
   const result = value.replace(/[^a-zA-Z0-9_]+/gu, '_').replace(/^_+|_+$/gu, '').slice(0, 48);
   if (!result) return DEFAULT_SCHEMA;
@@ -95,17 +123,39 @@ function sanitizeIdentifier(value: string): string {
  * Quote a SQL identifier after gating it against the safe-identifier charset. Exported for
  * tests: the DO-block policy statements interpolate identifiers into string literals where
  * bind parameters cannot go, so every such name must pass this gate first.
+ *
+ * @param value - Identifier to quote; must match `[a-zA-Z_][a-zA-Z0-9_]*`.
+ * @returns The identifier wrapped in double quotes.
+ * @throws Error - When `value` contains characters outside the safe identifier set.
  */
 export function quoteIdentifier(value: string): string {
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/u.test(value)) throw new Error(`Unsafe SQL identifier: ${value}`);
   return `"${value}"`;
 }
 
+/**
+ * Quotes a PostgreSQL role name for interpolation into GRANT statements,
+ * escaping embedded double quotes.
+ *
+ * @param value - Role name to quote; must be non-empty.
+ * @returns The role name wrapped in double quotes.
+ * @throws Error - When the name is empty or contains a NUL character.
+ */
 function quoteRole(value: string): string {
   if (!value || value.includes('\0')) throw new Error('Unsafe PostgreSQL role name.');
   return `"${value.replace(/"/gu, '""')}"`;
 }
 
+/**
+ * Builds {@link PostgresSettings} from the `CORTEX_RAG_*`/`POSTGRES_*`
+ * environment variables, preferring a connection string over discrete
+ * host/port/database settings and sanitizing the configured schema name.
+ *
+ * @returns Settings with pool sizing and timeouts, an optional separate
+ * migration connection string, and the sanitized schema (default
+ * `workspace_rag_v2`).
+ * @throws Never.
+ */
 function settingsFromEnv(): PostgresSettings {
   const connectionString = process.env['CORTEX_RAG_POSTGRES_URL']?.trim();
   const poolConfig: PoolConfig = {
@@ -144,18 +194,47 @@ function settingsFromEnv(): PostgresSettings {
   };
 }
 
+/**
+ * Renders a numeric vector as the PostgreSQL `vector` literal text form.
+ *
+ * @param vector - Embedding components; non-finite values are replaced with 0.
+ * @returns Text like `[1,2,3]` for use with a `::vector` cast.
+ * @throws Never.
+ */
 function toVector(vector: readonly number[]): string {
   return `[${vector.map(value => Number.isFinite(value) ? value : 0).join(',')}]`;
 }
 
+/**
+ * Current UTC time as an ISO-8601 string: the canonical timestamp format used
+ * for record timestamps written by this repository.
+ *
+ * @returns An ISO-8601 timestamp string.
+ * @throws Never.
+ */
 function now(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Serializes a value for storage in a JSONB column.
+ *
+ * @param value - JSON-serializable payload.
+ * @returns The JSON text.
+ * @throws TypeError - If the value is circular or otherwise not serializable.
+ */
 function json(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/**
+ * Converts a nullable SQL text column (BIGINT/COUNT results arrive as strings)
+ * into a number.
+ *
+ * @param value - Raw column text, or null.
+ * @returns The parsed number, or undefined when the input is null.
+ * @throws Never.
+ */
 function numeric(value: string | null): number | undefined {
   return value === null ? undefined : Number(value);
 }
@@ -176,6 +255,11 @@ export class PostgresRagV2Repository implements RagV2Repository {
   private readonly gcBatchSize: number;
 
   /**
+   * Creates the repository and opens the application pool (plus the migration
+   * pool with at most 2 clients when separately configured). Idle-client
+   * errors are logged rather than thrown. Call
+   * {@link PostgresRagV2Repository.initialize} before any other method.
+   *
    * @param settings - Connection settings (defaults from the environment).
    */
   constructor(settings = settingsFromEnv()) {
@@ -198,7 +282,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
 
   /**
    * Applies schema migrations and validates the stored vectorizer signature.
+   * Installs extensions (`vector`, best-effort `pg_trgm`), creates the schema,
+   * tables, per-dimension embeddings table, and indexes, enables row-level
+   * security, grants the application role, and opportunistically prunes
+   * expired audit records. Must complete before any other repository call.
+   *
    * @param vectorizer - Active vectorizer descriptor.
+   * @returns Resolves once the schema is ready for use.
+   * @throws Error - Postgres client errors from DDL or DML; audit-pruning
+   * failures are logged and swallowed instead.
    */
   async initialize(vectorizer: RagV2VectorizerInfo): Promise<void> {
     this.vectorizer = vectorizer;
@@ -221,6 +313,9 @@ export class PostgresRagV2Repository implements RagV2Repository {
    * Opportunistic startup pruning of audit payloads past the configured
    * retention window. Retrieval hits, query variants, and evidence cascade
    * from their run row.
+   *
+   * @returns Resolves immediately when retention is disabled (days <= 0).
+   * @throws Error - Postgres client errors from the retention deletes.
    */
   private async pruneExpiredAuditRecords(): Promise<void> {
     const retentionDays = ragV2AuditRetentionDaysFromEnv();
@@ -240,12 +335,32 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Shuts down the application pool and, when present, the migration pool.
+   *
+   * @returns Resolves once all pooled clients have closed.
+   * @throws Error - If a pool fails to terminate cleanly.
+   */
   async close(): Promise<void> {
     await this.pool.end();
     await this.migrationPool?.end();
   }
 
-  async beginGeneration(workspaceId: string, contextId: string, generationId: string): Promise<void> {
+  /**
+   * Starts a staging publication for `generationId` (no-op on conflict) and
+   * seeds its document membership from `sourceGenerationId`, falling back to
+   * the context's active publication when omitted. Idempotent: re-invoking for
+   * a generation an interrupted run left behind never resets it.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context being re-indexed.
+   * @param generationId - New generation to stage.
+   * @param sourceGenerationId - Generation whose membership to adopt; omit to
+   * copy from the active publication.
+   * @returns Resolves when the staging row and membership are written.
+   * @throws Error - Postgres client errors from the transaction.
+   */
+  async beginGeneration(workspaceId: string, contextId: string, generationId: string, sourceGenerationId?: string): Promise<void> {
     await this.withWorkspace(workspaceId, async client => {
       await client.query(`
         INSERT INTO ${this.table('publications')} (
@@ -262,16 +377,25 @@ export class PostgresRagV2Repository implements RagV2Repository {
         )
         SELECT $1, workspace_id, context_id, document_id, document_version_id, path
         FROM ${this.table('publication_documents')}
-        WHERE generation_id = (
+        WHERE workspace_id = $2 AND context_id = $3 AND generation_id = COALESCE($4::text, (
           SELECT generation_id FROM ${this.table('publications')}
           WHERE workspace_id = $2 AND context_id = $3 AND active = TRUE
           LIMIT 1
-        )
+        ))
         ON CONFLICT (generation_id, document_id) DO NOTHING
-      `, [generationId, workspaceId, contextId]);
+      `, [generationId, workspaceId, contextId, sourceGenerationId ?? null]);
     });
   }
 
+  /**
+   * Fetches one publication by generation id.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the publication.
+   * @param generationId - Generation to look up.
+   * @returns The publication record, or undefined when it does not exist.
+   * @throws Error - Postgres client errors from the query.
+   */
   async generation(
     workspaceId: string,
     contextId: string,
@@ -306,6 +430,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     } : undefined;
   }
 
+  /**
+   * Drops staging generations abandoned by earlier interrupted runs, keeping
+   * the given one.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context whose staging generations are pruned.
+   * @param keepGenerationId - Generation to preserve.
+   * @returns How many staging publications were deleted.
+   * @throws Error - Postgres client errors from the delete.
+   */
   async pruneStagingGenerations(
     workspaceId: string,
     contextId: string,
@@ -319,6 +453,22 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rowCount ?? 0;
   }
 
+  /**
+   * Deletes document versions that no active or staging publication protects
+   * and whose `modified_at` precedes `olderThan`, repeating in batches of the
+   * configured GC size until a batch deletes nothing. Section and passage
+   * counts are derived from the doomed rows (the rows themselves cascade);
+   * collection embeddings, stale routing summaries, derivative jobs, and
+   * terminal ingestion jobs/items are then cleaned up. A non-terminal
+   * ingestion job for the context unconditionally skips all deletions.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context to garbage-collect.
+   * @param olderThan - ISO-8601 timestamp cast to `timestamptz`; documents
+   * modified before it are eligible for deletion.
+   * @returns Aggregated deletion counts; `deletionsSkipped` reports gating.
+   * @throws Error - Postgres client errors from any batch.
+   */
   async pruneOrphans(
     workspaceId: string,
     contextId: string,
@@ -480,6 +630,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return aggregate;
   }
 
+  /**
+   * Deletes retired publication shells published before `olderThan` together
+   * with their collections' embeddings. Returns 0 while a non-terminal
+   * ingestion job is running for the context.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context whose retired generations are pruned.
+   * @param olderThan - ISO-8601 timestamp cast to `timestamptz`.
+   * @returns The number of retired generations deleted.
+   * @throws Error - Postgres client errors from the delete.
+   */
   async pruneRetiredGenerations(
     workspaceId: string,
     contextId: string,
@@ -516,6 +677,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Removes all non-audit persistence for a context: publications,
+   * embeddings, documents, routing summaries, derivative jobs, and ingestion
+   * jobs/items. Idempotent; audit rows are retained.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context being purged.
+   * @returns Resolves when all deletes complete.
+   * @throws Error - When ingestion is still running for the context, or on
+   * Postgres client errors.
+   */
   async purgeContext(workspaceId: string, contextId: string): Promise<void> {
     await this.withWorkspace(workspaceId, async client => {
       if (await this.gcBlockedWithClient(client, workspaceId, contextId)) {
@@ -531,6 +703,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Collects the distinct content hashes of every stored document across all
+   * workspaces and contexts. Runs on the DDL pool, bypassing workspace
+   * row-level security (the application role would see no rows without an
+   * `app.workspace_id` setting).
+   *
+   * @returns A set of SHA-256 content hashes referenced by any document.
+   * @throws Error - Postgres client errors from the query.
+   */
   async listReferencedContentHashes(): Promise<Set<string>> {
     const result = await this.ddlPool().query<{ content_sha256: string }>(`
       SELECT DISTINCT content_sha256 FROM ${this.table('documents')}
@@ -538,6 +719,14 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return new Set(result.rows.map(row => row.content_sha256));
   }
 
+  /**
+   * Fetches the context's currently active publication, if any.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context whose active publication is read.
+   * @returns The active publication, or undefined when none exists.
+   * @throws Error - Postgres client errors from the query.
+   */
   async activePublication(workspaceId: string, contextId: string): Promise<RagV2Publication | undefined> {
     const result = await this.withWorkspace(workspaceId, client => client.query<{
       generation_id: string;
@@ -568,6 +757,21 @@ export class PostgresRagV2Repository implements RagV2Repository {
     } : undefined;
   }
 
+  /**
+   * Promotes a staging generation to an active state: validates completeness,
+   * retires the previously active publication, activates this one, and
+   * propagates the new state onto every member document's
+   * `publication_state`.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Staging generation to publish.
+   * @param state - Target active state (lexical, hybrid partial, or hybrid
+   * complete).
+   * @returns Resolves when the publication and document states are updated.
+   * @throws Error - When generation validation fails, the staging row is
+   * missing, or a Postgres client error occurs.
+   */
   async publishGeneration(
     workspaceId: string,
     contextId: string,
@@ -599,6 +803,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Checks a generation's completeness without modifying it.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation to validate.
+   * @returns Counts of documents, sections, passages, lexical-ready passages,
+   * and passage embeddings, plus `errors` describing each failed invariant
+   * (`valid` is true only when `errors` is empty).
+   * @throws Error - Postgres client errors from the validation queries.
+   */
   async validateGeneration(workspaceId: string, contextId: string, generationId: string) {
     return this.withWorkspace(
       workspaceId,
@@ -606,14 +821,36 @@ export class PostgresRagV2Repository implements RagV2Repository {
     );
   }
 
+  /**
+   * Persists a new ingestion job (upsert on job id).
+   *
+   * @param job - Full job record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async createJob(job: RagV2Job): Promise<void> {
     await this.writeJob(job);
   }
 
+  /**
+   * Rewrites an existing ingestion job (upsert on job id).
+   *
+   * @param job - Full job record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async updateJob(job: RagV2Job): Promise<void> {
     await this.writeJob(job);
   }
 
+  /**
+   * Reads the most recently created ingestion job for a context.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context whose latest job is read.
+   * @returns The latest job payload, or undefined when none exists.
+   * @throws Error - Postgres client errors from the query.
+   */
   async currentJob(workspaceId: string, contextId: string): Promise<RagV2Job | undefined> {
     const result = await this.withWorkspace(workspaceId, client => client.query<{ payload: RagV2Job }>(`
       SELECT payload FROM ${this.table('ingestion_jobs')}
@@ -624,6 +861,14 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rows[0]?.payload;
   }
 
+  /**
+   * Inserts or updates one per-file job item, keyed by (job id, path).
+   *
+   * @param item - Job item record; its `workspaceId` selects the connection
+   * scope.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async upsertJobItem(item: RagV2JobItem): Promise<void> {
     await this.withWorkspace(item.workspaceId, client => client.query(`
       INSERT INTO ${this.table('ingestion_job_items')} (
@@ -638,6 +883,19 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]).then(() => undefined));
   }
 
+  /**
+   * Lists change-detection fingerprints for the documents held by a
+   * generation, defaulting to the active publication. The summary signature is
+   * the newest document-level summarizer signature for which every section of
+   * the document also carries a summary with the same signature.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation to fingerprint; omit for the active one.
+   * @returns One fingerprint per member document with `modifiedAt`
+   * normalized to ISO-8601 (no guaranteed order).
+   * @throws Error - Postgres client errors from the query.
+   */
   async listFingerprints(
     workspaceId: string,
     contextId: string,
@@ -702,6 +960,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }));
   }
 
+  /**
+   * Counts the document versions held for a generation, defaulting to the
+   * active publication.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation to count; omit for the active one.
+   * @returns The number of member documents (0 when the generation is unknown).
+   * @throws Error - Postgres client errors from the query.
+   */
   async countGenerationDocuments(workspaceId: string, contextId: string, generationId?: string): Promise<number> {
     const result = await this.withWorkspace(workspaceId, client => client.query<{ count: string }>(`
       SELECT COUNT(*)::TEXT AS count
@@ -716,10 +984,29 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return Number(result.rows[0]?.count ?? 0);
   }
 
+  /**
+   * Upserts the document record at the start of ingestion. Generation
+   * membership is recorded separately by
+   * {@link PostgresRagV2Repository.finishDocument}.
+   *
+   * @param _generationId - Unused; retained for the repository contract.
+   * @param document - Document record to upsert.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async beginDocument(_generationId: string, document: RagV2DocumentRecord): Promise<void> {
     await this.withWorkspace(document.workspaceId, client => this.upsertDocument(client, document));
   }
 
+  /**
+   * Batch-inserts sections (batches of 128 rows), updating the mutable tail
+   * fields on conflict of `section_id`. All sections in one call must share
+   * the same `workspaceId` (the first section's is used).
+   *
+   * @param sections - Section records to write; an empty array is a no-op.
+   * @returns Resolves when every batch is written.
+   * @throws Error - Postgres client errors from any batch.
+   */
   async appendSections(sections: readonly RagV2SectionRecord[]): Promise<void> {
     for (let start = 0; start < sections.length; start += INSERT_BATCH_SIZE) {
       const batch = sections.slice(start, start + INSERT_BATCH_SIZE);
@@ -751,6 +1038,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Batch-inserts passages (batches of 128 rows), updating text, lexical
+   * derivative, and state columns on conflict of `passage_id`. The language
+   * distribution is stored as JSONB and `lexicalText` falls back to `text`.
+   * All passages in one call must share the same `workspaceId`.
+   *
+   * @param passages - Passage records to write; an empty array is a no-op.
+   * @returns Resolves when every batch is written.
+   * @throws Error - Postgres client errors from any batch.
+   */
   async appendPassages(passages: readonly RagV2PassageRecord[]): Promise<void> {
     for (let start = 0; start < passages.length; start += INSERT_BATCH_SIZE) {
       const batch = passages.slice(start, start + INSERT_BATCH_SIZE);
@@ -788,6 +1085,21 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Batch-inserts embedding rows (batches of 128 rows) into the
+   * dimension-specific embeddings table, upserting on (signature, level, unit)
+   * and casting vectors to `::vector`; non-finite components are coerced to 0.
+   * Afterwards marks every written unit `embedding_state = 'ready'` in its
+   * owning table. Requires a completed
+   * {@link PostgresRagV2Repository.initialize}.
+   *
+   * @param records - Embedding records to write; an empty array skips the
+   * writes but the vectorizer check still applies.
+   * @param vectorizer - Vectorizer that produced the vectors; its dimension
+   * count must match the initialized one.
+   * @returns Resolves when all rows and state updates are written.
+   * @throws Error - On vectorizer dimension mismatch or Postgres client errors.
+   */
   async putEmbeddings(records: readonly RagV2EmbeddingRecord[], vectorizer: RagV2VectorizerInfo): Promise<void> {
     if (records.length === 0) return;
     if (vectorizer.dimensions !== this.vectorizer?.dimensions) {
@@ -850,6 +1162,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Attempts to satisfy each record by copying an already-stored embedding
+   * with the same vectorizer signature, level, and input content hash into the
+   * target unit, avoiding re-embedding identical content; reused units are
+   * marked `embedding_state = 'ready'`. Returns an empty set when the
+   * vectorizer dimensions differ from the initialized ones (nothing reusable).
+   *
+   * @param records - Candidate records without vectors.
+   * @param vectorizer - Active vectorizer descriptor.
+   * @returns The unit ids whose embeddings were reused.
+   * @throws Error - Postgres client errors from any query.
+   */
   async reuseEmbeddings(
     records: readonly Omit<RagV2EmbeddingRecord, 'vector'>[],
     vectorizer: RagV2VectorizerInfo,
@@ -898,6 +1222,21 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return reused;
   }
 
+  /**
+   * Deletes up to `limit` passage embeddings for a generation, oldest first
+   * (by `created_at`, then unit id), and marks the affected passages
+   * `embedding_state = 'evicted'`. Only rows matching the vectorizer signature
+   * are considered. Returns 0 when the vectorizer dimensions differ from the
+   * initialized ones.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation whose passage embeddings may be evicted.
+   * @param limit - Maximum number of embeddings to delete.
+   * @param vectorizer - Active vectorizer descriptor.
+   * @returns The number of embeddings actually deleted.
+   * @throws Error - Postgres client errors from the delete.
+   */
   async evictPassageEmbeddings(
     workspaceId: string,
     contextId: string,
@@ -937,6 +1276,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Upserts the document record and records its membership in the generation
+   * (path and version id), marking that document's ingestion complete.
+   *
+   * @param generationId - Generation the document belongs to.
+   * @param document - Document record to upsert.
+   * @returns Resolves when both writes complete.
+   * @throws Error - Postgres client errors from the transaction.
+   */
   async finishDocument(generationId: string, document: RagV2DocumentRecord): Promise<void> {
     await this.withWorkspace(document.workspaceId, async client => {
       await this.upsertDocument(client, document);
@@ -958,6 +1306,19 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Recomputes collection rows for a generation from its member documents:
+   * groups by `collection_id`, deletes the generation's existing collection
+   * rows, and inserts fresh ones with hashed content/version ids and
+   * `embedding_state = 'queued'`. Each routing summary aggregates up to 50
+   * member summaries and is truncated to 12,000 characters.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation whose collections are rebuilt.
+   * @returns One record per rebuilt collection (no guaranteed order).
+   * @throws Error - Postgres client errors from the rebuild.
+   */
   async rebuildCollections(
     workspaceId: string,
     contextId: string,
@@ -1028,6 +1389,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Looks up the newest routing summary for a unit by source content hash and
+   * summarizer signature, enabling summary reuse across generations.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the unit.
+   * @param level - Summary level (collection, document, or section).
+   * @param sourceContentSha256 - Content hash the summary was generated from.
+   * @param summarizerSignature - Signature of the summarizing model.
+   * @returns The newest matching summary, or undefined when none exists.
+   * @throws Error - Postgres client errors from the query.
+   */
   async findRoutingSummary(
     workspaceId: string,
     contextId: string,
@@ -1061,6 +1434,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
     } : undefined;
   }
 
+  /**
+   * Upserts a routing summary row and mirrors the summary text onto the owning
+   * unit (collection, document, or section).
+   *
+   * @param summary - Summary record; its `workspaceId` selects the connection
+   * scope.
+   * @returns Resolves when the row and the unit update are written.
+   * @throws Error - Postgres client errors from the writes.
+   */
   async putRoutingSummary(summary: RagV2RoutingSummaryRecord): Promise<void> {
     await this.withWorkspace(summary.workspaceId, async client => {
       await client.query(`
@@ -1084,6 +1466,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     });
   }
 
+  /**
+   * Removes generation membership rows whose path no longer appears among the
+   * job's item paths, aligning a staged generation with what the job actually
+   * processed.
+   *
+   * @param jobId - Ingestion job whose item paths define the surviving set.
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation to reconcile.
+   * @returns The number of membership rows deleted.
+   * @throws Error - Postgres client errors from the delete.
+   */
   async reconcileGeneration(
     jobId: string,
     workspaceId: string,
@@ -1101,6 +1495,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rowCount ?? 0;
   }
 
+  /**
+   * Runs a websearch-to-tsquery full-text search over the level's generated
+   * tsvector columns, selecting the `english`/`german`/`simple` configuration
+   * from `scope.lexicalLanguage`.
+   *
+   * @param level - Level to search (collection, document, section, passage).
+   * @param query - Websearch-syntax query string.
+   * @param scope - Search scope providing authorization, filters, and limit.
+   * @returns Hits ordered by descending ts_rank_cd score; `retrieverRank` is
+   * 1-based in this order and the retriever label is `<level>_lexical`.
+   * @throws Error - Postgres client errors from the query.
+   */
   async lexicalSearch(level: RagV2Level, query: string, scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     const result = await this.withWorkspace(scope.workspaceId, client => client.query<SearchRow>(
       this.searchSql(level, 'lexical', scope.lexicalLanguage),
@@ -1109,6 +1515,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rows.map((row, index) => this.rowToHit(row, `${level}_lexical`, index + 1));
   }
 
+  /**
+   * Finds passages whose text contains any of the given reference substrings
+   * (case-insensitive LIKE; `%`, `_`, and `\` in references are escaped).
+   *
+   * @param references - Literal substrings to match; an empty array returns no
+   * hits.
+   * @param scope - Search scope providing authorization, filters, and limit.
+   * @returns Hits ordered by passage ordinal with a constant score of
+   * max(1, number of references); the retriever label is `exact_reference`.
+   * @throws Error - Postgres client errors from the query.
+   */
   async exactSearch(references: readonly string[], scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     if (references.length === 0) return [];
     const patterns = references.map(value => `%${value.toLocaleLowerCase().replace(/[%_\\]/gu, '\\$&')}%`);
@@ -1142,6 +1559,23 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rows.map((row, index) => this.rowToHit(row, 'exact_reference', index + 1));
   }
 
+  /**
+   * Runs a cosine-distance vector search over the level's embeddings inside a
+   * dedicated transaction that applies the row-level-security settings and a
+   * relaxed HNSW iterative-scan mode (best-effort). In approximate index
+   * modes an oversized recall pool is fetched and re-ranked by exact score
+   * before trimming to `scope.limit`.
+   *
+   * @param level - Level to search (collection, document, section, passage).
+   * @param queryVector - Query embedding; must match the vectorizer's
+   * dimension count or no hits are returned.
+   * @param vectorizer - Active vectorizer descriptor providing the signature.
+   * @param scope - Search scope providing authorization, filters, and limit.
+   * @returns Hits ordered by descending exact cosine score; `retrieverRank`
+   * is 1-based in this order and the retriever label is `<level>_dense`.
+   * @throws Error - Postgres client errors from the transaction; the
+   * transaction is rolled back before rethrowing.
+   */
   async denseSearch(
     level: RagV2Level,
     queryVector: readonly number[],
@@ -1175,6 +1609,20 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Loads the passages of one section that belong to a generation, optionally
+   * restricted to those whose embeddings are not ready (e.g. for
+   * re-embedding).
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the section.
+   * @param generationId - Generation limiting membership.
+   * @param sectionId - Section whose passages are read.
+   * @param onlyMissingEmbeddings - When true, excludes passages with
+   * `embedding_state = 'ready'`.
+   * @returns Passages ordered by ordinal.
+   * @throws Error - Postgres client errors from the query.
+   */
   async passagesForSection(
     workspaceId: string,
     contextId: string,
@@ -1229,6 +1677,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }));
   }
 
+  /**
+   * Reads one document version as a full record, gated by ACL tokens.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the document.
+   * @param documentVersionId - Version to read.
+   * @param authorizationTokens - Tokens of the caller; at least one must
+   * intersect the document's ACL for the row to be visible.
+   * @returns The document record, or undefined when absent or not permitted.
+   * @throws Error - Postgres client errors from the query.
+   */
   async documentVersion(
     workspaceId: string,
     contextId: string,
@@ -1275,6 +1734,25 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return result.rows[0]?.payload;
   }
 
+  /**
+   * Runs a case-insensitive PostgreSQL regex over the text of explicit
+   * document versions inside a read-only transaction with a 2-second statement
+   * timeout, bounding the cost of adversarial patterns.
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the documents.
+   * @param generationId - Generation limiting membership.
+   * @param documentVersionIds - Versions to search.
+   * @param pattern - PostgreSQL regex (case-insensitive) applied to passage
+   * text.
+   * @param authorizationTokens - Tokens of the caller, intersected with each
+   * document's ACL.
+   * @param limit - Maximum number of hits returned.
+   * @returns Hits ordered by document version id then passage ordinal, with
+   * constant score 1; the retriever label is `narrowed_regex`.
+   * @throws Error - Postgres client errors (including statement timeout); the
+   * transaction is rolled back before rethrowing.
+   */
   async grepDocuments(
     workspaceId: string,
     contextId: string,
@@ -1314,10 +1792,27 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Persists the start of a retrieval run (upsert on run id).
+   *
+   * @param run - Retrieval run record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async createRetrievalRun(run: RagV2RetrievalRunRecord): Promise<void> {
     await this.writeRetrievalRun(run);
   }
 
+  /**
+   * Batch-inserts retrieval hits for a run (batches of 128 rows, plain
+   * inserts).
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the run.
+   * @param hits - Stored hits to write; each carries its run id.
+   * @returns Resolves when every batch is written.
+   * @throws Error - Postgres client errors from any batch.
+   */
   async appendRetrievalHits(
     workspaceId: string,
     contextId: string,
@@ -1347,6 +1842,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Batch-inserts evidence rows for a run (batches of 128 rows), replacing the
+   * payload on conflict of (run id, evidence id).
+   *
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the run.
+   * @param runId - Retrieval run the evidence belongs to.
+   * @param evidence - Evidence records to write.
+   * @returns Resolves when every batch is written.
+   * @throws Error - Postgres client errors from any batch.
+   */
   async appendRetrievalEvidence(
     workspaceId: string,
     contextId: string,
@@ -1378,10 +1884,28 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Persists the completion of a retrieval run (upsert on run id).
+   *
+   * @param run - Retrieval run record with final status and timings.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   async finishRetrievalRun(run: RagV2RetrievalRunRecord): Promise<void> {
     await this.writeRetrievalRun(run);
   }
 
+  /**
+   * Upserts an evaluation run (status `succeeded`) and its metrics. Top-level
+   * numeric metrics are stored under category `all`; entries of the
+   * `metrics.byCategory` object are stored under their category. Each metric
+   * row is upserted individually on (run id, metric, category).
+   *
+   * @param input - Evaluation run descriptor; only numeric metric values are
+   * persisted, all others are ignored.
+   * @returns Resolves when the run and all metric rows are written.
+   * @throws Error - Postgres client errors from any write.
+   */
   async saveEvaluationRun(input: {
     id: string;
     workspaceId: string;
@@ -1433,6 +1957,13 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Inserts one regex/grep retrieval audit record.
+   *
+   * @param run - Regex run record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the insert.
+   */
   async saveRegexRun(run: RagV2RegexRunRecord): Promise<void> {
     await this.withWorkspace(run.workspaceId, client => client.query(`
       INSERT INTO ${this.table('regex_runs')} (
@@ -1446,19 +1977,52 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]).then(() => undefined));
   }
 
+  /**
+   * Renders a schema-qualified, quoted table name for the configured schema.
+   *
+   * @param name - Unqualified table name.
+   * @returns The quoted `schema.name` SQL fragment.
+   * @throws Error - When `name` is not a safe SQL identifier.
+   */
   private table(name: string): string {
     return `${this.schemaSql}.${quoteIdentifier(name)}`;
   }
 
+  /**
+   * Returns the cached SQL name of the dimension-specific embeddings table.
+   *
+   * @returns The quoted `schema.unit_embeddings_<dimensions>` fragment.
+   * @throws Error - When called before
+   * {@link PostgresRagV2Repository.initialize}.
+   */
   private getEmbeddingsTable(): string {
     if (!this.embeddingsTableSql) throw new Error('Workspace RAG V2 repository is not initialized.');
     return this.embeddingsTableSql;
   }
 
+  /**
+   * Selects the pool used for DDL and cross-workspace reads: the dedicated
+   * migration pool when configured, otherwise the application pool. The
+   * migration owner bypasses workspace row-level security.
+   *
+   * @returns The pool to run DDL and owner-privileged queries on.
+   * @throws Never.
+   */
   private ddlPool(): PgPool {
     return this.migrationPool ?? this.pool;
   }
 
+  /**
+   * Idempotently creates the schema's tables (publications, documents,
+   * collections, memberships, sections, passages, jobs, summaries, and audit
+   * tables) plus the dimension-specific embeddings table, then backfills the
+   * embeddings' `content_sha256` for legacy rows.
+   *
+   * @param vectorizer - Vectorizer whose dimension count names the embeddings
+   * table.
+   * @returns Resolves when all DDL completes.
+   * @throws Error - Postgres client errors from any DDL statement.
+   */
   private async createTables(vectorizer: RagV2VectorizerInfo): Promise<void> {
     await this.ddlPool().query(`
       CREATE TABLE IF NOT EXISTS ${this.table('publications')} (
@@ -1801,6 +2365,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     await this.ddlPool().query(`ALTER TABLE ${this.getEmbeddingsTable()} ALTER COLUMN content_sha256 SET NOT NULL`);
   }
 
+  /**
+   * Idempotently creates join-supporting B-tree indexes, GIN tsvector indexes,
+   * best-effort trigram indexes, per-level HNSW vector indexes for the
+   * configured index mode, and the unique partial index guaranteeing a single
+   * active publication per context. Trigram and HNSW failures are logged and
+   * skipped, leaving the exact-search lanes available.
+   *
+   * @param vectorizer - Vectorizer whose dimension count parameterizes the
+   * HNSW and content-reuse indexes.
+   * @returns Resolves when all index DDL completes.
+   * @throws Error - Postgres client errors from required index statements.
+   */
   private async createIndexes(vectorizer: RagV2VectorizerInfo): Promise<void> {
     // Generation validation joins sections/passages by document membership alone; without
     // these, every publication on a large corpus degrades to full-table scans.
@@ -1897,6 +2473,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `);
   }
 
+  /**
+   * Applies the versioned schema migrations 1-7 inside a single transaction
+   * serialized by a schema-scoped advisory lock, recording applied versions in
+   * `schema_migrations`.
+   *
+   * @returns Resolves once all pending migrations are applied.
+   * @throws Error - Postgres client errors; the transaction is rolled back
+   * before rethrowing.
+   */
   private async runMigrations(): Promise<void> {
     const client = await this.ddlPool().connect();
     try {
@@ -2149,6 +2734,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Enables row-level security on every table and creates idempotent
+   * workspace-isolation policies comparing `workspace_id` to the
+   * `app.workspace_id` session setting. Policy names and identifiers are
+   * interpolated into DO-block string literals where bind parameters cannot
+   * go, so each is re-validated with {@link quoteIdentifier} at the
+   * interpolation point.
+   *
+   * @returns Resolves when all policies are in place.
+   * @throws Error - When an identifier fails the safety gate, or on Postgres
+   * client errors.
+   */
   private async enableRowSecurity(): Promise<void> {
     for (const name of [
       'publications', 'collections', 'documents', 'publication_documents', 'sections', 'passages',
@@ -2202,6 +2799,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `);
   }
 
+  /**
+   * Grants the application role DML on every table plus schema usage and
+   * sequence access, and enforces role separation: the application role must
+   * differ from the migration owner and must have neither SUPERUSER nor
+   * BYPASSRLS.
+   *
+   * @returns Resolves once the grants are applied; resolves immediately when
+   * no migration pool is configured and role separation is not required.
+   * @throws Error - When role separation is required but unconfigured, when a
+   * role check fails, or on Postgres client errors.
+   */
   private async grantApplicationRole(): Promise<void> {
     const required = process.env['CORTEX_RAG_V2_REQUIRE_SEPARATE_DB_ROLES'] === '1';
     if (!this.migrationPool) {
@@ -2250,6 +2858,20 @@ export class PostgresRagV2Repository implements RagV2Repository {
     );
   }
 
+  /**
+   * Runs `action` on a dedicated pool client inside a transaction with the
+   * row-level-security settings applied (`app.workspace_id`,
+   * `app.principal_id`, `app.group_ids`). Rolls back and rethrows on failure;
+   * the client is always released.
+   *
+   * @typeParam T - Result type of the action.
+   * @param workspaceId - Workspace set for the transaction's RLS checks.
+   * @param action - Callback receiving the transaction client; it must not
+   * commit or roll back the transaction itself.
+   * @returns The action's result once the transaction commits.
+   * @throws Error - Any error thrown by `action` or by Postgres; the
+   * transaction is rolled back first.
+   */
   private async withWorkspace<T>(workspaceId: string, action: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
@@ -2268,6 +2890,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }
   }
 
+  /**
+   * Reports whether garbage collection must be skipped because the context's
+   * most recent ingestion job has not reached a terminal state.
+   *
+   * @param client - Client positioned in the caller's workspace transaction.
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context whose latest job state is checked.
+   * @returns True when a non-terminal job exists for the context.
+   * @throws Error - Postgres client errors from the query.
+   */
   private async gcBlockedWithClient(
     client: PoolClient,
     workspaceId: string,
@@ -2284,6 +2916,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return state !== undefined && !(TERMINAL_JOB_STATES as readonly string[]).includes(state);
   }
 
+  /**
+   * Computes completeness counters for a generation and validates invariants:
+   * a non-empty generation must contain passages, and no passage may have an
+   * inverted byte/line range or a non-ready lexical state.
+   *
+   * @param client - Client positioned in the caller's workspace transaction.
+   * @param workspaceId - Workspace owning the context.
+   * @param contextId - Context of the generation.
+   * @param generationId - Generation to validate.
+   * @returns Counts plus an `errors` list (`valid` is true only when empty).
+   * @throws Error - Postgres client errors from the queries.
+   */
   private async validateGenerationWithClient(
     client: PoolClient,
     workspaceId: string,
@@ -2332,6 +2976,14 @@ export class PostgresRagV2Repository implements RagV2Repository {
     };
   }
 
+  /**
+   * Upserts an ingestion job row, storing the full job record as its JSONB
+   * payload.
+   *
+   * @param job - Job record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the upsert.
+   */
   private async writeJob(job: RagV2Job): Promise<void> {
     await this.withWorkspace(job.workspaceId, client => client.query(`
       INSERT INTO ${this.table('ingestion_jobs')} (
@@ -2345,6 +2997,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]).then(() => undefined));
   }
 
+  /**
+   * Inserts or updates a document row. On conflict of `document_version_id`,
+   * mutable metadata is overwritten while existing source ids are preserved
+   * when the incoming ones are absent.
+   *
+   * @param client - Client positioned in the caller's workspace transaction.
+   * @param document - Document record to write.
+   * @returns Resolves when the row is written.
+   * @throws Error - Postgres client errors from the statement.
+   */
   private async upsertDocument(client: PoolClient, document: RagV2DocumentRecord): Promise<void> {
     await client.query(`
       INSERT INTO ${this.table('documents')} (
@@ -2379,6 +3041,24 @@ export class PostgresRagV2Repository implements RagV2Repository {
     ]);
   }
 
+  /**
+   * Builds the positional bind array shared by the search SQL templates:
+   * $1 workspace, $2 context, $3 generation, $4 query text or vector literal,
+   * $5 document ids, $6 section ids, $7 authorization tokens (defaulting to
+   * `workspace:<id>`), $8 result limit, $9 vectorizer signature (null for
+   * lexical), $10 document types, $11 jurisdictions, $12 as-of date, and
+   * $13 collection ids. In approximate index modes the limit is scaled 4x
+   * (capped at 10,000) so the re-ranking pass can trim.
+   *
+   * @param scope - Search scope with filters and limit.
+   * @param queryOrVector - Lexical query text or the `vector` literal of the
+   * query embedding.
+   * @param signature - Vectorizer signature for dense search; omit for
+   * lexical search.
+   * @returns Bind values aligned with {@link PostgresRagV2Repository.searchSql}
+   * and the exact-search SQL.
+   * @throws Never.
+   */
   private searchParameters(
     scope: RagV2SearchScope,
     queryOrVector: string,
@@ -2404,6 +3084,21 @@ export class PostgresRagV2Repository implements RagV2Repository {
     return values;
   }
 
+  /**
+   * Composes the lexical or dense search SQL for document, section, or passage
+   * levels on top of the common SELECT fragments. The tsquery configuration
+   * (`english`/`german`/`simple`, from `lexicalLanguage`) is embedded as a
+   * literal from a fixed set; all variable input flows through bind
+   * parameters. The dense variant orders by exact or approximate cosine
+   * distance according to the configured vector index mode.
+   *
+   * @param level - Level to search.
+   * @param kind - `lexical` (full-text) or `dense` (vector).
+   * @param lexicalLanguage - Language selecting the tsvector column and
+   * tsquery configuration; defaults to `simple`.
+   * @returns The SQL text with placeholders $1-$13.
+   * @throws Error - For dense search when the repository is not initialized.
+   */
   private searchSql(
     level: RagV2Level,
     kind: 'lexical' | 'dense',
@@ -2496,6 +3191,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Composes collection-level search SQL. Authorization requires at least one
+   * member document that passes the scope's filters; self-comparison
+   * placeholders ($6/$9) keep parameter positions aligned with the shared
+   * bind array built by {@link PostgresRagV2Repository.searchParameters}.
+   *
+   * @param kind - `lexical` (full-text) or `dense` (vector).
+   * @param lexicalLanguage - Language selecting the tsvector column and
+   * tsquery configuration; defaults to `simple`.
+   * @returns The SQL text with placeholders $1-$13.
+   * @throws Error - For dense search when the repository is not initialized.
+   */
   private collectionSearchSql(kind: 'lexical' | 'dense', lexicalLanguage?: string): string {
     const authorization = `
       EXISTS (
@@ -2557,6 +3264,15 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Builds the shared collection SELECT fragment (column aliases matching
+   * {@link SearchRow}) with the caller's score expression embedded.
+   *
+   * @param score - Trusted score SQL expression built by this module, never
+   * user input.
+   * @returns A `SELECT ... FROM <collections> c` fragment.
+   * @throws Never.
+   */
   private commonCollectionSelect(score: string): string {
     return `
       SELECT 'collection'::text AS level, c.collection_version_id AS id,
@@ -2572,6 +3288,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Builds the shared document-level SELECT fragment (column aliases matching
+   * {@link SearchRow}) joined through generation membership, with the caller's
+   * score expression embedded.
+   *
+   * @param score - Trusted score SQL expression built by this module, never
+   * user input.
+   * @returns A `SELECT ... FROM <publication_documents>/<documents>` fragment.
+   * @throws Never.
+   */
   private commonDocumentSelect(score: string): string {
     return `
       SELECT 'document'::text AS level, d.document_version_id AS id,
@@ -2587,6 +3313,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Builds the shared section-level SELECT fragment (column aliases matching
+   * {@link SearchRow}) joined through generation membership, with the caller's
+   * score expression embedded.
+   *
+   * @param score - Trusted score SQL expression built by this module, never
+   * user input.
+   * @returns A `SELECT ... FROM <publication_documents>/<documents>/<sections>`
+   * fragment.
+   * @throws Never.
+   */
   private commonSectionSelect(score: string): string {
     return `
       SELECT 'section'::text AS level, s.section_id AS id,
@@ -2601,6 +3338,17 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Builds the shared passage-level SELECT fragment (column aliases matching
+   * {@link SearchRow}) joined through generation membership, with the caller's
+   * score expression embedded.
+   *
+   * @param score - Trusted score SQL expression built by this module, never
+   * user input.
+   * @returns A `SELECT ... FROM <publication_documents>/<documents>/<passages>`
+   * fragment.
+   * @throws Never.
+   */
   private commonPassageSelect(score: string): string {
     return `
       SELECT 'passage'::text AS level, p.passage_id AS id,
@@ -2615,6 +3363,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     `;
   }
 
+  /**
+   * Maps one raw search row to a ranked hit, copying optional range and source
+   * fields only when present and synthesizing a single retrieval reason.
+   *
+   * @param row - Raw row returned by a search query.
+   * @param retriever - Retriever label recorded on the hit.
+   * @param retrieverRank - 1-based rank of the hit within its retriever.
+   * @returns The mapped hit.
+   * @throws Never.
+   */
   private rowToHit(row: SearchRow, retriever: string, retrieverRank: number): RagV2RankedHit {
     return {
       level: row.level,
@@ -2645,6 +3403,16 @@ export class PostgresRagV2Repository implements RagV2Repository {
     };
   }
 
+  /**
+   * Upserts a retrieval run row and, for `running` runs, re-derives the query
+   * variants from the plan JSON (the original query plus lexical expansions),
+   * storing each with a SHA-256 query hash. Variant inserts are no-ops on
+   * conflict.
+   *
+   * @param run - Retrieval run record to write.
+   * @returns Resolves when the run row and its variants are written.
+   * @throws Error - Postgres client errors from any write.
+   */
   private async writeRetrievalRun(run: RagV2RetrievalRunRecord): Promise<void> {
     await this.withWorkspace(run.workspaceId, async client => {
       await client.query(`

@@ -13,6 +13,7 @@ export const DEFAULT_OUTPUT_LIMITS: Required<ToolOutputLimits> = {
   maxLines: 2000,
 };
 
+/** Result of applying the output policy to one tool result, with truncation metadata. */
 export interface TruncationOutcome {
   result: unknown;
   truncated: boolean;
@@ -20,12 +21,31 @@ export interface TruncationOutcome {
   savedTo?: string;
 }
 
+/**
+ * Render a tool result as text for size measurement and previews: strings pass through
+ * unchanged; anything else is pretty-printed as JSON, falling back to `String()` for values
+ * that cannot be serialized.
+ *
+ * @param result - The tool result to render.
+ * @returns The text form of the result.
+ * @throws Never.
+ */
 function serialize(result: unknown): string {
   if (typeof result === 'string') return result;
   try { return JSON.stringify(result, null, 2) ?? String(result); }
   catch { return String(result); }
 }
 
+/**
+ * Persist an oversized full output to the file store so truncated model context can point at it.
+ * The text is chunked into 64 KiB slices for streaming upload.
+ *
+ * @param files - File store to write the temporary file into.
+ * @param name - Logical file name (session/tool) for the stored output.
+ * @param text - The full output text to persist.
+ * @returns The stored file's name (or id), or undefined when the store write fails.
+ * @throws Never - Storage failures are swallowed and reported as undefined.
+ */
 async function saveFullOutput(
   files: FileStore,
   name: string,
@@ -34,6 +54,12 @@ async function saveFullOutput(
   try {
     const encoder = new TextEncoder();
     const bytes = encoder.encode(text);
+    /**
+     * Yield the encoded text as ordered 64 KiB byte slices.
+     *
+     * @returns A byte-chunk stream covering the whole text, in order.
+     * @throws Never.
+     */
     async function* chunks(): AsyncIterable<Uint8Array> {
       const size = 64 * 1024;
       for (let i = 0; i < bytes.length; i += size) {
@@ -52,6 +78,18 @@ async function saveFullOutput(
  * and byte count with a head/tail preview plus an explicit re-read hint; structured results whose
  * serialization overflows the byte cap are replaced with a truncated envelope that preserves a
  * preview and, when a FileStore is available, points at the full persisted output.
+ *
+ * @param result - The raw tool result; strings, primitives, objects, null, and undefined are
+ *                 all accepted.
+ * @param limits - Caps to apply; undefined falls back to {@link DEFAULT_OUTPUT_LIMITS}
+ *                 (51200 bytes, 2000 lines).
+ * @param files - Optional file store used to persist the full output when truncation occurs.
+ * @param saveName - Logical name (session/tool) for the persisted full output; saving happens
+ *                   only when both `files` and `saveName` are provided.
+ * @returns The (possibly replaced) result, whether truncation occurred, the serialized size in
+ *           bytes when truncated, and the saved file reference when one was written. The input
+ *           value is never mutated.
+ * @throws Never - Serialization and storage failures degrade to previews or undefined.
  */
 export async function truncateToolResult(
   result: unknown,

@@ -9,6 +9,11 @@ import type {
   RagV2SectionRecord,
 } from './types.js';
 
+/**
+ * One physical line emitted by the streaming line reader, with its byte and
+ * line positions in the source file. Overlong lines arrive in consecutive
+ * segments flagged with `completesLine: false`.
+ */
 interface RawLine {
   raw: Buffer;
   text: string;
@@ -18,6 +23,10 @@ interface RawLine {
   completesLine: boolean;
 }
 
+/**
+ * A raw structural block (heading, paragraph, code fence, table, front
+ * matter) assembled from consecutive lines, with byte and line extents.
+ */
 interface RawUnit {
   raw: Buffer;
   text: string;
@@ -69,6 +78,12 @@ export interface RagV2ParserSink {
    * @param passage - The passage record.
    */
   onPassage(passage: RagV2PassageRecord): Promise<void>;
+  /**
+   * Called periodically with the parse's current line/byte progress, awaited
+   * before the line is processed.
+   * @param line - 1-based line number just reached.
+   * @param byteOffset - Byte offset of that line's start in the source file.
+   */
   onLineCheckpoint?(line: number, byteOffset: number): Promise<void>;
 }
 
@@ -92,19 +107,51 @@ const TABLE_OF_CONTENTS_LIMIT = 10_000;
 const ROUTING_SUMMARY_CHARS = 4_000;
 const SECTION_SUMMARY_CHARS = 2_000;
 
+/**
+ * Computes the SHA-256 hex digest of a string or buffer.
+ * @param value - Content to hash.
+ * @returns Lowercase hex digest (64 characters).
+ * @throws Never.
+ */
 function digest(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * Derives a deterministic, collision-resistant identifier by hashing the
+ * namespace and value; the fixed version/variant nibbles give the result the
+ * shape of a UUID without any randomness.
+ * @param namespace - Domain prefix mixed into the hash (e.g. a document
+ *   version id), separating id spaces.
+ * @param value - Value to identify (e.g. a structural key plus ordinal).
+ * @returns UUID-formatted id derived from the SHA-256 digest.
+ * @throws Never.
+ */
 function stableId(namespace: string, value: string): string {
   const hex = digest(`${namespace}\0${value}`);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+/**
+ * Estimates the token count of a text at roughly four characters per token.
+ * @param text - Text to measure, in characters.
+ * @returns Estimated token count; never below 1.
+ * @throws Never.
+ */
 function tokenEstimate(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
+/**
+ * Detects whether a block of text is a heading and classifies its level.
+ * Recognizes ATX (`#`) and Setext (`=`/`-`) Markdown headings, legal clause
+ * headings (article/section/§/rozdział/…), and numbered headings like
+ * `1.2.3`.
+ * @param text - Candidate text; may span two lines for Setext headings.
+ * @returns Heading level (1-6) and cleaned heading text, or undefined when
+ *   the text is not a heading.
+ * @throws Never.
+ */
 function headingMatch(text: string): { level: number; text: string } | undefined {
   const setext = /^([^\r\n]+)\r?\n(=+|-+)[ \t]*(?:\r?\n)?$/u.exec(text);
   if (setext) return { level: setext[2]![0] === '=' ? 1 : 2, text: setext[1]!.trim() };
@@ -117,6 +164,13 @@ function headingMatch(text: string): { level: number; text: string } | undefined
   return undefined;
 }
 
+/**
+ * Classifies a unit by its first line.
+ * @param lines - The lines composing the unit.
+ * @returns One of `code`, `quote`, `list`, `table`, `front_matter`,
+ *   `horizontal_rule`, or `paragraph`.
+ * @throws Never.
+ */
 function unitType(lines: readonly RawLine[]): string {
   const first = lines[0]?.text.trim() ?? '';
   if (/^```|^~~~/u.test(first)) return 'code';
@@ -128,6 +182,13 @@ function unitType(lines: readonly RawLine[]): string {
   return 'paragraph';
 }
 
+/**
+ * Trims surrounding whitespace and removes one layer of matching single or
+ * double quotes.
+ * @param value - Raw front-matter value.
+ * @returns The unquoted, trimmed value.
+ * @throws Never.
+ */
 function unquote(value: string): string {
   const trimmed = value.trim();
   if (
@@ -137,6 +198,13 @@ function unquote(value: string): string {
   return trimmed;
 }
 
+/**
+ * Validates and normalizes a front-matter date value.
+ * @param value - Raw value; may be undefined or quoted.
+ * @returns The unquoted value when it matches an ISO `YYYY-MM-DD` (optionally
+ *   with time/offset) and parses as a date; otherwise undefined.
+ * @throws Never.
+ */
 function parseDate(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const candidate = unquote(value);
@@ -145,6 +213,17 @@ function parseDate(value: string | undefined): string | undefined {
   return candidate;
 }
 
+/**
+ * Parses a YAML-like front-matter block into document metadata. Recognizes
+ * scalar keys and inline or block lists, with several alias spellings per
+ * field (e.g. `book_id`/`series_id` for `collectionId`); unknown keys are
+ * ignored.
+ * @param text - The full front-matter block including both `---` fences; the
+ *   first and last lines are skipped.
+ * @returns Extracted metadata; absent optional fields are omitted and
+ *   `parties` defaults to an empty array.
+ * @throws Never.
+ */
 function parseFrontMatter(text: string): RagV2ParsedMetadata {
   const scalar = new Map<string, string>();
   const lists = new Map<string, string[]>();
@@ -204,10 +283,30 @@ function parseFrontMatter(text: string): RagV2ParsedMetadata {
   };
 }
 
+/**
+ * Joins the raw bytes of a unit's lines, returning the single buffer directly
+ * when there is only one line.
+ * @param lines - Non-empty line list.
+ * @returns Concatenated raw bytes of all lines.
+ * @throws Never.
+ */
 function concatenateRaw(lines: readonly RawLine[]): Buffer {
   return lines.length === 1 ? lines[0]!.raw : Buffer.concat(lines.map(line => line.raw));
 }
 
+/**
+ * Reads a file as newline-delimited lines without loading it fully into
+ * memory. Lines longer than the buffering budget are split into consecutive
+ * segments flagged with `completesLine: false`, cutting only on complete
+ * UTF-8 sequences.
+ * @param filePath - File to read.
+ * @param maxBufferedBytes - Overall buffering budget in bytes; scales the
+ *   read chunk size and the maximum line segment size.
+ * @returns Yields {@link RawLine} records in file order with absolute byte
+ *   offsets and 1-based line numbers, including a final unterminated line if
+ *   present.
+ * @throws Error - if the file cannot be opened or the stream fails.
+ */
 async function* streamLines(filePath: string, maxBufferedBytes: number): AsyncGenerator<RawLine> {
   const highWaterMark = Math.max(64 * 1024, Math.min(1024 * 1024, Math.floor(maxBufferedBytes / 4)));
   const maxLineSegment = Math.max(64 * 1024, Math.floor(maxBufferedBytes / 4));
@@ -278,6 +377,21 @@ async function* streamLines(filePath: string, maxBufferedBytes: number): AsyncGe
   }
 }
 
+/**
+ * Groups streamed lines into structural units. Headings become standalone
+ * units; fenced code and front matter stay together; other content is cut on
+ * blank lines or when buffered bytes reach a quarter of the budget. Line
+ * checkpoints are reported at the first line and every `lineIndexStride`
+ * lines thereafter.
+ * @param filePath - File to read.
+ * @param maxBufferedBytes - Buffering budget in bytes passed through to
+ *   {@link streamLines}; also sets the unit flush threshold.
+ * @param lineIndexStride - Interval in lines between checkpoint callbacks.
+ * @param onLineCheckpoint - Optional async callback invoked with the 1-based
+ *   line number and byte offset at each checkpoint.
+ * @returns Yields {@link RawUnit} records in file order.
+ * @throws Error - if reading the file fails or a checkpoint callback rejects.
+ */
 async function* streamUnits(
   filePath: string,
   maxBufferedBytes: number,
@@ -290,6 +404,11 @@ async function* streamUnits(
   let frontMatter = false;
   let bufferedBytes = 0;
 
+  /**
+   * Joins the buffered lines into one unit and resets the buffer.
+   * @returns The completed unit, or undefined when nothing is buffered.
+   * @throws Never.
+   */
   const flush = (): RawUnit | undefined => {
     if (lines.length === 0) return undefined;
     const raw = concatenateRaw(lines);
@@ -364,6 +483,17 @@ async function* streamUnits(
   if (pending) yield pending;
 }
 
+/**
+ * Splits an oversized unit into byte-bounded parts no larger than
+ * `hardMaxTokens * 4` bytes (minimum 1024), cutting only on complete UTF-8
+ * sequences and tracking line offsets. Later parts of a split table carry the
+ * table's first two lines as a `lexicalPrefix`.
+ * @param unit - The unit to split; returned unchanged when within budget.
+ * @param hardMaxTokens - Hard per-passage token limit, converted to bytes at
+ *   four bytes per token.
+ * @returns One or more parts covering the unit's full byte range in order.
+ * @throws Never.
+ */
 function splitUnit(unit: RawUnit, hardMaxTokens: number): RawUnit[] {
   const maxBytes = Math.max(1024, hardMaxTokens * 4);
   if (unit.raw.length <= maxBytes) return [unit];
@@ -403,8 +533,11 @@ function splitUnit(unit: RawUnit, hardMaxTokens: number): RawUnit[] {
  * @param identity - Identity stamped onto generated records.
  * @param policy - Passage sizing and buffering limits.
  * @param sink - Receiver for sections/passages (and optional checkpoints).
- * @param signal - Abort signal cancelling the parse.
+ * @param signal - Abort signal cancelling the parse; when omitted the parse
+ *   runs to completion.
  * @returns Parse statistics and extracted metadata.
+ * @throws Whatever `signal.reason` holds once the signal is aborted (an
+ *   `Error` is used when no reason is set), or the first sink rejection.
  */
 export async function parseMarkdownStream(
   filePath: string,
@@ -446,6 +579,16 @@ export async function parseMarkdownStream(
   let passageTokens = 0;
   let previousPassage: RagV2PassageRecord | undefined;
 
+  /**
+   * Starts a new section keyed by the current heading path and type, with a
+   * per-path ordinal keeping ids stable across re-parses.
+   * @param unit - The unit opening the section; supplies its start position.
+   * @param type - Structural type of the section.
+   * @param text - Heading text used as the section's title.
+   * @returns Nothing; `section`, `sectionCount`, and `headingOrdinals` are
+   *   updated in place.
+   * @throws Never.
+   */
   const openSection = (unit: RawUnit, type: string, text: string): void => {
     const structuralKey = `${headingPath.join(' > ')}\0${type}`;
     const samePathOrdinal = (headingOrdinals.get(structuralKey) ?? 0) + 1;
@@ -468,16 +611,39 @@ export async function parseMarkdownStream(
     sectionCount++;
   };
 
+  /**
+   * Opens a document-root section when none is open, so content before the
+   * first heading is still captured.
+   * @param unit - The unit about to be consumed.
+   * @returns Nothing.
+   * @throws Never.
+   */
   const ensureSection = (unit: RawUnit): void => {
     if (!section) openSection(unit, 'document_root', title);
   };
 
+  /**
+   * Delivers the held-back previous passage to the sink, linking it forward
+   * to `nextPassageId` when supplied. Passages are held back one step so each
+   * is emitted only once its successor's id is known.
+   * @param nextPassageId - Passage id of the following passage, when known.
+   * @returns A promise resolving once the sink has processed the passage.
+   * @throws Error - if the sink's `onPassage` rejects.
+   */
   const emitPreviousPassage = async (nextPassageId?: string): Promise<void> => {
     if (!previousPassage) return;
     await sink.onPassage(nextPassageId ? { ...previousPassage, nextPassageId } : previousPassage);
     previousPassage = undefined;
   };
 
+  /**
+   * Builds a {@link RagV2PassageRecord} from the buffered units (concatenating
+   * lexical prefixes for split tables), detects its language, updates section
+   * and document language/token totals and rolling summaries, and holds it as
+   * `previousPassage` until the next passage is built.
+   * @returns A promise resolving once the previous passage has been emitted.
+   * @throws Error - if the sink's `onPassage` rejects.
+   */
   const flushPassage = async (): Promise<void> => {
     if (passageUnits.length === 0 || !section) return;
     const raw = passageUnits.length === 1
@@ -535,6 +701,12 @@ export async function parseMarkdownStream(
     passageTokens = 0;
   };
 
+  /**
+   * Flushes the open passage and emits the open section with its content
+   * hash, token total, dominant language, and routing summary.
+   * @returns A promise resolving once the sink has processed the section.
+   * @throws Error - if the sink's `onSection` or `onPassage` rejects.
+   */
   const closeSection = async (): Promise<void> => {
     await flushPassage();
     if (!section) return;

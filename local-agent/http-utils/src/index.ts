@@ -175,6 +175,14 @@ export function assertSharedToken(request: IncomingMessage, token: string | unde
   }
 }
 
+/**
+ * Checks whether a Host header names the loopback origin. Accepts bare
+ * `localhost`, `127.0.0.1`, or `[::1]`, each with an optional port (the IPv6
+ * form is matched including its brackets, before port splitting).
+ *
+ * @param hostHeader - The raw `Host` header value.
+ * @returns True if the host part is one of the loopback names.
+ */
 function isLoopbackHost(hostHeader: string): boolean {
   const host = hostHeader.trim().toLowerCase();
   const name = host.startsWith("[")
@@ -183,6 +191,14 @@ function isLoopbackHost(hostHeader: string): boolean {
   return name === "localhost" || name === "127.0.0.1" || name === "[::1]";
 }
 
+/**
+ * Compares a presented token against the expected token in constant time, so
+ * token probing cannot be timed. Lengths must match for `timingSafeEqual`.
+ *
+ * @param presented - Token from the request header.
+ * @param expected - Configured shared secret.
+ * @returns True only on an exact byte-for-byte match.
+ */
 function tokensEqual(presented: string, expected: string): boolean {
   const a = Buffer.from(presented, "utf8");
   const b = Buffer.from(expected, "utf8");

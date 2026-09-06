@@ -43,6 +43,10 @@ const RANKER_SYSTEM =
   '\n' +
   'Do not include any prose outside the JSON object. Do not wrap it in code fences.';
 
+/**
+ * The expected shape of the ranker model's JSON reply: one score row per candidate skill, each
+ * with the exact skill name, an integer 0-100, and a one-line rationale.
+ */
 interface RankerCallResponse {
   scores: { skill: string; score: number; why: string }[];
 }
@@ -51,13 +55,28 @@ interface RankerCallResponse {
  *  defend against pathological pastes. */
 const FACT_MAX_CHARS = 2000;
 
+/**
+ * Trim a fact to a sensible size before showing it to the model. Facts are short by nature, but
+ * this defends against pathological pastes.
+ * @param text The raw fact text.
+ * @returns `text` unchanged when it is at most {@link FACT_MAX_CHARS} characters; otherwise the
+ *          first and last halves of the budget joined by `...` (middle elision keeps both the
+ *          opening and the conclusion of the fact visible).
+ * @throws Never.
+ */
 function clipFact(text: string): string {
   if (text.length <= FACT_MAX_CHARS) return text;
   const half = Math.floor((FACT_MAX_CHARS - 3) / 2);
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
-/** Render the candidate roster as a stable, line-oriented block. Order matches input order. */
+/**
+ * Render the candidate roster as a stable, line-oriented block. Order matches input order.
+ * @param candidates The skill metadata views to render.
+ * @returns One `- name / summary / entities / tags` entry per candidate; the `entities` and
+ *          `tags` lines are omitted for candidates that have none.
+ * @throws Never.
+ */
 function renderCandidates(candidates: readonly SkillCandidate[]): string {
   return candidates
     .map(c => {
@@ -68,13 +87,29 @@ function renderCandidates(candidates: readonly SkillCandidate[]): string {
     .join('\n');
 }
 
-/** Extract the first balanced {…} block from a model reply. Tolerates trailing prose or code-fence
- *  noise the prompt told it not to add. */
+/**
+ * Extract the first balanced {…} block from a model reply. Tolerates trailing prose or code-fence
+ * noise the prompt told it not to add. The match is greedy, so the substring spans from the first
+ * `{` to the last `}` in the reply.
+ * @param text The full model reply text.
+ * @returns The brace-delimited substring, or `undefined` if the reply contains no braces.
+ * @throws Never.
+ */
 function extractJsonObject(text: string): string | undefined {
   const m = text.match(/\{[\s\S]*\}/);
   return m ? m[0] : undefined;
 }
 
+/**
+ * Validates and parses a model reply into a {@link RankerCallResponse}. Requires a `scores` array
+ * whose rows each carry a string `skill` and a finite numeric `score`; a missing or non-string
+ * `why` is coerced to `''`. Any structural deviation rejects the whole reply rather than being
+ * partially accepted.
+ * @param raw The full model reply text.
+ * @returns The parsed response, or `undefined` if no JSON block is present or it fails
+ *          structural validation.
+ * @throws Never.
+ */
 function parseRankerResponse(raw: string): RankerCallResponse | undefined {
   const block = extractJsonObject(raw);
   if (block === undefined) return undefined;
@@ -95,17 +130,28 @@ function parseRankerResponse(raw: string): RankerCallResponse | undefined {
   return { scores: out };
 }
 
-/** Construct an LLM-backed ranker bound to a configured provider name. The provider must already
- *  exist in matbot.yaml; if it does not, calls error out at use time (the standard pattern). */
 /**
  * Constructs an LLM-backed ranker bound to a configured provider name.
  * @param services The matbot machine (used for `singleTurn`).
- * @param provider Provider key the ranking prompts are sent to.
+ * @param provider Provider key the ranking prompts are sent to. Must already exist in
+ *                 matbot.yaml; if it does not, calls error out at use time (the standard pattern).
  * @returns A {@link Ranker} that scores each fact against all candidates in
  *          parallel and degrades to zero scores (never throws) on per-fact failure.
  */
 export function createLlmRanker(services: MatbotMachine, provider: string): Ranker {
   return {
+    /**
+     * Scores every fact against every candidate in parallel (one `singleTurn` call per fact).
+     * Per-fact failures — transport error, abort, unparseable reply — degrade to all-zero scores
+     * for that fact and are logged, never thrown. Model-reported scores are rounded, clamped to
+     * [0, 1], and scaled down by 100; entries naming unknown skills are dropped.
+     * @param facts The facts to score.
+     * @param candidates The candidate skill metadata views.
+     * @param signal Cancellation signal forwarded to every provider call.
+     * @returns A flat array grouped per fact in input order, candidates in input order within
+     *          each fact's group, so every (fact, candidate) pair has an explicit Score; empty
+     *          when either input is empty.
+     */
     async rank(
       facts:      readonly RememberedFact[],
       candidates: readonly SkillCandidate[],
@@ -162,7 +208,13 @@ export function createLlmRanker(services: MatbotMachine, provider: string): Rank
   };
 }
 
-/** Score-zero every candidate for a fact whose call failed; keeps the pipeline's grid complete. */
+/**
+ * Score-zero every candidate for a fact whose call failed; keeps the pipeline's grid complete.
+ * @param factId Id of the fact whose scoring failed.
+ * @param candidates Candidate roster to emit zero rows for.
+ * @returns One zero {@link Score} per candidate, in candidate input order, with empty reasoning.
+ * @throws Never.
+ */
 function zeros(factId: string, candidates: readonly SkillCandidate[]): Score[] {
   return candidates.map(c => ({ factId, skill: c.name, score: 0, reasoning: '' }));
 }

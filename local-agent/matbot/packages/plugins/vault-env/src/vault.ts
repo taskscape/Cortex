@@ -24,10 +24,17 @@ export class EnvFileVault extends VaultImpl {
     }
     /**
      * Store a secret in memory and append/update it in the .env file so it survives restarts.
+     * Writes are serialized through an internal queue, and the file update is atomic
+     * (temp file + rename, mode 0600): the key must be a valid dotenv identifier and the
+     * value single-line; an existing line for the key is replaced.
+     *
      * @param name Secret key name.
      * @param value Secret value to persist.
      * @returns Resolves when the in-memory write and the .env update complete.
-     * @exception Error When reading or writing the .env file fails.
+     * @throws Error When the name is not a valid dotenv key, the value contains a
+     *   newline, or reading/writing the .env file fails.
+     * @throws NodeJS system errors (e.g. from `rename`/`rm`) when the atomic file
+     *   update fails; the in-memory write is not performed in that case.
      */
     override async writeSecret(name: string, value: string): Promise<void> {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || /[\r\n]/.test(value))

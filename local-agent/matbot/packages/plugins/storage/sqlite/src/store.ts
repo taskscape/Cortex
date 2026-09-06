@@ -2,10 +2,24 @@ import { DatabaseSync } from 'node:sqlite';
 import type { Store, StoreQuery, QueryResult, CASResult } from '@matatbread/matbot-plugin-api';
 import { executeQuery } from '@matatbread/matbot-storage-base';
 
+/**
+ * A {@link Store} persisting documents as rows of one table per namespace in a
+ * shared SQLite database (`<namespace>_store`, with id/version/JSON-doc
+ * columns). Writes go through synchronous `node:sqlite` calls; `cas` and the
+ * version-checked `delete` run inside `BEGIN IMMEDIATE` transactions, so their
+ * read-check-write sequences are atomic with respect to other connections.
+ */
 export class SQLiteStore<T extends { id: string; version: string }> implements Store<T> {
   private readonly db:    DatabaseSync;
   private readonly table: string;
 
+  /**
+   * Creates the store and its table if absent. The table name derives from the
+   * namespace with every non-alphanumeric character replaced by `_`.
+   * @param db - Shared SQLite connection.
+   * @param namespace - Namespace, mapped to table `<sanitised>_store`.
+   * @throws Propagates SQLite errors from table creation.
+   */
   constructor(db: DatabaseSync, namespace: string) {
     this.db    = db;
     this.table = `${namespace.replace(/[^a-zA-Z0-9]/g, '_')}_store`;
@@ -20,12 +34,20 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
    * Reads the document stored under `id`.
    * @param id - Record identifier.
    * @returns The parsed document, or null when absent.
+   * @throws Propagates SQLite errors or JSON parse errors from a corrupt row.
    */
   async get(id: string): Promise<T | null> {
     const row = this.db.prepare(`SELECT doc FROM "${this.table}" WHERE id = ?`).get(id) as unknown as { doc: string } | undefined;
     return row !== undefined ? JSON.parse(row.doc) as T : null;
   }
 
+  /**
+   * Unconditionally writes a document (`INSERT OR REPLACE`).
+   * @param id - Record identifier.
+   * @param value - Document to persist.
+   * @returns Resolves once the row is written.
+   * @throws Propagates SQLite errors from the write.
+   */
   async set(id: string, value: T): Promise<void> {
     this.db.prepare(`INSERT OR REPLACE INTO "${this.table}" (id, version, doc) VALUES (?, ?, ?)`)
       .run(id, value.version, JSON.stringify(value));
@@ -35,9 +57,6 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
    * Import legacy records without overwriting newer rows already present in SQLite.
    * The transaction turns a filesystem migration from one fsync per record into one
    * commit per chunk while remaining safely resumable after an interrupted startup.
-   */
-  /**
-   * Inserts records only when their id is not already present.
    * @param values - Records to import.
    * @returns Number of records actually inserted.
    * @throws Re-throws SQLite errors after rolling back the transaction.
@@ -115,6 +134,17 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
     }
   }
 
+  /**
+   * Compare-and-swap write inside a `BEGIN IMMEDIATE` transaction: reads the
+   * stored version, writes only on a match, and rolls back otherwise — so the
+   * read-check-write is atomic with respect to other connections.
+   * @param id - Record identifier.
+   * @param expected - Version the caller believes is current.
+   * @param next - Replacement document (stored with its own `version`).
+   * @returns `{ ok: true, doc: next }` on success, otherwise
+   *   `{ ok: false, current }` with the stored document (null when absent).
+   * @throws Re-throws SQLite errors after rolling back the transaction.
+   */
   async cas(id: string, expected: string, next: T): Promise<CASResult<T>> {
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -134,6 +164,17 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
     }
   }
 
+  /**
+   * Deletes a row, optionally gated on a version check. With `expectedVersion`
+   * the check and the delete run inside one transaction; without it the delete
+   * is unconditional.
+   * @param id - Record identifier.
+   * @param expectedVersion - When given, delete only if the stored version
+   *   matches.
+   * @returns True when a row was deleted, false on absence or version
+   *   mismatch.
+   * @throws Re-throws SQLite errors after rolling back the transaction.
+   */
   async delete(id: string, expectedVersion?: string): Promise<boolean> {
     if (expectedVersion !== undefined) {
       this.db.exec('BEGIN IMMEDIATE');
@@ -160,6 +201,7 @@ export class SQLiteStore<T extends { id: string; version: string }> implements S
    * query engine.
    * @param q - The store query to execute.
    * @returns Matching items plus the total count before pagination.
+   * @throws Propagates SQLite errors or JSON parse errors from a corrupt row.
    */
   async query(q: StoreQuery): Promise<QueryResult<T>> {
     const rows = this.db.prepare(`SELECT doc FROM "${this.table}"`).all() as unknown as Array<{ doc: string }>;
