@@ -6,6 +6,8 @@ import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
 import type { MatbotPluginSpec, ProviderConfig } from '@matatbread/matbot-plugin-api';
 import { pluginTool } from './plugin.js';
 import { createProviderTool } from './provider.js';
+import { createOpenRouterTool } from './openrouter.js';
+import { registerOpenRouterProfileConfiguration } from './openrouter-configuration.js';
 declare module '@matatbread/matbot-plugin-api' {
     interface MatbotServices {
         readonly RuntimeAdminConfig?: {
@@ -35,6 +37,7 @@ export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION,
         if (!config)
             throw new Error('runtime-admin requires host provider persistence');
         registerModelConfiguration(services, config.providers);
+        registerOpenRouterProfileConfiguration(services, config.providers);
         services.contributions?.register('health', 'runtime-plugins', {
             /**
              * Reports which plugins are loaded and whether any expected plugin is missing.
@@ -46,4 +49,5 @@ export const plugin: MatbotPluginSpec = { apiVersion: PLUGIN_API_VERSION,
             async probe() { const loaded = getRegisteredPlugins().map(p => p.name); const missing = (config.expectedPlugins ?? []).filter(name => !loaded.includes(name)); return { state: missing.length ? 'degraded' : 'ready', details: { loaded, missing, providers: [...config.providers.keys()] } }; } });
         await services.tools.register(pluginTool);
         await services.tools.register(createProviderTool(config.providers, config.originalPaths));
+        await services.tools.register(createOpenRouterTool(config.providers));
     } };

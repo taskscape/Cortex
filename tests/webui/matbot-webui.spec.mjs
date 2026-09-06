@@ -75,6 +75,26 @@ test("model label and expert selector use the same input meta typography", async
   expect(await inputMetaTypography(expertToggle)).toEqual(modelTypography);
 });
 
+test("renders safe OpenRouter completion status without exposing opaque metadata", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => window.CortexUI.features.renderSession({
+    messages: [{
+      role: "assistant",
+      content: [{ type: "text", text: "Partial answer." }],
+      metadata: { completion: {
+        gateway: "openrouter",
+        truncated: true,
+        returnedModel: "vendor/returned-model",
+        opaqueReasoning: "must never appear in the UI"
+      } }
+    }]
+  }));
+  await expect(page.locator(".message.assistant")).toContainText("Partial answer.");
+  await expect(page.locator(".marker-note")).toContainText("Response truncated at the configured output limit.");
+  await expect(page.locator(".marker-note")).toContainText("Returned model: vendor/returned-model.");
+  await expect(page.locator("body")).not.toContainText("must never appear in the UI");
+});
+
 test("persists provider and font preferences across reloads", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop preference controls coverage");
   await page.goto("/");
@@ -2985,7 +3005,7 @@ test("T3-E2E-006 excludes one denied-source canary from evidence product surface
   await expect(page.locator("#architecture-screen")).not.toContainText(denied);
 });
 
-test("T3-E2E-008 preserves a valid provider through discovery failure and falls back deterministically", async ({ page, isMobile }) => {
+test("T3-E2E-008 preserves a valid provider through discovery failure and requires reselection after removal", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop provider discovery recovery");
   await page.goto("/");
   await page.locator("#provider-select").selectOption("openai");
@@ -3010,8 +3030,11 @@ test("T3-E2E-008 preserves a valid provider through discovery failure and falls 
   await expect(page.locator("#provider-select")).toHaveValue("openai");
   await expect(page.locator("#provider-select")).toHaveAttribute("title", /Provider list unavailable/i);
   expect(await page.evaluate(() => window.CortexUI.features.runtime.refreshProviderSelect())).toBe(true);
+  await expect(page.locator("#provider-select")).toHaveValue("");
+  await expect(page.locator("#provider-select")).toContainText(/no longer available/i);
+  await expect(page.locator("#provider-select option")).toHaveCount(2);
+  await page.locator("#provider-select").selectOption("Recovered-Provider");
   await expect(page.locator("#provider-select")).toHaveValue("Recovered-Provider");
-  await expect(page.locator("#provider-select option")).toHaveCount(1);
 });
 
 test("T3-E2E-009 reconciles one accepted turn after reload loses its stream", async ({ page, request, isMobile }) => {

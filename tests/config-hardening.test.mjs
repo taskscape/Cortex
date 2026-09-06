@@ -159,23 +159,22 @@ test("L5: openai_compatible group colliding with a providers key warns", () => {
   assert.match(warnings[0], /provider "shared"/);
 });
 
-test("L5: object-valued parameters are warned about and skipped", () => {
-  const warnings = captureWarnings(() => {
-    const config = parseConfig([
-      "providers:",
-      "  p:",
-      "    module: ./some-module",
-      "    model: m",
-      "    parameters:",
-      "      nested:",
-      "        a: 1",
-      "",
-    ].join("\n"));
-    const params = config.providers.get("p").parameters;
-    assert.equal(params.nested, undefined);
-  });
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /parameter "nested".*skipping/);
+test("L5: nested provider parameters survive config parsing", () => {
+  const config = parseConfig([
+    "providers:",
+    "  p:",
+    "    module: ./some-module",
+    "    model: m",
+    "    parameters:",
+    "      nested:",
+    "        a: 1",
+    "        flags:",
+    "          - true",
+    "          - false",
+    "",
+  ].join("\n"));
+  const params = config.providers.get("p").parameters;
+  assert.deepEqual(params.nested, { a: 1, flags: [true, false] });
 });
 
 test("L5: numeric strings for known numeric parameters are coerced", () => {

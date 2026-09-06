@@ -65,6 +65,8 @@ export type CompletionEvent =
   | { type: 'refusal';             text: string }
   | { type: 'unknown-block';       blockType: string; raw: unknown }
   | { type: 'usage';               inputTokens: number; outputTokens: number; costUsd?: number; cacheReadTokens?: number; cacheCreationTokens?: number }
+  /** Safe provider completion identity/status. Metadata never implies a successful terminal event. */
+  | { type: 'completion-metadata'; gateway: string; requestedModel: string; returnedModel?: string; generationId?: string; upstreamProvider?: string; finishReason?: string; truncated?: boolean }
   | { type: 'done' };
 
 /** A provider adapter plugin: turns matbot messages into provider API calls and streams back events. */

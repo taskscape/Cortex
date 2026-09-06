@@ -837,6 +837,22 @@ importers:
         specifier: 'catalog:'
         version: 5.9.3
 
+  packages/plugins/providers/openrouter:
+    dependencies:
+      '@matatbread/matbot-plugin-api':
+        specifier: workspace:*
+        version: link:../../../core/plugin-api
+      '@matatbread/matbot-provider-openai-compat':
+        specifier: workspace:*
+        version: link:../openai-compat
+      '@matatbread/matbot-providers-base':
+        specifier: workspace:*
+        version: link:../../../core/providers/_base
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
   packages/plugins/retrieval-federation:
     dependencies:
       '@matatbread/matbot-capabilities-types':
@@ -892,6 +908,9 @@ importers:
       '@matatbread/matbot-plugin-materialization-node':
         specifier: workspace:*
         version: link:../plugin-materialization
+      '@matatbread/matbot-provider-openrouter':
+        specifier: workspace:*
+        version: link:../providers/openrouter
     devDependencies:
       '@types/node':
         specifier: 'catalog:'

@@ -1,0 +1,17 @@
+# Copy the profile into the active workspace's matbot.yaml. This example lives in
+# local-agent/config, so its module path is relative to this file, not matbot.yaml.
+# Store the real key in that workspace's .env or its vault; never put it in YAML.
+providers:
+  OpenRouter Chat:
+    module: ../matbot/packages/plugins/providers/openrouter
+    model: openai/gpt-4o
+    credentials:
+      apiKey: ${OPENROUTER_API_KEY}
+    parameters:
+      maxTokens: 4096
+      capabilities:
+        tools: true
+      openrouter:
+        provider:
+          require_parameters: true
+          allow_fallbacks: true

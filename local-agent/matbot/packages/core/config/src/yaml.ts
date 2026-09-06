@@ -90,9 +90,14 @@ function tokenize(text: string): Token[] {
  * @throws Never.
  */
 function parseScalar(raw: string): YamlScalar {
-  if ((raw.startsWith('"') && raw.endsWith('"')) ||
-      (raw.startsWith("'") && raw.endsWith("'"))) {
-    return raw.slice(1, -1);
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    // JSON quoting is a strict subset of YAML double-quoted scalars and gives generated
+    // configuration a reliable escape format without broadening this intentionally small parser.
+    try { return JSON.parse(raw) as string; }
+    catch { return raw.slice(1, -1); }
+  }
+  if (raw.startsWith("'") && raw.endsWith("'")) {
+    return raw.slice(1, -1).replace(/''/g, "'");
   }
 
   if (raw === 'null' || raw === '~') return null;
@@ -103,6 +108,17 @@ function parseScalar(raw: string): YamlScalar {
   if (!Number.isNaN(num) && raw !== '') return num;
 
   return raw;
+}
+
+/**
+ * Serialize one scalar in the supported YAML subset. Strings intentionally use JSON quoting,
+ * which {@link parseScalar} understands, so comment characters, quotes, and control characters
+ * cannot change the surrounding configuration structure.
+ */
+export function serializeYamlScalar(value: string | number | boolean | null): string {
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (value === null) return 'null';
+  return String(value);
 }
 
 /**
@@ -145,14 +161,14 @@ function parse(tokens: Token[], pos: number, baseIndent: number): { value: YamlV
 
   const first = tokens[pos]!;
 
-  if (first.raw.startsWith('- ')) {
+  if (first.raw === '-' || first.raw.startsWith('- ')) {
     const items: YamlValue[] = [];
     let i = pos;
     while (i < tokens.length) {
       const tok = tokens[i]!;
       if (tok.indent < first.indent) break;
-      if (tok.indent === first.indent && tok.raw.startsWith('- ')) {
-        const itemRaw = tok.raw.slice(2).trim();
+      if (tok.indent === first.indent && (tok.raw === '-' || tok.raw.startsWith('- '))) {
+        const itemRaw = tok.raw === '-' ? '' : tok.raw.slice(2).trim();
         if (itemRaw === '') {
           const sub = parse(tokens, i + 1, tok.indent + 2);
           items.push(sub.value);

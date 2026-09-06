@@ -17,6 +17,10 @@ invoked integration lane:
   the disposable Windows lifecycle.
 - A separately invoked disposable Docker/CUDA integration lane in
   `tests\docker-stack.integration.mjs`.
+- An opt-in OpenRouter live smoke lane in `tests\openrouter-live.integration.mjs`.
+  It skips before starting a network request unless an explicitly supplied
+  workspace configuration contains a selected OpenRouter profile with a
+  resolvable key reference and model name.
 
 Run the complete suite before treating a change as verified:
 
@@ -40,6 +44,16 @@ Run the complete Playwright WebUI suite:
 
 ```powershell
 npm run test:webui
+```
+
+Run the quota-consuming OpenRouter smoke only against an explicitly selected
+workspace profile (it is intentionally outside `test:all`):
+
+```powershell
+$env:CORTEX_OPENROUTER_INTEGRATION = '1'
+$env:CORTEX_OPENROUTER_CONFIG = (Resolve-Path .\local-agent\matbot\workspaces\private\matbot.yaml).Path
+$env:CORTEX_OPENROUTER_PROFILE = 'OpenRouter Chat'
+npm run test:integration:openrouter
 ```
 
 First Playwright setup on a machine:

@@ -34,6 +34,7 @@ providers, plugins, workspaces, or RAG folders.
 | Variable | Purpose |
 | --- | --- |
 | `OPENAI_API_KEY` | OpenAI-compatible hosted provider and Mem0/OpenAI verification. |
+| `OPENROUTER_API_KEY` | Optional key for an explicitly configured OpenRouter profile. |
 | `POSTGRES_PASSWORD` | Postgres password for the Mem0 Docker stack. |
 | `NEO4J_PASSWORD` | Neo4j password for the Mem0 Docker stack. |
 | `NEO4J_AUTH` | `neo4j/<NEO4J_PASSWORD>` value consumed by Neo4j. |
@@ -280,6 +281,84 @@ source-backed entity and relationship extraction after source version writes.
 `frontend/web` loads last so the WebUI sees the complete tool and plugin catalog.
 
 ## Providers
+
+### OpenRouter profiles
+
+OpenRouter is a dedicated Node-hosted provider adapter. Add one or more named
+profiles to the active workspace's `matbot.yaml`, select the profile in the
+conversation picker, and Cortex sends the exact configured model ID to
+`https://openrouter.ai/api/v1/chat/completions`. The adapter supports streamed
+text, Cortex local tools, cancellation, token usage, and supported image inputs.
+It does not enable OpenRouter in the browser-only bundle, OpenRouter server
+tools, embeddings, or automatic model fallback.
+
+Use a `${OPENROUTER_API_KEY}` reference, never a literal key. The value belongs
+in that workspace's `.env`, process environment, or configured vault. Profile
+names and model IDs are non-secret; configuration reads, browser storage, logs,
+and prompt history do not receive the resolved key.
+
+```yaml
+providers:
+  OpenRouter Chat:
+    module: ./packages/plugins/providers/openrouter
+    model: openai/gpt-4o
+    credentials:
+      apiKey: ${OPENROUTER_API_KEY}
+    parameters:
+      maxTokens: 4096
+      capabilities:
+        tools: true
+        # Set images: true only after choosing a model known to accept images.
+      openrouter:
+        provider:
+          require_parameters: true
+          allow_fallbacks: true
+```
+
+`module` is relative to the active `matbot.yaml`; use the complete example at
+`local-agent\config\matbot.openrouter.example.yaml` as a path-adjusted template.
+One credential reference may be used by several profiles with different exact
+model IDs. A profile change applies at the next provider call; a turn retains its
+resolved profile throughout its tool loop. Existing OpenAI-compatible, Anthropic,
+and local profiles remain independent.
+
+`parameters.openrouter.provider` accepts `require_parameters`,
+`allow_fallbacks`, `order`, `only`, `ignore`, `data_collection`, and `zdr`.
+`parameters.openrouter.reasoning` accepts `enabled`, `effort` (`low`, `medium`,
+or `high`), `max_tokens`, and `exclude`; `effort` and `max_tokens` are mutually
+exclusive. Unknown OpenRouter options and unsafe/unrelated endpoints fail before
+an authenticated request. The official API host is enforced; use the generic
+OpenAI-compatible profile when an operator intentionally needs a proxy.
+
+The runtime administration flow also supports `provider` `add` with
+`preset: "openrouter"`; it supplies the dedicated module, official endpoint,
+strict routing defaults, and an out-of-band password prompt for a new key. The
+`openrouter` administration tool lists the public catalog and separately checks
+configuration, key, model, or a deliberately small credit-consuming inference.
+The `openrouter-profiles` configuration contributor writes only references and
+non-secret settings with a version check, so refresh and retry after a conflict
+rather than overwriting a concurrent profile change.
+
+Manual model IDs are always usable without catalog discovery. An explicit key
+check is separate from model inference: it can establish key readiness but does
+not prove a model/capability will complete. The opt-in, quota-consuming smoke
+test takes its profile, exact model, and key reference from one explicitly named
+workspace configuration; it skips with a warning before a request when any of
+those is unavailable. Set `CORTEX_OPENROUTER_INTEGRATION=1`,
+`CORTEX_OPENROUTER_CONFIG` to that workspace's `matbot.yaml`, and optionally
+`CORTEX_OPENROUTER_PROFILE`, then run:
+
+```powershell
+$env:CORTEX_OPENROUTER_INTEGRATION = '1'
+$env:CORTEX_OPENROUTER_CONFIG = (Resolve-Path .\local-agent\matbot\workspaces\private\matbot.yaml).Path
+$env:CORTEX_OPENROUTER_PROFILE = 'OpenRouter Chat'
+npm run test:integration:openrouter
+```
+
+The test does not search for a developer workspace or load its `.env` unless
+the configuration path is explicitly supplied.
+If an explicitly saved provider profile is removed, the WebUI requires an
+explicit new selection rather than falling back to another provider.
 
 Native provider schema:
 

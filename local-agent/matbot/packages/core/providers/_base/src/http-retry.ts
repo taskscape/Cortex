@@ -12,6 +12,12 @@ export interface FetchRetryOptions {
    * the call throws with a descriptive timeout error instead of retrying.
    */
   timeoutMs?: number;
+  /** Do not shorten a server Retry-After hint. If it cannot fit the remaining budget, return the response. */
+  honorRetryAfterFully?: boolean;
+  /** Test/integration injection point; production callers use the platform fetch implementation. */
+  fetchImpl?: typeof fetch;
+  /** Return false for failures that must not be retried (for example, an authenticated redirect). */
+  shouldRetryError?: (error: unknown) => boolean;
 }
 
 /**
@@ -53,15 +59,18 @@ function delay(ms: number, signal?: AbortSignal | null): Promise<void> {
  * @returns The wait in milliseconds, or `undefined` when the header is absent or unparseable.
  * @throws Never.
  */
-function retryAfterMs(res: Response): number | undefined {
+function retryAfterMs(res: Response, clamp = true): number | undefined {
   const raw = res.headers.get('retry-after');
   if (raw === null) return undefined;
   const secs = Number(raw);
-  if (Number.isFinite(secs)) return Math.min(Math.max(secs, 0) * 1000, MAX_RETRY_AFTER_MS);
+  if (Number.isFinite(secs)) {
+    const value = Math.max(secs, 0) * 1000;
+    return clamp ? Math.min(value, MAX_RETRY_AFTER_MS) : value;
+  }
   const at = Date.parse(raw);
   return Number.isNaN(at)
     ? undefined
-    : Math.min(Math.max(at - Date.now(), 0), MAX_RETRY_AFTER_MS);
+    : (clamp ? Math.min(Math.max(at - Date.now(), 0), MAX_RETRY_AFTER_MS) : Math.max(at - Date.now(), 0));
 }
 
 /**
@@ -134,10 +143,10 @@ export async function fetchWithRetry(
     let res: Response;
     const request = attemptInit(attempt);
     try {
-      try { res = await fetch(url, request.init); }
+      try { res = await (options.fetchImpl ?? fetch)(url, request.init); }
       finally { request.clear(); }
     } catch (e) {
-      if (init.signal?.aborted || attempt >= maxAttempts) throw e;
+      if (init.signal?.aborted || attempt >= maxAttempts || options.shouldRetryError?.(e) === false) throw e;
       if (budgetExhausted()) throw timeoutError(url, options.timeoutMs);
       const backoff = Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS);
       await delay(deadline === undefined ? backoff : Math.min(backoff, Math.max(deadline - Date.now(), 0)), init.signal);
@@ -148,8 +157,14 @@ export async function fetchWithRetry(
     }
     await res.body?.cancel().catch(() => undefined);
     if (budgetExhausted()) throw timeoutError(url, options.timeoutMs);
-    let waitMs = retryAfterMs(res) ?? Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS);
-    if (deadline !== undefined) waitMs = Math.min(waitMs, Math.max(deadline - Date.now(), 0));
+    let waitMs = retryAfterMs(res, !options.honorRetryAfterFully) ?? Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS);
+    if (deadline !== undefined) {
+      const remaining = Math.max(deadline - Date.now(), 0);
+      // Returning the transient response lets the adapter classify it with the server's original
+      // retry hint. Retrying earlier than a long Retry-After is both impolite and incorrect.
+      if (options.honorRetryAfterFully && waitMs > remaining) return res;
+      waitMs = Math.min(waitMs, remaining);
+    }
     await delay(waitMs, init.signal);
   }
 }

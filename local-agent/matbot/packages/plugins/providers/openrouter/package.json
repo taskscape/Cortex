@@ -1,0 +1,15 @@
+{
+  "name": "@matatbread/matbot-provider-openrouter",
+  "version": "0.1.0",
+  "description": "OpenRouter Chat Completions provider for Cortex, with strict endpoint and configuration validation.",
+  "type": "module",
+  "matbotRuntime": ["node"],
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@matatbread/matbot-plugin-api": "workspace:*",
+    "@matatbread/matbot-providers-base": "workspace:*",
+    "@matatbread/matbot-provider-openai-compat": "workspace:*"
+  },
+  "devDependencies": { "typescript": "catalog:" }
+}

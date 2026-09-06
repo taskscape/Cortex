@@ -59,29 +59,59 @@ const NUMERIC_PARAMETER_NAMES = new Set([
 
 /**
  * Convert a raw YAML mapping into model parameters, coercing well-known numeric settings
- * (e.g. `temperature`, `maxTokens`) written as strings into numbers. Non-scalar values are
- * warned about and skipped.
+ * (e.g. `temperature`, `maxTokens`) written as strings into numbers. Provider parameters are
+ * deliberately JSON-shaped: adapters own their individual schemas, while the loader preserves
+ * nested maps and arrays so a valid provider-specific setting survives a restart.
  *
  * @param raw - The raw `parameters` mapping of a provider profile.
  * @returns The normalized parameters object.
  * @throws Never.
  */
+const MAX_PARAMETER_DEPTH = 8;
+const FORBIDDEN_PARAMETER_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Copy a YAML value into a bounded, JSON-compatible value. Keeping this generic is important:
+ * configuration loading must not reject another adapter's extension merely because OpenRouter
+ * does not use it. The adapter validates its own namespace later, immediately before a request.
+ */
+function normalizeParameter(value: YamlValue, path: string, depth = 0): unknown {
+  if (depth > MAX_PARAMETER_DEPTH) {
+    throw new Error(`Config: provider parameter "${path}" exceeds the maximum nesting depth of ${MAX_PARAMETER_DEPTH}`);
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error(`Config: provider parameter "${path}" must be finite`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => normalizeParameter(item, `${path}[${index}]`, depth + 1));
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (FORBIDDEN_PARAMETER_KEYS.has(key)) {
+      throw new Error(`Config: provider parameter "${path}.${key}" uses a forbidden object key`);
+    }
+    result[key] = normalizeParameter(child, `${path}.${key}`, depth + 1);
+  }
+  return result;
+}
+
 function toModelParameters(raw: YamlMap): ModelParameters {
   const params: ModelParameters = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (typeof v === 'number' || typeof v === 'boolean') {
-      params[k] = v;
-    } else if (typeof v === 'string') {
+    if (FORBIDDEN_PARAMETER_KEYS.has(k)) {
+      throw new Error(`Config: provider parameter "${k}" uses a forbidden object key`);
+    }
+    if (typeof v === 'string') {
       if (NUMERIC_PARAMETER_NAMES.has(k)) {
         const n = Number(v.trim());
-        params[k] = v.trim() !== '' && !Number.isNaN(n) ? n : v;
+        params[k] = v.trim() !== '' && Number.isFinite(n) ? n : v;
       } else {
         params[k] = v;
       }
     } else {
-      console.warn(
-        `Config: provider parameter "${k}" must be a number, string, or boolean; got ${Array.isArray(v) ? 'a sequence' : 'a mapping'} — skipping`,
-      );
+      params[k] = normalizeParameter(v, k);
     }
   }
   return params;

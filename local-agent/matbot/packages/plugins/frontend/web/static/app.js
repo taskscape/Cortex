@@ -51,15 +51,30 @@ async function refreshProviderSelect() {
   providerSel.innerHTML = '';
   delete providerSel.dataset.error;
   providerSel.title = '';
+  // A removed explicit profile must never silently turn into the first remaining service.
+  // That could send the next prompt to a different account/provider without the user's choice.
+  if (saved && !providers.includes(saved)) {
+    const missing = document.createElement('option');
+    missing.value = '';
+    missing.textContent = `Select a provider — "${saved}" is no longer available`;
+    missing.disabled = true;
+    missing.selected = true;
+    providerSel.appendChild(missing);
+    providerSel.value = '';
+    providerSel.dataset.error = 'The previously selected provider was removed. Select a provider before sending.';
+    providerSel.title = providerSel.dataset.error;
+  }
   for (const p of providers) {
     const opt = document.createElement('option');
     opt.value = opt.textContent = p;
     providerSel.appendChild(opt);
   }
-  providerSel.value = providers.includes(saved)
-    ? saved
-    : (providers.includes(previous) ? previous : (providers[0] ?? ''));
-  localStorage.setItem(providerStorageKey(workspaceId), providerSel.value);
+  if (!saved || providers.includes(saved)) {
+    providerSel.value = providers.includes(saved)
+      ? saved
+      : (providers.includes(previous) ? previous : (providers[0] ?? ''));
+    localStorage.setItem(providerStorageKey(workspaceId), providerSel.value);
+  }
   return true;
 }
 
@@ -1216,6 +1231,22 @@ function renderContentParts(wrap, content) {
   }
 }
 
+// Completion metadata is operational status, never model prose. Keep it short, text-only, and
+// restricted to the OpenRouter gateway so an opaque provider block can never become UI content.
+function appendOpenRouterCompletionStatus(wrap, metadata) {
+  const completion = metadata?.completion;
+  if (!completion || completion.gateway !== 'openrouter') return;
+  const parts = [];
+  if (completion.truncated === true) parts.push('Response truncated at the configured output limit.');
+  else if (completion.finishReason) parts.push(`Finished: ${completion.finishReason}.`);
+  if (typeof completion.returnedModel === 'string' && completion.returnedModel) parts.push(`Returned model: ${completion.returnedModel}.`);
+  if (!parts.length) return;
+  const note = document.createElement('div');
+  note.className = 'marker-note';
+  note.textContent = parts.join(' ');
+  wrap.appendChild(note);
+}
+
 function renderSession(session, startIdx, scrollTarget) {
   const allMsgs = session.messages;
   if (!startIdx) {
@@ -1237,6 +1268,7 @@ function renderSession(session, startIdx, scrollTarget) {
     } else if (msg.role === 'assistant') {
       const wrap = createAssistantWrap('assistant');
       renderContentParts(wrap, msg.content);
+      appendOpenRouterCompletionStatus(wrap, msg.metadata);
     } else if (msg.role === 'tool') {
       // Results are attached to their matching .tool-block via data-call-id; no wrapper needed.
       const dummy = document.createDocumentFragment();
@@ -2019,8 +2051,19 @@ async function init() {
   const savedProvider = providerPicker.savedProviderForWorkspace();
   if (savedProvider && providers.includes(savedProvider)) {
     providerPicker.providerSel.value = savedProvider;
+  } else if (savedProvider) {
+    const missing = document.createElement('option');
+    missing.value = '';
+    missing.textContent = `Select a provider — "${savedProvider}" is no longer available`;
+    missing.disabled = true;
+    missing.selected = true;
+    providerPicker.providerSel.prepend(missing);
+    providerPicker.providerSel.value = '';
+    providerPicker.providerSel.dataset.error = 'The previously selected provider was removed. Select a provider before sending.';
+    providerPicker.providerSel.title = providerPicker.providerSel.dataset.error;
+  } else {
+    localStorage.setItem(providerPicker.providerStorageKey(), providerPicker.providerSel.value);
   }
-  localStorage.setItem(providerPicker.providerStorageKey(), providerPicker.providerSel.value);
 
   providerPicker.providerSel.addEventListener('change', () => {
     localStorage.setItem(providerPicker.providerStorageKey(), providerPicker.providerSel.value);

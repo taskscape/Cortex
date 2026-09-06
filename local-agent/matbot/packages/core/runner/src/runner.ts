@@ -440,8 +440,13 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
     let providerInputTokens = 0;
     let providerOutputTokens = 0;
     let providerCostUsd = 0;
+    let providerCostKnown = false;
     let providerCacheReadTokens = 0;
     let providerCacheCreationTokens = 0;
+    let completionMetadata: {
+      gateway: string; requestedModel: string; returnedModel?: string; generationId?: string;
+      upstreamProvider?: string; finishReason?: string; truncated?: boolean;
+    } | undefined;
     let providerDone = false;
     await observe({
       phase: 'start', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
@@ -480,13 +485,22 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
             providerOutputTokens += ev.outputTokens;
             totalInputTokens += ev.inputTokens;
             totalOutputTokens += ev.outputTokens;
-            providerCostUsd += ev.costUsd ?? 0;
+            if (ev.costUsd !== undefined) {
+              providerCostKnown = true;
+              providerCostUsd += ev.costUsd;
+            }
             providerCacheReadTokens += ev.cacheReadTokens ?? 0;
             providerCacheCreationTokens += ev.cacheCreationTokens ?? 0;
             yield { type: 'usage', inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, traceId,
               ...(ev.costUsd              !== undefined ? { costUsd:              ev.costUsd              } : {}),
               ...(ev.cacheReadTokens     !== undefined ? { cacheReadTokens:     ev.cacheReadTokens     } : {}),
               ...(ev.cacheCreationTokens !== undefined ? { cacheCreationTokens: ev.cacheCreationTokens } : {}) };
+            break;
+          case 'completion-metadata':
+            {
+              const { type: _eventType, ...safeMetadata } = ev;
+              completionMetadata = { ...completionMetadata, ...safeMetadata };
+            }
             break;
           case 'done':
             providerDone = true;
@@ -504,7 +518,8 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
           outputTokens: providerOutputTokens,
           cacheReadTokens: providerCacheReadTokens,
           cacheCreationTokens: providerCacheCreationTokens,
-          costUsd: providerCostUsd,
+          costUsd: providerCostKnown ? providerCostUsd : null,
+          ...(completionMetadata !== undefined ? { completion: completionMetadata } : {}),
           timeToFirstTokenMs: firstTokenAt === undefined ? null : firstTokenAt - providerStartedAt,
           outputCharacters: textAcc.length,
           toolCallCount: pendingCalls.length,
@@ -535,7 +550,7 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
       if (assistantParts.length > 0) {
         session = appendMessage(session, createMessage({
           role: 'assistant', content: assistantParts, traceId, providerName: config.provider,
-          metadata: { incomplete: true },
+          metadata: { incomplete: true, ...(completionMetadata !== undefined ? { completion: completionMetadata } : {}) },
         }));
       }
       session = appendMessage(session, createMessage({
@@ -571,6 +586,7 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
         content:      assistantParts,
         traceId,
         providerName: config.provider,
+        ...(completionMetadata !== undefined ? { metadata: { completion: completionMetadata } } : {}),
       });
       session = appendMessage(session, assistantMsg);
     } else {

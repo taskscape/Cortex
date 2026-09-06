@@ -169,7 +169,7 @@ period, during periodic store maintenance triggered by writes or listing.
 
 ### Provider request reliability
 
-OpenAI-compatible and Anthropic providers enforce three deadlines through their
+OpenAI-compatible, Anthropic, and OpenRouter providers enforce three deadlines through their
 `parameters` settings: `requestTimeoutMs` (60,000 by default, covering headers and
 retries), `streamIdleTimeoutMs` (120,000), and `completionTimeoutMs` (600,000,
 covering the entire completion). Values must be positive integer milliseconds,
@@ -177,6 +177,18 @@ at most 3,600,000. Increase these for slow local models when needed. SSE comment
 do not reset the idle deadline, and activity never extends the overall deadline.
 Completed tool rounds and partial responses are saved when a completion fails;
 the session records an interruption marker, including for timeouts.
+
+### OpenRouter
+
+Cortex includes a Node-hosted OpenRouter profile adapter for explicit
+`https://openrouter.ai/api/v1` Chat Completions profiles. Configure an exact
+model ID and `${OPENROUTER_API_KEY}` reference in the active workspace; keys are
+resolved by the vault and are never stored in profile responses or the WebUI.
+Streaming text, supported image inputs, Cortex local tools, cancellation, and
+usage accounting follow the normal conversation runner. See
+[OpenRouter profiles](docs/configuration.md#openrouter-profiles) for the safe
+configuration template, capability/routing controls, diagnostics, and the
+separately gated live smoke test.
 
 Provider streams must confirm completion. OpenAI-compatible streamed errors,
 malformed events, and premature EOF are reported as failures; buffered tool

@@ -8,6 +8,7 @@ import type {} from '@matatbread/matbot-workspace-manager-types';
 import type {} from '@matatbread/matbot-runtime-admin';
 import type {} from '@matatbread/matbot-frontend-cli-node';
 import { loadConfig, loadConfigFromText, loadDotEnv } from './config.js';
+import { serializeYamlScalar }             from '@matatbread/matbot-config';
 import { installPlugin }                    from './install.js';
 import { loadPluginsWithDescriptions, readPluginMeta, type PluginLoadRequest } from './plugin-description.js';
 import { nodePluginResolver }               from './plugin-resolver.js';
@@ -547,6 +548,34 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
     const answer = await rl.question(`${question}: `);
     return answer.trim();
   };
+  /** Read a terminal secret without echoing it. Non-TTY callers retain normal readline behavior. */
+  const askSecret = async (question: string): Promise<string> => {
+    if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== 'function') return ask(question);
+    rl.pause();
+    process.stderr.write(`${question}: `);
+    return new Promise<string>((resolve, reject) => {
+      let value = '';
+      const stdin = process.stdin;
+      const done = (error?: Error): void => {
+        stdin.off('data', onData);
+        stdin.setRawMode(false);
+        rl.resume();
+        process.stderr.write('\n');
+        if (error) reject(error); else resolve(value.trim());
+      };
+      const onData = (chunk: Buffer): void => {
+        for (const byte of chunk) {
+          if (byte === 3) { done(new Error('Secret entry cancelled.')); return; }
+          if (byte === 13 || byte === 10) { done(); return; }
+          if (byte === 8 || byte === 127) { value = value.slice(0, -1); continue; }
+          if (byte >= 32) value += String.fromCharCode(byte);
+        }
+      };
+      stdin.setRawMode(true);
+      stdin.resume();
+      stdin.on('data', onData);
+    });
+  };
 
   try {
     process.stderr.write('\nNo providers configured. Let\'s set one up.\n\n');
@@ -584,10 +613,12 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
       process.stderr.write('Model name is required.\n');
     }
 
-    let endpoint = await ask('Endpoint URL');
-    let apiKey = await ask('API key');
+    const isOpenRouter = chosen.type === 'openrouter';
+    let endpoint = await ask(isOpenRouter ? 'Endpoint URL (blank uses https://openrouter.ai/api/v1)' : 'Endpoint URL');
+    if (isOpenRouter && !endpoint) endpoint = 'https://openrouter.ai/api/v1';
+    const apiKey = await askSecret('API key');
 
-    if (endpoint && !endpoint.startsWith('http')) {
+    if (endpoint && !endpoint.startsWith('http') && !isOpenRouter) {
       process.stderr.write(`\nTesting ${endpoint}… `);
       const reachable = await testEndpointReachable(endpoint);
       if (!reachable) {
@@ -618,14 +649,17 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
     const relDir = path.relative(configDir, chosen.dir).replace(/\\/g, '/');
     const moduleSpec = relDir.startsWith('.') ? relDir : `./${relDir}`;
 
+    if (providerName !== providerName.trim() || /[\u0000-\u001f\u007f:#]/.test(providerName)) {
+      throw new Error('Provider name must be a non-empty single-line name without YAML control characters.');
+    }
     const yaml = [
       'providers:',
       `  ${providerName}:`,
-      `    module: ${moduleSpec}`,
-      `    endpoint: ${endpoint}`,
-      `    model: ${model}`,
+      `    module: ${serializeYamlScalar(moduleSpec)}`,
+      `    endpoint: ${serializeYamlScalar(endpoint)}`,
+      `    model: ${serializeYamlScalar(model)}`,
       `    credentials:`,
-      `      apiKey: \${${envVarName}}`,
+      `      apiKey: ${serializeYamlScalar(`\${${envVarName}}`)}`,
     ].join('\n') + '\n';
 
     await mkdir(configDir, { recursive: true });

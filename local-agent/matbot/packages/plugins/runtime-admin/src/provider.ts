@@ -1,6 +1,8 @@
 import { replaceConfigurationFile } from './config-file.js';
 import type { Tool, ToolEvent, ToolContext, ProviderConfig, MatbotPlugin } from '@matatbread/matbot-plugin-api';
 import { getRegisteredPlugins, getSpecifierForPlugin } from '@matatbread/matbot-core';
+import { parseConfig, serializeYamlScalar } from '@matatbread/matbot-config';
+import { OPENROUTER_API_ORIGIN, validateOpenRouterConfig } from '@matatbread/matbot-provider-openrouter';
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -25,7 +27,8 @@ type ProviderInput = {
 } | {
     action: 'add';
     name: string;
-    module: string;
+    module?: string;
+    preset?: 'openrouter';
     model: string;
     endpoint?: string;
     credentialKey?: string;
@@ -35,6 +38,36 @@ type ProviderInput = {
     action: 'remove';
     name: string;
 };
+
+const OPENROUTER_MODULE = '@matatbread/matbot-provider-openrouter';
+
+function openRouterDefaults(parameters: Record<string, unknown> | undefined): Record<string, unknown> {
+    const supplied = parameters ?? {};
+    const suppliedOpenRouter = supplied['openrouter'];
+    const suppliedCapabilities = supplied['capabilities'];
+    const openRouterObject = suppliedOpenRouter !== null && typeof suppliedOpenRouter === 'object' && !Array.isArray(suppliedOpenRouter)
+        ? suppliedOpenRouter as Record<string, unknown>
+        : undefined;
+    const capabilities = suppliedCapabilities === undefined
+        ? { tools: true }
+        : suppliedCapabilities !== null && typeof suppliedCapabilities === 'object' && !Array.isArray(suppliedCapabilities)
+          ? { tools: true, ...suppliedCapabilities as Record<string, unknown> }
+          : suppliedCapabilities;
+    const openrouter = suppliedOpenRouter === undefined
+        ? { provider: { require_parameters: true, allow_fallbacks: true } }
+        : openRouterObject === undefined
+          ? suppliedOpenRouter
+          : {
+              ...openRouterObject,
+              ...(openRouterObject['provider'] === undefined ? { provider: { require_parameters: true, allow_fallbacks: true } } : {}),
+            };
+    return {
+        ...supplied,
+        maxTokens: supplied['maxTokens'] ?? 4096,
+        capabilities,
+        openrouter,
+    };
+}
 // ── YAML helpers (read/write only — runtime state comes from liveProviders) ───
 /**
  * Escapes regular-expression metacharacters in a string.
@@ -133,7 +166,9 @@ function yamlSpecifierFor(name: string, projectDir: string, pluginNameToOrigPath
 }
 /**
  * Appends YAML lines for an object's entries to an accumulator, recursing into plain objects and
- * arrays (arrays render one `- item` line per element). Values are stringified without quoting.
+ * arrays (arrays render one `- item` line per element). Scalar values use the configuration
+ * parser's JSON-compatible quoting, so a profile cannot be structurally changed by a `#`, quote,
+ * newline, or string that happens to resemble YAML.
  * @param obj - Entries to render; nested plain objects and arrays are expanded in place.
  * @param indent - Indentation prefix for this level (two spaces per depth).
  * @param lines - Accumulator the rendered lines are pushed onto, in entry order.
@@ -142,20 +177,63 @@ function yamlSpecifierFor(name: string, projectDir: string, pluginNameToOrigPath
  */
 function appendYamlFields(obj: Record<string, unknown>, indent: string, lines: string[]): void {
     for (const [k, v] of Object.entries(obj)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(k)) {
+            throw new Error(`Configuration field "${k}" cannot be represented by Cortex's YAML subset.`);
+        }
         if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
             lines.push(`${indent}${k}:`);
             appendYamlFields(v as Record<string, unknown>, `${indent}  `, lines);
         }
         else if (Array.isArray(v)) {
             lines.push(`${indent}${k}:`);
-            for (const item of v)
-                lines.push(`${indent}  - ${String(item)}`);
+            for (const item of v) {
+                if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+                    lines.push(`${indent}  -`);
+                    appendYamlFields(item as Record<string, unknown>, `${indent}    `, lines);
+                } else if (Array.isArray(item)) {
+                    throw new Error(`Configuration field "${k}" cannot contain nested sequences in Cortex's YAML subset.`);
+                } else if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean' || item === null) {
+                    lines.push(`${indent}  - ${serializeYamlScalar(item)}`);
+                } else {
+                    throw new Error(`Configuration field "${k}" contains an unsupported value.`);
+                }
+            }
         }
-        else {
-            lines.push(`${indent}${k}: ${String(v)}`);
+        else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null) {
+            lines.push(`${indent}${k}: ${serializeYamlScalar(v)}`);
+        } else {
+            throw new Error(`Configuration field "${k}" contains an unsupported value.`);
         }
     }
 }
+export function serializeProviderProfile(opts: {
+    name: string;
+    module: string;
+    model: string;
+    endpoint?: string;
+    credentials?: Record<string, string>;
+    parameters?: Record<string, unknown>;
+}): string {
+    if (!opts.name.trim() || opts.name !== opts.name.trim() || /[\u0000-\u001f\u007f:#\n\r]/.test(opts.name)) {
+        throw new Error('Provider profile name must be a non-empty single-line name without YAML control characters.');
+    }
+    const lines = [
+        `  ${opts.name}:`,
+        `    module: ${serializeYamlScalar(opts.module)}`,
+        ...(opts.endpoint !== undefined ? [`    endpoint: ${serializeYamlScalar(opts.endpoint)}`] : []),
+        `    model: ${serializeYamlScalar(opts.model)}`,
+    ];
+    if (opts.credentials !== undefined && Object.keys(opts.credentials).length > 0) {
+        lines.push(`    credentials:`);
+        appendYamlFields(opts.credentials, '      ', lines);
+    }
+    if (opts.parameters && Object.keys(opts.parameters).length > 0) {
+        lines.push(`    parameters:`);
+        appendYamlFields(opts.parameters, '      ', lines);
+    }
+    return lines.join('\n') + '\n';
+}
+
 function buildProviderBlock(opts: {
     name: string;
     module: string;
@@ -165,21 +243,14 @@ function buildProviderBlock(opts: {
     credentialKey?: string;
     parameters?: Record<string, unknown>;
 }): string {
-    const lines = [
-        `  ${opts.name}:`,
-        `    module: ${opts.module}`,
-        ...(opts.endpoint !== undefined ? [`    endpoint: ${opts.endpoint}`] : []),
-        `    model: ${opts.model}`,
-    ];
-    if (opts.envVarName) {
-        lines.push(`    credentials:`);
-        lines.push(`      ${opts.credentialKey ?? 'apiKey'}: \${${opts.envVarName}}`);
-    }
-    if (opts.parameters && Object.keys(opts.parameters).length > 0) {
-        lines.push(`    parameters:`);
-        appendYamlFields(opts.parameters, '      ', lines);
-    }
-    return lines.join('\n') + '\n';
+    return serializeProviderProfile({
+        name: opts.name,
+        module: opts.module,
+        model: opts.model,
+        ...(opts.endpoint !== undefined ? { endpoint: opts.endpoint } : {}),
+        ...(opts.envVarName !== undefined ? { credentials: { [opts.credentialKey ?? 'apiKey']: `\${${opts.envVarName}}` } } : {}),
+        ...(opts.parameters !== undefined ? { parameters: opts.parameters } : {}),
+    });
 }
 /**
  * Inserts a rendered provider block into the configuration file's `providers:` section. The block
@@ -214,6 +285,9 @@ async function addProviderToConfig(configPath: string, block: string): Promise<v
             ? `${text.slice(0, pi)}providers:\n${block}\n${text.slice(pi)}`
             : `providers:\n${block}\n${text}`;
     }
+    // Validate the exact serialized subset before swapping the configuration file. This catches
+    // a writer/parser mismatch before live provider state is changed.
+    parseConfig(updated);
     await replaceConfigurationFile(configPath, text, updated);
 }
 /**
@@ -316,9 +390,19 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
             }
             // ── add ────────────────────────────────────────────────────────────────
             if (action === 'add') {
-                const { name, module: mod, model, endpoint, credentialKey, credentialEnvVar, parameters } = input as Extract<ProviderInput, {
+                const { name, module: suppliedModule, preset, model, endpoint, credentialKey, credentialEnvVar, parameters } = input as Extract<ProviderInput, {
                     action: 'add';
                 }>;
+                const isOpenRouter = preset === 'openrouter';
+                if (preset !== undefined && !isOpenRouter) {
+                    yield { type: 'error', message: `Unsupported provider preset "${String(preset)}".` };
+                    return;
+                }
+                const mod = isOpenRouter ? OPENROUTER_MODULE : suppliedModule;
+                if (typeof mod !== 'string' || !mod.trim()) {
+                    yield { type: 'error', message: 'A provider module is required unless preset is "openrouter".' };
+                    return;
+                }
                 if (liveProviders.has(name)) {
                     yield { type: 'result', value: { message: `Profile "${name}" already exists. Use a different name or remove it first.` } };
                     return;
@@ -372,7 +456,11 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
                 }
                 else {
                     const credKey = credentialKey ?? 'apiKey';
-                    const answer = await ctx.prompt(`${credKey} for provider "${name}" (leave blank if none required):`, '');
+                    const answer = await ctx.prompt({
+                        name: `provider-${name}-credential`,
+                        label: `${credKey} for provider "${name}" (leave blank if none required)`,
+                        type: 'password', default: '', required: false,
+                    });
                     if (answer.trim()) {
                         const varName = credEnvVarName(name);
                         // createSecret may return a different name (an existing key the value already lives
@@ -381,9 +469,30 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
                         yield { type: 'stdout', chunk: `API key stored in vault as ${envVarName}.\n` };
                     }
                 }
-                if (endpoint) {
-                    yield { type: 'stdout', chunk: `Testing ${endpoint} …\n` };
-                    const err = await checkEndpoint(endpoint);
+                const effectiveEndpoint = isOpenRouter ? (endpoint ?? OPENROUTER_API_ORIGIN) : endpoint;
+                const effectiveParameters = isOpenRouter ? openRouterDefaults(parameters) : parameters;
+                if (isOpenRouter) {
+                    if (!envVarName) {
+                        yield { type: 'error', message: 'OpenRouter profiles require an API key reference. Enter a key or provide credentialEnvVar.' };
+                        return;
+                    }
+                    try {
+                        // Validate before persisting. The reference itself is resolved by the active
+                        // vault at turn time, so this deliberately uses a non-secret sentinel here.
+                        validateOpenRouterConfig({
+                            name, module: OPENROUTER_MODULE, model,
+                            ...(effectiveEndpoint !== undefined ? { endpoint: effectiveEndpoint } : {}),
+                            credentials: { [credentialKey ?? 'apiKey']: 'validation-sentinel' },
+                            ...(effectiveParameters !== undefined ? { parameters: effectiveParameters } : {}),
+                        });
+                    } catch (error) {
+                        yield { type: 'error', message: error instanceof Error ? error.message : 'Invalid OpenRouter profile.' };
+                        return;
+                    }
+                }
+                if (effectiveEndpoint) {
+                    yield { type: 'stdout', chunk: `Testing ${effectiveEndpoint} …\n` };
+                    const err = isOpenRouter ? undefined : await checkEndpoint(effectiveEndpoint);
                     if (err) {
                         const cont = await ctx.prompt(`Endpoint check failed: ${err}. Add anyway? [y/N]`, 'N');
                         if (!/^y(es)?$/i.test(cont.trim())) {
@@ -404,10 +513,10 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
                     name,
                     module: yamlModule,
                     model,
-                    ...(endpoint !== undefined ? { endpoint } : {}),
+                    ...(effectiveEndpoint !== undefined ? { endpoint: effectiveEndpoint } : {}),
                     ...(envVarName !== undefined ? { envVarName } : {}),
                     ...(credentialKey !== undefined ? { credentialKey } : {}),
-                    ...(parameters !== undefined ? { parameters } : {}),
+                    ...(effectiveParameters !== undefined ? { parameters: effectiveParameters } : {}),
                 });
                 await addProviderToConfig(configPath, block);
                 // Hot-update the live map — new profile is usable immediately without restart.
@@ -415,11 +524,11 @@ function makeExecutor(liveProviders: Map<string, ProviderConfig>, pluginNameToOr
                     name,
                     module: canonicalModule,
                     model,
-                    ...(endpoint !== undefined ? { endpoint } : {}),
+                    ...(effectiveEndpoint !== undefined ? { endpoint: effectiveEndpoint } : {}),
                     ...(envVarName !== undefined
                         ? { credentials: { [credentialKey ?? 'apiKey']: `\${${envVarName}}` } }
                         : {}),
-                    ...(parameters !== undefined ? { parameters } : {}),
+                    ...(effectiveParameters !== undefined ? { parameters: effectiveParameters } : {}),
                 });
                 yield {
                     type: 'result',
@@ -515,7 +624,7 @@ ACTIONS
 SHAPE  (TypeScript; see PARAMETERS below for the parameters object)
   type ProviderAction =
     | { action: 'list' }
-    | { action: 'add'; name: string; module: string; model: string;
+    | { action: 'add'; name: string; module?: string; preset?: 'openrouter'; model: string;
         endpoint?: string; credentialKey?: string; credentialEnvVar?: string; parameters?: object }
     | { action: 'remove'; name: string };
 
@@ -536,7 +645,7 @@ PARAMETERS  (pass as the parameters object)
 
 GUIDANCE
 When a user asks to add a new LLM or provider, ask for:
-  1. Which adapter module to use (from the list above)
+  1. Which adapter module to use (from the list above), or preset: "openrouter"
   2. Model name — e.g. claude-sonnet-4-6, gpt-4o, deepseek-chat, llama3.2
   3. Endpoint URL — required for OpenAI-compat adapters; may be optional for others
   4. API key source — existing env var (credentialEnvVar) or enter now (blank = prompted)
@@ -556,7 +665,11 @@ When a user asks to add a new LLM or provider, ask for:
                 },
                 module: {
                     type: 'string',
-                    description: 'Adapter module specifier (add only).',
+                    description: 'Adapter module specifier (add only; omit when preset is "openrouter").',
+                },
+                preset: {
+                    type: 'string', enum: ['openrouter'],
+                    description: 'Optional provider preset. openrouter supplies the dedicated adapter, official endpoint, and strict routing defaults.',
                 },
                 model: {
                     type: 'string',

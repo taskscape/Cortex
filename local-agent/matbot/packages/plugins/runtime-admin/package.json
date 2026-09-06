@@ -26,7 +26,8 @@
     "@matatbread/matbot-plugin-materialization-node": "workspace:*",
     "@matatbread/matbot-browser": "workspace:*",
     "@matatbread/matbot-capabilities-types": "workspace:*",
-    "@matatbread/matbot-config": "workspace:*"
+    "@matatbread/matbot-config": "workspace:*",
+    "@matatbread/matbot-provider-openrouter": "workspace:*"
   },
   "devDependencies": {
     "typescript": "catalog:",

@@ -12,6 +12,16 @@ export interface OAIMessage {
   tool_calls?:  OAIToolCall[];
   tool_call_id?: string;
   name?:        string;
+  /** OpenRouter's opaque, provider-signed reasoning replay payload. */
+  reasoning_details?: unknown[];
+  /** Plain OpenRouter reasoning when structured details were unavailable. */
+  reasoning?: string;
+}
+
+/** Restricts restoration of opaque OpenRouter reasoning to the exact compatible conversation. */
+export interface OpenRouterReplayOptions {
+  apiOrigin: string;
+  model: string;
 }
 
 /** Anthropic-style `cache_control` directive, honoured by OpenRouter-routed providers. */
@@ -110,7 +120,11 @@ export function serializeToolResult(result: unknown, isError?: boolean): string 
  * @param cache Add `cache_control` breakpoints (only for endpoints that honour them).
  * @returns OpenAI-format messages.
  */
-export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] {
+export function toOAIMessages(
+  messages: Message[],
+  cache = false,
+  openRouterReplay?: OpenRouterReplayOptions,
+): OAIMessage[] {
   const result: OAIMessage[] = [];
 
   for (const msg of messages) {
@@ -180,6 +194,21 @@ export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] 
     const oaiMsg: OAIMessage = { role: msg.role };
     if (content !== undefined) oaiMsg.content = content;
 
+    // Reasoning details are protocol data, not generic content. A signed/encrypted OpenRouter
+    // block is portable only to the same origin and model identity, so every other adapter (and a
+    // later profile/model switch) continues to elide it exactly as before.
+    if (msg.role === 'assistant' && openRouterReplay !== undefined) {
+      const replay = msg.content.find(c => c.type === 'unknown-content' && c.blockType === 'openrouter.reasoning.v1');
+      const raw = replay?.type === 'unknown-content' && replay.raw !== null && typeof replay.raw === 'object'
+        ? replay.raw as Record<string, unknown>
+        : undefined;
+      if (raw?.['apiOrigin'] === openRouterReplay.apiOrigin && raw['requestedModel'] === openRouterReplay.model &&
+          (raw['returnedModel'] === undefined || raw['returnedModel'] === openRouterReplay.model)) {
+        if (Array.isArray(raw['details'])) oaiMsg.reasoning_details = raw['details'];
+        if (typeof raw['reasoning'] === 'string') oaiMsg.reasoning = raw['reasoning'];
+      }
+    }
+
     if (toolCalls.length > 0) {
       oaiMsg.tool_calls = toolCalls.map(c => {
         if (c.type !== 'tool-call') return null!;
@@ -193,7 +222,8 @@ export function toOAIMessages(messages: Message[], cache = false): OAIMessage[] 
 
     // Provider-specific reasoning/thinking blocks are intentionally stripped above. If that leaves a
     // message with neither content nor tool calls, drop it rather than send an empty one.
-    if (oaiMsg.content === undefined && (oaiMsg.tool_calls?.length ?? 0) === 0) continue;
+    if (oaiMsg.content === undefined && (oaiMsg.tool_calls?.length ?? 0) === 0 &&
+        oaiMsg.reasoning_details === undefined && oaiMsg.reasoning === undefined) continue;
 
     result.push(oaiMsg);
   }
