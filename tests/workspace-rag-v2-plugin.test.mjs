@@ -14,11 +14,9 @@ const { plugin } = await import(
   "../local-agent/matbot/packages/plugins/workspace-rag/src/index.ts"
 );
 
-async function execute(tool, value) {
+async function execute(tool, value, context = { signal: new AbortController().signal }) {
   const events = [];
-  for await (const event of tool.executor.execute(value, {
-    signal: new AbortController().signal,
-  })) {
+  for await (const event of tool.executor.execute(value, context)) {
     events.push(event);
   }
   const error = events.find(event => event.type === "error");
@@ -57,6 +55,8 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
 
   const tools = new Map();
   const registry = new Map();
+  const ragEvents = [];
+  registry.set("Observability", { async record(event) { ragEvents.push(event); } });
   await plugin.setup({
     configPath: path.join(workspace, "matbot.yaml"),
     isSubAgent: () => false,
@@ -143,8 +143,44 @@ test("workspace_rag is V2-only, auto-reconciles configured folders, and exposes 
     action: "search",
     query: "distributor terminate sixty days",
     limit: 3,
+  }, {
+    signal: new AbortController().signal,
+    traceId: "trace-rag-diagnostics",
+    rootTraceId: "root-rag-diagnostics",
+    parentSpanId: "tool-rag-diagnostics",
+    callId: "call-rag-diagnostics",
+    session: {
+      id: "session-rag-diagnostics",
+      messages: [{ role: "user", content: [{ type: "text", text: "distributor terminate sixty days" }] }],
+    },
   });
   assert.ok(primary.hits.some(hit => hit.documentVersionId && hit.startLine));
+  const retrievalStart = ragEvents.find(event => event.name === "workspace_rag.search" && event.phase === "start");
+  const retrievalEnd = ragEvents.find(event => event.name === "workspace_rag.search" && event.phase === "end");
+  assert.equal(retrievalStart.attributes.query, "distributor terminate sixty days");
+  assert.equal(retrievalEnd.attributes.outcome, "hits");
+  assert.equal(retrievalEnd.attributes.returnedCount >= 1, true);
+  assert.equal(retrievalEnd.attributes.plan.standaloneQuery, "distributor terminate sixty days");
+
+  const empty = await execute(tool, {
+    action: "search",
+    query: "What does ZXQ-NOT-PRESENT-991 require?",
+    limit: 3,
+  }, {
+    signal: new AbortController().signal,
+    traceId: "trace-rag-empty",
+    rootTraceId: "root-rag-empty",
+    parentSpanId: "tool-rag-empty",
+    callId: "call-rag-empty",
+    session: {
+      id: "session-rag-empty",
+      messages: [{ role: "user", content: [{ type: "text", text: "What does ZXQ-NOT-PRESENT-991 require?" }] }],
+    },
+  });
+  assert.deepEqual(empty.hits, []);
+  const emptyEnd = ragEvents.find(event => event.traceId === "trace-rag-empty" && event.name === "workspace_rag.search" && event.phase === "end");
+  assert.equal(emptyEnd.attributes.outcome, "insufficient_evidence");
+  assert.equal(emptyEnd.attributes.answerability.abstained, true);
 
   const generationBeforeWatch = primary.generationId ?? reconciled.activeGenerationId;
   await writeFile(path.join(docs, "contract.md"), [

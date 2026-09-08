@@ -196,11 +196,36 @@ Persistence is deliberately split:
 | Sessions, files, stores, memories, skills | One Cortex workspace | that workspace's `.data` |
 | Source registry records, versions, health events, and access events | One Cortex workspace through Matbot stores | `sources`, `source_versions`, `source_health_events`, `source_access_events` |
 | Traces, spans, evaluation suites/runs/scores, ROI baselines, and verified outcomes | One Cortex workspace through Matbot stores | `observability_traces`, `observability_spans`, `observability_events`, `evaluation_suites`, `evaluation_runs`, `evaluation_scores`, `roi_baselines`, `outcome_events` |
+| Per-chat diagnostic timelines | One Cortex workspace, one append-only JSONL file per session | `.data\chat-diagnostics\session-<sha256-prefix>.jsonl` |
 | Workspace RAG config | One Cortex workspace | that workspace's `cortex-rag.json` |
 | Workspace RAG V2 catalog, lexical evidence, vectors, jobs, and traces | Workspace/context identities within the shared database | Postgres/pgvector `workspace_rag_v2` schema and dimension-specific derivative tables |
 | File-index data | Configured host corpus, owned by the selected index service | `local-agent\file-index\data\index.json` or `FILE_INDEX_STORE` |
 | Configuration change history | Workspace store, attributed to each contributor | Redacted pre-change records in `configuration_history`; secrets remain in the vault |
 | Mem0/Postgres/Neo4j | Docker stack | Docker volumes |
+
+### Per-Chat Diagnostic Logs
+
+`evaluation-observability` also writes a local JSONL timeline for each chat in
+`.data\chat-diagnostics`. Files are named from a SHA-256 prefix of the session
+id; the complete session and trace identifiers remain in each record. This keeps
+directory listings from exposing raw session ids while still making it possible
+to correlate one log with the trace inspector or a persisted session.
+
+Each line has a timestamp and one scrubbed observability event. It records the
+human request, provider/model request metadata, streamed-response completion
+and partial-response details, available versus selected tools, tool input and
+result, RAG query/rewritten-query plan, evidence metadata, answerability,
+empty-result reason, timings, and terminal/abort/failure state. A provider or
+retriever start without an end is evidence of a process interruption; a
+`gen_ai.chat.stalled` event means a provider call exceeded 30 seconds. RAG
+events explicitly distinguish `empty_evidence`, `insufficient_evidence`, an
+unavailable/no-active generation, cancellation, and search errors.
+
+The existing secret scrubber runs before a line is persisted: credential-shaped
+fields and values are redacted and nested values are bounded. The logs are still
+private workspace state because prompts, model prose, tool payloads, and RAG
+queries are intentionally retained for diagnosis. Cortex creates the directory
+and deletes only its regular `.jsonl` files older than seven days at startup.
 
 The implemented scale-out design for million-document corpora and exceptional
 multi-gigabyte Markdown sources is documented in
@@ -263,7 +288,7 @@ ordered, committable slices. Completed build-sequence items:
 | Context Graph MVP | Complete | `context-graph` registers `ContextGraph` and `context_graph_action`; entities, relationship assertions, extraction runs, and Neo4j projection operations are store-backed; workspace RAG enqueues deterministic source extraction after source version writes; graph retrieval expands source-backed facts within depth/relationship budgets and filters relationships from denied sources before results reach the model. |
 | Workflow Compiler MVP | Complete | `workflow-governance` now registers `WorkflowCompiler`; `workflow_action.compile` converts selected transcript text, input hints, source ids, and tool calls into a validated workflow definition, optional published version, persisted compilation record, and optional dry-run smoke test. |
 | Enterprise Expert Panel Upgrade | Complete | `expert-panel` now supports durable structured review records through `expert_panel.review`, `get_review`, and `list_reviews`; reviews link to workflows, workflow runs, dossiers, alerts, investigations, or chats and include structured expert recommendations, confidence, evidence ids, risks, blockers, mitigations, approval checklists, risk registers, consensus, disagreements, and synthesis. |
-| Evaluation, Observability, and ROI | Complete | `evaluation-observability` captures agent, model, tool, retriever, guardrail, evaluator, and workflow spans; supports redacted trace inspection and side-effect-free replay; runs versioned deterministic/model-scored regression suites; aggregates retrieval, citation, action, policy, workflow, approval, escalation, cost, latency, and pass-rate metrics; and calculates conservative ROI from baselines and verified business outcomes. |
+| Evaluation, Observability, and ROI | Complete | `evaluation-observability` captures agent, model, tool, retriever, guardrail, evaluator, and workflow spans; keeps redacted per-chat JSONL diagnostic timelines for seven days; supports redacted trace inspection and side-effect-free replay; runs versioned deterministic/model-scored regression suites; aggregates retrieval, citation, action, policy, workflow, approval, escalation, cost, latency, and pass-rate metrics; and calculates conservative ROI from baselines and verified business outcomes. |
 | Architecture WebUI Panels | In progress | The WebUI exposes dedicated source, governed SQL preview, Workflow Operations Center, context graph entity, expert review-card, and Evaluation & ROI panels. The evaluation panel includes trace waterfall inspection, safe replay, regression-suite execution, evaluation results, operating metrics, and sponsor evidence. Remaining product hardening includes source ownership display, source freshness directly inside graph detail, SQL cost warnings, workflow version diffs, scheduling, and manual expert-review assignment/status editing. |
 
 All current build-sequence items in `strategic_architecture.md` are complete.

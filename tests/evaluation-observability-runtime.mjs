@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 await import("../local-agent/matbot/apps/cli/register.js");
 const { plugin } = await import("../local-agent/matbot/packages/plugins/evaluation-observability/src/index.ts");
+const { CHAT_DIAGNOSTIC_RETENTION_MS, chatDiagnosticFileName } = await import("../local-agent/matbot/packages/plugins/evaluation-observability/src/chat-diagnostics.ts");
 const { runSession } = await import("../local-agent/matbot/packages/core/runner/src/runner.ts");
 
 class MemoryStore {
@@ -43,6 +47,14 @@ function match(item, filter) {
 }
 
 async function main() {
+  const workspaceDir = await mkdtemp(join(tmpdir(), "cortex-chat-diagnostics-"));
+  const chatLogDir = join(workspaceDir, ".data", "chat-diagnostics");
+  const oldLog = join(chatLogDir, "expired.jsonl");
+  await mkdir(chatLogDir, { recursive: true });
+  await writeFile(oldLog, "{\"expired\":true}\n", "utf8");
+  const oldDate = new Date(Date.now() - CHAT_DIAGNOSTIC_RETENTION_MS - 1_000);
+  await utimes(oldLog, oldDate, oldDate);
+  try {
   const stores = new Map();
   const servicesByKey = new Map();
   const tools = new Map();
@@ -53,6 +65,7 @@ async function main() {
   servicesByKey.set("WorkflowRunner", workflowRunner);
 
   const services = {
+    configPath: join(workspaceDir, "matbot.yaml"),
     providers: new Map([["judge", { name: "judge", module: "test", model: "test-model" }]]),
     createStore(namespace) {
       if (!stores.has(namespace)) stores.set(namespace, new MemoryStore());
@@ -65,6 +78,7 @@ async function main() {
   };
 
   await plugin.setup(services);
+  await assert.rejects(() => readFile(oldLog, "utf8"), /ENOENT/);
   const observability = servicesByKey.get("Observability");
   assert.ok(observability);
   assert.ok(tools.get("evaluation_action"));
@@ -111,6 +125,16 @@ async function main() {
     async unloadPlugin() { return false; },
   })) events.push(event);
   assert.equal(events.at(-1).type, "done");
+
+  const chatLog = await readFile(join(chatLogDir, chatDiagnosticFileName(session.id)), "utf8");
+  const chatEntries = chatLog.trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(chatEntries.some(entry => entry.event.name === "matbot.turn" && entry.event.phase === "start" && entry.event.attributes.request.text === "Run the governed action"));
+  assert.ok(chatEntries.some(entry => entry.event.name === "gen_ai.chat" && entry.event.phase === "start" && entry.event.attributes.request.latestHumanText === "Run the governed action"));
+  assert.ok(chatEntries.some(entry => entry.event.name === "gen_ai.tool_selection" && entry.event.attributes.decision === "tool_calls_requested"));
+  assert.ok(chatEntries.some(entry => entry.event.name === "test_action" && entry.event.phase === "end" && entry.event.attributes.result.ok === true));
+  assert.ok(chatEntries.some(entry => entry.event.name === "gen_ai.chat" && entry.event.phase === "end" && entry.event.attributes.response.text === "Completed with citation."));
+  assert.equal(chatLog.includes("should-not-persist"), false);
+  assert.equal(chatLog.includes("[REDACTED]"), true);
 
   await observability.record({
     traceId: "trace-observe", rootTraceId: "root-observe", spanId: "retrieval-1", timestamp: new Date().toISOString(),
@@ -185,6 +209,9 @@ async function main() {
   assert.equal(metrics.evaluations.passRate, 1);
 
   console.log("evaluation-observability records governed evidence");
+  } finally {
+    await rm(workspaceDir, { recursive: true, force: true });
+  }
 }
 
 await main();

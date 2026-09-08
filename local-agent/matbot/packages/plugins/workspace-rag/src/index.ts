@@ -359,13 +359,29 @@ interface RetrievalConversationContext {
   provider?: string;
 }
 
+/** Classifies every terminal path through a workspace RAG retrieval. */
+type WorkspaceSearchOutcomeState =
+  | 'aborted'
+  | 'workspace_not_found'
+  | 'blank_query'
+  | 'v2_unavailable'
+  | 'no_active_generation'
+  | 'search_error'
+  | 'empty_evidence'
+  | 'insufficient_evidence'
+  | 'hits';
+
 /**
- * Result of a detailed search: presentation-ready hits plus the raw V2
- * result (plan, answerability) when V2 produced one.
+ * Result of a detailed search: presentation-ready hits, the raw V2 result
+ * (plan, answerability) when V2 produced one, and a reason for every empty
+ * result. The latter prevents an empty RAG response from looking like an
+ * unexplained successful search in chat diagnostics.
  */
 interface WorkspaceSearchOutcome {
   hits: SearchHit[];
   v2Result?: RagV2SearchResult;
+  state: WorkspaceSearchOutcomeState;
+  error?: string;
 }
 
 /**
@@ -1630,27 +1646,33 @@ class WorkspaceRagManager {
     trace?: RetrievalTraceContext,
     conversation?: RetrievalConversationContext,
   ): Promise<WorkspaceSearchOutcome> {
-    if (signal.aborted) return { hits: [] };
+    if (signal.aborted) return { hits: [], state: 'aborted' };
     const workspace = (await this.listWorkspaces()).find(item => item.id === workspaceId);
-    if (!workspace || !query.trim()) return { hits: [] };
+    if (!workspace) return { hits: [], state: 'workspace_not_found' };
+    if (!query.trim()) return { hits: [], state: 'blank_query' };
     const config = await this.readConfig(workspace);
     const active = activeContext(config);
-    if (this.v2Mode === 'off' || !this.v2) return { hits: [] };
+    if (this.v2Mode === 'off' || !this.v2) return { hits: [], state: 'v2_unavailable' };
     try {
       const result = await this.v2.search(this.v2Workspace(workspace), active, query, {
         limit,
         ...(conversation?.turns.length ? { conversation: conversation.turns } : {}),
         ...(conversation?.provider ? { rewriteProvider: conversation.provider } : {}),
       }, signal);
-      return {
-        hits: result.evidence.length > 0
+      const hits = result.evidence.length > 0
           ? await this.enrichSearchHits(workspace, active, this.v2SearchHits(workspace, active, result), trace)
-          : [],
+          : [];
+      return {
+        hits,
         v2Result: result,
+        state: result.answerability.abstained
+          ? 'insufficient_evidence'
+          : hits.length === 0 ? 'empty_evidence' : 'hits',
       };
     } catch (error) {
-      console.warn(`[workspace-rag-v2] V2-only search failed: ${errorMessage(error)}`);
-      return { hits: [] };
+      const message = errorMessage(error);
+      console.warn(`[workspace-rag-v2] V2-only search failed: ${message}`);
+      return { hits: [], state: 'search_error', error: message };
     }
   }
 
@@ -2574,17 +2596,59 @@ class WorkspaceRagManager {
 }
 
 /**
- * Records a completed retriever span with the `Observability` service when
- * mounted and a trace id is supplied. Sink failures are logged rather than
- * thrown.
+ * Opens a retriever span before a workspace RAG query. A start without an end
+ * in the per-chat log is therefore useful evidence of a retrieval stall or a
+ * process interruption.
  *
  * @param services - Machine providing the optional `Observability` service.
  * @param trace - Correlation ids for the span.
- * @param query - Query text; recorded only as a SHA-256 hash.
- * @param hits - Hits returned by retrieval, ranked as presented.
- * @param startedAt - `Date.now()` value captured before retrieval began, in
- *   milliseconds.
- * @param spanId - Fresh span id for the retriever span.
+ * @param query - User query, scrubbed by the observability sink before disk write.
+ * @param limit - Requested evidence limit.
+ * @param spanId - Fresh retriever span id.
+ * @returns Resolves once the start was recorded or its failure logged.
+ * @throws Never.
+ */
+async function observeRetrievalStart(
+  services: MatbotMachine,
+  trace: RetrievalTraceContext,
+  query: string,
+  limit: number,
+  spanId: string,
+): Promise<void> {
+  const observability = services.get('Observability');
+  if (observability === undefined || trace.traceId === undefined) return;
+  try {
+    await observability.record({
+      traceId: trace.traceId,
+      rootTraceId: trace.rootTraceId ?? trace.traceId,
+      spanId,
+      ...(trace.parentSpanId !== undefined ? { parentSpanId: trace.parentSpanId } : {}),
+      ...(trace.sessionId !== undefined ? { sessionId: trace.sessionId } : {}),
+      timestamp: nowIso(),
+      phase: 'start', kind: 'retriever', name: 'workspace_rag.search',
+      attributes: {
+        query,
+        queryHash: sha256(query),
+        limit,
+        ...(trace.toolCallId !== undefined ? { toolCallId: trace.toolCallId } : {}),
+      },
+    });
+  } catch (error) {
+    console.warn(`[workspace-rag] observability sink failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Records a completed retriever span with query, planned rewrite, evidence
+ * metadata, and an explicit empty-result reason. Sink failures are logged
+ * rather than thrown.
+ *
+ * @param services - Machine providing the optional `Observability` service.
+ * @param trace - Correlation ids for the span.
+ * @param query - User query, scrubbed by the observability sink before disk write.
+ * @param outcome - Result and diagnostic state from the V2 search.
+ * @param startedAt - `Date.now()` value captured before retrieval began, in milliseconds.
+ * @param spanId - Fresh span id paired with {@link observeRetrievalStart}.
  * @returns Resolves once the span is recorded or its failure logged.
  * @throws Never.
  */
@@ -2592,7 +2656,7 @@ async function observeRetrieval(
   services: MatbotMachine,
   trace: RetrievalTraceContext,
   query: string,
-  hits: SearchHit[],
+  outcome: WorkspaceSearchOutcome,
   startedAt: number,
   spanId: string,
 ): Promise<void> {
@@ -2606,13 +2670,42 @@ async function observeRetrieval(
       ...(trace.parentSpanId !== undefined ? { parentSpanId: trace.parentSpanId } : {}),
       ...(trace.sessionId !== undefined ? { sessionId: trace.sessionId } : {}),
       timestamp: nowIso(),
-      phase: 'end', kind: 'retriever', name: 'workspace_rag.search', status: 'ok',
+      phase: 'end', kind: 'retriever', name: 'workspace_rag.search',
+      status: ['search_error', 'v2_unavailable', 'no_active_generation', 'workspace_not_found', 'aborted'].includes(outcome.state) ? 'error' : 'ok',
       durationMs: Date.now() - startedAt,
       attributes: {
+        query,
         queryHash: sha256(query),
-        returnedCount: hits.length,
-        retrievedSourceIds: hits.map(hit => hit.sourceId).filter((value): value is string => value !== undefined),
-        hits: hits.map((hit, rank) => ({ rank: rank + 1, sourceId: hit.sourceId ?? null, sourceVersionId: hit.sourceVersionId ?? null, score: hit.score, path: hit.path, citation: hit.citation ?? null, health: hit.sourceHealthState ?? null, freshness: hit.sourceStalenessState ?? null })),
+        outcome: outcome.state,
+        ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+        returnedCount: outcome.hits.length,
+        retrievedSourceIds: outcome.hits.map(hit => hit.sourceId).filter((value): value is string => value !== undefined),
+        hits: outcome.hits.map((hit, rank) => ({ rank: rank + 1, sourceId: hit.sourceId ?? null, sourceVersionId: hit.sourceVersionId ?? null, score: hit.score, path: hit.path, citation: hit.citation ?? null, health: hit.sourceHealthState ?? null, freshness: hit.sourceStalenessState ?? null })),
+        ...(outcome.v2Result !== undefined ? {
+          runId: outcome.v2Result.runId,
+          generationId: outcome.v2Result.generationId,
+          plan: {
+            originalQuery: outcome.v2Result.plan.originalQuery,
+            latestQuestion: outcome.v2Result.plan.latestQuestion,
+            standaloneQuery: outcome.v2Result.plan.standaloneQuery,
+            rewriteMethod: outcome.v2Result.plan.rewriteMethod,
+            conversationTurnsUsed: outcome.v2Result.plan.conversationTurnsUsed,
+            intent: outcome.v2Result.plan.intent,
+            exactReferences: outcome.v2Result.plan.exactReferences,
+            quotedPhrases: outcome.v2Result.plan.quotedPhrases,
+            entities: outcome.v2Result.plan.entities,
+            documentTypes: outcome.v2Result.plan.documentTypes,
+            jurisdictions: outcome.v2Result.plan.jurisdictions,
+            asOfDate: outcome.v2Result.plan.asOfDate ?? null,
+            queryLanguage: outcome.v2Result.plan.queryLanguage,
+            answerLanguage: outcome.v2Result.plan.answerLanguage,
+          },
+          answerability: outcome.v2Result.answerability,
+          degraded: outcome.v2Result.degraded,
+          timings: outcome.v2Result.timings,
+          candidateCounts: outcome.v2Result.diagnostics.candidateCounts,
+        } : {}),
+        ...(trace.toolCallId !== undefined ? { toolCallId: trace.toolCallId } : {}),
       },
     });
   } catch (error) {
@@ -2918,12 +3011,13 @@ function createWorkspaceRagTool(manager: WorkspaceRagManager, services: MatbotMa
             const trace = { ...(ctx.traceId !== undefined ? { traceId: ctx.traceId } : {}), ...(ctx.rootTraceId !== undefined ? { rootTraceId: ctx.rootTraceId } : {}), ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}), ...(ctx.session?.id !== undefined ? { sessionId: ctx.session.id } : {}), ...(ctx.callId !== undefined ? { toolCallId: ctx.callId } : {}) };
             const startedAt = Date.now();
             const spanId = randomUUID();
-            const hits = await manager.searchCurrent(query, limit, ctx.signal, trace, {
+            await observeRetrievalStart(services, trace, query, limit, spanId);
+            const outcome = await manager.searchCurrentDetailed(query, limit, ctx.signal, trace, {
               turns: conversationBeforeLatestUser(ctx.session),
               ...(ctx.provider ? { provider: ctx.provider } : {}),
             });
-            await observeRetrieval(services, trace, query, hits, startedAt, spanId);
-            yield { type: 'result', value: { hits } };
+            await observeRetrieval(services, trace, query, outcome, startedAt, spanId);
+            yield { type: 'result', value: { hits: outcome.hits } };
             return;
           }
           yield { type: 'error', message: `Unknown workspace_rag action "${action}".` };
@@ -3121,23 +3215,33 @@ export const plugin: MatbotPluginSpec = {
       async handler(ctx) {
         const query = latestUserText(ctx.session);
         if (!query.trim()) return;
-        const status = await manager.statusCurrent();
-        if (!status.activeGenerationId) return {
-          markers: [{
-            type: 'marker',
-            creator: 'workspace-rag',
-            data: { state: status.job?.state ?? 'pending', message: status.message },
-          }],
+        const trace = {
+          ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}),
+          ...(ctx.config.rootTraceId !== undefined ? { rootTraceId: ctx.config.rootTraceId } : {}),
+          sessionId: ctx.session.id,
         };
-        const trace = { ...(ctx.config.traceId !== undefined ? { traceId: ctx.config.traceId } : {}), ...(ctx.config.rootTraceId !== undefined ? { rootTraceId: ctx.config.rootTraceId } : {}), sessionId: ctx.session.id };
         const startedAt = Date.now();
         const spanId = randomUUID();
+        await observeRetrievalStart(services, trace, query, MAX_CONTEXT_CHUNKS, spanId);
+        const status = await manager.statusCurrent();
+        if (!status.activeGenerationId) {
+          await observeRetrieval(services, trace, query, {
+            hits: [], state: 'no_active_generation', error: status.message,
+          }, startedAt, spanId);
+          return {
+            markers: [{
+              type: 'marker',
+              creator: 'workspace-rag',
+              data: { state: status.job?.state ?? 'pending', message: status.message },
+            }],
+          };
+        }
         const outcome = await manager.searchCurrentDetailed(query, MAX_CONTEXT_CHUNKS, ctx.signal, trace, {
           turns: conversationBeforeLatestUser(ctx.session),
           provider: ctx.config.provider,
         });
         const hits = outcome.hits;
-        await observeRetrieval(services, trace, query, hits, startedAt, spanId);
+        await observeRetrieval(services, trace, query, outcome, startedAt, spanId);
         if (outcome.v2Result?.answerability.abstained) {
           return {
             ephemeral: [{ type: 'text', text: renderAbstention(outcome.v2Result) }],

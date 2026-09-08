@@ -12,6 +12,31 @@ import { isToolHiddenByRules } from './permissions.js';
 import { HookRegistry } from './hooks.js';
 import { appendMessage, createMessage } from './session.js';
 
+/** Emit a warning event when a provider call has not finished after this interval. */
+const PROVIDER_STALL_WARNING_MS = 30_000;
+
+/**
+ * Extracts the human-authored text of the latest user turn for local
+ * diagnostics. Durable machine-injected fragments are deliberately excluded:
+ * they are captured separately by screen/RAG events and are not the request a
+ * user typed.
+ *
+ * @param session Chat session to inspect.
+ * @returns Latest human user text, or an empty string when none is present.
+ * @throws Never.
+ */
+function latestHumanRequest(session: Session): string {
+  for (let index = session.messages.length - 1; index >= 0; index--) {
+    const message = session.messages[index];
+    if (message?.role !== 'user') continue;
+    return message.content
+      .filter((part): part is Extract<MessageContent, { type: 'text' }> => part.type === 'text' && part.origin !== 'robo')
+      .map(part => part.text)
+      .join('\n');
+  }
+  return '';
+}
+
 /** Loop budget policy for one agentic turn (spec R1). Absent fields are unlimited. */
 export interface LoopPolicy {
   /** Maximum provider calls (iterations) per turn. Default unlimited. */
@@ -322,12 +347,30 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
 
   await observe({
     phase: 'start', kind: 'agent', name: 'matbot.turn', spanId: turnSpanId, sessionId,
-    attributes: { provider: config.provider, persona: config.persona ?? null },
+    attributes: {
+      provider: config.provider,
+      persona: config.persona ?? null,
+      request: {
+        text: scrubSpanValue(latestHumanRequest(opts.session)),
+        textCharacters: latestHumanRequest(opts.session).length,
+        persistedMessageCount: opts.session.messages.length,
+      },
+    },
   });
 
   // ── 1. screen — once per turn: shape/abort the incoming submission ──────────
 
   const screen = await hookReg.runScreen({ session: opts.session, config, signal, prompt: promptFn });
+  await observe({
+    phase: 'event', kind: 'agent', name: 'matbot.screen', spanId: turnSpanId, sessionId,
+    attributes: {
+      aborted: screen.abort ?? null,
+      durableContextBlocks: screen.durable.length,
+      ephemeralContextBlocks: screen.ephemeral.length,
+      markerCount: screen.markers.length,
+      screenedMessageCount: screen.session.messages.length,
+    },
+  });
   if (screen.abort) {
     // Hook-failure (and any other screen-injected) markers carried live, even on abort, so a
     // misconfigured hook surfaces this turn rather than only on a later reload.
@@ -448,10 +491,35 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
       upstreamProvider?: string; finishReason?: string; truncated?: boolean;
     } | undefined;
     let providerDone = false;
+    const providerStallTimer = setTimeout(() => {
+      void observe({
+        phase: 'event', kind: 'llm', name: 'gen_ai.chat.stalled', spanId: providerSpanId,
+        parentSpanId: turnSpanId, sessionId,
+        attributes: {
+          provider: config.provider,
+          model: providerConfig.model,
+          elapsedMs: Date.now() - providerStartedAt,
+          stage: firstTokenAt === undefined ? 'awaiting_first_token' : 'streaming_response',
+          providerDone,
+        },
+      });
+    }, PROVIDER_STALL_WARNING_MS);
     await observe({
       phase: 'start', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
       parentSpanId: turnSpanId, sessionId,
-      attributes: { provider: config.provider, model: providerConfig.model, messageCount: outgoing.length, toolCount: tools.size },
+      attributes: {
+        provider: config.provider,
+        model: providerConfig.model,
+        messageCount: outgoing.length,
+        toolCount: tools.size,
+        availableTools: [...tools.keys()],
+        request: {
+          latestHumanText: scrubSpanValue(latestHumanRequest(session)),
+          latestHumanTextCharacters: latestHumanRequest(session).length,
+          systemContextCharacters: systemText?.length ?? 0,
+          injectedEphemeralBlocks: ephemeral.length,
+        },
+      },
     });
     try {
       for await (const ev of provider.complete(outgoing, providerConfig, [...tools.values()], signal)) {
@@ -509,6 +577,16 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
       }
       if (!providerDone) throw new Error('Provider stream ended without a terminal done event.');
       await observe({
+        phase: 'event', kind: 'llm', name: 'gen_ai.tool_selection', spanId: providerSpanId,
+        parentSpanId: turnSpanId, sessionId,
+        attributes: {
+          selectedToolCalls: pendingCalls.map(call => ({ id: call.id, name: call.name, input: scrubSpanValue(call.input) })),
+          selectedToolCallCount: pendingCalls.length,
+          availableTools: [...tools.keys()],
+          decision: pendingCalls.length === 0 ? 'no_tool_call' : 'tool_calls_requested',
+        },
+      });
+      await observe({
         phase: 'end', kind: 'llm', name: 'gen_ai.chat', spanId: providerSpanId,
         parentSpanId: turnSpanId, sessionId, status: 'ok', durationMs: Date.now() - providerStartedAt,
         attributes: {
@@ -523,6 +601,11 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
           timeToFirstTokenMs: firstTokenAt === undefined ? null : firstTokenAt - providerStartedAt,
           outputCharacters: textAcc.length,
           toolCallCount: pendingCalls.length,
+          response: {
+            text: scrubSpanValue(textAcc),
+            visibleTextCharacters: textAcc.length,
+            toolCalls: pendingCalls.map(call => ({ id: call.id, name: call.name, input: scrubSpanValue(call.input) })),
+          },
         },
       });
     } catch (e) {
@@ -542,6 +625,11 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
           provider: config.provider,
           error: detail,
           ...(stack !== undefined ? { errorStack: stack } : {}),
+          partialResponse: {
+            text: scrubSpanValue(textAcc),
+            visibleTextCharacters: textAcc.length,
+            pendingToolCallCount: pendingCalls.length,
+          },
         },
       });
       // Preserve partial prose and completed rounds, but never release buffered
@@ -572,6 +660,8 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
       yield { type: 'error', error: detail, traceId };
       await finishTurn('error', { terminal: 'error', error: detail });
       return;
+    } finally {
+      clearTimeout(providerStallTimer);
     }
 
     // Build and store assistant message
@@ -595,6 +685,19 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
       // replied". Logged here so a silent no-reply turn is traceable. (textAcc length is shown to
       // tell a truly empty stream apart from one that was only whitespace.)
       console.warn(`[runner] empty completion (no assistant content) on traceId ${traceId}; textAcc=${textAcc.length} chars, provider=${config.provider}`);
+    }
+
+    if (textAcc.trim().length === 0 && pendingCalls.length === 0) {
+      await observe({
+        phase: 'event', kind: 'llm', name: 'gen_ai.no_visible_response', spanId: providerSpanId,
+        parentSpanId: turnSpanId, sessionId,
+        attributes: {
+          provider: config.provider,
+          assistantPartCount: assistantParts.length,
+          outputCharacters: textAcc.length,
+          providerDone,
+        },
+      });
     }
 
     // No tool calls → done
@@ -658,7 +761,7 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
           void observe({
             phase: 'end', kind: 'tool', name: tc.name, spanId,
             parentSpanId: turnSpanId, sessionId, status: 'error', durationMs: Date.now() - startedAt,
-            attributes: { callId: tc.id, isError: true },
+            attributes: { callId: tc.id, result: scrubSpanValue(result), isError: true, execution: 'skipped' },
           });
         };
 

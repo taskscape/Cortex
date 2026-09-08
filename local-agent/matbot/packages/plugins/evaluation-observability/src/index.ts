@@ -1,7 +1,9 @@
 import type {} from '@matatbread/matbot-capabilities-types';
 import {uiContribution} from './ui.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
+import { ChatDiagnosticJournal, CHAT_DIAGNOSTIC_DIRECTORY } from './chat-diagnostics.js';
 import type {
   MatbotMachine,
   MatbotPluginSpec,
@@ -633,6 +635,7 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
   private readonly scores: Store<ScoreResult>;
   private readonly baselines: Store<RoiBaseline>;
   private readonly outcomes: Store<OutcomeEvent>;
+  private readonly chatJournal: ChatDiagnosticJournal | undefined;
 
   /**
    * @param services - The matbot machine, used for `singleTurn` (rubric scoring) and the optional
@@ -647,6 +650,7 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
    * @param scores - Store for {@link ScoreResult}s.
    * @param baselines - Store for {@link RoiBaseline}s.
    * @param outcomes - Store for {@link OutcomeEvent}s.
+   * @param chatJournal - Optional append-only per-chat JSONL diagnostic journal.
    * @throws Never.
    */
   constructor(
@@ -661,6 +665,7 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     scores: Store<ScoreResult>,
     baselines: Store<RoiBaseline>,
     outcomes: Store<OutcomeEvent>,
+    chatJournal?: ChatDiagnosticJournal,
   ) {
     this.services = services;
     this.traces = traces;
@@ -673,6 +678,7 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
     this.scores = scores;
     this.baselines = baselines;
     this.outcomes = outcomes;
+    this.chatJournal = chatJournal;
   }
 
   /**
@@ -696,6 +702,13 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
       version: randomUUID(),
       ...(raw.attributes !== undefined ? { attributes: sanitizedAttributes(raw.attributes) } : {}),
     };
+    if (this.chatJournal !== undefined) {
+      try {
+        await this.chatJournal.record(event);
+      } catch (error) {
+        console.warn(`[evaluation-observability] failed to append chat diagnostic log: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     await this.events.set(event.id, event);
 
     const existingSpan = await this.spans.get(raw.spanId);
@@ -1410,7 +1423,7 @@ function createEvaluationActionTool(service: EvaluationObservability): Tool {
  * @returns The service instance.
  * @throws If any backing store cannot be created.
  */
-export function createEvaluationObservability(services: MatbotMachine): EvaluationObservability {
+export function createEvaluationObservability(services: MatbotMachine, chatJournal?: ChatDiagnosticJournal): EvaluationObservability {
   return new StoreBackedEvaluationObservability(
     services,
     services.createStore<CortexTrace>(TRACE_STORE),
@@ -1423,6 +1436,7 @@ export function createEvaluationObservability(services: MatbotMachine): Evaluati
     services.createStore<ScoreResult>(SCORE_STORE),
     services.createStore<RoiBaseline>(BASELINE_STORE),
     services.createStore<OutcomeEvent>(OUTCOME_STORE),
+    chatJournal,
   );
 }
 
@@ -1442,7 +1456,18 @@ export const plugin: MatbotPluginSpec = {
    */
   async setup(services) {
     services.contributions?.register('webui','evaluation',uiContribution);
-    const service = createEvaluationObservability(services);
+    let chatJournal: ChatDiagnosticJournal | undefined;
+    if (services.configPath !== undefined) {
+      chatJournal = new ChatDiagnosticJournal(join(dirname(services.configPath), '.data', CHAT_DIAGNOSTIC_DIRECTORY));
+      try {
+        const removed = await chatJournal.initialize();
+        if (removed > 0) console.warn(`[evaluation-observability] pruned ${removed} chat diagnostic log(s) older than seven days.`);
+      } catch (error) {
+        console.warn(`[evaluation-observability] could not prepare chat diagnostic logs: ${error instanceof Error ? error.message : String(error)}`);
+        chatJournal = undefined;
+      }
+    }
+    const service = createEvaluationObservability(services, chatJournal);
     await services.register('Observability', service);
     services.tools.register(createEvaluationActionTool(service));
   },
