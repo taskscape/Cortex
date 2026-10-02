@@ -15,13 +15,26 @@ export async function* parseSSEFrames(body: ReadableStream<Uint8Array>, signal?:
   const decoder = new TextDecoder();
   let buffer = '';
   let dataLines: string[] = [];
+  let dataChars = 0;
   const abort = (): void => { void reader.cancel(signal?.reason).catch(() => undefined); };
   signal?.addEventListener('abort', abort, { once: true });
+
+  // Bound both complete lines and the accumulated event. A peer can otherwise
+  // evade the partial-line limit with endless data lines and no blank delimiter.
+  const appendData = (line: string): void => {
+    const data = line[5] === ' ' ? line.slice(6) : line.slice(5);
+    dataChars += data.length + (dataLines.length > 0 ? 1 : 0);
+    if (dataChars > MAX_BUFFER_CHARS) {
+      throw new Error(`SSE event exceeded ${MAX_BUFFER_CHARS} buffered characters`);
+    }
+    dataLines.push(data);
+  };
 
   const dispatch = async function* (): AsyncIterable<SSEFrame> {
     if (dataLines.length === 0) return;
     const data = dataLines.join('\n');
     dataLines = [];
+    dataChars = 0;
     if (data === '[DONE]') {
       yield { type: 'done' };
       return;
@@ -39,6 +52,9 @@ export async function* parseSSEFrames(body: ReadableStream<Uint8Array>, signal?:
       buffer += decoder.decode(value, { stream: true });
       let nl: number;
       while ((nl = buffer.indexOf('\n')) !== -1) {
+        if (nl > MAX_BUFFER_CHARS) {
+          throw new Error(`SSE stream exceeded ${MAX_BUFFER_CHARS} buffered characters in one line`);
+        }
         const line = buffer.slice(0, nl).replace(/\r$/, '');
         buffer = buffer.slice(nl + 1);
         if (line === '') {
@@ -52,7 +68,7 @@ export async function* parseSSEFrames(body: ReadableStream<Uint8Array>, signal?:
         }
         if (line.startsWith(':')) continue;
         if (line.startsWith('data:')) {
-          dataLines.push(line[5] === ' ' ? line.slice(6) : line.slice(5));
+          appendData(line);
         }
       }
       if (buffer.length > MAX_BUFFER_CHARS) {
@@ -61,11 +77,14 @@ export async function* parseSSEFrames(body: ReadableStream<Uint8Array>, signal?:
     }
     // Flush a final split UTF-8 code point before examining an unterminated final frame.
     buffer += decoder.decode();
+    if (buffer.length > MAX_BUFFER_CHARS) {
+      throw new Error(`SSE stream exceeded ${MAX_BUFFER_CHARS} buffered characters without a newline`);
+    }
     // Some otherwise-valid implementations omit the final blank line. Preserve their last
     // complete data frame, but do not manufacture a missing `[DONE]` sentinel.
     if (buffer.length > 0) {
       const line = buffer.replace(/\r$/, '');
-      if (line.startsWith('data:')) dataLines.push(line[5] === ' ' ? line.slice(6) : line.slice(5));
+      if (line.startsWith('data:')) appendData(line);
     }
     yield* dispatch();
   } finally {
@@ -87,7 +106,7 @@ export async function* parseSSEFrames(body: ReadableStream<Uint8Array>, signal?:
  *                 underlying reader is cancelled and iteration ends.
  * @returns An async iterable of SSE `data:` payload strings, in stream order.
  * @throws The abort `signal`'s reason when it fires during consumption.
- * @throws If the buffer exceeds the maximum size without a newline (a malformed/unbounded stream).
+ * @throws If an individual line or accumulated event exceeds the maximum size.
  */
 export async function* parseSSE(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<string> {
   for await (const frame of parseSSEFrames(body, signal)) {

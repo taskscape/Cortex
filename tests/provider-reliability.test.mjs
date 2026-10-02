@@ -6,6 +6,58 @@ await import('../local-agent/matbot/apps/cli/register.js');
 const { OpenAICompatAdapter } = await import('../local-agent/matbot/packages/plugins/providers/openai-compat/src/adapter.ts');
 const { AnthropicAdapter } = await import('../local-agent/matbot/packages/plugins/providers/anthropic/src/adapter.ts');
 const { fetchWithRetry } = await import('../local-agent/matbot/packages/core/providers/_base/src/http-retry.ts');
+const { parseSSEFrames } = await import('../local-agent/matbot/packages/core/providers/_base/src/sse.ts');
+
+test('a Retry-After beyond the budget preserves the error response body', async () => {
+  let requests = 0;
+  const response = await fetchWithRetry('https://provider.invalid', {}, 3, {
+    timeoutMs: 1000, honorRetryAfterFully: true,
+    fetchImpl: async () => {
+      requests++;
+      return new Response('{"error":{"message":"Capacity exhausted","code":"capacity"}}', {
+        status: 429, headers: { 'retry-after': '60' },
+      });
+    },
+  });
+  assert.equal(requests, 1);
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).error.code, 'capacity');
+});
+
+for (const mode of ['multiline', 'complete-line', 'split-line', 'final-line']) {
+  test(`SSE rejects oversized ${mode} frames and releases the stream`, async () => {
+    const limit = 1_048_576;
+    const encoder = new TextEncoder();
+    const chunks = mode === 'multiline' ? Array(1025).fill(`data: ${'x'.repeat(1024)}\n`)
+      : mode === 'split-line' ? ['data: ', 'x'.repeat(limit), '\n\n']
+      : [`data: ${'x'.repeat(limit + 1)}${mode === 'final-line' ? '' : '\n\n'}`];
+    let index = 0;
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (index < chunks.length) controller.enqueue(encoder.encode(chunks[index++]));
+        else controller.close();
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    await assert.rejects(async () => {
+      for await (const _frame of parseSSEFrames(stream)) assert.fail('Oversized frame was emitted');
+    }, /SSE.*exceeded/);
+    assert.equal(cancelled, true);
+    assert.equal(stream.locked, false);
+  });
+}
+
+test('SSE frame limits reset between valid events and preserve multiline data', async () => {
+  const payload = 'x'.repeat(600_000);
+  const stream = new Response(`data: ${payload}\n\ndata: first\ndata: second\n\ndata: ${payload}\n\ndata: [DONE]\n\n`).body;
+  const frames = [];
+  for await (const frame of parseSSEFrames(stream)) frames.push(frame);
+  assert.deepEqual(frames, [
+    { type: 'data', data: payload }, { type: 'data', data: 'first\nsecond' },
+    { type: 'data', data: payload }, { type: 'done' },
+  ]);
+});
 
 async function serverFor(t, handler) {
   const server = createServer(handler);

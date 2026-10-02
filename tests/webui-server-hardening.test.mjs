@@ -278,6 +278,45 @@ function baseSession(id) {
   };
 }
 
+test('foreign browser origins cannot create sessions or invoke tools', async () => {
+  let writes = 0;
+  let invocations = 0;
+  const { web, port } = await startServer({
+    store: { ...noopStore(), async set() { writes++; } },
+    tools: { resolve() { invocations++; }, async *watch() {} },
+  });
+  try {
+    for (const origin of ['https://evil.example', 'null']) {
+      for (const path of ['/sessions', '/tools/echo_tool', '/stream/tools/echo_tool']) {
+        const response = await request(port, path, {
+          method: 'POST', headers: { origin, 'content-type': 'text/plain' }, body: '{}',
+        });
+        assert.equal(response.status, 403, `${origin} must not write to ${path}`);
+        assert.match(JSON.parse(response.body).error, /origin/i);
+      }
+    }
+    assert.equal(writes, 0);
+    assert.equal(invocations, 0);
+    for (const origin of [undefined, `http://localhost:${port}`]) {
+      const response = await request(port, '/sessions', {
+        method: 'POST', headers: origin ? { origin } : {}, body: '',
+      });
+      assert.equal(response.status, 201);
+    }
+    assert.equal(writes, 2);
+  } finally { await stopServer(web); }
+});
+
+test('explicit CORS configuration authorizes only the configured origin for writes', async () => {
+  const { web, port } = await startServer({ cors: 'https://ui.example' });
+  try {
+    for (const [origin, status] of [['https://ui.example', 201], ['https://evil.example', 403], ['http://localhost:19778', 403]]) {
+      const response = await request(port, '/sessions', { method: 'POST', headers: { origin }, body: '' });
+      assert.equal(response.status, status);
+    }
+  } finally { await stopServer(web); }
+});
+
 function casStore(failFirstN) {
   let casCalls = 0;
   const state = { session: baseSession("sess-cas"), setCalls: 0 };

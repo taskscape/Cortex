@@ -113,7 +113,7 @@ export interface WebServerDeps {
   skills?:        () => SkillManager | undefined;
   // Access-Control-Allow-Origin override. Default (unset): reflect the request Origin only when it
   // is a loopback origin (http(s)://127.0.0.1|localhost|[::1]:<port>); foreign origins get no ACAO
-  // header, so browsers block the response.
+  // header. Mutating requests from disallowed origins are rejected before routing.
   cors?:          string;
   workdir?:       string;
   files?:         FileStore;
@@ -716,8 +716,20 @@ export function createWebServer(deps: WebServerDeps) {
       res.setHeader(k, v);
     }
 
+    // CORS alone only hides responses: a browser can still send a simple POST
+    // (including text/plain) without preflight. Reject foreign writes before any
+    // tool, session, prompt, or workspace operation can run. Native clients have
+    // no Origin; explicit CORS configuration remains the browser allowlist.
+    const mutating = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+    const origin = req.headers.origin;
+    if (mutating && origin !== undefined && !(configuredCors === '*'
+      || (configuredCors !== undefined ? origin === configuredCors : isLoopbackOrigin(origin)))) {
+      json(res, 403, { error: 'Request origin is not allowed to modify Cortex.' });
+      return;
+    }
+
     // Shared-secret gate on mutating routes. GET/OPTIONS stay open so the UI keeps rendering.
-    if ((method === 'POST' || method === 'PUT' || method === 'DELETE') && requiredToken) {
+    if (mutating && requiredToken) {
       const presented = req.headers[TOKEN_HEADER];
       if (typeof presented !== 'string' || !tokensEqual(presented, requiredToken)) {
         json(res, 401, { error: 'Unauthorized.' });

@@ -155,8 +155,6 @@ export async function fetchWithRetry(
     if (!isTransientStatus(res.status) || attempt >= maxAttempts || init.signal?.aborted) {
       return res;
     }
-    await res.body?.cancel().catch(() => undefined);
-    if (budgetExhausted()) throw timeoutError(url, options.timeoutMs);
     let waitMs = retryAfterMs(res, !options.honorRetryAfterFully) ?? Math.min(BASE_DELAY_MS * 2 ** (attempt - 1), MAX_DELAY_MS);
     if (deadline !== undefined) {
       const remaining = Math.max(deadline - Date.now(), 0);
@@ -165,6 +163,10 @@ export async function fetchWithRetry(
       if (options.honorRetryAfterFully && waitMs > remaining) return res;
       waitMs = Math.min(waitMs, remaining);
     }
+    // Only discard a response once we have committed to retrying it. The caller
+    // still needs the error body when Retry-After cannot fit the remaining budget.
+    await res.body?.cancel().catch(() => undefined);
+    if (budgetExhausted()) throw timeoutError(url, options.timeoutMs);
     await delay(waitMs, init.signal);
   }
 }

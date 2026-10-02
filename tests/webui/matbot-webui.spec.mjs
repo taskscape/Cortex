@@ -76,8 +76,9 @@ test("model label and expert selector use the same input meta typography", async
 });
 
 test("renders safe OpenRouter completion status without exposing opaque metadata", async ({ page }) => {
-  await page.goto("/");
-  await page.evaluate(() => window.CortexUI.features.renderSession({
+  const session = {
+    id: "s0",
+    title: "OpenRouter partial response",
     messages: [{
       role: "assistant",
       content: [{ type: "text", text: "Partial answer." }],
@@ -88,7 +89,16 @@ test("renders safe OpenRouter completion status without exposing opaque metadata
         opaqueReasoning: "must never appear in the UI"
       } }
     }]
-  }));
+  };
+  await page.route("**/tools/session_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "get" && input.sessionId === session.id) {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(session) });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.goto("/#s0");
   await expect(page.locator(".message.assistant")).toContainText("Partial answer.");
   await expect(page.locator(".marker-note")).toContainText("Response truncated at the configured output limit.");
   await expect(page.locator(".marker-note")).toContainText("Returned model: vendor/returned-model.");
