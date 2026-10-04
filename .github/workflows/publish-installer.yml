@@ -1,0 +1,170 @@
+name: Publish Cortex installer
+
+on:
+  push:
+    branches: [main]
+
+# Each pushed commit gets a distinct tag. Do not use a shared concurrency group:
+# GitHub can replace an older pending run when another commit arrives.
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Find commits in this push
+    runs-on: ubuntu-latest
+    outputs:
+      commits: ${{ steps.range.outputs.commits }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the pushed commit range
+        id: range
+        shell: pwsh
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $before = $env:PUSH_BEFORE
+          $after = $env:PUSH_AFTER
+          $commits = @($after)
+
+          if ($before -and $before -notmatch '^0+$') {
+            git merge-base --is-ancestor $before $after
+            if ($LASTEXITCODE -eq 0) {
+              $commits = @(git rev-list --reverse "$before..$after")
+              if ($LASTEXITCODE -ne 0 -or $commits.Count -eq 0) {
+                throw 'Could not resolve the main-branch commits in this push.'
+              }
+            } else {
+              Write-Warning 'Previous revision is not an ancestor; building the new main tip only.'
+            }
+          }
+
+          $json = ConvertTo-Json -InputObject @($commits) -Compress
+          "commits=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Building $($commits.Count) pushed commit(s): $($commits -join ', ')"
+
+  build-and-publish:
+    name: Release ${{ matrix.commit }}
+    needs: discover
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJson(needs.discover.outputs.commits) }}
+    env:
+      RELEASE_SHA: ${{ matrix.commit }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+
+      # windows-2025 currently includes Inno Setup. Fail clearly if the image
+      # changes instead of silently using an unreviewed compiler download.
+      - name: Locate Inno Setup
+        id: inno
+        shell: pwsh
+        run: |
+          $iscc = @(
+            'C:\Program Files\Inno Setup 6\ISCC.exe',
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup 6 is missing from the Windows runner.' }
+          "path=$iscc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Compiler: $iscc"
+
+      - name: Build installer from the checked-out source
+        shell: pwsh
+        env:
+          ISCC_PATH: ${{ steps.inno.outputs.path }}
+        run: |
+          ./installer/Build-Installer.ps1 -IsccPath $env:ISCC_PATH
+
+      - name: Verify installer and write SHA-256 manifest
+        id: artifact
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath './package.json' -Raw | ConvertFrom-Json).version
+          $name = "Cortex-$version-win-x64-Setup.exe"
+          $installer = [System.IO.Path]::GetFullPath("./installer/Output/$name")
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer is missing: $installer"
+          }
+          if ((Get-Item -LiteralPath $installer).Length -le 0) {
+            throw "Installer is empty: $installer"
+          }
+          $digest = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = "$installer.sha256"
+          "$digest  $name" | Set-Content -LiteralPath $checksum -Encoding ascii
+          "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksum=$checksum" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "$name SHA-256: $digest"
+
+      - name: Publish release for this commit
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ steps.artifact.outputs.installer }}
+          CHECKSUM_PATH: ${{ steps.artifact.outputs.checksum }}
+          APP_VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "build-$env:RELEASE_SHA"
+          $short = $env:RELEASE_SHA.Substring(0, 12)
+          $existingJson = & gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,assets 2>$null
+          $exists = $LASTEXITCODE -eq 0
+
+          if ($exists) {
+            $tagCommit = (& gh api "repos/$env:GITHUB_REPOSITORY/commits/$tag" --jq .sha).Trim()
+            if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $env:RELEASE_SHA) {
+              throw "Release tag $tag does not point to $env:RELEASE_SHA."
+            }
+            $release = $existingJson | ConvertFrom-Json
+            if (-not $release.isDraft) {
+              $names = @($release.assets | ForEach-Object { $_.name })
+              foreach ($required in @([IO.Path]::GetFileName($env:INSTALLER_PATH), [IO.Path]::GetFileName($env:CHECKSUM_PATH))) {
+                if ($required -notin $names) { throw "Published release $tag is missing $required." }
+              }
+              Write-Host "Release $tag is already published with both assets."
+              exit 0
+            }
+          } else {
+            & gh release create $tag --repo $env:GITHUB_REPOSITORY `
+              --target $env:RELEASE_SHA --draft --latest=false `
+              --title "Cortex $env:APP_VERSION ($short)" `
+              --notes "Automated Windows installer for main commit $env:RELEASE_SHA."
+            if ($LASTEXITCODE -ne 0) { throw "Could not create draft release $tag." }
+          }
+
+          & gh release upload $tag $env:INSTALLER_PATH $env:CHECKSUM_PATH `
+            --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload installer assets to $tag." }
+
+          $mainTip = (& gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the current main revision.' }
+          if ($mainTip -eq $env:RELEASE_SHA) {
+            & gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          } else {
+            & gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest=false
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish release $tag." }
+
+          $published = & gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $published.isDraft) { throw "Release $tag is still a draft." }
+          $names = @($published.assets | ForEach-Object { $_.name })
+          foreach ($required in @([IO.Path]::GetFileName($env:INSTALLER_PATH), [IO.Path]::GetFileName($env:CHECKSUM_PATH))) {
+            if ($required -notin $names) { throw "Release $tag is missing $required." }
+          }
+          Write-Host "Published and verified $tag for $env:RELEASE_SHA."

@@ -1,0 +1,32 @@
+# Initial Cortex configuration. This file is copied only on first install.
+# Configure additional providers in the WebUI after Cortex starts.
+providers:
+  OpenAI:
+    module: ./packages/plugins/providers/openai-compat
+    endpoint: https://api.openai.com/v1/chat/completions
+    model: gpt-4.1-nano
+    credentials:
+      apiKey: ${OPENAI_API_KEY}
+    parameters:
+      maxTokens: 4096
+
+plugins:
+  - ./packages/plugins/sessions
+  - ./plugins/hybrid-knowledge-index
+  - ./plugins/file-broker
+  - ./packages/plugins/source-registry
+  - ./packages/plugins/connector-fabric
+  - ./packages/plugins/structured-data
+  - ./packages/plugins/workflow-governance
+  - ./packages/plugins/context-graph
+  - ./packages/plugins/evaluation-observability
+  - ./packages/plugins/workspace-rag
+  - ./packages/plugins/skills
+  - ./packages/plugins/triggers
+  - ./packages/plugins/rumsfeld
+  - ./packages/plugins/cognition
+  - ./packages/plugins/memory-browser
+  - ./packages/plugins/workspace
+  - ./plugins/expert-panel
+  - ./packages/plugins/frontend/web
+  - ./packages/plugins/session-titler

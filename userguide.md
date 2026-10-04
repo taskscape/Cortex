@@ -45,7 +45,41 @@ details, use the [reference documentation](docs/architecture.md) instead.
 - An OpenAI-compatible provider for real model turns. A local compatible
   endpoint can be used instead of a hosted provider.
 
-### Configure secrets
+### Install with the Windows setup program
+
+Build the setup program from a source checkout with Inno Setup 6:
+
+```powershell
+.\installer\Build-Installer.ps1
+```
+
+Each commit pushed to `main` also triggers the GitHub Actions installer workflow.
+It publishes a GitHub Release tagged `build-<full commit SHA>` with the setup
+program and a SHA-256 manifest. A push containing several commits builds each
+commit separately. Rerunning a completed workflow reuses its existing release.
+
+Run `installer\Output\Cortex-0.1.0-win-x64-Setup.exe` on Windows 10/11 x64.
+Setup checks for Docker Desktop and Node.js 24 or newer before copying Cortex.
+If Docker Desktop is missing, Setup downloads Docker's pinned Windows installer,
+verifies its published SHA-256, and runs its per-user installation. Docker
+Desktop must be able to run Linux containers; Setup starts it and waits for its
+engine if necessary. Complete any Docker first-run, WSL, license, or restart
+prompts. Rerun Setup if Docker requires a Windows restart. Node.js 24 or newer
+must already be installed. Setup asks for an OpenAI API key on the first
+install, generates local service secrets, installs Node dependencies, builds
+Cortex, starts its services, checks the WebUI, and creates a **Cortex** Start
+menu shortcut. That shortcut starts Cortex when needed and opens
+`http://localhost:19778/` in the default browser. Initial downloads require
+network access and can take several minutes.
+
+Setup preserves existing `matbot.yaml`, workspace registry, workspace data,
+provider secrets, and Docker volumes on upgrades. It starts with no authorized
+host file roots. Add roots in the installed
+`local-agent\config\workspaces.json` only after reviewing their permissions.
+If first-run setup fails, read `local-agent\logs\installer-setup.log` under the
+chosen install directory, address the error, and run Setup again.
+
+### Configure secrets manually
 
 From the repository root, run the setup command once:
 

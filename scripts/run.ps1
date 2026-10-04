@@ -130,6 +130,14 @@ function Ensure-Pnpm {
 
     Write-Step "Installing pnpm 9"
     Invoke-LoggedCommand "npm" @("install", "-g", "pnpm@9") $Root
+    # A fresh Node install may not have the user npm prefix in the current
+    # Explorer/Powershell PATH yet, even after the global install succeeds.
+    $globalPrefix = (& npm config get prefix).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to find the npm global prefix.' }
+    if (Test-Path -LiteralPath $globalPrefix) {
+        $env:PATH = $globalPrefix + ';' + $env:PATH
+    }
+    if (-not (Test-Command pnpm)) { throw 'pnpm 9 was installed but is not available on PATH.' }
 }
 
 Write-Host "Cortex local-agent launcher"
