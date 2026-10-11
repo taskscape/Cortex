@@ -429,10 +429,13 @@ export const plugin: MatbotPluginSpec = {
         } catch (e) {
           if (ac.signal.aborted) break;
           console.warn(`[frontend-telegram] Poll error: ${e}\n`);
-          // Brief back-off; abort exits the wait immediately.
+          // Brief back-off; abort exits the wait immediately. The listener is removed when the timer
+          // wins: with the network down this runs every couple of seconds, and each one left behind
+          // would stay on the signal until teardown.
           await new Promise<void>(resolve => {
-            const t = setTimeout(resolve, 2_000);
-            ac.signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+            const onAbort = (): void => { clearTimeout(t); resolve(); };
+            const t = setTimeout(() => { ac.signal.removeEventListener('abort', onAbort); resolve(); }, 2_000);
+            ac.signal.addEventListener('abort', onAbort, { once: true });
           });
         }
       }

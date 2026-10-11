@@ -77,10 +77,17 @@ export async function readJsonBody<T>(request: IncomingMessage, options: ReadJso
  * internal listeners are removed once the request closes, including on normal
  * completion, so keep-alive connections do not accumulate listeners.
  *
+ * The request alone only reveals a client that leaves while still sending: its
+ * `close` fires as soon as the whole request has been read, which for most
+ * requests is before the work has started. Pass the response as well to also
+ * abort when the client leaves while that work is running.
+ *
  * @param request - The incoming request to observe.
+ * @param response - The response to the same request; when given, the signal
+ *   also aborts if its connection closes before the response has been sent.
  * @returns A signal that is aborted with a disconnect error if the client goes away.
  */
-export function requestAbortSignal(request: IncomingMessage): AbortSignal {
+export function requestAbortSignal(request: IncomingMessage, response?: ServerResponse): AbortSignal {
   const controller = new AbortController();
   const abort = (): void => {
     cleanup();
@@ -91,11 +98,16 @@ export function requestAbortSignal(request: IncomingMessage): AbortSignal {
       abort();
       return;
     }
-    cleanup();
+    if (response === undefined) cleanup();
+  };
+  const onResponseClose = (): void => {
+    if (response !== undefined && !response.writableFinished) abort();
+    else cleanup();
   };
   const cleanup = (): void => {
     request.removeListener("aborted", abort);
     request.removeListener("close", onClose);
+    response?.removeListener("close", onResponseClose);
   };
   if (request.aborted) {
     abort();
@@ -103,6 +115,7 @@ export function requestAbortSignal(request: IncomingMessage): AbortSignal {
   }
   request.once("aborted", abort);
   request.once("close", onClose);
+  response?.once("close", onResponseClose);
   return controller.signal;
 }
 

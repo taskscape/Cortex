@@ -51,6 +51,10 @@ type FileBrokerInput =
   | { action: "read"; path: string }
   | { action: "write"; path: string; content: string; approved?: boolean };
 
+// A broker that accepts the connection and then never answers must not hold the calling tool —
+// and the turn it belongs to — open until the user cancels. Covers the response body too.
+const REQUEST_TIMEOUT_MS = 60_000;
+
 /** Options for constructing a {@link FileBrokerClient}. */
 export interface FileBrokerClientOptions {
   /** Base URL of the local file-broker service. */
@@ -166,19 +170,24 @@ export class FileBrokerClient {
    * @throws {@link FileBrokerRequestError} on non-OK status; Error on network failure.
    */
   private async requestUrl(method: string, url: URL, options: { body?: string | undefined; signal?: AbortSignal | undefined } = {}): Promise<unknown> {
+    const deadline = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     let response: Response;
+    let text: string;
     try {
       response = await fetch(url, {
         method,
         headers:{...(options.body!==undefined?{"content-type":"application/json"}:{}),...(this.options.token?{"x-cortex-token":this.options.token}:{})},
         ...(options.body !== undefined ? { body: options.body } : {}),
-        ...(options.signal !== undefined ? { signal: options.signal } : {})
+        signal: options.signal !== undefined ? AbortSignal.any([options.signal, deadline]) : deadline
       });
+      text = await response.text();
     } catch (error) {
+      if (deadline.aborted && options.signal?.aborted !== true) {
+        throw new Error(`File broker request failed: no response within ${REQUEST_TIMEOUT_MS}ms.`);
+      }
       throw new Error(`File broker request failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    const text = await response.text();
     const payload = parseJsonResponse(text);
 
     if (!response.ok) {

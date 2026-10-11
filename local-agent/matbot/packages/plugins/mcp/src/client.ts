@@ -5,6 +5,12 @@ import type { MCPClient, MCPToolDef, MCPToolResult } from '@matatbread/matbot-mc
 const PROTOCOL_VERSION = '2024-11-05';
 const CLIENT_INFO = { name: 'matbot', version: '0.1.0' };
 const REQUEST_TIMEOUT_MS = 30_000;
+// A response is one line. A server that never ends its line would otherwise grow this buffer
+// without limit; the cap is far above any real tool result (inline images included).
+const MAX_LINE_CHARS = 64 * 1024 * 1024;
+// stderr is a server's log channel. It is drained (see the constructor) and only this much of its
+// end is kept, to say why a server died.
+const STDERR_TAIL_CHARS = 2_000;
 
 /** JSON-RPC 2.0 request carrying a numeric id; responses are matched back by that id. */
 interface JsonRpcRequest      { jsonrpc: '2.0'; id: number; method: string; params: unknown }
@@ -44,6 +50,7 @@ export class StdioMCPClient implements MCPClient {
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private nextId = 1;
   private buf = '';
+  private stderrTail = '';
   private dead = false;
 
   /**
@@ -71,16 +78,33 @@ export class StdioMCPClient implements MCPClient {
     // reject the same pending requests instead of allowing an EPIPE event to crash the process.
     this.child.stdin?.on('error', error => this.fail(error));
 
-    this.child.stdout?.on('data', (chunk: Buffer) => {
-      this.buf += chunk.toString('utf8');
+    // Decoded by the stream, which carries a character split across two chunks over to the next;
+    // decoding each chunk separately corrupts it, and with it the JSON line it belongs to.
+    this.child.stdout?.setEncoding('utf8');
+    this.child.stdout?.on('data', (chunk: string) => {
+      this.buf += chunk;
       let nl: number;
       while ((nl = this.buf.indexOf('\n')) !== -1) {
         const line = this.buf.slice(0, nl).trim();
         this.buf = this.buf.slice(nl + 1);
         if (line) this.onLine(line);
       }
+      if (this.buf.length > MAX_LINE_CHARS) {
+        this.buf = '';
+        this.fail(new Error(`MCP server sent more than ${MAX_LINE_CHARS} characters without ending a message`));
+        this.child.kill('SIGTERM');
+      }
     });
-    this.child.on('close', () => this.fail(new Error('MCP server process exited unexpectedly')));
+    // Servers log to stderr. Left unread, the pipe fills (a few KB to 64 KB depending on the
+    // platform) and the server then blocks on its next log line — every call after that times out.
+    this.child.stderr?.setEncoding('utf8');
+    this.child.stderr?.on('data', (chunk: string) => {
+      this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_CHARS);
+    });
+    this.child.on('close', () => {
+      const tail = this.stderrTail.trim();
+      this.fail(new Error(`MCP server process exited unexpectedly${tail ? `: ${tail}` : ''}`));
+    });
   }
 
   /**
@@ -138,16 +162,32 @@ export class StdioMCPClient implements MCPClient {
    *
    * @param method - The JSON-RPC method name.
    * @param params - The `params` payload; defaults to an empty object.
+   * @param signal - Optional cancellation signal; aborting rejects the request at once and tells
+   *          the server to stop working on it.
    * @returns The `result` value of the matching response.
-   * @throws Error - Rejects if the client is closed, after the 30 s timeout, on process failure,
-   *           or with the server's JSON-RPC error message.
+   * @throws Error - Rejects if the client is closed, after the 30 s timeout, on cancellation, on
+   *           process failure, or with the server's JSON-RPC error message.
    */
-  private request(method: string, params: unknown = {}): Promise<unknown> {
+  private request(method: string, params: unknown = {}, signal?: AbortSignal): Promise<unknown> {
     if (this.dead) return Promise.reject(new Error('MCP client is closed'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`MCP request "${method}" timed out`)); }, REQUEST_TIMEOUT_MS);
-      this.pending.set(id, { resolve, reject, timer });
+      const onAbort = (): void => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        clearTimeout(entry.timer);
+        this.pending.delete(id);
+        if (!this.dead) this.write({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'Cancelled by the client.' } });
+        reject(new Error(`MCP request "${method}" was cancelled`));
+      };
+      const unlisten = (): void => signal?.removeEventListener('abort', onAbort);
+      const timer = setTimeout(() => { this.pending.delete(id); unlisten(); reject(new Error(`MCP request "${method}" timed out`)); }, REQUEST_TIMEOUT_MS);
+      this.pending.set(id, {
+        resolve: value => { unlisten(); resolve(value); },
+        reject:  error => { unlisten(); reject(error); },
+        timer,
+      });
+      signal?.addEventListener('abort', onAbort, { once: true });
       this.write({ jsonrpc: '2.0', id, method, params });
     });
   }
@@ -177,13 +217,14 @@ export class StdioMCPClient implements MCPClient {
    * Invoke a tool on the server via `tools/call`.
    * @param name Tool name on the server.
    * @param args Arguments object passed to the tool.
-   * @param signal Checked before sending; aborting mid-request is not supported by stdio.
+   * @param signal Aborting rejects the call and sends the server a cancellation notice; the
+   *        server is not required to act on it.
    * @returns The tool result (content parts and error flag).
    * @throws If already closed or aborted, or on process exit, timeout, or JSON-RPC error response.
    */
   async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPToolResult> {
     if (signal?.aborted) throw new Error('Aborted');
-    return await this.request('tools/call', { name, arguments: args }) as MCPToolResult;
+    return await this.request('tools/call', { name, arguments: args }, signal) as MCPToolResult;
   }
 
   /**
@@ -193,9 +234,10 @@ export class StdioMCPClient implements MCPClient {
    * @throws Never.
    */
   close(): void {
-    if (this.dead) return;
-    this.fail(new Error('MCP client is closed'));
-    this.child.kill('SIGTERM');
+    if (!this.dead) this.fail(new Error('MCP client is closed'));
+    // Not skipped for a client already marked dead: a failed write marks it dead while the server
+    // process itself is still running.
+    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill('SIGTERM');
   }
 }
 
@@ -207,6 +249,12 @@ export class StdioMCPClient implements MCPClient {
  */
 export async function createStdioClient(command: string, args: string[], env?: Record<string, string>): Promise<StdioMCPClient> {
   const client = new StdioMCPClient(command, args, env);
-  await client.initialize();
+  try {
+    await client.initialize();
+  } catch (error) {
+    // The caller never receives the client, so nothing else could stop the process it started.
+    client.close();
+    throw error;
+  }
   return client;
 }

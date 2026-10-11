@@ -435,7 +435,22 @@ interface Store<T extends { id: string; version: string }> {
   cas(id: string, expected: string, next: T): Promise<CASResult<T>>;
   delete(id: string, expectedVersion?: string): Promise<boolean>;
   query(q: StoreQuery): Promise<QueryResult<T>>;
+  queryProjected?<P extends { id: string; version: string }>(
+    projection: StoreProjection<T, P>, q: StoreQuery): Promise<QueryResult<P>>;
 }
+```
+
+`queryProjected` is optional, for a backend that can list a namespace without reading every
+document in full. The caller names a projection — `{ key, select(doc) }`, a slimmer document that
+keeps `id` and `version` — and the backend keeps the projected values, recomputing only those
+whose document changed (the filesystem store checks each file's modification time, size and inode).
+`q` is evaluated against the projected values, so they must carry the fields it filters and sorts
+on; the returned values are shared with the store and frozen. A consumer that lists large
+documents often (the session list) should prefer it and fall back to `query()` + `select`:
+
+```ts
+const projected = await store.queryProjected?.(SUMMARY, q);
+const items = projected !== undefined ? projected.items : (await store.query(q)).items.map(SUMMARY.select);
 ```
 
 `StoreQuery` is a deliberately minimal grammar designed to translate to a real backend (SQL

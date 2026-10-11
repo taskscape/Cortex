@@ -207,8 +207,41 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
    * @throws Never.
    */
   const emit = (s: SessionState, ev: PipelineEvent): void => {
-    s.replay.push(ev);
+    record(s.replay, ev);
     for (const sink of s.subscribers) sink.push(ev);
+  };
+
+  /**
+   * Append an event to a turn's replay buffer, folding a streamed fragment into the entry before
+   * it when both continue the same stream. Kept one entry per fragment, a long answer or a chatty
+   * tool is thousands of buffered events for the life of the turn, and as many separate events
+   * pushed at every subscriber that joins mid-turn; folded, the replay is the same text in a
+   * handful of events. The folded entry is a new object: the fragments themselves were already
+   * handed to live subscribers and must not change under them.
+   *
+   * @param replay - The turn's replay buffer.
+   * @param ev - The event to record.
+   * @returns Nothing.
+   * @throws Never.
+   */
+  const record = (replay: PipelineEvent[], ev: PipelineEvent): void => {
+    const at   = replay.length - 1;
+    const last = replay[at];
+    switch (ev.type) {
+      case 'text-delta':
+        if (last?.type === 'text-delta' && last.traceId === ev.traceId) { replay[at] = { ...last, delta: last.delta + ev.delta }; return; }
+        break;
+      case 'thinking':
+        if (last?.type === 'thinking' && last.traceId === ev.traceId) { replay[at] = { ...last, delta: last.delta + ev.delta }; return; }
+        break;
+      case 'tool:stdout':
+        if (last?.type === 'tool:stdout' && last.callId === ev.callId) { replay[at] = { ...last, chunk: last.chunk + ev.chunk }; return; }
+        break;
+      case 'tool:stderr':
+        if (last?.type === 'tool:stderr' && last.callId === ev.callId) { replay[at] = { ...last, chunk: last.chunk + ev.chunk }; return; }
+        break;
+    }
+    replay.push(ev);
   };
 
   /**

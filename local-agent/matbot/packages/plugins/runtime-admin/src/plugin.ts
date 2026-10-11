@@ -3,7 +3,7 @@ import type { Tool, ToolEvent, ToolContext, MatbotPlugin, FormField, Runtime, Pl
 import { CONFIRM_YES, CONFIRM_NO, IncompatibleRuntimeError, NotAPluginError } from '@matatbread/matbot-plugin-api';
 import { getRegisteredPlugins, getRegisteredTools, getRegisteredFrontendPlugins, getRegisteredServiceKeys, getHookPlugins, getSystemContextPlugins, getSpecifierForPlugin, getPluginNameForSpecifier } from '@matatbread/matbot-core';
 import { readFile, writeFile, access, readdir } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -446,30 +446,165 @@ async function detectPackageManager(dir: string): Promise<string> {
     }
     return 'npm';
 }
+// ── Launching the package manager ──────────────────────────────────────────────
+// npm, pnpm and yarn are `.cmd` shims on Windows, which only cmd.exe can run. `shell: true` gets
+// there by joining the arguments into the command line as they are, so the specifier is parsed as
+// shell syntax: `left-pad & calc` runs calc, and ordinary specifiers are silently rewritten
+// (`pkg@^1.2.3` arrives as `pkg@1.2.3`, a URL is cut at its first `&`). The command line is built
+// here instead, each argument double-quoted — inside quotes cmd.exe reads `& | < > ^ ( )` and
+// spaces literally, both on the command line and again when the shim re-expands it through `%*`.
+//
+// Quotes do not neutralise everything, and what they cannot is refused rather than escaped: `"`
+// closes the quoting; `%NAME%` (and `!NAME!` under delayed expansion) is substituted before quotes
+// are even looked at, which is enough to produce a `"` (`%CMDCMDLINE:~-1%`); a control character
+// can end the line.
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 /**
- * Spawns a command and captures its combined output. The child runs through the shell on Windows
- * (so `.cmd` shims such as npm/pnpm resolve) and is executed directly elsewhere; there is no
- * timeout — a hung child blocks the promise.
+ * Names what makes a string impossible to pass to a Windows command line safely.
+ *
+ * @param text - A command name or argument.
+ * @returns A phrase naming the offending characters, or undefined when quoting is sufficient.
+ * @throws Never.
+ */
+function cmdUnquotable(text: string): string | undefined {
+    if (CONTROL_CHARACTERS.test(text))
+        return 'control characters';
+    const found = [...new Set(text.match(/["%!]/g) ?? [])];
+    return found.length > 0 ? found.join(' ') : undefined;
+}
+/**
+ * Explains why a plugin specifier must not be handed to a package manager.
+ *
+ * @param specifier - The specifier as supplied to the tool or the command line.
+ * @param platform - Platform whose launch rules apply. Defaults to the host's.
+ * @returns The reason, phrased to follow "…: it"; undefined when the specifier may be passed on.
+ * @throws Never.
+ */
+export function packageSpecifierHazard(specifier: string, platform: NodeJS.Platform = process.platform): string | undefined {
+    if (CONTROL_CHARACTERS.test(specifier))
+        return 'it contains control characters';
+    if (specifier.startsWith('-'))
+        return 'it starts with "-", which a package manager reads as an option rather than a package';
+    if (platform === 'win32') {
+        const unquotable = cmdUnquotable(specifier);
+        if (unquotable !== undefined)
+            return `it contains ${unquotable}, which cannot be passed to a package manager safely on Windows`;
+    }
+    return undefined;
+}
+/**
+ * Works out how to start `cmd args…` so that no argument is ever interpreted as shell syntax.
+ * Elsewhere than Windows the command is executed directly. On Windows it goes through cmd.exe
+ * (the only way to run a `.cmd` shim) on a command line assembled here.
+ *
+ * @param cmd - Executable name, resolved via PATH.
+ * @param args - Arguments, delivered to the command verbatim.
+ * @param platform - Platform whose launch rules apply. Defaults to the host's.
+ * @returns The file, argument vector and spawn options to pass to `child_process.spawn`.
+ * @throws Error - On Windows, if `cmd` or an argument contains something quoting cannot
+ *   neutralise (`"`, `%`, `!`, or a control character).
+ */
+export function commandLaunch(cmd: string, args: readonly string[], platform: NodeJS.Platform = process.platform): {
+    file: string;
+    args: string[];
+    options: { windowsVerbatimArguments?: true };
+} {
+    if (platform !== 'win32')
+        return { file: cmd, args: [...args], options: {} };
+    const line = [cmd, ...args].map(part => {
+        const unquotable = cmdUnquotable(part);
+        if (unquotable !== undefined)
+            throw new Error(`${JSON.stringify(part)} cannot be passed to a Windows command safely: it contains ${unquotable}`);
+        // A trailing backslash would escape the closing quote for the program that finally parses it.
+        return `"${part.replace(/\\+$/, '$&$&')}"`;
+    }).join(' ');
+    // `/s` strips exactly the outer pair of quotes and runs the rest as written.
+    return { file: process.env['ComSpec'] ?? 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], options: { windowsVerbatimArguments: true } };
+}
+// A package-manager run that has produced nothing useful in this long is waiting on something that
+// will not arrive (a registry that stopped answering, an interactive prompt with no terminal).
+const COMMAND_TIMEOUT_MS = 10 * 60_000;
+const COMMAND_KILL_GRACE_MS = 5_000;
+const COMMAND_OUTPUT_LIMIT_CHARS = 1_000_000;
+/**
+ * Terminates a spawned command together with whatever it started.
+ *
+ * @param child - The spawned process.
+ * @returns Nothing.
+ * @throws Never.
+ */
+function killCommand(child: ChildProcess): void {
+    if (child.pid === undefined)
+        return;
+    if (process.platform === 'win32') {
+        // The command runs under cmd.exe here; killing only the shell would orphan the package manager.
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        killer.on('error', () => { child.kill(); });
+        return;
+    }
+    child.kill('SIGTERM');
+    setTimeout(() => { child.kill('SIGKILL'); }, COMMAND_KILL_GRACE_MS).unref();
+}
+/**
+ * Spawns a command and captures its combined output. Arguments reach the command verbatim on
+ * every platform (see {@link commandLaunch}); none is interpreted by a shell. It is killed when
+ * `signal` aborts or after `timeoutMs`, so a hung package manager cannot hold a tool call open.
  *
  * @param cmd - Executable name, resolved via PATH.
  * @param args - Argument vector passed verbatim.
  * @param cwd - Working directory for the child process.
- * @returns The interleaved stdout+stderr text when the child exits with code 0.
- * @throws Error - If the child exits with a non-zero code; the message carries the exit code and
- *   the captured output.
+ * @param signal - Optional cancellation signal; aborting kills the command.
+ * @param timeoutMs - Wall-clock limit for the command. Default ten minutes.
+ * @returns The interleaved stdout+stderr text (first million characters) when the child exits
+ *   with code 0.
+ * @throws Error - If an argument cannot be passed safely, or the child cannot be started, exits
+ *   with a non-zero code, is cancelled, or times out; the message carries the reason and the
+ *   captured output.
  */
-function runCommand(cmd: string, args: string[], cwd: string): Promise<string> {
+export function runCommand(cmd: string, args: string[], cwd: string, signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
     return new Promise((resolve, reject) => {
         const chunks: string[] = [];
-        const child = spawn(cmd, args, { cwd, shell: process.platform === 'win32' });
-        child.stdout?.on('data', (d: Buffer) => chunks.push(d.toString()));
-        child.stderr?.on('data', (d: Buffer) => chunks.push(d.toString()));
-        child.on('close', code => {
-            if (code === 0)
+        let captured = 0;
+        let stopped: string | undefined;
+        const launch = commandLaunch(cmd, args);
+        const child = spawn(launch.file, launch.args, { cwd, windowsHide: true, ...launch.options });
+        const stop = (why: string): void => {
+            if (stopped !== undefined)
+                return;
+            stopped = why;
+            killCommand(child);
+        };
+        const onAbort = (): void => stop('was cancelled');
+        const timer = setTimeout(() => stop(`timed out after ${Math.round(timeoutMs / 1000)}s`), timeoutMs);
+        const settle = (outcome: () => void): void => {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+            outcome();
+        };
+        const capture = (d: Buffer): void => {
+            if (captured >= COMMAND_OUTPUT_LIMIT_CHARS)
+                return;
+            const text = d.toString();
+            captured += text.length;
+            chunks.push(text);
+        };
+        child.stdout?.on('data', capture);
+        child.stderr?.on('data', capture);
+        // Without a listener, a child that cannot be spawned (missing executable, vanished cwd) is an
+        // uncaught exception for the whole process and this promise never settles.
+        child.on('error', error => settle(() => reject(new Error(`${cmd} could not be started: ${error.message}`))));
+        child.on('close', code => settle(() => {
+            if (stopped !== undefined)
+                reject(new Error(`${cmd} ${stopped}\n${chunks.join('')}`));
+            else if (code === 0)
                 resolve(chunks.join(''));
             else
                 reject(new Error(`${cmd} exited with code ${String(code)}\n${chunks.join('')}`));
-        });
+        }));
+        if (signal?.aborted)
+            onAbort();
+        else
+            signal?.addEventListener('abort', onAbort, { once: true });
     });
 }
 /**
@@ -687,6 +822,12 @@ const executor = {
         // human name ("install the mcp plugin") to a specifier is the model's job (it can run
         // `discover_local` first), not the tool's — there is no fuzzy-match step here.
         if (action === 'add') {
+            // Whatever kind it turns out to be, the specifier becomes a line of matbot.yaml; a line
+            // break in it would add entries of its own.
+            if (CONTROL_CHARACTERS.test(specifier)) {
+                yield { type: 'error', message: `Refusing to install ${JSON.stringify(specifier)}: it contains control characters.` };
+                return;
+            }
             const existing = await readPluginsList(configPath);
             if (existing.includes(specifier)) {
                 yield { type: 'result', value: { message: `"${specifier}" is already configured.` } };
@@ -700,6 +841,15 @@ const executor = {
                 yield { type: 'error', message: `"${specifier}" looks like a local path but no package.json was found at "${classified.resolved}" ` +
                         `or any parent directory. Check the path, or pass an npm name, URL, or github: specifier.` };
                 return;
+            }
+            // Refused before the confirmation prompt: nobody should be asked to approve a specifier
+            // whose displayed text does not say what the package manager would be made to do.
+            if (classified.kind === 'npm' || classified.kind === 'pnpm-url') {
+                const hazard = packageSpecifierHazard(specifier);
+                if (hazard !== undefined) {
+                    yield { type: 'error', message: `Refusing to install "${specifier}": ${hazard}.` };
+                    return;
+                }
             }
             // Pre-fetch verification for remote (raw-source) plugins: confirm the package.json declares
             // matbotRuntime including "node" BEFORE downloading or executing any code, so a stray URL
@@ -751,7 +901,7 @@ const executor = {
                 yield { type: 'stdout', chunk: `Installing "${specifier}" with ${pm}...\n` };
                 const before = await readDependencyNames(projectDir);
                 try {
-                    const out = await runCommand(pm, ['add', specifier], projectDir);
+                    const out = await runCommand(pm, ['add', specifier], projectDir, ctx.signal);
                     if (out)
                         yield { type: 'stdout', chunk: out };
                 }
@@ -855,7 +1005,7 @@ const executor = {
                 && await confirmAction(ctx, `Also uninstall the npm package **"${pkgName}"**?`)) {
                 const pm = await detectPackageManager(projectDir);
                 try {
-                    const out = await runCommand(pm, ['remove', pkgName], projectDir);
+                    const out = await runCommand(pm, ['remove', pkgName], projectDir, ctx.signal);
                     if (out)
                         yield { type: 'stdout', chunk: out };
                 }

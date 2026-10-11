@@ -472,7 +472,12 @@ export class FilesystemFileStore implements FileStore {
       if (t !== undefined) clearTimeout(t);
       debounces.set(id, setTimeout(() => {
         debounces.delete(id);
-        void handleChange(id).catch(error => { failure = error; done = true; wake(); });
+        // One file that cannot be read at this moment (another process holds it open, or it was
+        // replaced between the notification and the read) loses this event, not the whole watch:
+        // ending the stream here would silence every later change to every file until restart.
+        void handleChange(id).catch(error => {
+          console.warn(`[files] change to "${id}" not reported: ${error instanceof Error ? error.message : String(error)}`);
+        });
       }, 50));
     });
     watcher.on('error', error => { failure = error; done = true; wake(); });

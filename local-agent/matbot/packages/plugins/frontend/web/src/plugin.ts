@@ -152,6 +152,9 @@ export const plugin: MatbotPluginSpec = {
       // "http://localhost:…" line N times.
       server.once('listening', () => {
         if (activeListenErrorHandler) server.off('error', activeListenErrorHandler);
+        // The bind handler above is gone; with no listener at all, a later server-level error
+        // (e.g. the process running out of handles while accepting) is an uncaught exception.
+        server.on('error', (ex: Error) => console.warn(`[frontend-web] server error: ${ex.message}`));
         process.stderr.write(`[frontend-web] http://localhost:${port}\n`);
         resolve();
       });

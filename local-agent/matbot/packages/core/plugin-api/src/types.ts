@@ -537,6 +537,29 @@ export type CASResult<T> =
   | { ok: false; current: T | null };
 
 /**
+ * A named reduction of a stored document to the part a listing needs — a slimmer document that
+ * keeps `id` and `version`. See {@link Store.queryProjected}.
+ *
+ * @typeParam T - The stored document type.
+ * @typeParam P - The projected type.
+ */
+export interface StoreProjection<T, P extends { id: string; version: string }> {
+  /**
+   * Identifies what `select` computes. A store keeps projected values under this key, so use one
+   * constant per `select` and change it whenever `select` changes what it returns.
+   */
+  key: string;
+  /**
+   * Reduce one document. Must depend on `doc` alone: the result is reused for as long as the
+   * stored document is unchanged.
+   *
+   * @param doc - The stored document.
+   * @returns The projected value.
+   */
+  select(doc: T): P;
+}
+
+/**
  * The universal document-store interface. All writes that may race use compare-and-swap
  * (`cas`) — never write without a version check when concurrent updates are possible.
  */
@@ -581,6 +604,23 @@ export interface Store<T extends { id: string; version: string }> {
    * @throws {StoreQueryError} If the query fails validation.
    */
   query(q: StoreQuery): Promise<QueryResult<T>>;
+  /**
+   * Run a query over a projection of each document instead of over the documents. Optional:
+   * provided by a backend that can keep projected values and recompute only those whose document
+   * changed, so listing a namespace of large documents costs their number rather than their size.
+   * Where it is absent, `query()` followed by `projection.select` gives the same items.
+   *
+   * `q` is evaluated against the projected values, so they must carry every field it filters or
+   * sorts on. The returned items are shared with the store and frozen: read them, do not modify
+   * them.
+   *
+   * @typeParam P - The projected type.
+   * @param projection - What to reduce each document to.
+   * @param q - Filter/sort/page specification, applied to the projected values.
+   * @returns One page of matching projected values.
+   * @throws {StoreQueryError} If the query fails validation.
+   */
+  queryProjected?<P extends { id: string; version: string }>(projection: StoreProjection<T, P>, q: StoreQuery): Promise<QueryResult<P>>;
 }
 
 // ── Knowledge index ───────────────────────────────────────────────────────────

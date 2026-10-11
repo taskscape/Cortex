@@ -15,6 +15,70 @@ import type { FormField } from './types.js';
  * @throws Never.
  */
 export function createInvocationState() { return { chain: Promise.resolve(), approved: [] as PermissionRule[] }; }
+/**
+ * How long an aborted invocation keeps waiting for its executor before abandoning it. Twice the
+ * shell tools' SIGTERM→SIGKILL grace, so a tool that honours the signal always finishes its own
+ * cleanup first.
+ */
+export const DEFAULT_TOOL_ABORT_GRACE_MS = 10_000;
+/**
+ * Iterate a tool's event stream without letting it outlive an abort indefinitely. A tool receives
+ * the abort signal but is free to ignore it; awaiting such an executor would pin the turn — and
+ * every submission queued behind it — forever. Once `signal` has been aborted for `graceMs` with
+ * the executor still silent, iteration fails with the abort reason and the executor is abandoned.
+ *
+ * @typeParam T - Event type produced by the executor.
+ * @param source - The executor's event stream.
+ * @param signal - The invocation's abort signal.
+ * @param graceMs - Time allowed after abort for the executor to yield or finish.
+ * @returns The source's events, in order.
+ * @throws The abort reason once the grace period expires; otherwise whatever `source` throws.
+ */
+async function* untilAbandoned<T>(source: AsyncIterable<T>, signal: AbortSignal, graceMs: number): AsyncIterable<T> {
+    const iterator = source[Symbol.asyncIterator]();
+    let expired = false;
+    let rejectPending: ((reason: unknown) => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+        timer = setTimeout(() => { expired = true; rejectPending?.(signal.reason); }, graceMs);
+    };
+    if (signal.aborted)
+        arm();
+    else
+        signal.addEventListener('abort', arm, { once: true });
+    let exhausted = false;
+    try {
+        for (;;) {
+            if (expired)
+                throw signal.reason;
+            const next = await new Promise<IteratorResult<T>>((resolve, reject) => {
+                rejectPending = reject;
+                iterator.next().then(resolve, reject);
+            });
+            rejectPending = undefined;
+            if (next.done) {
+                exhausted = true;
+                return;
+            }
+            yield next.value;
+        }
+    }
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
+        signal.removeEventListener('abort', arm);
+        if (!exhausted) {
+            // An async generator queues return() behind its pending next() — the very call that never
+            // settles for an executor ignoring its signal — so the wait for cleanup is capped too.
+            const closing = Promise.resolve(iterator.return?.()).then(() => undefined, () => undefined);
+            if (!expired) {
+                let cap: ReturnType<typeof setTimeout> | undefined;
+                await Promise.race([closing, new Promise<void>(resolve => { cap = setTimeout(resolve, graceMs); })]);
+                clearTimeout(cap);
+            }
+        }
+    }
+}
 /** Outcome of one validated, permission-gated tool invocation. */
 export interface ToolInvocationResult {
     result: unknown;
@@ -26,7 +90,7 @@ export interface ToolInvocationResult {
  * with {@link RunSessionOpts}), the call and resolved tool, and optional invocation-scoped state,
  * progress, marker, and span plumbing.
  */
-export interface ToolInvocationOptions extends Pick<RunSessionOpts, 'session' | 'config' | 'signal' | 'vault' | 'prompt' | 'hooks' | 'permissions' | 'toolOutput' | 'files' | 'workdir' | 'configPath' | 'loadPlugin' | 'unloadPlugin'> {
+export interface ToolInvocationOptions extends Pick<RunSessionOpts, 'session' | 'config' | 'signal' | 'vault' | 'prompt' | 'hooks' | 'permissions' | 'toolOutput' | 'toolAbortGraceMs' | 'files' | 'workdir' | 'configPath' | 'loadPlugin' | 'unloadPlugin'> {
     call: {
         id: string;
         name: string;
@@ -266,7 +330,7 @@ export async function executeToolInvocation(opts: ToolInvocationOptions, push: (
             ...(opts.files !== undefined ? { files: opts.files } : {}),
         };
         try {
-            for await (const toolEv of tool.executor.execute(tc.input, toolCtx)) {
+            for await (const toolEv of untilAbandoned(tool.executor.execute(tc.input, toolCtx), signal, opts.toolAbortGraceMs ?? DEFAULT_TOOL_ABORT_GRACE_MS)) {
                 signal.throwIfAborted();
                 switch (toolEv.type) {
                     case 'stdout':

@@ -111,6 +111,11 @@ async function main() {
     executor: { async *execute() { yield { type: "result", value: { ok: true, citation: { sourceId: "source:1", versionId: "version:1" } } }; } },
   };
 
+  const spanStore = services.createStore("observability_spans");
+  const querySpans = spanStore.query.bind(spanStore);
+  let spanStoreScans = 0;
+  spanStore.query = async query => { spanStoreScans++; return querySpans(query); };
+
   const events = [];
   for await (const event of runSession({
     session,
@@ -125,6 +130,8 @@ async function main() {
     async unloadPlugin() { return false; },
   })) events.push(event);
   assert.equal(events.at(-1).type, "done");
+  // Recording runs on every turn's hot path; it must never rescan the whole span store.
+  assert.equal(spanStoreScans, 0);
 
   const chatLog = await readFile(join(chatLogDir, chatDiagnosticFileName(session.id)), "utf8");
   const chatEntries = chatLog.trim().split("\n").map(line => JSON.parse(line));
@@ -153,6 +160,8 @@ async function main() {
   assert.equal(inspected.trace.outputTokens, 6);
   assert.ok(inspected.spans.some(span => span.kind === "llm"));
   assert.ok(inspected.spans.some(span => span.kind === "tool"));
+  assert.equal(inspected.trace.spanCount, inspected.spans.length);
+  assert.equal(inspected.trace.eventCount, inspected.events.length);
   assert.equal(JSON.stringify(inspected).includes("should-not-persist"), false);
   assert.equal(JSON.stringify(inspected).includes("[REDACTED]"), true);
 
@@ -207,6 +216,17 @@ async function main() {
   assert.equal(metrics.workflows.verifiedCompleted, 1);
   assert.equal(metrics.evaluations.runs, 1);
   assert.equal(metrics.evaluations.passRate, 1);
+
+  // Parallel tool calls report spans concurrently; the trace aggregate is read-modify-write, so
+  // every event must still be counted.
+  await Promise.all(Array.from({ length: 25 }, (_, index) => observability.record({
+    traceId: "trace-burst", rootTraceId: "trace-burst", spanId: `burst-${index % 5}`, timestamp: new Date().toISOString(),
+    phase: index < 5 ? "start" : "event", kind: "tool", name: "burst",
+  })));
+  const burst = await observability.inspectTrace("trace-burst");
+  assert.equal(burst.trace.eventCount, 25);
+  assert.equal(burst.trace.spanCount, 5);
+  assert.equal(burst.spans.length, 5);
 
   console.log("evaluation-observability records governed evidence");
   } finally {

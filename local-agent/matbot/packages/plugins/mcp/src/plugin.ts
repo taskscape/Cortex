@@ -67,7 +67,14 @@ export function createMCPPlugin(): MatbotPluginSpec {
    */
   async function connectLocal(config: MCPServerConfigLocal): Promise<MCPToolDef[]> {
     const client = await createStdioClient(config.command, config.args ?? [], config.env);
-    const tools  = await client.listTools();
+    let tools: MCPToolDef[];
+    try {
+      tools = await client.listTools();
+    } catch (error) {
+      // Not yet in `localActive`, so nothing else would ever stop the process.
+      client.close();
+      throw error;
+    }
     localActive.set(config.name, {
       config, client, tools,
       ...(client.instructions !== undefined ? { instructions: client.instructions } : {}),

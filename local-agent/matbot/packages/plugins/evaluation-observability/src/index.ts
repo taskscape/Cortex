@@ -636,6 +636,8 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
   private readonly baselines: Store<RoiBaseline>;
   private readonly outcomes: Store<OutcomeEvent>;
   private readonly chatJournal: ChatDiagnosticJournal | undefined;
+  /** Tail of the in-flight {@link record} chain per trace; entries drop once the chain drains. */
+  private readonly traceTails = new Map<string, Promise<void>>();
 
   /**
    * @param services - The matbot machine, used for `singleTurn` (rubric scoring) and the optional
@@ -687,15 +689,35 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
    * before any write; span attributes merge with new values winning; identity fields stick from the
    * first sighting. Trace token/cost totals accumulate only on `end` events of `llm`/`evaluator`
    * kind (cost via {@link pricedCost}); the trace's `status`/`endedAt`/`durationMs` are set by the
-   * agent kind's `end` event; `spanCount` is recomputed from the spans store and `eventCount`
-   * incremented per event. `workspaceId` comes from the existing trace, else the event's
-   * `workspaceId` attribute, else `CORTEX_WORKSPACE_ID`, else `'default'`.
+   * agent kind's `end` event; `spanCount` grows by one per first-seen span and `eventCount` by one
+   * per event. `workspaceId` comes from the existing trace, else the event's `workspaceId`
+   * attribute, else `CORTEX_WORKSPACE_ID`, else `'default'`.
+   *
+   * Events of one trace are applied one at a time: the span and trace aggregates are
+   * read-modify-write, and parallel tool calls report their spans concurrently.
    *
    * @param raw - The event to record.
    * @returns Resolves when all three writes (event, span, trace) complete.
    * @throws If any of the event/span/trace store writes rejects.
    */
-  async record(raw: ObservabilityEvent): Promise<void> {
+  record(raw: ObservabilityEvent): Promise<void> {
+    const previous = this.traceTails.get(raw.traceId) ?? Promise.resolve();
+    const run = previous.then(() => this.recordSerialized(raw));
+    const tail = run.then(() => undefined, () => undefined);
+    this.traceTails.set(raw.traceId, tail);
+    void tail.then(() => { if (this.traceTails.get(raw.traceId) === tail) this.traceTails.delete(raw.traceId); });
+    return run;
+  }
+
+  /**
+   * Applies one event to the event, span, and trace stores. Callers must hold the trace's slot in
+   * {@link traceTails}; see {@link record}.
+   *
+   * @param raw - The event to record.
+   * @returns Resolves when all three writes (event, span, trace) complete.
+   * @throws If any of the event/span/trace store writes rejects.
+   */
+  private async recordSerialized(raw: ObservabilityEvent): Promise<void> {
     const event: CortexTraceEvent = {
       ...raw,
       id: randomUUID(),
@@ -747,7 +769,9 @@ class StoreBackedEvaluationObservability implements EvaluationObservability {
       status: raw.kind === 'agent' && raw.phase === 'end' ? raw.status ?? 'unset' : existingTrace?.status ?? 'unset',
       startedAt: existingTrace?.startedAt ?? raw.timestamp,
       updatedAt: raw.timestamp,
-      spanCount: (await this.spansForTrace(raw.traceId)).length,
+      // Counted incrementally: recounting from the spans store reads every span the workspace has
+      // ever recorded, on every event of every turn.
+      spanCount: (existingTrace?.spanCount ?? 0) + (existingSpan ? 0 : 1),
       eventCount: (existingTrace?.eventCount ?? 0) + 1,
       inputTokens: (existingTrace?.inputTokens ?? 0) + inputTokens,
       outputTokens: (existingTrace?.outputTokens ?? 0) + outputTokens,

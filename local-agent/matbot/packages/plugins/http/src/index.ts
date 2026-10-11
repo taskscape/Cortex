@@ -12,6 +12,38 @@ interface HttpInput {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+// The body is buffered whole before it is returned, and the URL is the model's choice: without a
+// cap one request for a large download exhausts the process's memory. Results above the tool
+// output limit are truncated for the model anyway; this only bounds what is held to get there.
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Read a response body as UTF-8 text, refusing bodies larger than `maxBytes`.
+ *
+ * @param res - The response to read.
+ * @param maxBytes - Largest body accepted.
+ * @returns The decoded body.
+ * @throws Error - When the body exceeds `maxBytes` (the download is cancelled) or the stream fails.
+ */
+async function readBodyText(res: Response, maxBytes: number): Promise<string> {
+  if (res.body === null) return '';
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return text + decoder.decode();
+      received += value.byteLength;
+      if (received > maxBytes) throw new Error(`response exceeded the ${maxBytes}-byte limit`);
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
 /**
  * Extract a human-readable message from an unknown thrown value.
  *
@@ -42,7 +74,7 @@ const executor = {
 
     let text: string;
     try {
-      text = await res.text();
+      text = await readBodyText(res, MAX_RESPONSE_BYTES);
     } catch (e) {
       yield { type: 'error', message: `Failed to read response: ${errorMessage(e)}` };
       return;

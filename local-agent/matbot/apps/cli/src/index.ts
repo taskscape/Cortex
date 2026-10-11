@@ -693,6 +693,15 @@ async function runSetupWizard(configPath: string): Promise<import('./config.js')
 async function main(): Promise<void> {
   const initialCwd = process.cwd();
   const serverMode = process.argv[2] === 'start';
+  if (serverMode) {
+    // Node terminates on a promise rejection nobody handled. For a server that is every session's
+    // in-flight turn lost to a failure that, by definition, no caller was waiting on — one missed
+    // `.catch` in any plugin. Record it and keep serving. (Uncaught synchronous exceptions keep
+    // their default: the process exits.)
+    process.on('unhandledRejection', reason => {
+      console.error('[matbot] unhandled promise rejection (server continues):', reason instanceof Error ? (reason.stack ?? reason.message) : String(reason));
+    });
+  }
   const restartDelay = Number(process.env['CORTEX_RESTART_DELAY_MS'] ?? '0');
   if (serverMode && Number.isFinite(restartDelay) && restartDelay > 0) await sleep(restartDelay);
 
@@ -1247,18 +1256,27 @@ async function main(): Promise<void> {
       // kept serving the old workspace to the browser.
       setTimeout(() => { void (async () => {
         await releaseRuntime();
-        appendFileSync(
-          logs.out,
-          `[${new Date().toISOString()} ${_pid}] [matbot] restarting into workspace "${workspaceId}"\n`,
-        );
-        const outFd = openSync(logs.out, 'a');
-        const errFd = openSync(logs.err, 'a');
+        // By now this process has given up its ports, so the replacement must start whatever else
+        // goes wrong: a log file that cannot be written (locked, disk full) costs the child its
+        // log, not the user their Cortex.
+        let outFd: number | undefined;
+        let errFd: number | undefined;
+        try {
+          appendFileSync(
+            logs.out,
+            `[${new Date().toISOString()} ${_pid}] [matbot] restarting into workspace "${workspaceId}"\n`,
+          );
+          outFd = openSync(logs.out, 'a');
+          errFd = openSync(logs.err, 'a');
+        } catch (e) {
+          console.error('[matbot] restart log unavailable; starting the replacement without one:', e instanceof Error ? e.message : String(e));
+        }
         let child: ChildProcess;
         try {
           child = spawn(process.execPath, args, {
             cwd: childCwd,
             detached: true,
-            stdio: ['ignore', outFd, errFd],
+            stdio: ['ignore', outFd ?? 'ignore', errFd ?? 'ignore'],
             env: {
               ...process.env,
               INIT_CWD: process.env['INIT_CWD'] ?? initialCwd,
@@ -1270,12 +1288,17 @@ async function main(): Promise<void> {
             },
           });
         } finally {
-          closeSync(outFd);
-          closeSync(errFd);
+          if (outFd !== undefined) closeSync(outFd);
+          if (errFd !== undefined) closeSync(errFd);
         }
         child.unref();
         process.exit(0);
-      })(); }, 250);
+      })().catch(e => {
+        // Torn down with no replacement started: exit non-zero so a supervisor restarts us, instead
+        // of lingering as a process that serves nothing.
+        console.error('[matbot] workspace switch could not start the replacement process:', e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }); }, 250);
     });
     const current = await workspaceManager.current();
     serviceRegistry.set('WorkspaceBootstrap', { manager: workspaceManager, context: Object.freeze({ id: current.id, configPath, registryPath: workspaceManager.getRegistryPath() }) });

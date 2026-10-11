@@ -116,7 +116,39 @@ churn and less likely to affect a consumer who doesn't use them.
   may be a fixable typo. Exported from `@matatbread/matbot-plugin-api` and re-exported from
   `@matatbread/matbot-core`.
 
+- **`Store.queryProjected` — list a namespace by a projection of its documents.** An optional
+  `Store` method taking a `StoreProjection` (`{ key, select(doc) }`, new, exported from
+  `@matatbread/matbot-plugin-api`) and a `StoreQuery` that is evaluated against the projected
+  values. It is for the backend that can keep those values and recompute only the ones whose
+  document changed, so that listing a namespace of large documents costs their number rather than
+  their size; `query()` had no way to say "I only need three fields of each". A projection keeps
+  `id` and `version`, the values returned are shared with the store and frozen, and where the
+  method is absent `query()` followed by `select` gives the same items. The capture-safe store
+  proxies forward it like any other member, and a store swapped in without it reads as absent.
+
 ### Bug fixes
+
+- **A tool that ignores its abort signal can no longer pin a turn.** `executeToolInvocation` awaited
+  the executor's next event with no bound, so Stop (or any abort) had no effect on a tool that never
+  looked at `ctx.signal`: the turn stayed "running" and every later submission queued behind it
+  forever. Once the signal has been aborted for `toolAbortGraceMs` (new `RunSessionOpts` field,
+  default 10 s — twice the shell tools' SIGTERM→SIGKILL grace) with the executor still silent, the
+  invocation is abandoned, its call is answered with an error result so history stays paired, and the
+  turn ends `aborted`. A tool that honours the signal is unaffected and still finishes its own cleanup
+  before the terminal event. A failed parallel tool batch can also no longer surface as an unhandled
+  rejection when the turn's consumer stops pulling events first.
+
+- **The replay sent to a viewer joining mid-turn no longer grows by one event per fragment.** The
+  session runner kept every `text-delta`, `thinking` and tool-output event of the running turn and
+  pushed each one separately at a subscriber that attached late — for a long answer, thousands of
+  buffered objects held for the life of the turn and as many frames written (and re-rendered) on
+  every reconnect. Consecutive fragments of the same stream are now folded as they are recorded: the
+  replay carries the same text, in the same order, in a handful of events. Live subscribers are
+  unaffected and still receive each fragment as it is produced.
+
+- **A turn with no observability sink no longer scrubs span attributes it then throws away.** Every
+  tool input, tool result and answer was serialised, scanned for secrets and re-parsed on the turn's
+  hot path before `observe` could decline the event.
 
 - **Workspace RAG V2 now reclaims orphaned persistence after source removal.** Successful
   reconciliation sweeps document versions that are no longer reachable from an active or staging
@@ -221,6 +253,138 @@ churn and less likely to affect a consumer who doesn't use them.
   the parsed response, so honest responses store their vectors (and lying ones are still rejected).
 
 ### Optional
+
+- **evaluation-observability** — recording a span no longer rescans the whole span store. Every
+  observability event (eleven in a one-tool turn, each awaited on the turn's hot path) recounted the
+  trace's spans by reading and parsing every span the workspace had ever recorded, so per-turn
+  latency grew with the workspace's age without limit. `spanCount` is now maintained incrementally,
+  and events of one trace are applied one at a time, so the read-modify-write trace aggregate no
+  longer loses counts when parallel tool calls report at once.
+
+- **storage-filesystem** — `query()` reads a namespace in bounded batches (32) instead of opening
+  every document at once; past the handle limit the failed reads were indistinguishable from corrupt
+  files and silently dropped from results. On Windows, a write whose replace-by-rename hits a
+  transient sharing violation (antivirus, indexer) is retried for under a second instead of failing
+  the save — for sessions, the turn. The per-id write lock no longer retains an entry for every id
+  ever written.
+
+- **storage-filesystem** — implements `Store.queryProjected`. Projected values are kept per document
+  file and reused while the file's modification time, size and inode are unchanged, so a listing is
+  one `stat` per document and reads only what was written since the last one — by this process or by
+  another on the same directory. The store's own writes also discard the kept value directly, which
+  makes them independent of how finely the filesystem timestamps files.
+
+- **sessions** — `session_action` `list` no longer reads and parses every session in full to produce
+  four short fields of each. It asks the store for a summary projection, so the sidebar's list —
+  requested on load, on opening a session and after every turn — costs the number of sessions
+  instead of the size of all their conversations, which grew without bound (1000 sessions / 150 MiB:
+  about 220 ms and 150 MiB of parsed JSON per listing, now about 7 ms). The result is unchanged,
+  and a storage backend without `queryProjected` is listed as before.
+
+- **frontend-web** —
+  - A static UI file that fails to read answers 404/500 instead of leaving the request unanswered
+    behind an unhandled rejection (fatal to the process); `/matbot.html` is absent whenever the web
+    bundle is unbuilt.
+  - A prompt raised while no viewer is attached (the tab was closed mid-turn, or the submit won the
+    race against the event stream) is delivered to the viewer that attaches next, instead of leaving
+    the turn parked on a question nobody was shown.
+  - An event-stream client that stops reading is disconnected once 16 MiB is queued for it, rather
+    than buffering every later event in memory without bound; the client's reconnect resumes it.
+  - File downloads are paced by the client and stop reading the file when the client goes away.
+  - The server keeps an `error` listener after startup, so a later server-level error is logged
+    rather than uncaught. Same for the memory-browser, file-index and file-broker HTTP servers.
+  - The browser client draws streamed text and thinking at most once per frame. It re-parsed the
+    whole answer as markdown, rebuilt its DOM and forced layout on every token, which made long
+    answers quadratic and the page unresponsive while they streamed. Tool output is appended in
+    place instead of being re-read and replaced per chunk, and is kept scrolled to its end once
+    per frame rather than with a forced layout of the whole output per chunk.
+  - A turn that is still producing events while the server shuts down (a workspace switch with a
+    session streaming) no longer writes to the event stream the shutdown has just ended. That
+    write is an `error` event nobody listens for — an uncaught exception, in the process that was
+    about to start its replacement. The stream writers tested `res.writable`, which stays `true`
+    after `end()` and after the client disconnects; they now test what actually changes, so a
+    departed viewer is also dropped from its stream at the next event rather than only when its
+    request closes.
+  - Prompts raised at the same time by one turn's parallel tool calls (an `ask_user` beside a
+    permission ask) are queued and shown one at a time. The session had a single slot, so the
+    second prompt replaced the first, whose tool then waited on an answer that could no longer be
+    delivered. Stop, "give up" and the last viewer leaving settle every queued prompt, not only
+    the one on screen.
+  - `POST /tools/:name` and `POST /stream/tools/:name` cancel the tool when the client disconnects.
+    They listened for the request's `close`, which has already fired by the time a request body
+    has been read, so the tool always ran to completion for nobody.
+
+- **powershell / bash** —
+  - The command gets no stdin instead of a pipe nothing writes to. Anything a script ran that reads
+    its input (`sort.exe`, `cat`, a program asking a question, an interpreter started without a
+    file) waited forever, and with no timeout given so did the turn.
+  - Timeout, cancel and output overflow end the processes the script started, not only the shell
+    (Windows: `taskkill /T`, run without a shell on the numeric pid). A survivor kept the output
+    pipes open, so a "timed out" call did not return until that process exited by itself.
+  - Once the shell has exited, output pipes still held by something it left running (a server
+    started in the background) are given two seconds and then dropped; the call returns with the
+    script's own exit code and what was captured.
+  - A call cancelled while its script was still being written out is stopped as it starts, instead
+    of running to completion.
+  - The SIGKILL escalation is no longer cancelled when the event stream ends before the process
+    does (output overflow, an abandoning consumer).
+
+- **mcp** — for local (stdio) servers:
+  - The server's stderr is drained. It is where servers log, and unread it fills its pipe, after
+    which the server blocks on its next log line and every later call times out. The end of it is
+    kept and reported as the reason when the server exits unexpectedly.
+  - Cancelling a tool call rejects it at once and sends `notifications/cancelled`; previously the
+    call ran on to the 30 s request timeout whatever the turn did.
+  - Responses are decoded as a stream, so a multi-byte character split across two chunks is no
+    longer corrupted (and with it the JSON message it was in).
+  - A server whose handshake or tool listing fails is stopped rather than left running with nothing
+    holding a reference to it; a server that never ends a message is cut off at 64 MiB.
+
+- **file-broker** — client requests carry a 60 s deadline covering the response body. On the service
+  side, `requestAbortSignal` accepts the response as well as the request and then also aborts when
+  the client leaves while the work is running; with the request alone it could only see a client
+  that left mid-upload. The file broker passes it; the file index does not, because an index run
+  must be able to outlive the request that started it.
+
+- **files** — one file whose metadata cannot be read (held open by another process, replaced
+  between the notification and the read) loses that change event instead of ending the watch,
+  which silenced every later file change until restart.
+
+- **frontend-telegram** — the poll loop's error back-off removes its abort listener when the delay
+  elapses; with the network down it added one every two seconds for as long as the outage lasted.
+
+- **workspace-rag** — creating a context or changing its paths while Workspace RAG V2 is unavailable
+  (its store was unreachable at startup) no longer terminates the process: the reconcile that cannot
+  start was a detached, unhandled rejection. The configuration is saved and the failure recorded.
+
+- **runtime-admin** — the package-manager runner behind `plugin add`/`remove` has an `error`
+  listener (a child that could not be spawned was an uncaught exception and a promise that never
+  settled), a ten-minute limit, and is killed — with its process tree — when the tool call is
+  cancelled.
+
+- **runtime-admin / cli (`install`)** — a plugin specifier can no longer run as shell syntax on
+  Windows. npm, pnpm and yarn are `.cmd` shims there, and both installers reached them with
+  `shell: true`, which joins the arguments into cmd.exe's command line unescaped: `plugin add` with
+  `left-pad & calc` ran `calc` once the install was confirmed, and ordinary specifiers were silently
+  rewritten (`pkg@^1.2.3` installed as `pkg@1.2.3`, a tarball URL was cut at its first `&`, a
+  `>=` range redirected output to a file). The command line is now built with every argument
+  double-quoted, so the package manager receives each specifier verbatim. What quoting cannot
+  neutralise on Windows — `"`, `%`, `!` — is refused, as are (on every platform) control characters
+  and a leading `-`, which a package manager would read as an option. `plugin add` refuses before
+  asking for confirmation, and rejects a line break in any specifier, which would otherwise have
+  been written into `matbot.yaml` as an entry of its own.
+
+- **hybrid-knowledge-index / memory-mem0** — Mem0 and file-index requests carry a deadline (search
+  30 s / 15 s, writes 120 s). A service that accepted the connection and then never answered held the
+  calling tool, and its turn, open until the user cancelled.
+
+- **http** — the response body is read with a 10 MiB cap; the tool buffered whatever a model-chosen
+  URL returned, so one large download could exhaust the process's memory.
+
+- **cli (`start`)** — an unhandled promise rejection is logged and the server keeps running, instead
+  of terminating with every session's in-flight turn. A workspace switch still starts the
+  replacement process when the restart log cannot be written, and exits non-zero rather than
+  lingering as a torn-down process if the replacement cannot be started at all.
 
 - **New plugin `@matatbread/matbot-tool-harness`** — workspace-confined coding-harness tools:
   `read` (line offsets/limits, byte/line caps, continuation hints, binary sniffing, missing-file

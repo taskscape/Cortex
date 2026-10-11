@@ -19,7 +19,7 @@ export function createFileBrokerServer(service: Pick<HostFileAccessService, 'hea
         try {
             assertLoopbackRequest(request);
             const url = new URL(request.url ?? '/', 'http://' + (request.headers.host ?? 'localhost'));
-            const signal = requestAbortSignal(request);
+            const signal = requestAbortSignal(request, response);
             if (request.method === 'GET' && url.pathname === '/health') {
                 sendJson(response, 200, await service.health(signal));
                 return;

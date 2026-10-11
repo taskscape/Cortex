@@ -318,6 +318,39 @@ test("requestAbortSignal removes its listeners when the request closes normally 
   assert.equal(preAborted.listenerCount("close"), 0);
 });
 
+test("requestAbortSignal given the response aborts when the client leaves while the work is running", () => {
+  // A request closes as soon as it has been read in full, long before the work it asked for is
+  // done; from then on only the response can show that the client went away.
+  const request = new EventEmitter();
+  request.aborted = false;
+  request.complete = false;
+  const response = new EventEmitter();
+  response.writableFinished = false;
+  const signal = requestAbortSignal(request, response);
+  request.complete = true;
+  request.emit("close");
+  assert.equal(signal.aborted, false, "a request received in full is not a disconnect");
+  assert.equal(response.listenerCount("close"), 1, "the response stays watched after the request closes");
+  response.emit("close");
+  assert.equal(signal.aborted, true, "a connection closed before the response was sent is a disconnect");
+  assert.equal(request.listenerCount("aborted"), 0);
+  assert.equal(request.listenerCount("close"), 0);
+  assert.equal(response.listenerCount("close"), 0);
+
+  const answeredRequest = new EventEmitter();
+  answeredRequest.aborted = false;
+  answeredRequest.complete = true;
+  const answeredResponse = new EventEmitter();
+  answeredResponse.writableFinished = false;
+  const answeredSignal = requestAbortSignal(answeredRequest, answeredResponse);
+  answeredRequest.emit("close");
+  answeredResponse.writableFinished = true;
+  answeredResponse.emit("close");
+  assert.equal(answeredSignal.aborted, false, "a response that was sent in full must not abort the signal");
+  assert.equal(answeredRequest.listenerCount("aborted"), 0, "listeners are released once the response closes");
+  assert.equal(answeredResponse.listenerCount("close"), 0);
+});
+
 function captureResponse() {
   const captured = { status: 0, body: null };
   return {

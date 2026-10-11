@@ -19,11 +19,17 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolve();
       return;
     }
-    const id = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => {
+    const onAbort = (): void => {
       clearTimeout(id);
       resolve();
-    }, { once: true });
+    };
+    // Removed when the timer wins: this runs every hour for the life of the process, and each
+    // leftover listener would otherwise stay on the signal until shutdown.
+    const id = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
 }
 

@@ -36,6 +36,8 @@ export function createHttpPlugin(): MatbotPluginSpec {
             const backend = { health: (...args: Parameters<NonNullable<typeof services.HostFileAccess>['health']>) => resolve().health(...args), list: (...args: Parameters<NonNullable<typeof services.HostFileAccess>['list']>) => resolve().list(...args), read: (...args: Parameters<NonNullable<typeof services.HostFileAccess>['read']>) => resolve().read(...args), write: (...args: Parameters<NonNullable<typeof services.HostFileAccess>['write']>) => resolve().write(...args) };
             server = createFileBrokerServer(backend, process.env.CORTEX_FILE_BROKER_TOKEN);
             await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(Number(process.env.FILE_BROKER_PORT ?? 8878), '127.0.0.1', resolve); });
+            // The startup listener is one-shot; a later server error with no listener is an uncaught exception.
+            server.on('error', error => console.warn(`[file-broker-http] server error: ${error.message}`));
         }, /**
      * Close all open connections, then stop the server.
      *

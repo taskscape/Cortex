@@ -1,8 +1,18 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import type { Store, StoreQuery, QueryResult, CASResult } from '@matatbread/matbot-plugin-api';
+import type { Store, StoreProjection, StoreQuery, QueryResult, CASResult } from '@matatbread/matbot-plugin-api';
 import { executeQuery } from '@matatbread/matbot-storage-base';
+
+/**
+ * What {@link FilesystemStore.queryProjected} remembers about one document file: the identity of
+ * the file a value was computed from, and the value. `value` is absent for a file that could not be
+ * parsed, so a corrupt document is not re-read on every listing either.
+ */
+interface ProjectedEntry {
+  stamp:  string;
+  value?: { id: string; version: string };
+}
 
 // A record id is an opaque string — plugins mint ids like `source:<hash>` — but a file name cannot
 // hold every character: `:` is illegal on Windows, and `/` or `..` would escape the directory. Ids
@@ -13,6 +23,37 @@ const FILE_SAFE_ID = /^[\w-]+$/;
 
 // Leaves room under the common 255-byte file-name limit for the `.json`/`.json.tmp` suffixes.
 const MAX_ENCODED_NAME = 200;
+
+// A query reads every document in the namespace. Reads are issued a bounded batch at a time so a
+// large namespace cannot hold thousands of file handles and buffers open at once — past the
+// handle limit the failed reads would be indistinguishable from corrupt files and silently dropped.
+const QUERY_READ_CONCURRENCY = 32;
+
+// Windows refuses to replace a file another process holds open (antivirus, search indexer,
+// backup). Those handles last milliseconds, so a short bounded retry turns what would be a failed
+// save into a slightly slower one. Elsewhere these codes mean a real permission problem.
+const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const RENAME_RETRY_DELAYS_MS = process.platform === 'win32' ? [10, 25, 50, 100, 200, 400] : [];
+
+/**
+ * Renames `from` over `to`, retrying briefly on Windows sharing violations.
+ * @param from - Source path.
+ * @param to - Destination path, replaced if present.
+ * @returns Resolves once the rename succeeds.
+ * @throws The rename error once it is not transient or the retry budget is spent.
+ */
+async function renameReplacing(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.rename(from, to);
+      return;
+    } catch (e) {
+      const delay = RENAME_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !TRANSIENT_RENAME_CODES.has((e as { code?: string }).code ?? '')) throw e;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
 
 /**
  * Percent-encodes every UTF-8 byte of `id` that is not a filesystem-safe
@@ -37,10 +78,16 @@ function encodeName(id: string): string {
  * encoded per UTF-8 byte; over-long names fall back to a `%h%<sha256>` digest.
  * Writes are atomic (tmp file + rename) and `set`/`cas`/`delete` serialise
  * per id with an in-process promise-chain mutex (single-process safety only).
+ * `queryProjected` keeps projected values per document file, so a listing
+ * re-reads only the documents that changed since the last one.
  */
 export class FilesystemStore<T extends { id: string; version: string }> implements Store<T> {
   private initPromise: Promise<void> | undefined;
   private locks = new Map<string, Promise<unknown>>();
+  // Projection key → file name → what that projection made of the file.
+  private projections = new Map<string, Map<string, ProjectedEntry>>();
+  // One set per `queryProjected` call in progress: the files this store wrote while it ran.
+  private listings = new Set<Set<string>>();
 
   private readonly dir: string;
   /**
@@ -110,7 +157,10 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
    */
   private withLock<R>(key: string, fn: () => Promise<R>): Promise<R> {
     const tail = (this.locks.get(key) ?? Promise.resolve()).then(() => fn());
-    this.locks.set(key, tail.then(() => undefined, () => undefined));
+    const settled = tail.then(() => undefined, () => undefined);
+    this.locks.set(key, settled);
+    // Drop the entry once the chain drains, or the map keeps one promise per id ever written.
+    void settled.then(() => { if (this.locks.get(key) === settled) this.locks.delete(key); });
     return tail;
   }
 
@@ -127,7 +177,7 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
     const tmp = `${filePath}.tmp`;
     await fs.writeFile(tmp, content, 'utf8');
     try {
-      await fs.rename(tmp, filePath);
+      await renameReplacing(tmp, filePath);
     } catch (e) {
       await fs.unlink(tmp).catch(() => undefined);
       throw e;
@@ -177,6 +227,23 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
   private async writeDoc(id: string, value: T): Promise<void> {
     await this.init();
     await this.writeAtomic(this.filePath(id), JSON.stringify(value, null, 2));
+    this.forgetProjected(id);
+  }
+
+  /**
+   * Discards what `queryProjected` keeps for one document, so the next listing
+   * reads its file again. A write already changes the identity the kept value
+   * is checked against; this makes the store's own writes independent of how
+   * finely the filesystem happens to timestamp files. A listing that is
+   * running right now is told as well, since it may have looked at the file
+   * before the write landed.
+   * @param id - Record identifier just written.
+   * @throws Never.
+   */
+  private forgetProjected(id: string): void {
+    const name = `${this.safeName(id)}.json`;
+    for (const kept of this.projections.values()) kept.delete(name);
+    for (const written of this.listings) written.add(name);
   }
 
   /**
@@ -242,18 +309,106 @@ export class FilesystemStore<T extends { id: string; version: string }> implemen
       return { items: [], total: 0 };
     }
 
-    // Collect into a mutable array to avoid Awaited<T> inference from Promise.all
+    const names = entries.filter(e => /^[\w%-]+\.json$/.test(e));
     const pool: T[] = [];
-    await Promise.all(
-      entries
-        .filter(e => /^[\w%-]+\.json$/.test(e))
-        .map(async e => {
-          try {
-            pool.push(JSON.parse(await fs.readFile(join(this.dir, e), 'utf8')) as T);
-          } catch { /* skip corrupted */ }
-        }),
-    );
+    let cursor = 0;
+    const reader = async (): Promise<void> => {
+      for (let i = cursor++; i < names.length; i = cursor++) {
+        try {
+          pool.push(JSON.parse(await fs.readFile(join(this.dir, names[i]!), 'utf8')) as T);
+        } catch { /* skip corrupted */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(QUERY_READ_CONCURRENCY, names.length) }, reader));
 
+    return executeQuery(pool, q);
+  }
+
+  /**
+   * Runs a query over a projection of every document, opening only the files
+   * that changed since the projection was last computed. Each file is
+   * recognised by its modification time, size and inode: every write replaces
+   * the file, whichever process makes it, so an unchanged identity means an
+   * unchanged document and its projected value is reused without a read. A
+   * listing therefore costs one `stat` per document instead of reading and
+   * parsing all of them. Corrupted files are skipped, as in `query`.
+   * @typeParam P - The projected type.
+   * @param projection - What to reduce each document to; values are kept under
+   *   its `key`.
+   * @param q - The store query to execute against the projected values.
+   * @returns Matching projected values plus the total count before pagination.
+   *   The values are shared with the store and frozen.
+   * @throws Propagates directory-creation errors from lazy initialisation and
+   *   anything `projection.select` throws; values computed by a call that
+   *   fails are not kept.
+   */
+  async queryProjected<P extends { id: string; version: string }>(projection: StoreProjection<T, P>, q: StoreQuery): Promise<QueryResult<P>> {
+    await this.init();
+
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.dir);
+    } catch {
+      return { items: [], total: 0 };
+    }
+
+    const names = entries.filter(e => /^[\w%-]+\.json$/.test(e));
+    const known = this.projections.get(projection.key);
+    // Rebuilt rather than updated in place, so files that have gone leave no entry behind.
+    const current = new Map<string, ProjectedEntry>();
+    let cursor = 0;
+    const reader = async (): Promise<void> => {
+      for (let i = cursor++; i < names.length; i = cursor++) {
+        const name = names[i]!;
+        const file = join(this.dir, name);
+        let stamp: string;
+        try {
+          // Taken before the read, never after: a file replaced in between is then kept under
+          // the older identity and recomputed next time, rather than a stale value being kept
+          // under the newer one for good.
+          const info = await fs.stat(file, { bigint: true });
+          stamp = `${info.mtimeNs}:${info.size}:${info.ino}`;
+        } catch {
+          continue; // deleted since the directory was read
+        }
+        const kept = known?.get(name);
+        if (kept !== undefined && kept.stamp === stamp) {
+          current.set(name, kept);
+          continue;
+        }
+        let doc: T;
+        try {
+          doc = JSON.parse(await fs.readFile(file, 'utf8')) as T;
+        } catch {
+          current.set(name, { stamp }); // skip corrupted
+          continue;
+        }
+        let value: P;
+        try {
+          value = projection.select(doc);
+        } catch (error) {
+          cursor = names.length; // the call is failing: the other readers have nothing left to do
+          throw error;
+        }
+        current.set(name, { stamp, value: Object.freeze(value) });
+      }
+    };
+    const written = new Set<string>();
+    this.listings.add(written);
+    try {
+      await Promise.all(Array.from({ length: Math.min(QUERY_READ_CONCURRENCY, names.length) }, reader));
+    } finally {
+      this.listings.delete(written);
+    }
+
+    const pool: P[] = [];
+    for (const entry of current.values()) {
+      if (entry.value !== undefined) pool.push(entry.value as P);
+    }
+    // What this call saw of a file written meanwhile is a fair answer for this call, but may
+    // predate the write, so it is not kept.
+    for (const name of written) current.delete(name);
+    this.projections.set(projection.key, current);
     return executeQuery(pool, q);
   }
 }

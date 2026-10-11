@@ -406,6 +406,8 @@ export const plugin: MatbotPluginSpec = {
         reject(e);
       });
       server.listen(PORT, HOST, () => {
+        // The startup listener is one-shot; a later server error with no listener is an uncaught exception.
+        server.on('error', (e: Error) => console.warn(`[memory-browser] server error: ${e.message}`));
         activeServer = server;
         activeUrl = BASE_URL;
         startupError = undefined;

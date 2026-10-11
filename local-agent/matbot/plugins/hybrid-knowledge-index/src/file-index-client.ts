@@ -7,6 +7,10 @@ export interface LocalFileIndexClientOptions {
   baseUrl: string;
 }
 
+// A file-index service that accepts the connection but never answers must not hold the search —
+// and the turn that issued it — open indefinitely.
+const SEARCH_TIMEOUT_MS = 15_000;
+
 /** One snippet result returned by the file-index search service. */
 interface FileSearchResult {
   path: string;
@@ -35,11 +39,12 @@ export class LocalFileIndexClient {
    * @throws Error when the service responds with a non-OK status.
    */
   async search(query: string, signal?: AbortSignal): Promise<KnowledgeEntry[]> {
+    const deadline = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
     const response = await fetch(new URL("/search", this.options.baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query, limit: 10 }),
-      ...(signal !== undefined ? { signal } : {})
+      signal: signal !== undefined ? AbortSignal.any([signal, deadline]) : deadline
     });
 
     if (!response.ok) {

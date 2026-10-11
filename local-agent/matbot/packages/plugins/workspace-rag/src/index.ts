@@ -1349,8 +1349,25 @@ class WorkspaceRagManager {
       pathsChanged,
     });
     await this.refreshWatchers();
-    if (pathsChanged) void this.requestV2Reconcile(workspace, activeContext(next), 'configuration', false);
+    if (pathsChanged) this.reconcileAfterConfigChange(workspace, activeContext(next));
     return configView(next);
+  }
+
+  /**
+   * Starts a `configuration`-triggered reconcile without awaiting it. The request rejects when
+   * the V2 manager is unavailable (its store was unreachable at startup); the configuration has
+   * already been saved, so that is recorded on the reconcile state rather than left as an
+   * unhandled rejection, which would terminate the process.
+   *
+   * @param workspace - Workspace owning the context.
+   * @param context - Context whose configuration changed.
+   * @throws Never.
+   */
+  private reconcileAfterConfigChange(workspace: WorkspaceRef, context: RagContextConfig): void {
+    void this.requestV2Reconcile(workspace, context, 'configuration', false).catch(error => {
+      this.reconcileState(workspace.id, context.id).lastError = errorMessage(error);
+      console.warn(`[workspace-rag-v2] configuration saved, but reconciliation could not start for ${workspace.id}/${context.id}: ${errorMessage(error)}`);
+    });
   }
 
   /**
@@ -1437,7 +1454,7 @@ class WorkspaceRagManager {
       paths: nextContext.paths,
     });
     await this.refreshWatchers();
-    void this.requestV2Reconcile(workspace, nextContext, 'configuration', false);
+    this.reconcileAfterConfigChange(workspace, nextContext);
     return configView(next);
   }
 

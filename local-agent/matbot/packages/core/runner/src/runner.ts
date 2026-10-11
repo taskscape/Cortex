@@ -114,6 +114,11 @@ export interface RunSessionOpts {
   permissions?:   PermissionConfig;
   /** Output limits applied to tool results before they enter model context. */
   toolOutput?:    ToolOutputLimits;
+  /**
+   * How long an aborted turn waits for a still-running tool to stop before abandoning it and
+   * recording an aborted result. Default 10000 ms.
+   */
+  toolAbortGraceMs?: number;
   /** Hot-load a plugin (delegated into tool contexts). */
   loadPlugin:     (specifier: string, prompt?: PromptFn) => Promise<MatbotPlugin>;
   /** Hot-unload a plugin (delegated into tool contexts). */
@@ -260,6 +265,10 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
    * @throws Never.
    */
   const scrubSpanValue = (value: unknown): unknown => {
+    // Span attributes are built before `observe` can decline them. With no sink they are dropped
+    // unread, and serialising, scanning and re-parsing every tool result and answer for secrets
+    // would be work on the turn's hot path for nothing.
+    if (opts.observability === undefined) return value;
     if (typeof value === 'string') return vault.scrub(value);
     if (value === null || typeof value !== 'object') return value;
     try {
@@ -871,6 +880,9 @@ async function* runSessionTurn(opts: RunSessionOpts): AsyncIterable<PipelineEven
         queue.end();
       }
     })();
+    // Observed below by `await batch`; this only keeps a rejection from being reported as
+    // unhandled (fatal) if the consumer stops pulling events before that line is reached.
+    batch.catch(() => undefined);
     for await (const ev of queue) yield ev;
     await batch;
 

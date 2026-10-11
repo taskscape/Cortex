@@ -36,6 +36,8 @@ export function createHttpPlugin(): MatbotPluginSpec {
             const backend = { health: (...args: Parameters<NonNullable<typeof services.FileIndex>['health']>) => resolve().health(...args), index: (...args: Parameters<NonNullable<typeof services.FileIndex>['index']>) => resolve().index(...args), search: (...args: Parameters<NonNullable<typeof services.FileIndex>['search']>) => resolve().search(...args), cancel: (...args: Parameters<NonNullable<typeof services.FileIndex>['cancel']>) => resolve().cancel(...args) };
             server = createFileIndexServer(backend, process.env.CORTEX_FILE_INDEX_TOKEN);
             await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(Number(process.env.FILE_INDEX_PORT ?? 8877), '127.0.0.1', resolve); });
+            // The startup listener is one-shot; a later server error with no listener is an uncaught exception.
+            server.on('error', error => console.warn(`[file-index-http] server error: ${error.message}`));
         }, /**
      * Close all open connections, then stop the server.
      *

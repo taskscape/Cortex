@@ -258,6 +258,65 @@ const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set(['bash', 'powershell', 'do
 // then fail the request (409) — never a bypassing unconditional write.
 const MAX_CAS_ATTEMPTS = 10;
 
+// A client that stops reading its event stream (a suspended tab, a stalled proxy) leaves every later
+// event queued in this process with no bound. Past this backlog the stream is cut instead; the
+// client's reconnect resumes from committed history plus the runner's replay of the running turn.
+const MAX_SSE_BACKLOG_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Writes one SSE frame unless the connection is gone or too far behind.
+ *
+ * @param res - Event-stream response to write to.
+ * @param msg - Fully serialised SSE frame.
+ * @returns `false` when the connection is unusable (and was cut if it was backlogged).
+ * @throws Never.
+ */
+function writeSse(res: ServerResponse, msg: string): boolean {
+  // Not `res.writable`: it stays true after the client disconnects and after `end()`, and a write
+  // to an ended response is an `error` event nobody listens for — an uncaught exception.
+  if (res.writableEnded || res.destroyed) return false;
+  if (res.writableLength > MAX_SSE_BACKLOG_BYTES) {
+    res.destroy();
+    return false;
+  }
+  res.write(msg);
+  return true;
+}
+
+/**
+ * Waits until a response can accept more data, or has closed.
+ *
+ * @param res - Response whose last `write()` returned `false`.
+ * @returns Resolves on `drain` or `close`, whichever comes first.
+ * @throws Never.
+ */
+function drained(res: ServerResponse): Promise<void> {
+  return new Promise(resolve => {
+    const done = (): void => {
+      res.off('drain', done);
+      res.off('close', done);
+      resolve();
+    };
+    res.once('drain', done);
+    res.once('close', done);
+  });
+}
+
+/**
+ * Aborts `ac` when the client goes away before its response is complete.
+ *
+ * The request's own `close` cannot be used for this: once a body has been read it has already
+ * fired, so a listener added afterwards never runs and the work outlives its caller.
+ *
+ * @param res - Response whose connection to watch.
+ * @param ac - Controller cancelling the work done on behalf of the request.
+ * @returns Nothing.
+ * @throws Never.
+ */
+function abortOnDisconnect(res: ServerResponse, ac: AbortController): void {
+  res.once('close', () => { if (!res.writableFinished) ac.abort(); });
+}
+
 /** Thrown by {@link appendSessionMessages} when the session stays contended past the CAS retry budget. */
 export class SessionConflictError extends Error {
   /**
@@ -534,9 +593,30 @@ export function createWebServer(deps: WebServerDeps) {
    * @throws Never.
    */
   const expertSessions=()=>deps.expertSessions?deps.expertSessions():fallbackExpertSessions;
-  // session ID → the parked prompt's settlers. `resolve` delivers an answer (applying the default
-  // fallback); `cancel` rejects it with PromptCancelledError — the "give up" path.
-  const pendingPrompts = new Map<string, { resolve: (answer: string) => void; cancel: () => void }>();
+  // session ID → the parked prompts' settlers, oldest first. `resolve` delivers an answer (applying
+  // the default fallback); `cancel` rejects it with PromptCancelledError — the "give up" path.
+  // `frame` is the SSE `prompt` event, kept so a viewer that attaches while the prompt is parked can
+  // be asked too. A queue, not a slot: turns are serialised, but one turn's parallel tool calls can
+  // prompt at the same time (an `ask_user` beside a permission ask), and a second prompt replacing
+  // the first would leave the first's tool waiting on an answer that can no longer be delivered.
+  // Only the head has been shown; each is shown as it reaches the head.
+  const pendingPrompts = new Map<string, Array<{ resolve: (answer: string) => void; cancel: () => void; frame: string }>>();
+
+  /**
+   * Settles every prompt parked for a session, leaving none behind to be shown.
+   *
+   * @param sessionId - Session whose parked prompts to settle.
+   * @param how - `resolve` answers each with its default (or `''`); `cancel` rejects each with
+   *              {@link PromptCancelledError}.
+   * @returns Nothing; a no-op when nothing is parked.
+   * @throws Never.
+   */
+  function settlePrompts(sessionId: string, how: 'resolve' | 'cancel'): void {
+    const parked = pendingPrompts.get(sessionId);
+    if (parked === undefined) return;
+    pendingPrompts.delete(sessionId);
+    for (const entry of parked) { if (how === 'cancel') entry.cancel(); else entry.resolve(''); }
+  }
 
   // One multiplexed event stream (GET /events) carries every global, non-session event — session
   // busy/idle, file changes, and tool/skill/plugin CRUD — each tagged by name and demuxed client-side.
@@ -554,7 +634,7 @@ export function createWebServer(deps: WebServerDeps) {
    * @throws Never.
    */
   const broadcast = (msg: string): void => {
-    for (const res of globalListeners) { if (res.writable) res.write(msg); else globalListeners.delete(res); }
+    for (const res of globalListeners) { if (!writeSse(res, msg)) globalListeners.delete(res); }
   };
 
   // Per-file watchers (GET /events/files/:ns/:name), keyed `<namespace>/<name>` so single-file streams
@@ -582,7 +662,7 @@ export function createWebServer(deps: WebServerDeps) {
         const msg = sseEvent('file-changed', event);
         broadcast(msg);
         const subs = fileEventListeners.get(`${event.namespace ?? ''}/${event.name}`);
-        if (subs) for (const res of subs) { if (res.writable) res.write(msg); else subs.delete(res); }
+        if (subs) for (const res of subs) { if (!writeSse(res, msg)) subs.delete(res); }
       }
     })().catch(error => reportWatchFailure('file', error));
   }
@@ -638,7 +718,7 @@ export function createWebServer(deps: WebServerDeps) {
   function sendToSession(sessionId: string, msg: string): void {
     const conns = sessionConns.get(sessionId);
     if (conns === undefined) return;
-    for (const res of conns) { if (res.writable) res.write(msg); else conns.delete(res); }
+    for (const res of conns) { if (!writeSse(res, msg)) conns.delete(res); }
   }
 
   // Broadcast a session's busy/idle transition to the global status listeners (sidebar), deduped
@@ -748,7 +828,7 @@ export function createWebServer(deps: WebServerDeps) {
       await runAs(principal, () => handleRequest(req, res, method, url, principal));
     } catch (e) {
       if (!res.headersSent) json(res, e instanceof SessionConflictError ? 409 : 500, { error: String(e) });
-      else if (res.writable)  res.end();
+      else if (!res.writableEnded) res.end();
     }
   });
 
@@ -916,7 +996,14 @@ export function createWebServer(deps: WebServerDeps) {
       '/matbot.html': static200(res, 'text/html; charset=utf-8', "../../../../../apps/web-bundle/dist/matbot.html"),
     };
     if (method === 'GET' && url in staticRoutes) {
-      staticRoutes[url]?.();
+      // Awaited: left detached, a failed read is an unhandled rejection (fatal to the process) and
+      // the request is never answered. `/matbot.html` is absent whenever the web bundle is unbuilt.
+      try {
+        await staticRoutes[url]?.();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        json(res, 404, { error: 'Not found' });
+      }
       return;
     }
     // if (method === 'GET' && url === '/')       { static200(res, 'text/html; charset=utf-8',              await html()); return; }
@@ -1091,8 +1178,8 @@ export function createWebServer(deps: WebServerDeps) {
        * event on the session's stream.
        *
        * Resolves when `POST /sessions/:id/prompt` answers (an empty answer falls back to the offered
-       * default, else `''`); rejects with {@link PromptCancelledError} on the cancel path. At most
-       * one prompt is outstanding per session, since turns are serialised.
+       * default, else `''`); rejects with {@link PromptCancelledError} on the cancel path. Prompts
+       * raised while another is parked for the session queue behind it and are shown one at a time.
        *
        * @param p - Question string or form field offered by the tool.
        * @param defaultValue - Default answer for a string question.
@@ -1102,17 +1189,21 @@ export function createWebServer(deps: WebServerDeps) {
       const promptFn = ((p: string | FormField, defaultValue?: string): Promise<string> =>
         new Promise<string>((resolve, reject) => {
           const def = typeof p === 'string' ? defaultValue : p.default;
-          pendingPrompts.set(targetId, {
-            resolve: answer => { pendingPrompts.delete(targetId); resolve(answer || def || ''); },
-            cancel:  ()     => { pendingPrompts.delete(targetId); reject(new PromptCancelledError()); },
-          });
-          sendToSession(targetId, sseEvent('prompt', {
+          const frame = sseEvent('prompt', {
             type: 'prompt',
             traceId,
             question: typeof p === 'string' ? p : p.label,
             ...(def !== undefined ? { defaultValue: def } : {}),
             ...(typeof p === 'string' ? {} : { field: p }),
-          }));
+          });
+          let parked = pendingPrompts.get(targetId);
+          if (parked === undefined) { parked = []; pendingPrompts.set(targetId, parked); }
+          parked.push({
+            resolve: answer => resolve(answer || def || ''),
+            cancel:  ()     => reject(new PromptCancelledError()),
+            frame,
+          });
+          if (parked.length === 1) sendToSession(targetId, frame);
         })) as PromptFn;
 
       // The first submit of a busy period anchors the server-owned busy tracker on its OWN view
@@ -1213,8 +1304,7 @@ export function createWebServer(deps: WebServerDeps) {
             sessionConns.delete(sId);
             // No viewers left: release any pending prompt so a turn parked on ctx.prompt() doesn't
             // hang awaiting an answer that can never arrive.
-            const r = pendingPrompts.get(sId);
-            if (r) { pendingPrompts.delete(sId); r.resolve(''); }
+            settlePrompts(sId, 'resolve');
           }
         }
       });
@@ -1223,17 +1313,22 @@ export function createWebServer(deps: WebServerDeps) {
       void (async () => {
         try {
           for await (const ev of view.events) {
-            if (!res.writable) break;
             // `idle` is the runner's busy→idle lifecycle signal (session-runner pump): it arrives
             // *after* `running` flips false, so updateBusy reads an authoritative idle with no
             // microtask race. It's status bookkeeping, not turn content — don't forward it to the
             // client (app.js has no case for it).
             if (ev.type === 'idle') { updateBusy(sId); continue; }
-            res.write(sseEvent(ev.type, ev));
+            if (!writeSse(res, sseEvent(ev.type, ev))) break;
             updateBusy(sId);
           }
         } catch { /* stream torn down */ }
       })();
+      // A prompt raised before this viewer attached reached only the viewers present at the time
+      // (none, if the tab was closed mid-turn), so without this the turn stays parked on a question
+      // nobody was shown. Deferred a macrotask: the replay above drains in microtasks, so the prompt
+      // lands after the events that led to it.
+      const parked = pendingPrompts.get(sId)?.[0];
+      if (parked) setImmediate(() => { if (pendingPrompts.get(sId)?.[0] === parked) writeSse(res, parked.frame); });
       return;
     }
 
@@ -1243,8 +1338,7 @@ export function createWebServer(deps: WebServerDeps) {
       const sId    = abortMatch[1]!;
       // Release any pending prompt first so a turn parked on ctx.prompt() can observe the abort
       // rather than hang, then drop the queue + abort the running turn.
-      const r = pendingPrompts.get(sId);
-      if (r) { pendingPrompts.delete(sId); r.resolve(''); }
+      settlePrompts(sId, 'resolve');
       deps.run.abort(sId);
       updateBusy(sId);
       json(res, 200, { ok: true });
@@ -1272,7 +1366,7 @@ export function createWebServer(deps: WebServerDeps) {
       if (!tool) { json(res, 404, { error: `Tool "${toolName}" not found` }); return; }
 
       const ac = new AbortController();
-      req.on('close', () => ac.abort());
+      abortOnDisconnect(res, ac);
 
       const invocation = await resolveDirectToolInvocation(input);
       if (!invocation.ok) { json(res, invocation.status, { error: invocation.error }); return; }
@@ -1336,7 +1430,7 @@ export function createWebServer(deps: WebServerDeps) {
       if (!tool) { json(res, 404, { error: `Tool "${toolName}" not found` }); return; }
 
       const ac = new AbortController();
-      req.on('close', () => ac.abort());
+      abortOnDisconnect(res, ac);
 
       const invocation = await resolveDirectToolInvocation(input);
       if (!invocation.ok) { json(res, invocation.status, { error: invocation.error }); return; }
@@ -1350,11 +1444,10 @@ export function createWebServer(deps: WebServerDeps) {
 
       try {
         for await (const ev of (deps.invokeTool ?? invokeToolEvents)(tool, invocation.invocation.input, makeToolCtx(ac, principal, invocation.invocation))) {
-          if (!res.writable) break;
-          res.write(sseEvent(ev.type, ev));
+          if (!writeSse(res, sseEvent(ev.type, ev))) break;
         }
       } catch (e) {
-        if (res.writable) res.write(sseEvent('error', { type: 'error', message: String(e) }));
+        writeSse(res, sseEvent('error', { type: 'error', message: String(e) }));
       } finally {
         res.end();
       }
@@ -1368,14 +1461,20 @@ export function createWebServer(deps: WebServerDeps) {
       let body: { answer?: string; cancel?: boolean };
       try { body = JSON.parse(await readBody(req)) as { answer?: string; cancel?: boolean }; }
       catch { json(res, 400, { error: 'Invalid JSON' }); return; }
-      const entry = pendingPrompts.get(sId);
-      if (!entry) { json(res, 409, { error: 'No pending prompt for this session' }); return; }
+      const parked = pendingPrompts.get(sId);
+      const entry = parked?.[0];
+      if (parked === undefined || entry === undefined) { json(res, 409, { error: 'No pending prompt for this session' }); return; }
       if (body.cancel) {
         // Give up: reject the prompt (the tool closes its call with an error result) and abandon the
-        // turn without disturbing the queue — pump advances to the next submission or idles.
-        entry.cancel();
+        // turn without disturbing the queue — pump advances to the next submission or idles. Prompts
+        // queued behind it belong to the same abandoned turn, so they go with it rather than being
+        // shown after the user has given up.
+        settlePrompts(sId, 'cancel');
         deps.run.cancelTurn(sId);
       } else {
+        parked.shift();
+        if (parked.length === 0) pendingPrompts.delete(sId);
+        else sendToSession(sId, parked[0]!.frame);
         entry.resolve(body.answer ?? '');
       }
       json(res, 200, { ok: true });
@@ -1421,10 +1520,13 @@ export function createWebServer(deps: WebServerDeps) {
         'cache-control': 'no-cache',
         ...corsHeaders(resolveCorsOrigin(req)),
       });
+      // Paced by the client: without waiting for `drain` a large file is read into memory as fast as
+      // the disk allows, and a client that has gone away is still served the whole file.
       for await (const chunk of handle.stream()) {
-        res.write(chunk);
+        if (res.destroyed) break;
+        if (!res.write(chunk)) await drained(res);
       }
-      res.end();
+      if (!res.destroyed) res.end();
       return;
     }
 
@@ -1459,8 +1561,7 @@ export function createWebServer(deps: WebServerDeps) {
     fileEventListeners.clear();
 
     // Resolve all pending prompts so callers don't hang.
-    for (const entry of pendingPrompts.values()) entry.resolve('');
-    pendingPrompts.clear();
+    for (const sessionId of [...pendingPrompts.keys()]) settlePrompts(sessionId, 'resolve');
 
     // `server.close()` stops accepting and then waits for every open connection. Node ≥19 drops IDLE
     // keep-alive sockets itself, but a connection that is mid-request holds the close open with no

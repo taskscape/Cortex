@@ -1,4 +1,4 @@
-import type { Tool, ToolEvent, ToolContext, Session, Store } from '@matatbread/matbot-plugin-api';
+import type { Tool, ToolEvent, ToolContext, Session, Store, StoreProjection, StoreQuery } from '@matatbread/matbot-plugin-api';
 
 /**
  * Builds a one-line preview of a session: the text of its first user message, truncated to 60
@@ -15,6 +15,32 @@ function sessionPreview(session: Session): string {
   )?.text ?? '';
   return text.length > 60 ? `${text.slice(0, 60)}…` : text;
 }
+
+/** What `list` needs of a session — a few short strings, whatever the length of the conversation. */
+interface SessionSummary {
+  id:        string;
+  version:   string;
+  title:     string | undefined;
+  preview:   string;
+  updatedAt: string;
+  status:    Session['status'];
+}
+
+// Listing is what a frontend does most (the sidebar, after every turn), and a session's summary
+// changes far less often than the session does. Handed to the store as a projection, the summaries
+// of unchanged sessions come back without the sessions being read. `status` is carried for the
+// archived filter, which the store evaluates against the summary.
+const SESSION_SUMMARY: StoreProjection<Session, SessionSummary> = {
+  key: 'session_action.list/1',
+  select: session => ({
+    id:        session.id,
+    version:   session.version,
+    title:     session.title,
+    preview:   sessionPreview(session),
+    updatedAt: session.updatedAt,
+    status:    session.status,
+  }),
+};
 
 /**
  * Builds the session management tools bound to the given session store.
@@ -80,16 +106,20 @@ function makeSessionActionTool(store: Store<Session>): Tool {
         switch (args.action) {
           case 'list': {
             const { includeArchived } = args as Extract<SessionInput, { action: 'list' }>;
-            const { items } = await store.query(
-              includeArchived ? {} : { where: { op: 'neq', field: 'status', value: 'archived' } },
-            );
-            const sorted = items.slice().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+            const query: StoreQuery = includeArchived ? {} : { where: { op: 'neq', field: 'status', value: 'archived' } };
+            // A store that cannot keep projections is asked for the sessions themselves — every
+            // one read in full — and they are summarised here instead.
+            const projected = await store.queryProjected?.(SESSION_SUMMARY, query);
+            const summaries = projected !== undefined
+              ? projected.items
+              : (await store.query(query)).items.map(SESSION_SUMMARY.select);
+            const sorted = summaries.slice().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
             yield {
               type:  'result',
               value: sorted.map(s => ({
                 id:        s.id,
                 title:     s.title,
-                preview:   sessionPreview(s),
+                preview:   s.preview,
                 updatedAt: s.updatedAt,
               })),
             };

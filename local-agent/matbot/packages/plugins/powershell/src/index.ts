@@ -1,6 +1,6 @@
 import type { Tool, ToolEvent, ToolContext, MatbotPluginSpec } from '@matatbread/matbot-plugin-api';
 import { PLUGIN_API_VERSION } from '@matatbread/matbot-plugin-api';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,8 @@ interface PowerShellInput {
 const MAX_TIMEOUT_MS   = 2_147_000_000;
 const KILL_GRACE_MS    = 5_000;
 const MAX_OUTPUT_BYTES = 1_000_000;
+// How long output still in flight may take to arrive once the script itself has exited.
+const EXIT_DRAIN_GRACE_MS = 2_000;
 
 /**
  * Clamp a tool-supplied timeout to a safe setTimeout value.
@@ -117,17 +119,40 @@ async function createScriptRun(script: string): Promise<{ dir: string; scriptPat
 }
 
 /**
+ * Terminate a spawned script together with every process it started.
+ *
+ * Terminating only the script's own process leaves whatever it launched running — and holding
+ * the output pipes open, so the stream read from them would not end until those processes exit by
+ * themselves. On Windows the whole tree is taken down by `taskkill`, started without a shell and
+ * given nothing but the numeric pid, so no tool input can alter what is executed; it has to run
+ * while the script's process is still alive, because the tree is found through it. Elsewhere the
+ * process gets SIGTERM.
+ *
+ * @param child - The spawned script process.
+ * @returns Nothing.
+ * @throws Never.
+ */
+function killTree(child: ChildProcess): void {
+  if (process.platform !== 'win32' || child.pid === undefined) { child.kill('SIGTERM'); return; }
+  const taskkill = join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32', 'taskkill.exe');
+  const killer = spawn(taskkill, ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  killer.on('error', () => { child.kill('SIGTERM'); });
+  killer.on('exit', code => { if (code !== 0) child.kill('SIGTERM'); });
+}
+
+/**
  * Bridge event-emitter callbacks to an AsyncIterable<ToolEvent>.
  *
- * Spawns `command` with `args` (no shell) and forwards stdout/stderr chunks as streaming
- * `stdout`/`stderr` events until the {@link MAX_OUTPUT_BYTES} cap, the timeout, the abort
- * signal, a spawn error, or process close ends the run. Timeout and abort send SIGTERM (on
- * Windows Node this maps to TerminateProcess — the signal is kept named so timeout and abort
- * input cannot alter what is executed), escalating to SIGKILL after {@link KILL_GRACE_MS}. The
- * terminal event is exactly one of: an error event (overflow, timeout/abort kill, non-zero
- * exit, or spawn error — each carrying the accumulated output where present) or a result event
- * with `{ exitCode, stdout, stderr }`, followed by stream end. Abandoning the iterator early
- * kills the child.
+ * Spawns `command` with `args` (no shell, no stdin) and forwards stdout/stderr chunks as
+ * streaming `stdout`/`stderr` events until the {@link MAX_OUTPUT_BYTES} cap, the timeout, the
+ * abort signal, a spawn error, or process close ends the run. Timeout and abort terminate the
+ * process and everything it started (see {@link killTree}), escalating to SIGKILL after
+ * {@link KILL_GRACE_MS}. Once the process has exited, output pipes still held open by something
+ * it left running are abandoned after {@link EXIT_DRAIN_GRACE_MS}. The terminal event is exactly
+ * one of: an error event (overflow, timeout/abort kill, non-zero exit, or spawn error — each
+ * carrying the accumulated output where present) or a result event with
+ * `{ exitCode, stdout, stderr }`, followed by stream end. Abandoning the iterator early kills
+ * the child.
  *
  * @param command - Executable to spawn.
  * @param args - Argument vector passed verbatim (no shell).
@@ -157,7 +182,10 @@ function spawnAndStream(
     wakeup = null;
   };
 
-  const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, shell: false });
+  // No stdin: nothing ever writes to it, so anything the script runs that reads its input (a
+  // program asking a question, `sort.exe`, an interpreter started without a file) would wait on an
+  // open pipe forever. With none it reads end-of-input at once.
+  const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
 
   const timeoutMs = sanitizeTimeout(opts.timeout);
 
@@ -168,6 +196,7 @@ function spawnAndStream(
   let stopReason: 'timeout' | 'aborted' | 'overflow' | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * Kill the child for the given reason, escalating to SIGKILL after the grace period.
@@ -180,12 +209,11 @@ function spawnAndStream(
     if (stopped || finalized) return;
     stopped = true;
     stopReason = reason;
-    // On Windows Node maps SIGTERM to TerminateProcess.  Keep the signal named
-    // rather than using a shell command so timeout and abort input cannot alter
-    // what is executed.
-    child.kill('SIGTERM');
-    // A child ignoring SIGTERM must not outlive its deadline — escalate.
+    killTree(child);
+    // A child that survives the first kill must not outlive its deadline — escalate. Cleared only
+    // once the child is known to be gone, so a consumer abandoning the stream cannot cancel it.
     killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+    killTimer.unref();
   };
   /**
    * Abort listener that stops the child with the "aborted" reason.
@@ -194,7 +222,9 @@ function spawnAndStream(
    * @throws Never.
    */
   const killOnAbort = (): void => { stop('aborted'); };
-  opts.signal.addEventListener('abort', killOnAbort, { once: true });
+  // An abort that landed while the script file was being written raises no event here.
+  if (opts.signal.aborted) killOnAbort();
+  else opts.signal.addEventListener('abort', killOnAbort, { once: true });
 
   let totalBytes = 0;
   /**
@@ -236,9 +266,17 @@ function spawnAndStream(
     push({ type: 'error', message: e.message });
     push(null);
   });
+  child.on('exit', () => {
+    // `close` waits for the output pipes, and a process the script left behind (a server it
+    // started, a child that outlived the kill) can hold them open indefinitely. Output still in
+    // flight gets a moment to arrive; then the pipes are dropped, which lets `close` fire.
+    drainTimer = setTimeout(() => { child.stdout?.destroy(); child.stderr?.destroy(); }, EXIT_DRAIN_GRACE_MS);
+    drainTimer.unref();
+  });
   child.on('close', (code: number | null) => {
     if (timer !== undefined) clearTimeout(timer);
     if (killTimer !== undefined) clearTimeout(killTimer);
+    if (drainTimer !== undefined) clearTimeout(drainTimer);
     if (finalized) return;
     finalized = true;
     if (stopReason === 'timeout' || stopReason === 'aborted') {
@@ -265,7 +303,9 @@ function spawnAndStream(
   }
 
   /**
-   * Clear the timers and abort listener exactly once at stream end.
+   * Clear the timeout and abort listener exactly once at stream end. The kill-escalation and
+   * pipe-drain timers are left to the child's `close`: the stream can end (output overflow, a
+   * consumer walking away) while the child is still being stopped.
    *
    * @returns Nothing.
    * @throws Never.
@@ -274,7 +314,6 @@ function spawnAndStream(
     if (done) return;
     done = true;
     if (timer !== undefined) clearTimeout(timer);
-    if (killTimer !== undefined) clearTimeout(killTimer);
     opts.signal.removeEventListener('abort', killOnAbort);
   }
 

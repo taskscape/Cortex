@@ -1580,6 +1580,65 @@ async function renderTurn(sid, traceId) {
     if (turnStartedAt === null) turnStartedAt = performance.now();
   }
 
+  // Streamed text and thinking are drawn at most once per frame, not once per token. Each draw
+  // re-parses the whole answer so far as markdown, rebuilds its DOM and forces layout, so drawing
+  // per token costs time quadratic in the answer's length and leaves the page unresponsive while a
+  // long answer streams. Every other event flushes first (see the loop below), so what a tool
+  // block, prompt or terminal event is drawn after is always current.
+  // A tool's output is appended as it arrives, but keeping it scrolled to its end is done here
+  // too: reading scrollHeight forces a layout of the whole output, and a chatty command sends
+  // thousands of chunks.
+  let textDirty      = false;
+  let thinkingDirty  = false;
+  let outputScrollEl = null;
+  let renderFrame    = 0;
+  let renderTimer    = 0;
+  let lastRenderMs   = 0;
+
+  function flushRender() {
+    if (renderFrame) { cancelAnimationFrame(renderFrame); renderFrame = 0; }
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = 0; }
+    if (outputScrollEl) {
+      outputScrollEl.scrollTop = outputScrollEl.scrollHeight;
+      outputScrollEl = null;
+    }
+    if (!textDirty && !thinkingDirty) return;
+    const startedAt = performance.now();
+    if (thinkingDirty) {
+      thinkingDirty = false;
+      if (thinkingContent) {
+        thinkingContent.textContent = thinkingAccum;
+        // If no text content yet, scroll to show the user processing is happening.
+        if (!turnWrap.querySelector('.msg-text') && !isScrollSuppressed()) {
+          programmaticScrollTo(() => {
+            turnWrap.scrollIntoView({ block: 'end', behavior: 'instant' });
+          });
+        }
+      }
+    }
+    if (textDirty) {
+      textDirty = false;
+      if (textEl) {
+        textEl.innerHTML = md(textAccum);
+        scrollToOutputStart();
+      }
+    }
+    lastRenderMs = performance.now() - startedAt;
+  }
+
+  function scheduleRender() {
+    if (renderFrame || renderTimer) return;
+    // Once one draw costs more than a frame, pace draws by their own cost so a very long answer
+    // still leaves most of the main thread to input and to the stream itself.
+    if (lastRenderMs > 12) {
+      renderTimer = setTimeout(flushRender, Math.min(250, lastRenderMs * 4));
+      return;
+    }
+    renderFrame = requestAnimationFrame(flushRender);
+    // requestAnimationFrame does not fire in a background tab; this keeps the answer arriving there.
+    renderTimer = setTimeout(flushRender, 250);
+  }
+
   function appendTurnStats() {
     if (!turnWrap) return;
     if (turnWrap.querySelector('.turn-stats')) return;
@@ -1610,6 +1669,7 @@ async function renderTurn(sid, traceId) {
 
   try {
     for await (const ev of turnEvents(traceId)) {
+      if (ev.type !== 'text-delta' && ev.type !== 'thinking' && ev.type !== 'tool:stdout' && ev.type !== 'tool:stderr') flushRender();
       switch (ev.type) {
         case 'queued': {
           markTurnClockStarted();
@@ -1660,8 +1720,11 @@ async function renderTurn(sid, traceId) {
           removeLoading();
           if (textElFinalised) { textEl = null; textAccum = ''; textElFinalised = false; }
           textAccum += ev.delta;
-          getOrMakeTextEl().innerHTML = md(textAccum);
-          scrollToOutputStart();
+          // The element is created now so it keeps its place among the turn's blocks; its content is
+          // drawn by the coalesced render.
+          getOrMakeTextEl();
+          textDirty = true;
+          scheduleRender();
           break;
 
         case 'thinking': {
@@ -1674,13 +1737,8 @@ async function renderTurn(sid, traceId) {
             thinkingContent = c;
           }
           thinkingAccum += ev.delta;
-          thinkingContent.textContent = thinkingAccum;
-            // If no text content yet, scroll to show the user processing is happening.
-            if (!turnWrap.querySelector('.msg-text') && !isScrollSuppressed()) {
-              programmaticScrollTo(() => {
-                turnWrap.scrollIntoView({ block: 'end', behavior: 'instant' });
-              });
-            }
+          thinkingDirty = true;
+          scheduleRender();
           break;
         }
 
@@ -1710,8 +1768,11 @@ async function renderTurn(sid, traceId) {
               outEl.className = 'tool-output';
               currentTool.appendChild(outEl);
             }
-            outEl.textContent += ev.chunk;
-            outEl.scrollTop = outEl.scrollHeight;
+            // Appended in place: `textContent +=` re-reads and replaces the whole output per chunk.
+            if (outEl.lastChild && outEl.lastChild.nodeType === Node.TEXT_NODE) outEl.lastChild.appendData(ev.chunk);
+            else outEl.appendChild(document.createTextNode(ev.chunk));
+            outputScrollEl = outEl;
+            scheduleRender();
           }
           break;
         }
@@ -1959,6 +2020,7 @@ async function renderTurn(sid, traceId) {
     errDiv.textContent = '[error: ' + e.message + ']';
     turnWrap.appendChild(errDiv);
   } finally {
+    flushRender();
     // Don't markStarted() here — a turn that was only queued then cancelled must not spawn an empty
     // assistant wrap. Just clear any loading dots that are still showing.
     if (loadingEl) { loadingEl.remove(); loadingEl = null; }

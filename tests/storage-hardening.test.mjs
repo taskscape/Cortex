@@ -248,3 +248,36 @@ test('REL-03 legacy named and anonymous entries remain readable and migrate on o
   await store.put('named.txt', 'text/plain', streamOf([Buffer.from('updated')]));
   assert.equal(await readHandle(await store.get('named.txt')), 'updated');
 });
+
+test("a file whose metadata cannot be read loses its event, not the whole watch", { timeout: 10_000 }, async t => {
+  const root = await fileFs.mkdtemp(join(tmpdir(), "cortex-file-watch-skip-"));
+  t.after(() => fileFs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  const store = new FilesystemFileStore(root);
+  const ctrl = new AbortController();
+  const seen = [];
+  let failure;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = message => { warnings.push(String(message)); };
+  const watching = (async () => {
+    try { for await (const event of store.watch(ctrl.signal)) seen.push(event.name); }
+    catch (error) { failure = error; }
+  })();
+  try {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // Unreadable metadata for one file, as a half-replaced or externally locked file would be.
+    await fileFs.writeFile(join(root, "broken.meta.json"), "{broken");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await store.put("after.txt", "text/plain", streamOf([Buffer.from("still watching")]));
+    const deadline = Date.now() + 5_000;
+    while (!seen.includes("after.txt") && failure === undefined && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.equal(failure, undefined, `the watch ended on one unreadable file: ${String(failure)}`);
+    assert.ok(seen.includes("after.txt"), "changes after the unreadable file must still be reported");
+    assert.ok(warnings.some(message => /broken/.test(message)), "the skipped change is reported in the log");
+  } finally {
+    console.warn = originalWarn;
+    ctrl.abort();
+    await watching;
+  }
+});

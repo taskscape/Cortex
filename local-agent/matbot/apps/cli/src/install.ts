@@ -3,6 +3,7 @@ import { spawn }                        from 'node:child_process';
 import path                             from 'node:path';
 import process                          from 'node:process';
 import type { MatbotPlugin }            from '@matatbread/matbot-core';
+import { commandLaunch, packageSpecifierHazard } from '@matatbread/matbot-runtime-admin/plugin';
 import { backfillPluginDescription }    from './plugin-description.js';
 
 // ── Package manager detection ───────────────────────��─────────────────────────
@@ -23,17 +24,21 @@ async function detectPackageManager(dir: string): Promise<string> {
 // ── Shell runner ───────────────────────��───────────────────────────────���──────
 
 /**
- * Run a command in a directory, inheriting the parent's stdio. Uses the shell on Windows so
- * `.cmd` shims (npm/pnpm/yarn/bun) resolve without an explicit extension.
+ * Run a command in a directory, inheriting the parent's stdio. Arguments reach the command
+ * verbatim on every platform — `.cmd` shims (npm/pnpm/yarn) are launched through
+ * {@link commandLaunch} rather than `shell: true`, which would parse them as shell syntax.
  * @param cmd - Executable to run (e.g. the detected package manager).
  * @param args - Command-line arguments passed verbatim.
  * @param cwd - Working directory for the child process.
  * @returns Resolves when the child exits with code 0.
- * @throws Error - Rejects when the child exits with a non-zero code.
+ * @throws Error - Rejects when an argument cannot be passed safely, the child cannot be started,
+ *   or it exits with a non-zero code.
  */
 function runCommand(cmd: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' });
+    const launch = commandLaunch(cmd, args);
+    const child = spawn(launch.file, launch.args, { cwd, stdio: 'inherit', ...launch.options });
+    child.on('error', error => reject(new Error(`${cmd} could not be started: ${error.message}`)));
     child.on('close', code => {
       if (code === 0) resolve();
       else reject(new Error(`${cmd} exited with code ${String(code)}`));
@@ -99,6 +104,8 @@ export async function installPlugin(specifier: string, configPath: string): Prom
   // 1. Install via package manager (skip for local paths — already on disk)
   const isLocalPath = specifier.startsWith('./') || specifier.startsWith('../') || path.isAbsolute(specifier);
   if (!isLocalPath) {
+    const hazard = packageSpecifierHazard(specifier);
+    if (hazard !== undefined) throw new Error(`Cannot install "${specifier}": ${hazard}.`);
     const pm = await detectPackageManager(projectDir);
     process.stderr.write(`\nInstalling "${specifier}" with ${pm}...\n`);
     await runCommand(pm, ['add', specifier], projectDir);

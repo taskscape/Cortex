@@ -32,8 +32,24 @@ test("PowerShell tool reports a timed-out long-running process as an error and c
   await runScenario("timeout");
 });
 
+test("PowerShell tool ends a timed-out script together with the processes it started", { skip: process.platform !== "win32" }, async () => {
+  await runScenario("tree-timeout");
+});
+
+test("PowerShell tool gives a command that reads its input end-of-input instead of an open pipe", { skip: process.platform !== "win32" }, async () => {
+  await runScenario("stdin");
+});
+
+test("PowerShell tool returns once the script exits even if a process it started keeps the output open", { skip: process.platform !== "win32" }, async () => {
+  await runScenario("left-running");
+});
+
+test("PowerShell tool stops a script whose call was already cancelled when it started", { skip: process.platform !== "win32" }, async () => {
+  await runScenario("pre-aborted");
+});
+
 test("PowerShell invocation retains the documented non-interactive, no-profile argument boundary", async () => {
   const source = await readFile("local-agent/matbot/packages/plugins/powershell/src/index.ts", "utf8");
-  assert.match(source, /spawn\(command, args, \{ cwd: opts\.cwd, env: opts\.env, shell: false \}\)/);
+  assert.match(source, /spawn\(command, args, \{ cwd: opts\.cwd, env: opts\.env, shell: false, stdio: \['ignore', 'pipe', 'pipe'\] \}\)/);
   assert.match(source, /'-NoProfile',\s*'-NonInteractive',\s*'-ExecutionPolicy',\s*'Bypass',\s*'-File',\s*scriptPath/s);
 });

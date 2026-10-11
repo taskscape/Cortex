@@ -14,6 +14,11 @@ export interface Mem0ClientOptions {
     userId?: string;
     workspaceId?: string;
 }
+// A Mem0 container that accepts the connection and then never answers would otherwise hold the
+// calling tool — and the turn it belongs to — open until the user cancels. Writes get longer:
+// storing a memory runs fact extraction through a model on the Mem0 side.
+const SEARCH_TIMEOUT_MS = 30_000;
+const WRITE_TIMEOUT_MS = 120_000;
 /**
  * Client for a Mem0 memory service: adds knowledge entries as memories and searches
  * them, mapping responses back into `KnowledgeEntry` shape. Endpoint paths are tried
@@ -55,7 +60,7 @@ export class Mem0Client {
             method: "POST",
             body: JSON.stringify(payload),
             ...(signal !== undefined ? { signal } : {})
-        });
+        }, WRITE_TIMEOUT_MS);
     }
     /**
      * Search the memory store and map results into knowledge entries, dropping rows
@@ -75,7 +80,7 @@ export class Mem0Client {
             method: "POST",
             body: JSON.stringify(payload),
             ...(signal !== undefined ? { signal } : {})
-        });
+        }, SEARCH_TIMEOUT_MS);
         const rows = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
         return rows.map((item: Record<string, unknown>) => {
             const content = String(item.memory ?? item.text ?? item.content ?? "");
@@ -107,16 +112,19 @@ export class Mem0Client {
      *   tried in order.
      * @param init - Fetch init (method, body, optional abort signal); an
      *   `authorization` header is added when an API key is configured.
+     * @param timeoutMs - Deadline for each attempt, covering the response body too.
      * @returns The parsed JSON response body (object or array), or `{}` for 204.
      * @throws Error - The last candidate's failure: 404 "endpoint not found"
-     *   errors, non-OK status errors, network failures, or JSON parse errors.
+     *   errors, non-OK status errors, network failures, timeouts, or JSON parse errors.
      */
-    private async request(paths: string[], init: RequestInit): Promise<Record<string, unknown> | unknown[]> {
+    private async request(paths: string[], init: RequestInit, timeoutMs: number): Promise<Record<string, unknown> | unknown[]> {
         let lastError: unknown;
         for (const requestPath of paths) {
             try {
+                const deadline = AbortSignal.timeout(timeoutMs);
                 const response = await fetch(new URL(requestPath, this.options.baseUrl), {
                     ...init,
+                    signal: init.signal ? AbortSignal.any([init.signal, deadline]) : deadline,
                     headers: {
                         "content-type": "application/json",
                         ...(this.options.apiKey ? { authorization: `Bearer ${this.options.apiKey}` } : {})
@@ -136,6 +144,11 @@ export class Mem0Client {
             }
             catch (error) {
                 init.signal?.throwIfAborted();
+                // A service that timed out on one route is not going to answer on the alternate one.
+                if (error instanceof Error && error.name === "TimeoutError") {
+                    lastError = new Error(`Mem0 request timed out after ${timeoutMs}ms: ${requestPath}`);
+                    break;
+                }
                 lastError = error;
             }
         }
