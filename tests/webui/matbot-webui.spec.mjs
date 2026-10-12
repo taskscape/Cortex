@@ -105,6 +105,46 @@ test("renders safe OpenRouter completion status without exposing opaque metadata
   await expect(page.locator("body")).not.toContainText("must never appear in the UI");
 });
 
+test("renders stored OpenRouter reasoning as a thinking block instead of dumping the replay block", async ({ page }) => {
+  const session = {
+    id: "s0",
+    title: "OpenRouter reasoning replay",
+    messages: [{
+      role: "assistant",
+      content: [
+        { type: "unknown-content", blockType: "openrouter.reasoning.v1", raw: {
+          version: 1, apiOrigin: "https://openrouter.ai/api/v1", requestedModel: "vendor/exact-model",
+          details: [
+            { type: "reasoning.text", text: "The user asks", format: "unknown", index: 0 },
+            { type: "reasoning.encrypted", data: "opaque-signed-payload" }
+          ],
+          reasoning: "The user asks for their name."
+        } },
+        { type: "unknown-content", blockType: "vendor.opaque.v1", raw: { secret: "other-opaque-payload" } },
+        { type: "text", text: "Your name is Ada." }
+      ],
+      metadata: { completion: { gateway: "openrouter", finishReason: "stop", returnedModel: "vendor/exact-model" } }
+    }]
+  };
+  await page.route("**/tools/session_action", async route => {
+    const input = route.request().postDataJSON();
+    if (input.action === "get" && input.sessionId === session.id) {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(session) });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.goto("/#s0");
+  const message = page.locator(".message.assistant");
+  await expect(message.locator(".msg-text")).toHaveText("Your name is Ada.");
+  await expect(message.locator(".thinking-block")).toHaveCount(1);
+  await expect(message.locator(".thinking-block .thinking-content")).toHaveText("The user asks for their name.");
+  await expect(message.locator(".thinking-block[open]")).toHaveCount(0);
+  for (const leaked of ["unknown-content", "openrouter.reasoning.v1", "reasoning.text", "opaque-signed-payload", "other-opaque-payload"]) {
+    await expect(page.locator("body")).not.toContainText(leaked);
+  }
+});
+
 test("persists provider and font preferences across reloads", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop preference controls coverage");
   await page.goto("/");

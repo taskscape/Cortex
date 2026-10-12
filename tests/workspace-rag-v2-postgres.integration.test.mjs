@@ -350,6 +350,461 @@ integration("workspace RAG V2 PostgreSQL resumes an interrupted scan and prunes 
   repository.rebuildCollections = rebuild;
 });
 
+integration("workspace RAG V2 PostgreSQL indexes NUL-bearing sources and reconciles deletions past a failing file", async t => {
+  const schema = `workspace_rag_v2_nul_${process.pid}`;
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
+  );
+  const { WorkspaceRagV2Manager } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts"
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-pg-nul-"));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const removedPath = path.join(docs, "removed.md");
+  // PDF extraction leaves U+0000 where a ligature glyph had no Unicode mapping.
+  await writeFile(
+    path.join(docs, "extracted.md"),
+    "# Pro\0l \0rmy\n\nOferta danej \0rmy PG-NUL-EVIDENCE-771.",
+    "utf8",
+  );
+  await writeFile(path.join(docs, "broken.md"), "# Broken\n\nThis source never registers.", "utf8");
+  await writeFile(removedPath, "# Removed\n\nPG-REMOVED-EVIDENCE-772.", "utf8");
+  const poolConfig = process.env.CORTEX_RAG_POSTGRES_URL
+    ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }
+    : {
+        host: process.env.CORTEX_RAG_POSTGRES_HOST || "127.0.0.1",
+        port: Number(process.env.CORTEX_RAG_POSTGRES_PORT || 5432),
+        database: process.env.CORTEX_RAG_POSTGRES_DB || "mem0",
+        user: process.env.CORTEX_RAG_POSTGRES_USER || "mem0",
+        password: process.env.CORTEX_RAG_POSTGRES_PASSWORD || process.env.POSTGRES_PASSWORD,
+      };
+  const cleanup = new Pool(poolConfig);
+  const repository = new PostgresRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: { backend: "test", model: "test", dimensions: 32, signature: "test-pg-nul-v1" },
+    async embed(texts) { return texts.map(text => embedding(text)); },
+  }, {
+    async register(_workspace, _context, filePath) {
+      if (filePath.endsWith("/broken.md")) throw new Error("intentional source registration failure");
+      return {};
+    },
+    async recordFailure() {},
+    async markRemoved() {},
+  });
+  t.after(async () => {
+    await manager.close().catch(() => undefined);
+    await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await cleanup.end();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const workspace = { id: "postgres-nul-workspace", name: "Postgres", configDir: root };
+  const context = { id: "extracted", name: "Extracted", paths: [docs] };
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  const indexed = await manager.status("primary", workspace, context);
+  assert.equal(indexed.job.failedFiles, 1, "only the source that cannot register fails");
+  assert.equal(indexed.job.addedFiles, 2);
+  const stored = await cleanup.query(`
+    SELECT title FROM "${schema}".documents WHERE path LIKE '%/extracted.md'
+  `);
+  assert.deepEqual(stored.rows, [{ title: "Prol rmy" }]);
+  const found = await manager.search(workspace, context, "PG-NUL-EVIDENCE-771", { limit: 3 });
+  assert.ok(
+    found.evidence.some(value => /Oferta danej rmy PG-NUL-EVIDENCE-771/.test(value.text)),
+    "the retrieval audit accepts evidence read back from NUL-bearing source bytes",
+  );
+
+  await unlink(removedPath);
+  manager.startIngestion(workspace, context, "watch");
+  await manager.waitForIngestion(workspace.id, context.id);
+  const reconciled = await manager.status("primary", workspace, context);
+  assert.equal(reconciled.job.failedFiles, 1, "the same source keeps failing");
+  assert.equal(reconciled.job.removedFiles, 1, "a failing file no longer blocks deletion reconciliation");
+  assert.deepEqual(
+    (await repository.listFingerprints(workspace.id, context.id)).map(value => path.basename(value.path)),
+    ["extracted.md"],
+  );
+  const gone = await manager.search(workspace, context, "PG-REMOVED-EVIDENCE-772", { limit: 3 });
+  assert.equal(gone.evidence.some(value => value.text.includes("PG-REMOVED-EVIDENCE-772")), false);
+});
+
+integration("workspace RAG V2 PostgreSQL stores front-matter metadata and filters by document type, jurisdiction, and as-of date", async t => {
+  const schema = `workspace_rag_v2_meta_${process.pid}`;
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
+  );
+  const { WorkspaceRagV2Manager } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts"
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-pg-meta-"));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "contract-pl.md"), [
+    "---",
+    "document_type: contract",
+    "jurisdiction: PL",
+    "governing_law: Polish Civil Code",
+    "parties: [Acme Sp. z o.o., Globex GmbH]",
+    "publication_date: 2024-01-01",
+    "valid_from: 2024-02-01",
+    "valid_to: 2027-12-31",
+    "---",
+    "# Polish contract",
+    "",
+    "The supplier must give thirty days notice.",
+  ].join("\n"));
+  await writeFile(path.join(docs, "note.md"), "# Plain note\n\nThe supplier must give sixty days notice.");
+  await writeFile(path.join(docs, "policy-us.md"), [
+    "---",
+    "document_type: policy",
+    "jurisdiction: US",
+    "publication_date: 2026-01-01",
+    "---",
+    "# US policy",
+    "",
+    "The supplier must give ninety days notice.",
+  ].join("\n"));
+  const poolConfig = process.env.CORTEX_RAG_POSTGRES_URL
+    ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }
+    : {
+        host: process.env.CORTEX_RAG_POSTGRES_HOST || "127.0.0.1",
+        port: Number(process.env.CORTEX_RAG_POSTGRES_PORT || 5432),
+        database: process.env.CORTEX_RAG_POSTGRES_DB || "mem0",
+        user: process.env.CORTEX_RAG_POSTGRES_USER || "mem0",
+        password: process.env.CORTEX_RAG_POSTGRES_PASSWORD || process.env.POSTGRES_PASSWORD,
+      };
+  const cleanup = new Pool(poolConfig);
+  const repository = new PostgresRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: { backend: "test", model: "test", dimensions: 32, signature: "test-pg-meta-v1" },
+    async embed(texts) { return texts.map(text => embedding(text)); },
+  });
+  t.after(async () => {
+    await manager.close().catch(() => undefined);
+    await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await cleanup.end();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const workspace = { id: "postgres-meta-workspace", name: "Postgres", configDir: root };
+  const context = { id: "filters", name: "Filters", paths: [docs] };
+  const storedMetadata = async () => (await cleanup.query(`
+    SELECT path, document_type, jurisdiction, governing_law, parties,
+      publication_date::text AS publication_date, valid_from::text AS valid_from, valid_to::text AS valid_to
+    FROM "${schema}".documents ORDER BY path
+  `)).rows.map(row => ({ ...row, path: path.basename(row.path) }));
+  const expectedMetadata = [
+    {
+      path: "contract-pl.md", document_type: "contract", jurisdiction: "PL",
+      governing_law: "Polish Civil Code", parties: ["Acme Sp. z o.o.", "Globex GmbH"],
+      publication_date: "2024-01-01", valid_from: "2024-02-01", valid_to: "2027-12-31",
+    },
+    {
+      path: "note.md", document_type: "markdown", jurisdiction: null,
+      governing_law: null, parties: [],
+      publication_date: null, valid_from: null, valid_to: null,
+    },
+    {
+      path: "policy-us.md", document_type: "policy", jurisdiction: "US",
+      governing_law: null, parties: [],
+      publication_date: "2026-01-01", valid_from: null, valid_to: null,
+    },
+  ];
+  const assertFilters = async () => {
+    const filtered = await manager.search(workspace, context, "supplier notice", {
+      documentTypes: ["contract"],
+      jurisdictions: ["PL"],
+      asOfDate: "2025-01-01",
+      limit: 4,
+    });
+    assert.ok(filtered.evidence.length >= 1, "the type and jurisdiction filters match front-matter values");
+    assert.ok(filtered.evidence.every(item => item.sourceUri.endsWith("contract-pl.md")));
+    assert.ok(filtered.evidence.some(item => /thirty days/i.test(item.text)));
+    assert.equal(filtered.evidence[0].documentType, "contract");
+    assert.equal(filtered.evidence[0].jurisdiction, "PL");
+    const expired = await manager.search(workspace, context, "supplier notice", {
+      jurisdictions: ["PL"],
+      asOfDate: "2028-01-01",
+      limit: 4,
+    });
+    assert.equal(expired.evidence.length, 0, "valid_to excludes the contract after it lapses");
+    const untyped = await manager.search(workspace, context, "supplier notice", {
+      documentTypes: ["markdown"],
+      limit: 4,
+    });
+    assert.ok(untyped.evidence.length >= 1);
+    assert.ok(untyped.evidence.every(item => item.sourceUri.endsWith("note.md")));
+  };
+
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  assert.deepEqual(await storedMetadata(), expectedMetadata);
+  await assertFilters();
+
+  // Rows written before the metadata columns joined the upsert hold only the
+  // placeholder values; a forced reindex of the unchanged files repairs them.
+  await cleanup.query(`
+    UPDATE "${schema}".documents
+    SET document_type = 'markdown', jurisdiction = NULL, governing_law = NULL, parties = '[]'::jsonb,
+      publication_date = NULL, valid_from = NULL, valid_to = NULL
+  `);
+  manager.startIngestion(workspace, context, "manual", [], true);
+  await manager.waitForIngestion(workspace.id, context.id);
+  assert.deepEqual(await storedMetadata(), expectedMetadata);
+  await assertFilters();
+});
+
+integration("workspace RAG V2 PostgreSQL checks generation membership per candidate instead of driving searches from it", async t => {
+  const schema = `workspace_rag_v2_plan_${process.pid}`;
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
+  );
+  const { WorkspaceRagV2Manager } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts"
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-pg-plan-"));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "notice.md"), [
+    "# Notice periods",
+    "",
+    "## Supplier",
+    "",
+    "The supplier must give thirty days notice.",
+    "",
+    "## Customer",
+    "",
+    "The customer must give sixty days notice.",
+  ].join("\n"));
+  const poolConfig = process.env.CORTEX_RAG_POSTGRES_URL
+    ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }
+    : {
+        host: process.env.CORTEX_RAG_POSTGRES_HOST || "127.0.0.1",
+        port: Number(process.env.CORTEX_RAG_POSTGRES_PORT || 5432),
+        database: process.env.CORTEX_RAG_POSTGRES_DB || "mem0",
+        user: process.env.CORTEX_RAG_POSTGRES_USER || "mem0",
+        password: process.env.CORTEX_RAG_POSTGRES_PASSWORD || process.env.POSTGRES_PASSWORD,
+      };
+  const cleanup = new Pool(poolConfig);
+  const repository = new PostgresRagV2Repository();
+  const vectorizer = { backend: "test", model: "test", dimensions: 32, signature: "test-pg-plan-v1" };
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: vectorizer,
+    async embed(texts) { return texts.map(text => embedding(text)); },
+  });
+  t.after(async () => {
+    await manager.close().catch(() => undefined);
+    await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await cleanup.end();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const workspace = { id: "postgres-plan-workspace", name: "Postgres", configDir: root };
+  const context = { id: "plans", name: "Plans", paths: [docs] };
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  const publication = await repository.activePublication(workspace.id, context.id);
+  const scope = {
+    workspaceId: workspace.id,
+    contextId: context.id,
+    generationId: publication.generationId,
+    authorizationTokens: [`workspace:${workspace.id}`],
+    limit: 10,
+  };
+  const queryVector = embedding("supplier notice");
+
+  // Table statistics never describe a generation published after they were
+  // gathered, so membership planned as a join is estimated at one row and
+  // becomes the driving table: the search then visits every document of the
+  // generation instead of using its GIN or HNSW index. Membership must stay a
+  // per-candidate subplan whatever the statistics say.
+  const membershipScans = plan => {
+    const scans = [];
+    const visit = (node, inSubPlan) => {
+      const nested = inSubPlan || node["Parent Relationship"] === "SubPlan";
+      if (node["Relation Name"] === "publication_documents") scans.push(nested);
+      for (const child of node.Plans ?? []) visit(child, nested);
+    };
+    visit(plan, false);
+    return scans;
+  };
+  for (const level of ["document", "section", "passage"]) {
+    for (const kind of ["lexical", "dense"]) {
+      const parameters = kind === "lexical"
+        ? repository.searchParameters({ ...scope, documentIds: ["d"], sectionIds: ["s"] }, "supplier notice")
+        : repository.searchParameters(
+            { ...scope, documentIds: ["d"], sectionIds: ["s"] },
+            `[${queryVector.join(",")}]`,
+            vectorizer.signature,
+          );
+      const explained = await cleanup.query(
+        `EXPLAIN (FORMAT JSON) ${repository.searchSql(level, kind)}`,
+        parameters,
+      );
+      const scans = membershipScans(explained.rows[0]["QUERY PLAN"][0].Plan);
+      assert.ok(scans.length >= 1, `${level} ${kind} search checks generation membership`);
+      assert.ok(scans.every(Boolean), `${level} ${kind} search never joins through generation membership`);
+    }
+  }
+
+  const passages = await repository.lexicalSearch("passage", "supplier notice", scope);
+  assert.equal(passages.length, 1);
+  assert.match(passages[0].text, /thirty days notice/);
+  const { documentId, sectionId } = passages[0];
+  const scoped = { ...scope, documentIds: [documentId], sectionIds: [sectionId] };
+  assert.deepEqual(
+    (await repository.lexicalSearch("passage", "supplier notice", scoped)).map(hit => hit.passageId),
+    [passages[0].passageId],
+  );
+  assert.deepEqual(
+    (await repository.denseSearch("passage", queryVector, vectorizer, scoped)).map(hit => hit.passageId),
+    [passages[0].passageId],
+    "a section scope narrows vector search to that section's passages",
+  );
+  assert.deepEqual(
+    (await repository.exactSearch(["thirty days"], scoped)).map(hit => hit.passageId),
+    [passages[0].passageId],
+  );
+  assert.deepEqual(await repository.lexicalSearch("passage", "supplier notice", { ...scope, sectionIds: ["missing-section"] }), []);
+  assert.equal(
+    (await repository.passagesForSection(workspace.id, context.id, publication.generationId, sectionId, false)).length,
+    1,
+  );
+
+  // A generation the documents were never published in sees none of them.
+  const foreign = { ...scope, generationId: "generation-without-members" };
+  assert.deepEqual(await repository.lexicalSearch("document", "supplier notice", foreign), []);
+  assert.deepEqual(await repository.lexicalSearch("section", "supplier notice", foreign), []);
+  assert.deepEqual(await repository.lexicalSearch("passage", "supplier notice", foreign), []);
+  assert.deepEqual(await repository.denseSearch("passage", queryVector, vectorizer, foreign), []);
+  assert.deepEqual(await repository.exactSearch(["thirty days"], foreign), []);
+  assert.deepEqual(
+    await repository.passagesForSection(workspace.id, context.id, foreign.generationId, sectionId, false),
+    [],
+  );
+});
+
+integration("workspace RAG V2 PostgreSQL exact-reference search narrows through the trigram index and matches source text only", async t => {
+  const schema = `workspace_rag_v2_exact_${process.pid}`;
+  process.env.CORTEX_RAG_V2_POSTGRES_SCHEMA = schema;
+  const { PostgresRagV2Repository } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/postgres-repository.ts"
+  );
+  const { WorkspaceRagV2Manager } = await import(
+    "../local-agent/matbot/packages/plugins/workspace-rag/src/v2/manager.ts"
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-pg-exact-"));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const rows = Array.from({ length: 400 }, (_, index) =>
+    `| Party ${index}${index === 300 ? " ROW-9902" : ""} | ${index + 1} days |`);
+  await writeFile(path.join(docs, "notice-table.md"), [
+    "# Notice periods",
+    "",
+    "| Clause HDR-4471 | Notice |",
+    "| --- | --- |",
+    ...rows,
+    "",
+  ].join("\n"));
+  const poolConfig = process.env.CORTEX_RAG_POSTGRES_URL
+    ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }
+    : {
+        host: process.env.CORTEX_RAG_POSTGRES_HOST || "127.0.0.1",
+        port: Number(process.env.CORTEX_RAG_POSTGRES_PORT || 5432),
+        database: process.env.CORTEX_RAG_POSTGRES_DB || "mem0",
+        user: process.env.CORTEX_RAG_POSTGRES_USER || "mem0",
+        password: process.env.CORTEX_RAG_POSTGRES_PASSWORD || process.env.POSTGRES_PASSWORD,
+      };
+  const cleanup = new Pool(poolConfig);
+  const repository = new PostgresRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, {
+    info: { backend: "test", model: "test", dimensions: 32, signature: "test-pg-exact-v1" },
+    async embed(texts) { return texts.map(text => embedding(text)); },
+  });
+  t.after(async () => {
+    await manager.close().catch(() => undefined);
+    await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await cleanup.end();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const workspace = { id: "postgres-exact-workspace", name: "Postgres", configDir: root };
+  const context = { id: "exact", name: "Exact", paths: [docs] };
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  const publication = await repository.activePublication(workspace.id, context.id);
+  const scope = {
+    workspaceId: workspace.id,
+    contextId: context.id,
+    generationId: publication.generationId,
+    authorizationTokens: [`workspace:${workspace.id}`],
+    limit: 20,
+  };
+
+  // The table is too large for one passage; its later chunks repeat the header
+  // in `lexical_text` only, which is the column the trigram index covers.
+  const repeated = await cleanup.query(`
+    SELECT COUNT(*)::int AS count FROM "${schema}".passages
+    WHERE lexical_text <> text AND lower(lexical_text) LIKE '%hdr-4471%'
+  `);
+  assert.ok(repeated.rows[0].count >= 1, "later table chunks repeat the header in their search text");
+
+  // An exact-reference hit claims the reference is inside the cited byte range.
+  const header = await repository.exactSearch(["HDR-4471"], scope);
+  assert.equal(header.length, 1);
+  assert.match(header[0].text, /^\| Clause HDR-4471 \|/);
+  const row = await repository.exactSearch(["row-9902"], scope);
+  assert.equal(row.length, 1);
+  assert.match(row[0].text, /ROW-9902/);
+  assert.doesNotMatch(row[0].text, /HDR-4471/);
+  assert.equal((await repository.exactSearch(["HDR-4471", "row-9902"], scope)).length, 2);
+  assert.deepEqual(await repository.exactSearch(["100%_"], scope), [], "LIKE wildcards in a reference are literal");
+
+  // The trigram index is created on a best-effort basis (pg_trgm is optional).
+  const trigramIndex = (await cleanup.query(
+    `SELECT to_regclass($1) IS NOT NULL AS present`,
+    [`"${schema}".idx_rag_v2_passages_text_trgm`],
+  )).rows[0].present;
+  if (!trigramIndex) {
+    t.diagnostic("pg_trgm is unavailable; skipping the index-usage check");
+    return;
+  }
+  // With every other way of reading passages priced out, the statement can
+  // only avoid a sequential scan if its predicate matches the indexed
+  // expression. On a real corpus that scan is the whole passages table.
+  const planner = await cleanup.connect();
+  try {
+    await planner.query("SET enable_seqscan = off");
+    await planner.query("SET enable_indexscan = off");
+    await planner.query("SET enable_nestloop = off");
+    const query = repository.exactSearchQuery(["HDR-4471", "row-9902"], scope);
+    const explained = await planner.query(`EXPLAIN (FORMAT JSON) ${query.text}`, query.values);
+    const nodes = [];
+    const visit = node => { nodes.push(node); for (const child of node.Plans ?? []) visit(child); };
+    visit(explained.rows[0]["QUERY PLAN"][0].Plan);
+    assert.ok(
+      nodes.some(node => node["Index Name"] === "idx_rag_v2_passages_text_trgm"),
+      "exact-reference search reads passages through the trigram index",
+    );
+    assert.equal(
+      nodes.some(node => node["Node Type"] === "Seq Scan" && node["Relation Name"] === "passages"),
+      false,
+      "exact-reference search does not scan every passage",
+    );
+  } finally {
+    planner.release(true);
+  }
+});
+
 integration("workspace RAG V2 enforces RLS through a separate non-owner application role", async t => {
   const ownerConfig = process.env.CORTEX_RAG_POSTGRES_URL
     ? { connectionString: process.env.CORTEX_RAG_POSTGRES_URL }

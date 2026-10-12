@@ -157,6 +157,53 @@ churn and less likely to affect a consumer who doesn't use them.
   opt-in managed-object sweep also removes globally unreferenced source blobs, while grace periods,
   bounded batches, and ingestion gates protect in-flight and resumable data.
 
+- **Workspace RAG V2 removes deleted sources even when another file fails to index.** One failed
+  file anywhere in a context made the whole run skip deletion reconciliation, and a file that fails
+  deterministically made that permanent: every scan published `0 removed` and deleted, renamed, or
+  de-configured Markdown stayed searchable. Reconciliation now always drops paths the scan did not
+  discover; a file that failed still keeps its previously published version, and the completion
+  message reports the failed count instead of a deferral.
+
+- **Workspace RAG V2 indexes Markdown containing NUL bytes.** PostgreSQL rejects U+0000 in `text` and
+  `jsonb`, so one NUL (typically left by PDF text extraction) failed the entire file on every scan
+  with `invalid byte sequence for encoding "UTF8": 0x00`. NULs are now dropped when source bytes are
+  decoded for indexing and for retrieval evidence; byte ranges and content hashes still address the
+  raw bytes.
+
+- **Workspace RAG V2 stores front-matter metadata on PostgreSQL.** Each file writes its document row
+  twice, a placeholder before parsing and the parsed record after, and the second write's
+  `ON CONFLICT` update left out `document_type`, `jurisdiction`, `governing_law`, `parties`,
+  `publication_date`, `valid_from`, and `valid_to`. Every document stayed `markdown` with no
+  jurisdiction or dates, so the `documentTypes`, `jurisdictions`, and `asOfDate` search filters could
+  never match a front-matter value; the in-memory repository was unaffected. The update now writes
+  those columns. Documents indexed before this fix keep the placeholder values until they are
+  re-ingested (`reindex_now`, or any change to the file), because unchanged files are skipped.
+
+- **Workspace RAG V2 search on PostgreSQL no longer takes minutes after a publication.** Every search
+  joined generation membership (`publication_documents`) into the query. A generation published after
+  the table's statistics were gathered is estimated at one row, so PostgreSQL chose it as the driving
+  table and walked every document, section, and passage of the generation instead of using the GIN or
+  HNSW index: on a 1M-document context the automatic per-turn retrieval took 21 minutes before the
+  model was called. Membership is now a per-candidate index probe the planner cannot reorder, in
+  lexical, dense, exact-reference, regex, and section-passage queries; the same search takes about
+  3 seconds. A section-scoped passage search also names the passage's workspace and context, which
+  lets it use the section index instead of scanning every passage.
+
+- **Workspace RAG V2 exact-reference search on PostgreSQL uses its trigram index.** A query with a
+  quoted phrase or an exact reference (a clause number, date, identifier, e-mail address, amount, or
+  path) matched `lower(text)`, while the trigram index is built on `lower(lexical_text)`, so every
+  such query read the whole passages table: 149 seconds for one phrase on a 4.3M-passage context.
+  The statement now tests the indexed column first and still decides on `text`. `lexical_text` only
+  ever adds search context in front of `text` (a split table's header), so the index can narrow the
+  candidates without changing which passages match; a hit still means the reference is inside the
+  cited byte range. The same phrase now takes 1 to 9 seconds.
+
+- **The web UI no longer prints a provider's reasoning-replay block as raw JSON.** An assistant message
+  stored from an OpenRouter reasoning model carries an `openrouter.reasoning.v1` block for replay, and
+  reopening the conversation dumped it into the answer, encrypted reasoning details included. Such
+  blocks are no longer rendered generically; the plain reasoning text, when the block has one, is
+  shown as the same collapsed thinking block the live turn showed.
+
 - **A workspace switch no longer leaves two runtimes fighting over one port.** The handoff spawned the
   replacement process immediately and scheduled its own teardown on a timer, betting that 900ms of
   child-side start delay would outlast the shutdown. When it didn't, the incoming process could not

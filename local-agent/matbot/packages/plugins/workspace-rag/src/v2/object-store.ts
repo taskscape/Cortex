@@ -38,6 +38,20 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Decodes source bytes as UTF-8 for indexing and evidence, dropping NUL
+ * characters. PostgreSQL rejects U+0000 in both `text` and `jsonb`, so a
+ * single NUL would otherwise fail the whole file; byte ranges and content
+ * hashes keep addressing the raw bytes.
+ * @param raw - Raw source bytes.
+ * @returns The decoded text without U+0000.
+ * @throws Never.
+ */
+export function decodeSourceText(raw: Buffer): string {
+  const text = raw.toString('utf8');
+  return raw.includes(0) ? text.replace(/\0/gu, '') : text;
+}
+
+/**
  * Appends (line, byteOffset) entries to a content-addressed line index file.
  */
 export class RagV2LineIndexWriter {

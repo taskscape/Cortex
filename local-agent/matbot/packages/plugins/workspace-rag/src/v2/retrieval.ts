@@ -3,7 +3,7 @@ import type {RagV2Reranker} from '../adapters/reranker.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { detectPassageLanguage } from './language.js';
 import { RagV2ColbertAdapter } from './late-interaction.js';
-import { RagV2ObjectStore } from './object-store.js';
+import { decodeSourceText, RagV2ObjectStore } from './object-store.js';
 import type { RagV2Repository, RagV2RetrievalRunRecord, RagV2SearchScope } from './repository.js';
 import {
   decomposeRagV2Query,
@@ -1022,7 +1022,7 @@ export class RagV2RetrievalEngine {
             byteRange: { from: hit.startByte, to: hit.endByte },
             lineRange: { from: hit.startLine, to: hit.endLine },
             language: hit.language,
-            text: raw.toString('utf8'),
+            text: decodeSourceText(raw),
             contentSha256: rangeHash,
             retrievalReasons: unique(hit.retrievalReasons),
             score: hit.rerankerScore ?? hit.fusionScore ?? hit.retrieverScore,

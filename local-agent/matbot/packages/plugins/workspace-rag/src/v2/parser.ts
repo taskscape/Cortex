@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { detectPassageLanguage } from './language.js';
+import { decodeSourceText } from './object-store.js';
 import type {
   RagV2HeadingRef,
   RagV2IngestionPolicy,
@@ -325,7 +326,7 @@ async function* streamLines(filePath: string, maxBufferedBytes: number): AsyncGe
         const bodyEnd = raw.length >= 2 && raw[raw.length - 2] === 0x0D ? raw.length - 2 : raw.length - 1;
         yield {
           raw,
-          text: raw.subarray(0, bodyEnd).toString('utf8'),
+          text: decodeSourceText(raw.subarray(0, bodyEnd)),
           startByte: byteOffset,
           endByte: byteOffset + raw.length,
           lineNumber,
@@ -349,7 +350,7 @@ async function* streamLines(filePath: string, maxBufferedBytes: number): AsyncGe
         const raw = buffer.subarray(cursor, cursor + length);
         yield {
           raw,
-          text: raw.toString('utf8'),
+          text: decodeSourceText(raw),
           startByte: byteOffset,
           endByte: byteOffset + raw.length,
           lineNumber,
@@ -368,7 +369,7 @@ async function* streamLines(filePath: string, maxBufferedBytes: number): AsyncGe
   if (carry.length > 0) {
     yield {
       raw: carry,
-      text: carry.toString('utf8'),
+      text: decodeSourceText(carry),
       startByte: byteOffset,
       endByte: byteOffset + carry.length,
       lineNumber,
@@ -414,7 +415,7 @@ async function* streamUnits(
     const raw = concatenateRaw(lines);
     const result: RawUnit = {
       raw,
-      text: raw.toString('utf8'),
+      text: decodeSourceText(raw),
       type: unitType(lines),
       startByte: lines[0]!.startByte,
       endByte: lines.at(-1)!.endByte,
@@ -438,7 +439,7 @@ async function* streamUnits(
       if (pending) yield pending;
       yield {
         raw: line.raw,
-        text: line.raw.toString('utf8'),
+        text: decodeSourceText(line.raw),
         type: 'heading',
         startByte: line.startByte,
         endByte: line.endByte,
@@ -510,7 +511,7 @@ function splitUnit(unit: RawUnit, hardMaxTokens: number): RawUnit[] {
     const lineCount = raw.reduce((count, byte) => count + (byte === 0x0A ? 1 : 0), 0);
     parts.push({
       raw: Buffer.from(raw),
-      text: raw.toString('utf8'),
+      text: decodeSourceText(raw),
       type: unit.type,
       startByte: unit.startByte + cursor,
       endByte: unit.startByte + end,
@@ -649,7 +650,7 @@ export async function parseMarkdownStream(
     const raw = passageUnits.length === 1
       ? passageUnits[0]!.raw
       : Buffer.concat(passageUnits.map(unit => unit.raw));
-    const text = raw.toString('utf8');
+    const text = decodeSourceText(raw);
     const lexicalText = `${passageUnits.map(unit => unit.lexicalPrefix ?? '').join('')}${text}`;
     const language = detectPassageLanguage(text);
     const ordinal = passageCount;

@@ -1151,6 +1151,18 @@ function renderContentParts(wrap, content) {
         wrap.appendChild(div);
         break;
       }
+      case 'unknown-content': {
+        // A provider's own replay data: it can hold encrypted or signed payloads, so it is never
+        // dumped. OpenRouter's block may also carry the plain reasoning text the live turn already
+        // streamed as thinking; show that so a reopened chat matches what was seen live.
+        const reasoning = part.blockType === 'openrouter.reasoning.v1' ? part.raw?.reasoning : undefined;
+        if (typeof reasoning === 'string' && reasoning) {
+          const { details, content: c } = makeThinkingBlock('\ud83d\udcad Thinking', false);
+          c.textContent = reasoning;
+          wrap.appendChild(details);
+        }
+        break;
+      }
       case 'tool-call':
         wrap.appendChild(makeToolBlock(part.name, part.input, part.id));
         break;

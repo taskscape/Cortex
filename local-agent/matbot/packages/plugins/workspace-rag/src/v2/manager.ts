@@ -1559,7 +1559,8 @@ export class WorkspaceRagV2Manager {
    * still backs indexed documents), then discovers and processes files tier
    * by tier (`authority` -> `current` -> `archive`) through a bounded worker
    * pool with periodic checkpoint publications. After discovery it reconciles
-   * removals (deferring them when files failed), rebuilds and embeds
+   * removals (paths no longer discovered; files that failed keep their
+   * previous version), rebuilds and embeds
    * collections, validates the generation, and publishes it; failures mark
    * the job `retryable_failure` (or `cancelled` on abort) with a best-effort
    * terminal update before rethrowing.
@@ -1725,14 +1726,11 @@ export class WorkspaceRagV2Manager {
       job.message = 'Validating the Workspace RAG V2 staging generation.';
       await this.repository.updateJob(job);
       removedPaths = [...fingerprints.keys()].filter(filePath => !seenPaths.has(filePath));
-      if (job.failedFiles > 0) {
-        job.deletionsDeferred = removedPaths.length > 0;
-        removedPaths = [];
-      } else {
-        job.removedFiles = await this.repository.reconcileGeneration(
-          job.id, workspace.id, context.id, job.generationId,
-        );
-      }
+      // A file that failed still has a job item, so reconciliation keeps its
+      // previously published version; only undiscovered paths are dropped.
+      job.removedFiles = await this.repository.reconcileGeneration(
+        job.id, workspace.id, context.id, job.generationId,
+      );
       const collections = await this.repository.rebuildCollections(
         workspace.id,
         context.id,
@@ -1796,7 +1794,9 @@ export class WorkspaceRagV2Manager {
         ...(job.skippedPaths?.length
           ? [`Skipped ${job.skippedPaths.length} unavailable configured path${job.skippedPaths.length === 1 ? '' : 's'}.`]
           : []),
-        ...(job.deletionsDeferred ? ['Deletion reconciliation was deferred because one or more files failed.'] : []),
+        ...(job.failedFiles > 0
+          ? [`${job.failedFiles} file${job.failedFiles === 1 ? '' : 's'} failed to index.`]
+          : []),
       ].join(' ');
       delete job.currentPath;
       await this.repository.updateJob(job);

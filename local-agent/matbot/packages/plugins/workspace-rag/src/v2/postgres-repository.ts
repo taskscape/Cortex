@@ -42,6 +42,16 @@ const TERMINAL_JOB_STATES = [
 ] as const;
 
 /**
+ * Section restriction for passage-level searches ($6 section ids). The
+ * workspace and context equalities repeat what the document join already
+ * implies: they are the leading columns of the passages section index, which
+ * the planner cannot use for `section_id` alone.
+ */
+const PASSAGE_SECTION_FILTER = `AND ($6::text[] IS NULL OR (
+  p.workspace_id = $1 AND p.context_id = $2 AND p.section_id = ANY($6::text[])
+))`;
+
+/**
  * Builds the zeroed {@link RagV2GcResult} used as the aggregation base for a
  * garbage-collection pass.
  *
@@ -1528,35 +1538,65 @@ export class PostgresRagV2Repository implements RagV2Repository {
    */
   async exactSearch(references: readonly string[], scope: RagV2SearchScope): Promise<RagV2RankedHit[]> {
     if (references.length === 0) return [];
-    const patterns = references.map(value => `%${value.toLocaleLowerCase().replace(/[%_\\]/gu, '\\$&')}%`);
-    const result = await this.withWorkspace(scope.workspaceId, client => client.query<SearchRow>(`
-      ${this.commonPassageSelect("GREATEST(1, cardinality($4::text[]))::float8")}
-      WHERE pd.generation_id = $3
-        AND d.workspace_id = $1 AND d.context_id = $2
-        AND lower(p.text) LIKE ANY($4::text[])
-        AND ($5::text[] IS NULL OR d.document_id = ANY($5::text[]))
-        AND ($6::text[] IS NULL OR p.section_id = ANY($6::text[]))
-        AND d.acl_tokens && $7::text[]
-        AND ($9::text[] IS NULL OR lower(d.document_type) = ANY($9::text[]))
-        AND ($10::text[] IS NULL OR lower(d.jurisdiction) = ANY($10::text[]))
-        AND ($11::date IS NULL OR (
-          (d.publication_date IS NULL OR d.publication_date <= $11::date)
-          AND (d.valid_from IS NULL OR d.valid_from <= $11::date)
-          AND (d.valid_to IS NULL OR d.valid_to >= $11::date)
-        ))
-        AND ($12::text[] IS NULL OR d.collection_id = ANY($12::text[]))
-      ORDER BY p.ordinal
-      LIMIT $8
-    `, [
-      scope.workspaceId, scope.contextId, scope.generationId, patterns,
-      scope.documentIds ?? null, scope.sectionIds ?? null,
-      scope.authorizationTokens ?? [`workspace:${scope.workspaceId}`], scope.limit,
-      scope.documentTypes?.map(value => value.toLocaleLowerCase()) ?? null,
-      scope.jurisdictions?.map(value => value.toLocaleLowerCase()) ?? null,
-      scope.asOfDate ?? null,
-      scope.collectionIds ?? null,
-    ]));
+    const query = this.exactSearchQuery(references, scope);
+    const result = await this.withWorkspace(
+      scope.workspaceId,
+      client => client.query<SearchRow>(query.text, query.values),
+    );
     return result.rows.map((row, index) => this.rowToHit(row, 'exact_reference', index + 1));
+  }
+
+  /**
+   * Composes the exact-reference search statement and its bind values.
+   *
+   * A hit asserts that the reference occurs in the passage's own source bytes,
+   * so `text` decides the match. The trigram index, however, covers
+   * `lexical_text`, which is `text` with search-only context (a repeated table
+   * header) in front of it: every match in `text` is also a match there. That
+   * column is therefore tested first, purely so the index can narrow the
+   * candidates instead of every passage being scanned.
+   *
+   * @param references - Literal substrings to match; must not be empty.
+   * @param scope - Search scope providing authorization, filters, and limit.
+   * @returns The SQL text with placeholders $1-$12 and the aligned values.
+   * @throws Never.
+   */
+  private exactSearchQuery(
+    references: readonly string[],
+    scope: RagV2SearchScope,
+  ): { text: string; values: unknown[] } {
+    const patterns = references.map(value => `%${value.toLocaleLowerCase().replace(/[%_\\]/gu, '\\$&')}%`);
+    return {
+      text: `
+        ${this.commonPassageSelect("GREATEST(1, cardinality($4::text[]))::float8")}
+        WHERE ${this.generationMembership()}
+          AND d.workspace_id = $1 AND d.context_id = $2
+          AND lower(p.lexical_text) LIKE ANY($4::text[])
+          AND lower(p.text) LIKE ANY($4::text[])
+          AND ($5::text[] IS NULL OR d.document_id = ANY($5::text[]))
+          ${PASSAGE_SECTION_FILTER}
+          AND d.acl_tokens && $7::text[]
+          AND ($9::text[] IS NULL OR lower(d.document_type) = ANY($9::text[]))
+          AND ($10::text[] IS NULL OR lower(d.jurisdiction) = ANY($10::text[]))
+          AND ($11::date IS NULL OR (
+            (d.publication_date IS NULL OR d.publication_date <= $11::date)
+            AND (d.valid_from IS NULL OR d.valid_from <= $11::date)
+            AND (d.valid_to IS NULL OR d.valid_to >= $11::date)
+          ))
+          AND ($12::text[] IS NULL OR d.collection_id = ANY($12::text[]))
+        ORDER BY p.ordinal
+        LIMIT $8
+      `,
+      values: [
+        scope.workspaceId, scope.contextId, scope.generationId, patterns,
+        scope.documentIds ?? null, scope.sectionIds ?? null,
+        scope.authorizationTokens ?? [`workspace:${scope.workspaceId}`], scope.limit,
+        scope.documentTypes?.map(value => value.toLocaleLowerCase()) ?? null,
+        scope.jurisdictions?.map(value => value.toLocaleLowerCase()) ?? null,
+        scope.asOfDate ?? null,
+        scope.collectionIds ?? null,
+      ],
+    };
   }
 
   /**
@@ -1642,9 +1682,8 @@ export class PostgresRagV2Repository implements RagV2Repository {
     }>(`
       SELECT p.*
       FROM ${this.table('passages')} p
-      JOIN ${this.table('publication_documents')} pd
-        ON pd.document_version_id = p.document_version_id AND pd.generation_id = $3
       WHERE p.workspace_id = $1 AND p.context_id = $2 AND p.section_id = $4
+        AND ${this.generationMembership('p.document_version_id')}
         AND ($5::boolean = FALSE OR p.embedding_state <> 'ready')
       ORDER BY p.ordinal
     `, [workspaceId, contextId, generationId, sectionId, onlyMissingEmbeddings]));
@@ -1771,7 +1810,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
       await client.query(`SET LOCAL statement_timeout = '2000ms'`);
       const result = await client.query<SearchRow>(`
         ${this.commonPassageSelect('1::float8')}
-        WHERE pd.generation_id = $3
+        WHERE ${this.generationMembership()}
           AND d.workspace_id = $1 AND d.context_id = $2
           AND d.document_version_id = ANY($4::text[])
           AND d.acl_tokens && $5::text[]
@@ -3024,6 +3063,10 @@ export class PostgresRagV2Repository implements RagV2Repository {
         source_version_id = COALESCE(EXCLUDED.source_version_id, ${this.table('documents')}.source_version_id),
         title = EXCLUDED.title, collection_id = EXCLUDED.collection_id,
         collection_title = EXCLUDED.collection_title,
+        document_type = EXCLUDED.document_type, jurisdiction = EXCLUDED.jurisdiction,
+        governing_law = EXCLUDED.governing_law, parties = EXCLUDED.parties,
+        publication_date = EXCLUDED.publication_date, valid_from = EXCLUDED.valid_from,
+        valid_to = EXCLUDED.valid_to,
         language_distribution = EXCLUDED.language_distribution,
         line_count = EXCLUDED.line_count, table_of_contents = EXCLUDED.table_of_contents,
         routing_summary = EXCLUDED.routing_summary, publication_state = EXCLUDED.publication_state,
@@ -3126,13 +3169,13 @@ export class PostgresRagV2Repository implements RagV2Repository {
         ? `AND ($6::text[] IS NULL OR TRUE)`
         : level === 'section'
           ? `AND ($6::text[] IS NULL OR s.section_id = ANY($6::text[]))`
-          : `AND ($6::text[] IS NULL OR p.section_id = ANY($6::text[]))`;
+          : PASSAGE_SECTION_FILTER;
       return `
         ${source}
         CROSS JOIN LATERAL (
           SELECT ${level === 'document' ? 'd' : level === 'section' ? 's' : 'p'}.${vectorColumn} AS search_vector
         ) x
-        WHERE pd.generation_id = $3
+        WHERE ${this.generationMembership()}
           AND d.workspace_id = $1 AND d.context_id = $2
           AND x.search_vector @@ websearch_to_tsquery('${configuration}'::regconfig, $4)
           AND ($5::text[] IS NULL OR d.document_id = ANY($5::text[]))
@@ -3168,12 +3211,12 @@ export class PostgresRagV2Repository implements RagV2Repository {
       ? `AND ($6::text[] IS NULL OR TRUE)`
       : level === 'section'
         ? `AND ($6::text[] IS NULL OR s.section_id = ANY($6::text[]))`
-        : `AND ($6::text[] IS NULL OR p.section_id = ANY($6::text[]))`;
+        : PASSAGE_SECTION_FILTER;
     return `
       ${source}
       JOIN ${this.getEmbeddingsTable()} e
         ON e.level = '${level}' AND e.unit_id = ${unitId} AND e.embedding_signature = $9
-      WHERE pd.generation_id = $3
+      WHERE ${this.generationMembership()}
         AND d.workspace_id = $1 AND d.context_id = $2
         AND ($5::text[] IS NULL OR d.document_id = ANY($5::text[]))
         ${idFilter}
@@ -3289,13 +3332,37 @@ export class PostgresRagV2Repository implements RagV2Repository {
   }
 
   /**
+   * Builds the predicate restricting a search to documents published in the
+   * generation bound to `$3`.
+   *
+   * `OFFSET 0` keeps the planner from flattening this into a join. Every
+   * publication writes its membership under a generation id the table
+   * statistics have never seen, so a join is estimated at one row and picked
+   * as the driving table: the search then walks every document of the
+   * generation instead of using its GIN or HNSW index. As a subquery,
+   * membership is always one index probe per candidate row.
+   *
+   * @param versionColumn - Trusted column reference holding the candidate's
+   * document version id.
+   * @returns An `EXISTS (...)` SQL predicate.
+   * @throws Never.
+   */
+  private generationMembership(versionColumn = 'd.document_version_id'): string {
+    return `EXISTS (
+      SELECT 1 FROM ${this.table('publication_documents')} pd
+      WHERE pd.generation_id = $3 AND pd.document_version_id = ${versionColumn}
+      OFFSET 0
+    )`;
+  }
+
+  /**
    * Builds the shared document-level SELECT fragment (column aliases matching
-   * {@link SearchRow}) joined through generation membership, with the caller's
-   * score expression embedded.
+   * {@link SearchRow}) with the caller's score expression embedded. Callers
+   * add {@link PostgresRagV2Repository.generationMembership}.
    *
    * @param score - Trusted score SQL expression built by this module, never
    * user input.
-   * @returns A `SELECT ... FROM <publication_documents>/<documents>` fragment.
+   * @returns A `SELECT ... FROM <documents>` fragment.
    * @throws Never.
    */
   private commonDocumentSelect(score: string): string {
@@ -3308,20 +3375,18 @@ export class PostgresRagV2Repository implements RagV2Repository {
         d.title || E'\\n' || d.routing_summary AS text, d.content_sha256,
         d.source_id, d.source_version_id, d.object_path, d.line_index_path, d.embedding_state,
         ${score} AS score
-      FROM ${this.table('publication_documents')} pd
-      JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+      FROM ${this.table('documents')} d
     `;
   }
 
   /**
    * Builds the shared section-level SELECT fragment (column aliases matching
-   * {@link SearchRow}) joined through generation membership, with the caller's
-   * score expression embedded.
+   * {@link SearchRow}) with the caller's score expression embedded. Callers
+   * add {@link PostgresRagV2Repository.generationMembership}.
    *
    * @param score - Trusted score SQL expression built by this module, never
    * user input.
-   * @returns A `SELECT ... FROM <publication_documents>/<documents>/<sections>`
-   * fragment.
+   * @returns A `SELECT ... FROM <documents>/<sections>` fragment.
    * @throws Never.
    */
   private commonSectionSelect(score: string): string {
@@ -3332,21 +3397,19 @@ export class PostgresRagV2Repository implements RagV2Repository {
         s.language, s.heading_text || E'\\n' || s.routing_summary AS text, s.content_sha256,
         d.source_id, d.source_version_id, d.object_path, d.line_index_path, s.embedding_state,
         ${score} AS score
-      FROM ${this.table('publication_documents')} pd
-      JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+      FROM ${this.table('documents')} d
       JOIN ${this.table('sections')} s ON s.document_version_id = d.document_version_id
     `;
   }
 
   /**
    * Builds the shared passage-level SELECT fragment (column aliases matching
-   * {@link SearchRow}) joined through generation membership, with the caller's
-   * score expression embedded.
+   * {@link SearchRow}) with the caller's score expression embedded. Callers
+   * add {@link PostgresRagV2Repository.generationMembership}.
    *
    * @param score - Trusted score SQL expression built by this module, never
    * user input.
-   * @returns A `SELECT ... FROM <publication_documents>/<documents>/<passages>`
-   * fragment.
+   * @returns A `SELECT ... FROM <documents>/<passages>` fragment.
    * @throws Never.
    */
   private commonPassageSelect(score: string): string {
@@ -3357,8 +3420,7 @@ export class PostgresRagV2Repository implements RagV2Repository {
         p.language, p.text, p.content_sha256,
         d.source_id, d.source_version_id, d.object_path, d.line_index_path, p.embedding_state,
         ${score} AS score
-      FROM ${this.table('publication_documents')} pd
-      JOIN ${this.table('documents')} d ON d.document_version_id = pd.document_version_id
+      FROM ${this.table('documents')} d
       JOIN ${this.table('passages')} p ON p.document_version_id = d.document_version_id
     `;
   }

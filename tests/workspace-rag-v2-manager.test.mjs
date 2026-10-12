@@ -866,7 +866,7 @@ test("workspace RAG V2 does not publish nested-directory deletions from a discov
   assert.equal((await manager.status("primary", workspace, context)).job.state, "active_hybrid_complete");
 });
 
-test("workspace RAG V2 defers deletions when any discovered file fails ingestion", async t => {
+test("workspace RAG V2 reconciles deletions when another discovered file fails ingestion", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-file-failure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const docs = path.join(root, "docs");
@@ -874,16 +874,17 @@ test("workspace RAG V2 defers deletions when any discovered file fails ingestion
   const changedPath = path.join(docs, "changed.md");
   const removedPath = path.join(docs, "removed.md");
   await writeFile(changedPath, "# Changed\n\nORIGINAL-SAFE-EVIDENCE", "utf8");
-  await writeFile(removedPath, "# Removed\n\nPRESERVE-ON-FAILURE-991", "utf8");
+  await writeFile(removedPath, "# Removed\n\nDELETED-SOURCE-EVIDENCE-991", "utf8");
   const repository = new MemoryRagV2Repository();
   let rejectRegistration = false;
+  const removed = [];
   const sourceBridge = {
     async register() {
       if (rejectRegistration) throw new Error("intentional source registration failure");
       return {};
     },
     async recordFailure() {},
-    async markRemoved() {},
+    async markRemoved(_workspace, _context, paths) { removed.push(...paths); },
   };
   const manager = new WorkspaceRagV2Manager(repository, testEmbedder(), sourceBridge);
   t.after(() => manager.close());
@@ -900,13 +901,92 @@ test("workspace RAG V2 defers deletions when any discovered file fails ingestion
   const status = await manager.status("primary", workspace, context);
   assert.equal(status.job.discoveryComplete, true);
   assert.equal(status.job.failedFiles, 1);
-  assert.equal(status.job.deletionsDeferred, true);
-  assert.equal(status.job.removedFiles, 0);
-  assert.equal((await repository.listFingerprints(workspace.id, context.id)).length, 2);
-  const search = await manager.search(
-    workspace, context, "PRESERVE-ON-FAILURE-991", 3, new AbortController().signal,
+  assert.equal(status.job.deletionsDeferred, false);
+  assert.equal(status.job.removedFiles, 1);
+  assert.match(status.job.message, /1 removed\. 1 file failed to index\./);
+  assert.deepEqual(removed.map(value => path.basename(value)), ["removed.md"]);
+  const fingerprints = await repository.listFingerprints(workspace.id, context.id);
+  assert.deepEqual(fingerprints.map(value => path.basename(value.path)), ["changed.md"]);
+  const deleted = await manager.search(
+    workspace, context, "DELETED-SOURCE-EVIDENCE-991", 3, new AbortController().signal,
   );
-  assert.ok(search.evidence.some(value => value.text.includes("PRESERVE-ON-FAILURE-991")));
+  assert.equal(deleted.evidence.some(value => value.text.includes("DELETED-SOURCE-EVIDENCE-991")), false);
+  const retained = await manager.search(
+    workspace, context, "ORIGINAL-SAFE-EVIDENCE", 3, new AbortController().signal,
+  );
+  assert.ok(
+    retained.evidence.some(value => value.text.includes("ORIGINAL-SAFE-EVIDENCE")),
+    "the file that failed keeps its previously published version",
+  );
+});
+
+test("workspace RAG V2 indexes sources containing NUL bytes and returns NUL-free evidence", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-nul-source-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  await writeFile(path.join(docs, "extracted.md"), "# Prospecting\n\nOferta danej \0rmy NUL-EVIDENCE-552", "utf8");
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+
+  const status = await manager.status("primary", workspace, context);
+  assert.equal(status.job.failedFiles, 0);
+  assert.equal(status.job.addedFiles, 1);
+  const search = await manager.search(workspace, context, "NUL-EVIDENCE-552", { limit: 3 });
+  assert.equal(search.evidence.length, 1);
+  assert.match(search.evidence[0].text, /Oferta danej rmy NUL-EVIDENCE-552/);
+  // Evidence is persisted as jsonb, which rejects the \u0000 escape.
+  assert.equal(JSON.stringify(search).includes("\\u0000"), false);
+});
+
+test("workspace RAG V2 exact-reference search matches a passage's source text, not a table header repeated for search", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-exact-table-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docs = path.join(root, "docs");
+  await mkdir(docs, { recursive: true });
+  const rows = Array.from({ length: 400 }, (_, index) =>
+    `| Party ${index}${index === 300 ? " ROW-9902" : ""} | ${index + 1} days |`);
+  await writeFile(path.join(docs, "notice-table.md"), [
+    "# Notice periods",
+    "",
+    "| Clause HDR-4471 | Notice |",
+    "| --- | --- |",
+    ...rows,
+    "",
+  ].join("\n"), "utf8");
+  const repository = new MemoryRagV2Repository();
+  const manager = new WorkspaceRagV2Manager(repository, testEmbedder());
+  t.after(() => manager.close());
+  const { workspace, context } = refs(root, docs);
+  manager.startIngestion(workspace, context);
+  await manager.waitForIngestion(workspace.id, context.id);
+  const publication = await repository.activePublication(workspace.id, context.id);
+  const scope = {
+    workspaceId: workspace.id,
+    contextId: context.id,
+    generationId: publication.generationId,
+    authorizationTokens: [`workspace:${workspace.id}`],
+    limit: 20,
+  };
+
+  // The table is too large for one passage; its later chunks repeat the header
+  // in their search-only text, so full-text search finds every chunk.
+  const lexical = await repository.lexicalSearch("passage", "HDR-4471", scope);
+  assert.ok(lexical.length > 1, "later table chunks are searchable by the header");
+
+  // An exact-reference hit claims the reference is inside the cited byte range.
+  const header = await repository.exactSearch(["HDR-4471"], scope);
+  assert.equal(header.length, 1);
+  assert.match(header[0].text, /^\| Clause HDR-4471 \|/);
+  const row = await repository.exactSearch(["row-9902"], scope);
+  assert.equal(row.length, 1);
+  assert.match(row[0].text, /ROW-9902/);
+  assert.doesNotMatch(row[0].text, /HDR-4471/);
 });
 
 test("workspace RAG V2 derivative reuse hashes the exact path-derived embedding input", async t => {

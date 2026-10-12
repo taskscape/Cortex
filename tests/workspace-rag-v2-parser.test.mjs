@@ -166,6 +166,53 @@ test("workspace RAG V2 splits a very long structural unit within the parser memo
   }
 });
 
+test("workspace RAG V2 drops NUL characters from parsed text while citations keep addressing raw bytes", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-nul-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = path.join(root, "extracted.md");
+  await writeFile(source, [
+    "---",
+    "document_type: arti\0cle",
+    "---",
+    "# Pro\0l \0rmy",
+    "",
+    "Oferta danej \0rmy tra\0a do skrzynki odbiorczej.",
+    "",
+  ].join("\n"), "utf8");
+
+  const objectStore = new RagV2ObjectStore(path.join(root, "objects"));
+  const object = await objectStore.putFile(source);
+  const sections = [];
+  const passages = [];
+  const parsed = await parseMarkdownStream(
+    object.objectPath,
+    {
+      workspaceId: "workspace-1",
+      contextId: "context-1",
+      documentId: "document-nul",
+      documentVersionId: object.contentSha256,
+    },
+    ragV2PolicyFromEnv(),
+    {
+      async onSection(section) { sections.push(section); },
+      async onPassage(passage) { passages.push(passage); },
+    },
+  );
+
+  // PostgreSQL rejects U+0000 in text and in jsonb, so no emitted string may carry one.
+  assert.equal(JSON.stringify({ parsed, sections, passages }).includes("\\u0000"), false);
+  assert.equal(parsed.title, "Prol rmy");
+  assert.equal(parsed.metadata.documentType, "article");
+  assert.deepEqual(sections[0].headingPath, ["Prol rmy"]);
+  assert.match(passages.map(passage => passage.text).join(""), /Oferta danej rmy traa do skrzynki/);
+  for (const passage of passages) {
+    const raw = await objectStore.fetchRange(object.contentSha256, passage.startByte, passage.endByte);
+    assert.equal(raw.includes(0), true, "the stored object keeps the source bytes verbatim");
+    assert.equal(sha256(raw), passage.contentSha256);
+    assert.equal(raw.toString("utf8").replaceAll("\0", ""), passage.text);
+  }
+});
+
 test("workspace RAG V2 promotes front matter, preserves fenced blocks, and repeats split table headers only for search", async t => {
   const root = await mkdtemp(path.join(tmpdir(), "cortex-rag-v2-structure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
